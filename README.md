@@ -1,35 +1,50 @@
 # MYSTIC OS
 
-An operating system written from scratch. It boots on real hardware.
+A beautiful, small, secure desktop OS for old PCs. It runs Linux apps natively
+and Windows apps through Wine.
 
-**Status: stage 1.** The boot sector fits in 512 bytes, is loaded by the BIOS at
-`0x7C00`, switches the screen to text mode and prints a banner. Then it halts.
+Not a Linux skin. Not a distro remix. The desktop is ours: our compositor, our
+theme, our shell, our security model.
 
-## Build
+## What works today
+
+`image.sh` builds a **3.7 MB** bootable root filesystem from Alpine's kernel +
+our own userspace, and boots it in QEMU to a shell. That is the floor
+everything else stands on: a real kernel, a real rootfs we assemble, a real
+boot.
+
+```
+stage/        our userspace - the only files that are "us"
+  init          PID 1: mounts, banner, hands over to the shell
+tools/
+  mkimage.py    builds the rootfs image (cpio) straight from tarballs
+  ppm2png.py    turns QEMU screenshots into PNG
+image.sh        download kernel -> pack rootfs -> boot
+boot/boot.asm   stage 1: our own 512-byte boot sector (kept as a lesson)
+build.sh        builds that boot sector into a floppy image
+```
+
+## Build and run
 
 ```bash
-./build.sh
+./image.sh          # build + boot in a window
+./image.sh shell    # build + boot with a serial console
+./image.sh shot 10  # build, boot headless, screenshot after 10s
 ```
 
-Produces `build/mystic.img` — a 1.44 MB bootable disk image.
+## Design targets (the things we will be judged on)
 
-## Run
-
-No emulator is assumed. To see it boot:
-
-- **in QEMU** (once installed): `qemu-system-x86_64 -drive format=raw,file=build/mystic.img`
-- **on a real machine**: write `build/mystic.img` to a USB stick and boot it
-
-## Layout
-
-```
-boot/boot.asm    the 512-byte boot sector: where the machine wakes up
-build.sh         assemble + pack into a disk image
-build/           output (never committed)
-```
+| | Target |
+|---|---|
+| Idle RAM | under 128 MB with the desktop running |
+| Boot to desktop | under 2 seconds on 2010-era hardware |
+| CPU baseline | x86-64 without SSE4.2 / POPCNT; no TPM, no Secure Boot |
+| Apps | Linux native, Windows via Wine |
+| Security | read-only root, every app sandboxed, per-app permissions you can see |
 
 ## Rules this project keeps
 
 1. Nothing is "done" until it has been built and booted.
-2. No file grows by copy-paste. If something is duplicated, it gets deleted.
-3. One idea at a time. The next idea is only started when the last one boots.
+2. No file grows by copy-paste. Duplication gets deleted.
+3. One idea at a time. The next idea starts when the last one boots.
+4. Claim nothing that was not measured here.
