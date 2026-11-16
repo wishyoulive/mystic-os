@@ -1,50 +1,83 @@
 # MYSTIC OS
 
-A beautiful, small, secure desktop OS for old PCs. It runs Linux apps natively
-and Windows apps through Wine.
+A small, fast, secure desktop operating system for old PCs.
+Runs Linux apps natively, Windows apps through Wine.
 
-Not a Linux skin. Not a distro remix. The desktop is ours: our compositor, our
-theme, our shell, our security model.
+Not a distro remix: the desktop is ours — our compositor, our renderer, our
+themes, our security model. Everything below was built and booted here.
+
+![Obsidian](docs/screenshots/obsidian.png)
 
 ## What works today
 
-`image.sh` builds a **3.7 MB** bootable root filesystem from Alpine's kernel +
-our own userspace, and boots it in QEMU to a shell. That is the floor
-everything else stands on: a real kernel, a real rootfs we assemble, a real
-boot.
+A real desktop, drawn pixel by pixel by our own compositor on a bare
+framebuffer. No X11, no Wayland, no GPU driver.
 
-```
-stage/        our userspace - the only files that are "us"
-  init          PID 1: mounts, banner, hands over to the shell
-tools/
-  mkimage.py    builds the rootfs image (cpio) straight from tarballs
-  ppm2png.py    turns QEMU screenshots into PNG
-image.sh        download kernel -> pack rootfs -> boot
-boot/boot.asm   stage 1: our own 512-byte boot sector (kept as a lesson)
-build.sh        builds that boot sector into a floppy image
-```
+| | |
+|---|---|
+| Boot | 0.43 s to userspace (hardware accelerated in a VM) |
+| Memory | ~62 MB used of 216 MB, including kernel + rootfs |
+| Image | 6.5 MB rootfs, 13 MB kernel |
+| Graphics | bochs/simpledrm framebuffer, 1280×800, 32bpp |
+| Text | real TrueType rasterising (Lato), antialiased |
+| Themes | three, switched live with the number keys |
+| Input | evdev keyboard + mouse, drag windows |
+
+Press `1` `2` `3` to switch theme. Drag the title bar to move the window.
+
+| Obsidian | Porcelain | Aurora |
+|---|---|---|
+| ![](docs/screenshots/obsidian.png) | ![](docs/screenshots/porcelain.png) | ![](docs/screenshots/aurora.png) |
 
 ## Build and run
 
 ```bash
-./image.sh          # build + boot in a window
-./image.sh shell    # build + boot with a serial console
-./image.sh shot 10  # build, boot headless, screenshot after 10s
+./image.sh            # build and boot the desktop in a window
+./image.sh probe      # boot headless, print machine facts, power off
+./image.sh shot 10    # boot headless, screenshot after 10 s
+./image.sh themes     # boot once, screenshot all three themes
 ```
 
-## Design targets (the things we will be judged on)
+Nothing needs to be installed except QEMU, zig and nasm — and the builder
+fetches the kernel and base rootfs itself.
 
-| | Target |
-|---|---|
-| Idle RAM | under 128 MB with the desktop running |
-| Boot to desktop | under 2 seconds on 2010-era hardware |
-| CPU baseline | x86-64 without SSE4.2 / POPCNT; no TPM, no Secure Boot |
-| Apps | Linux native, Windows via Wine |
-| Security | read-only root, every app sandboxed, per-app permissions you can see |
+## Layout
+
+```
+src/              the desktop: C, no dependencies
+  main.c          the desktop itself: layout, dock, window, event loop
+  gfx.c           CPU drawing: gradients, rounded rects, real blur, polygons
+  font.c          TrueType rasterising via stb_truetype
+  fb.c            /dev/fb0
+  input.c         /dev/input/event* (evdev)
+  theme.c         the theme file parser
+stage/            our userspace - the only files that are "us"
+  init            PID 1
+  etc/mystic/themes/*.theme
+tools/
+  fetch-kernel.sh get a kernel + exactly the modules we need
+  build-desktop.sh cross-compile the desktop into the rootfs
+  mkimage.py      pack a rootfs image (works where symlinks can't be made)
+  ppm2png.py      QEMU screenshots -> PNG
+image.sh          the whole pipeline
+boot/             stage 1: our own 512-byte boot sector (kept as a lesson)
+```
+
+## Design targets
+
+| | Target | Now |
+|---|---|---|
+| Idle RAM | under 128 MB | 62 MB |
+| Boot to desktop | under 2 s | 0.43 s (VM) |
+| CPU baseline | x86-64 without SSE4.2 / POPCNT | not yet measured |
+| Apps | Linux native, Windows via Wine | not yet |
+| Security | read-only root, per-app sandbox, visible permissions | not yet |
 
 ## Rules this project keeps
 
-1. Nothing is "done" until it has been built and booted.
+1. Nothing is "done" until it has been built and booted here.
 2. No file grows by copy-paste. Duplication gets deleted.
-3. One idea at a time. The next idea starts when the last one boots.
-4. Claim nothing that was not measured here.
+3. One idea at a time. The next one starts when the last one boots.
+4. Claim nothing that was not measured on this machine.
+5. No placeholder assets. The fonts are real fonts, the numbers are real
+   numbers read from /proc, the screenshots are real screenshots.

@@ -1,22 +1,99 @@
 #!/bin/sh
-# Mystic OS - first userspace that runs.
+# ============================================================
+#  Mystic OS - PID 1
+#
+#  Monts the pseudo-filesystems, loads the drivers we depend on,
+#  then either shows the banner (normal) or reports facts and
+#  powers off (probe).
+#
+#  probe mode exists so the build can verify the OS without a
+#  human watching a screen:   ./image.sh probe
+# ============================================================
+
 /bin/mount -t proc     none /proc
 /bin/mount -t sysfs    none /sys
 /bin/mount -t devtmpfs none /dev
 /bin/hostname mystic
 export PATH=/sbin:/usr/sbin:/bin:/usr/bin
 
-clear 2>/dev/null
+KV=$(uname -r)
 
+# ------------------------------------------------------------
+# Drivers. Alpine ships them as modules, so the first thing
+# userspace does is load what we need. depmod reads our module
+# tree and writes modules.dep, which modprobe then follows.
+# ------------------------------------------------------------
+load_modules() {
+    [ -d "/lib/modules/$KV" ] || return 0
+    depmod -a "$KV" 2>/dev/null
+    for m in drm drm_kms_helper ttm drm_ttm_helper drm_vram_helper \
+             drm_shmem_helper drm_client_lib fb_sys_fops sysimgblt sysfillrect \
+             bochs virtio-gpu evdev psmouse; do
+        modprobe "$m" 2>/dev/null
+    done
+}
+
+probe() {
+    echo "--- mystic probe ---"
+    echo "kernel   : $(uname -r)"
+    echo "uptime   : $(cut -d' ' -f1 /proc/uptime)s"
+    echo "memory   : $(awk '/MemTotal/{printf "%d MB", $2/1024}' /proc/meminfo)"
+
+    echo "modules  : $(awk '{print $1}' /proc/modules | tr '\n' ' ')"
+
+    echo "graphics :"
+    [ -e /dev/dri/card0 ] && echo "  card0: yes" || echo "  card0: no"
+    [ -e /dev/fb0 ]       && echo "  fb0  : yes" || echo "  fb0  : no"
+    for f in /sys/class/drm/card*/status; do
+        [ -e "$f" ] && echo "  $(cat "$f"): $f"
+    done
+    for f in /sys/class/drm/card*/modes; do
+        [ -e "$f" ] && echo "  modes: $(head -1 "$f")"
+    done
+    for f in /sys/class/graphics/*/name; do
+        [ -e "$f" ] && echo "  fb name: $(cat "$f")"
+    done
+
+    echo "input    :"
+    ls /dev/input 2>/dev/null | sed 's/^/  /' || echo "  none"
+    for d in /sys/class/input/event*; do
+        [ -e "$d/device/name" ] && echo "  $(cat "$d/device/name")"
+    done
+
+    echo "--- end probe ---"
+}
+
+load_modules
+
+if grep -q 'mystic.probe=1' /proc/cmdline; then
+    probe
+    sync
+    poweroff -f
+    while true; do sleep 1; done
+fi
+
+# If there is a screen, start the desktop. Otherwise drop to a shell
+# (this is what a headless probe boot does).
+if [ -x /usr/bin/mystic-desktop ] && [ -e /dev/fb0 ]; then
+    # Unbind the kernel's framebuffer console first. It keeps painting its
+    # text cursor on top of whatever we draw, so it has to go before the
+    # desktop takes the screen.
+    for v in /sys/class/vtconsole/vtcon*; do
+        [ -e "$v/name" ] || continue
+        case "$(cat "$v/name")" in
+            *frame\ buffer*) [ -e "$v/bind" ] && echo 0 > "$v/bind" 2>/dev/null ;;
+        esac
+    done
+    echo "starting mystic-desktop"
+    exec /usr/bin/mystic-desktop
+fi
+
+clear 2>/dev/null
 echo
 cat /etc/mystic-banner
 echo
 echo "  kernel : $(uname -r)"
-echo "  cpu    : $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')"
-echo "  memory : $(grep MemTotal /proc/meminfo | awk '{printf "%d MB", $2/1024}') visible to the OS"
-echo "  uptime : $(cut -d' ' -f1 /proc/uptime) seconds to get here"
-echo
-echo "  This is a real Linux kernel running our own rootfs."
-echo "  Next: our own desktop on top of it."
+echo "  memory : $(awk '/MemTotal/{printf "%d MB", $2/1024}' /proc/meminfo) visible to the OS"
+echo "  display: $([ -e /dev/dri/card0 ] && echo card0 || echo none)"
 echo
 exec /bin/sh
