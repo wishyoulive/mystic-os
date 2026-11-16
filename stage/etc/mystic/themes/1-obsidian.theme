@@ -1,0 +1,15 @@
+name          = Obsidian
+dark          = 1
+bg_top        = #0B0F1A
+bg_bottom     = #161C2E
+accent        = #7AA2F7
+glow          = #3D59A0
+glow_strength = 0.55
+panel         = #8C161C2B
+panel_border  = #1AFFFFFF
+text          = #E8ECF6
+text_dim      = #99E8ECF6
+window_bg     = #D9141928
+window_border = #22FFFFFF
+corner        = 14
+blur          = 1.0

@@ -1,0 +1,15 @@
+name          = Aurora
+dark          = 1
+bg_top        = #04121A
+bg_bottom     = #0A2C34
+accent        = #4FD1C5
+glow          = #2C7A7B
+glow_strength = 0.7
+panel         = #8C0B2028
+panel_border  = #22FFFFFF
+text          = #E6FFFB
+text_dim      = #99E6FFFB
+window_bg     = #D90A1E26
+window_border = #22FFFFFF
+corner        = 18
+blur          = 1.0

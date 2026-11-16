@@ -1,0 +1,15 @@
+name          = Porcelain
+dark          = 0
+bg_top        = #F6F3EE
+bg_bottom     = #DED8CE
+accent        = #B4633A
+glow          = #FFFFFF
+glow_strength = 0.85
+panel         = #C0FFFFFF
+panel_border  = #33000000
+text          = #2A2620
+text_dim      = #992A2620
+window_bg     = #E8FFFFFF
+window_border = #22000000
+corner        = 16
+blur          = 1.0
