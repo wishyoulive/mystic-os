@@ -4,4 +4,6 @@ build/
 *.bin
 *.o
 *.elf
+*.ppm
+*.png
 .DS_Store
