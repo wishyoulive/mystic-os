@@ -1,0 +1,22 @@
+#!/bin/sh
+# Mystic OS - first userspace that runs.
+/bin/mount -t proc     none /proc
+/bin/mount -t sysfs    none /sys
+/bin/mount -t devtmpfs none /dev
+/bin/hostname mystic
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+
+clear 2>/dev/null
+
+echo
+cat /etc/mystic-banner
+echo
+echo "  kernel : $(uname -r)"
+echo "  cpu    : $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')"
+echo "  memory : $(grep MemTotal /proc/meminfo | awk '{printf "%d MB", $2/1024}') visible to the OS"
+echo "  uptime : $(cut -d' ' -f1 /proc/uptime) seconds to get here"
+echo
+echo "  This is a real Linux kernel running our own rootfs."
+echo "  Next: our own desktop on top of it."
+echo
+exec /bin/sh
