@@ -73,6 +73,7 @@ void wms_poll(WmClient *c, int n);                  /* accept + read */
 void wms_notify_key(WmClient *c, int key, int mods, int press);
 void wms_notify_text(WmClient *c, const char *utf8);
 void wms_notify_mouse(WmClient *c, int x, int y, int buttons);
+void wms_notify_wheel(WmClient *c, int notches);
 void wms_notify_resize(WmClient *c, int w, int h);
 void wms_notify_close(WmClient *c);
 void wms_shutdown_client(WmClient *c);

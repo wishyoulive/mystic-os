@@ -11,6 +11,7 @@
  *          to launch an app, click a window's red dot to close it.
  * ============================================================ */
 #include <signal.h>
+#include <sys/stat.h>
 
 #include "mystic.h"
 #include "ipc.h"
@@ -223,6 +224,40 @@ static void icon_grid(Surface *s, float x, float y, float sz, u32 fg) {
             gfx_rrect(s, ox + c * (q + gap), oy + r * (q + gap), q, q, q * 0.22f, fg);
 }
 
+static void icon_web(Surface *s, float x, float y, float sz, u32 fg) {
+    float cx = x + sz * 0.5f, cy = y + sz * 0.5f, r = sz * 0.36f;
+    gfx_rrect_aa(s, cx - r, cy - r, r * 2, r * 2, r, 0, fg, sz * 0.065f);
+    gfx_line(s, cx - r, cy, cx + r, cy, sz * 0.055f, fg);          /* equator */
+    gfx_line(s, cx, cy - r, cx, cy + r, sz * 0.055f, fg);          /* meridian */
+    gfx_line(s, cx - r * 0.62f, cy - r * 0.72f, cx + r * 0.62f, cy - r * 0.72f, sz * 0.05f, fg);
+    gfx_line(s, cx - r * 0.62f, cy + r * 0.72f, cx + r * 0.62f, cy + r * 0.72f, sz * 0.05f, fg);
+}
+
+static void icon_2048(Surface *s, float x, float y, float sz, u32 fg) {
+    float q = sz * 0.27f;
+    float ox = x + (sz - 2 * q - sz * 0.10f) / 2, oy = y + (sz - 2 * q - sz * 0.10f) / 2;
+    gfx_rrect(s, ox, oy, q, q, sz * 0.06f, fg);
+    gfx_rrect(s, ox + q + sz * 0.10f, oy, q, q, sz * 0.06f, fg);
+    gfx_rrect(s, ox, oy + q + sz * 0.10f, q, q, sz * 0.06f, fg);
+    gfx_rrect(s, ox + q + sz * 0.10f, oy + q + sz * 0.10f, q, q, sz * 0.06f, fg);
+}
+
+/* A bundle used to be a letter in a box ("C", "F", "2"), which is why the
+ * launcher looked unfinished. Each known app now has the same kind of drawn
+ * icon the built-ins have; anything unknown still falls back to its initial. */
+typedef void (*IconFn)(Surface *, float, float, float, u32);
+static IconFn icon_for_bundle(const char *id) {
+    if (!strcmp(id, "clock"))      return icon_clock;
+    if (!strcmp(id, "files"))      return icon_folder;
+    if (!strcmp(id, "g2048"))      return icon_2048;
+    if (!strcmp(id, "life"))       return icon_life;
+    if (!strcmp(id, "mandel"))     return icon_mandel;
+    if (!strcmp(id, "paint"))      return icon_paint;
+    if (!strcmp(id, "sysmon"))     return icon_sysmon;
+    if (!strcmp(id, "web"))        return icon_web;
+    return NULL;
+}
+
 static void icon_bars(Surface *s, float x, float y, float sz, u32 fg) {
     for (int i = 0; i < 3; i++) {
         float hh = sz * (0.22f + i * 0.16f);
@@ -351,7 +386,13 @@ static void run_pkg(const char *verb, const char *name) {
     pid_t pid = fork();
     if (pid < 0) return;
     if (pid == 0) {
-        execl("/bin/sh", "sh", "-c", "pkg", verb, name, (char *)NULL);
+        /* sh -c CMD A B does not append A and B to CMD: they become $0 and
+         * $1, so the old form ran a bare "pkg" and printed the package list
+         * instead of installing anything. Build the whole command instead;
+         * both words are already restricted to [a-z0-9-] by pkg_name_ok. */
+        char cmd[96];
+        snprintf(cmd, sizeof(cmd), "pkg %s %s", verb, name);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
     fprintf(stderr, "pkg: %s %s started as pid %d\n", verb, name, (int)pid);
@@ -965,17 +1006,24 @@ static void draw_launcher(Surface *s, const Theme *th) {
             /* an installed bundle: a real program from /usr/share/mystic/apps */
             int b = i - LAUNCHER_N;
             label = (b >= 0 && b < bundle_count) ? bundles[b].name : "?";
-            /* an installed app gets its initial in a tile: one glyph, read
-             * from its manifest name, so each app is distinguishable */
+            /* an installed app gets its own drawn icon; the initial is only
+             * the fallback for a bundle this build does not know */
             u32 tile_bg = hovered ? color_alpha(th->accent, 0.34f)
                                   : color_alpha(th->text, 0.10f);
             gfx_rrect_aa(s, (float)tx + (tw - isz) / 2, (float)ty + 18, isz, isz, 12,
                          tile_bg, 0, 0);
-            char initial[2] = { (char)(label && label[0] ? label[0] : '?'), 0 };
-            Font *fi = font_get(FONT_SEMIBOLD, 26);
-            float iw2 = font_width(fi, initial);
-            font_draw(s, fi, (float)tx + (tw - iw2) / 2, (float)ty + 28, initial,
-                      hovered ? th->accent : th->text);
+            IconFn fn = (b >= 0 && b < bundle_count) ? icon_for_bundle(bundles[b].id) : NULL;
+            float ix = (float)tx + (tw - isz) / 2, iy = (float)ty + 18;
+            if (fn) {
+                fn(s, ix + isz * 0.16f, iy + isz * 0.16f, isz * 0.68f,
+                   hovered ? th->accent : th->text);
+            } else {
+                char initial[2] = { (char)(label && label[0] ? label[0] : '?'), 0 };
+                Font *fi = font_get(FONT_SEMIBOLD, 26);
+                float iw2 = font_width(fi, initial);
+                font_draw(s, fi, (float)tx + (tw - iw2) / 2, (float)ty + 28, initial,
+                          hovered ? th->accent : th->text);
+            }
         }
 
         float lw = font_width(f12, label);
@@ -1067,6 +1115,22 @@ static void try_unlock(void) {
 }
 
 /* ------------------------------------------------------------ cursor */
+/* Copy one rectangle between surfaces. The cursor is drawn straight onto the
+ * framebuffer copy, so moving it means putting back what was underneath -
+ * which we have: `scene` is the composited desktop without the cursor. */
+static void copy_rect(Surface *dst, const Surface *src,
+                      int x, int y, int w, int h) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > dst->w) w = dst->w - x;
+    if (y + h > dst->h) h = dst->h - y;
+    if (w <= 0 || h <= 0) return;
+    for (int row = y; row < y + h; row++)
+        memcpy(dst->px + (size_t)row * dst->stride + x,
+               src->px + (size_t)row * src->stride + x,
+               (size_t)w * sizeof(u32));
+}
+
 static void draw_cursor_at(Surface *s, int x, int y) {
     static const float shape[] = {
         0, 0,   0, 17,   4.2f, 12.6f,   7.4f, 19.6f,   10.6f, 18.2f,
@@ -1119,7 +1183,28 @@ static int taskbar_click(int mx, int my) {
     return 0;
 }
 
-static int handle_click(void) {
+/* Maximise/restore in one place: the yellow dot and the title-bar
+ * double-click must do exactly the same thing, or one of them drifts. */
+static void win_toggle_max(Window *w) {
+    if (!w->maxed) {
+        w->restore_x = w->x; w->restore_y = w->y;
+        w->restore_w = w->w; w->restore_h = w->h;
+        int top_ = topbar_h();
+        int bdx, bdy, bdw, bdh;
+        int reserved = dock_rect(&bdx, &bdy, &bdw, &bdh)
+                     ? (disp.h - bdy + ui_px(12)) : ui_px(16);
+        w->x = 0; w->y = top_;
+        w->w = disp.w; w->h = disp.h - top_ - reserved;
+        w->maxed = 1;
+    } else {
+        w->x = w->restore_x; w->y = w->restore_y;
+        w->w = w->restore_w; w->h = w->restore_h;
+        w->maxed = 0;
+    }
+    window_resized(w);
+}
+
+        static int handle_click(void) {
     int mx = input.mouse_x, my = input.mouse_y;
 
     /* The taskbar is drawn above the windows, so it must be hit first:
@@ -1173,9 +1258,22 @@ static int handle_click(void) {
          * The band is derived from the same centre the dots are drawn on, so
          * at scale 1.6 the target still sits on the dot instead of the fixed
          * 13..27 band the dots had already left. */
-        int dot_y = traffic_y(tb);
-        if (ly >= dot_y - 2 && ly < dot_y + DOT_SZ + 2 && lx >= 14 && lx < 24) { win_close(hit); return 1; }
-        if (ly >= dot_y - 2 && ly < dot_y + DOT_SZ + 2 && lx >= 32 && lx < 42) { hit->hidden = 1; return 1; }
+int dot_y = traffic_y(tb);
+        /* red closes, yellow maximises, green minimises - the order they are
+         * painted in. The green dot had no handler at all and yellow
+         * minimised, so "maximise" and "minimise" were both wrong. */
+        if (ly >= dot_y - 2 && ly < dot_y + DOT_SZ + 2 && lx >= 14 && lx < 24) {
+            win_close(hit);
+            return 1;
+        }
+        if (ly >= dot_y - 2 && ly < dot_y + DOT_SZ + 2 && lx >= 32 && lx < 42) {
+            win_toggle_max(hit);
+            return 1;
+        }
+        if (ly >= dot_y - 2 && ly < dot_y + DOT_SZ + 2 && lx >= 50 && lx < 60) {
+            hit->hidden = 1;
+            return 1;
+        }
         /* bottom-right corner resizes */
         if (lx >= hit->w - 18 && ly >= hit->h - 18) {
             resize_win = (int)(hit - wins);
@@ -1184,22 +1282,7 @@ static int handle_click(void) {
         }
         /* double-click on the title bar toggles maximise */
         if (ly < tb && input.clicked2) {
-            if (!hit->maxed) {
-                hit->restore_x = hit->x; hit->restore_y = hit->y;
-                hit->restore_w = hit->w; hit->restore_h = hit->h;
-                int top_ = topbar_h();
-                int bdx, bdy, bdw, bdh;
-                int reserved = dock_rect(&bdx, &bdy, &bdw, &bdh)
-                             ? (disp.h - bdy + ui_px(12)) : ui_px(16);
-                hit->x = 0; hit->y = top_;
-                hit->w = disp.w; hit->h = disp.h - top_ - reserved;
-                hit->maxed = 1;
-            } else {
-                hit->x = hit->restore_x; hit->y = hit->restore_y;
-                hit->w = hit->restore_w; hit->h = hit->restore_h;
-                hit->maxed = 0;
-            }
-            window_resized(hit);
+            win_toggle_max(hit);
             return 1;
         }
 
@@ -1269,6 +1352,7 @@ int main(void) {
     fprintf(stderr, "wms: %d installed app bundle(s)\n", bundle_count);
 
     int quit = 0, dirty = 1;
+    int cur_x = -1, cur_y = -1;      /* where the cursor is painted right now */
     long last_tick = 0;
 
     while (!quit) {
@@ -1390,6 +1474,15 @@ int main(void) {
                     continue;
                 }
                 if (k == 28) {               /* Enter launches the selection */
+                    /* Enter arrives twice in one frame: as a key here and as
+                     * the '
+' character in the text queue. The launcher
+                     * consumes the key, so the text must go too - otherwise
+                     * the app it just opened receives a newline and activates
+                     * its own selected row (opening the launcher and starting
+                     * an app with one press). */
+                    input.text_len = 0;
+                    input.text[0] = 0;
                     int idx = launcher_sel;
                     if (idx < LAUNCHER_N) {
                         if (LAUNCHER[idx].app_id) win_open(WIN_APP, LAUNCHER[idx].app_id);
@@ -1498,15 +1591,29 @@ int main(void) {
 
         /* mouse */
         if (input.wheel) {
+            /* The wheel goes to whatever the pointer is over - any window,
+             * not just terminals, and not only the focused one. */
             Window *under = NULL;
             for (int i = 0; i < MAX_WINDOWS; i++) {
                 Window *w = &wins[i];
-                if (!w->used || !w->term) continue;
+                if (!w->used || w->hidden) continue;
                 if (input.mouse_x < w->x || input.mouse_x >= w->x + w->w) continue;
                 if (input.mouse_y < w->y || input.mouse_y >= w->y + w->h) continue;
                 if (!under || w->z > under->z) under = w;
             }
-            if (under) { term_scroll(under->term, input.wheel * 3); dirty = 1; }
+            if (under) {
+                if (under->term) {
+                    term_scroll(under->term, input.wheel * 3);
+                    dirty = 1;
+                } else if (under->kind == WIN_CLIENT && under->client >= 0 &&
+                           clients[under->client].used) {
+                    wms_notify_wheel(&clients[under->client], input.wheel);
+                    dirty = 1;
+                } else if (under->app) {
+                    app_wheel(under->app, input.wheel);
+                    dirty = 1;
+                }
+            }
         }
         if (input.clicked & 1) { if (handle_click()) dirty = 1; }
         if (input.released & 1) {
@@ -1682,6 +1789,24 @@ int main(void) {
                 char want[64];
                 if (take_request("/run/mystic/install.request", want, sizeof(want)))
                     run_pkg("install", want);
+                /* first run: the Store needs an index to show anything, and
+                 * asking the user to press Refresh before they have ever seen
+                 * the list is a dead end. Fetch it once, in the background. */
+                static int index_tried;
+                if (!index_tried) {
+                    index_tried = 1;
+                    struct stat ist;
+                    if (stat("/run/mystic/repo.index", &ist) != 0) {
+                        pid_t pid = fork();
+                        if (pid == 0) {
+                            execl("/bin/sh", "sh", "-c",
+                                  "wget -q -T 10 -O /run/mystic/repo.index "
+                                  "http://10.0.2.2:8000/index.tsv", (char *)NULL);
+                            _exit(127);
+                        }
+                    }
+                }
+
                 if (take_request("/run/mystic/repo.refresh", want, sizeof(want))) {
                     pid_t pid = fork();
                     if (pid == 0) {
@@ -1725,7 +1850,20 @@ int main(void) {
                 remove("/run/mystic/launch.request");
             }
         }
-        if (input.mouse_dx || input.mouse_dy) dirty = 1;
+        /* A mouse move used to set dirty, which recomposed the whole desktop -
+         * every window's shadow and blur - for every single motion event.
+         * That was the stutter the user felt when moving the pointer. Now the
+         * cursor alone is redrawn, unless the pointer is over chrome that
+         * highlights (the dock magnifies, the top bar reacts). */
+        int over_chrome = input.mouse_y < topbar_h();
+        {
+            int bdx, bdy, bdw, bdh;
+            if (dock_rect(&bdx, &bdy, &bdw, &bdh) &&
+                input.mouse_y >= bdy - ui_px(24))
+                over_chrome = 1;
+        }
+        int cursor_moved = (input.mouse_x != cur_x || input.mouse_y != cur_y);
+        if ((input.mouse_dx || input.mouse_dy) && over_chrome) dirty = 1;
 
         if (dirty) {
             draw_desktop(&scene, &themes[theme_index]);
@@ -1733,6 +1871,25 @@ int main(void) {
             draw_cursor_at(&screen, input.mouse_x, input.mouse_y);
             disp_present(&disp, &screen);
             dirty = 0;
+            cur_x = input.mouse_x;
+            cur_y = input.mouse_y;
+        } else if (cursor_moved) {
+            /* put back the 24x26 box the old cursor covered, then draw the
+             * new one. No blur, no shadows, no full-screen copy. */
+            if (cur_x >= 0)
+                copy_rect(&screen, &scene, cur_x - 2, cur_y - 2, 26, 28);
+            draw_cursor_at(&screen, input.mouse_x, input.mouse_y);
+            if (cur_x >= 0) {
+                int ux = cur_x < input.mouse_x ? cur_x : input.mouse_x;
+                int uy = cur_y < input.mouse_y ? cur_y : input.mouse_y;
+                int uw = (cur_x < input.mouse_x ? input.mouse_x - cur_x : cur_x - input.mouse_x) + 28;
+                int uh = (cur_y < input.mouse_y ? input.mouse_y - cur_y : cur_y - input.mouse_y) + 30;
+                disp_present_rect(&disp, &screen, ux - 2, uy - 2, uw, uh);
+            } else {
+                disp_present(&disp, &screen);
+            }
+            cur_x = input.mouse_x;
+            cur_y = input.mouse_y;
         }
 
         struct pollfd pfd[2];

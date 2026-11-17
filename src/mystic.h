@@ -112,6 +112,7 @@ typedef struct {
 
 int  disp_open(Display *d, const char *path);
 void disp_present(Display *d, Surface *s);   /* copy a surface to the screen */
+void disp_present_rect(Display *d, Surface *s, int x, int y, int w, int h);
 
 /* ------------------------------------------------------------
  * Input (evdev)
@@ -163,6 +164,7 @@ typedef struct {
     void (*key)(App *a, const char *bytes, int n);
     void (*click)(App *a, int x, int y, int buttons);
     void (*resize)(App *a, int w, int h);
+    void (*wheel)(App *a, int notches);   /* positive scrolls up */
     void (*free)(App *a);
 } AppVT;
 
@@ -175,6 +177,7 @@ App *app_new(const char *id, int w, int h);
 void app_free(App *a);
 void app_draw(App *a, Surface *s, int x, int y, int w, int h, const Theme *th);
 void app_key(App *a, const char *bytes, int n);
+void app_wheel(App *a, int notches);
 void app_click(App *a, int x, int y, int buttons);
 const char *app_title(App *a);
 
@@ -210,6 +213,7 @@ void  term_destroy(Term *t);
 float ui_scale_get(void);
 void  ui_scale_load(const char *path);
 int   ui_px(int base);            /* a size scaled by ui_scale, min 1 */   /* close the pty, reap the shell, free the grid */
+void ui_scale_set_effective(float v);   /* client side: scale from the WM */
 int   term_fd(Term *t);
 int   term_alive(Term *t);
 /* Rebuild the grid and scrollback at a new size, keeping the top-left content,

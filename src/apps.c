@@ -61,6 +61,10 @@ void app_key(App *a, const char *bytes, int n) {
     if (a && a->vt && a->vt->key) a->vt->key(a, bytes, n);
 }
 
+void app_wheel(App *a, int notches) {
+    if (a && a->vt && a->vt->wheel) a->vt->wheel(a, notches);
+}
+
 void app_click(App *a, int x, int y, int buttons) {
     if (a && a->vt && a->vt->click) a->vt->click(a, x, y, buttons);
 }

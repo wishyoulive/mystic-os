@@ -260,6 +260,11 @@ void wms_notify_text(WmClient *c, const char *utf8) {
     buf[o] = 0;
     sendf(c, "TEXT %s\n", buf);
 }
+void wms_notify_wheel(WmClient *c, int notches) {
+    /* A wheel has no position of its own: the client already knows where its
+     * pointer is from the MOUSE events. One number, positive = up. */
+    sendf(c, "WHEEL %d\n", notches);
+}
 void wms_notify_mouse(WmClient *c, int x, int y, int buttons) {
     sendf(c, "MOUSE %d %d %d\n", x, y, buttons);
 }
@@ -284,15 +289,20 @@ static int cmp_app(const void *a, const void *b) {
     return strcmp(((const WmApp *)a)->id, ((const WmApp *)b)->id);
 }
 
-int wms_scan_apps(WmApp *out, int max) {
-    DIR *d = opendir(WM_APP_DIR);
-    if (!d) return 0;
-    int n = 0;
+/* Two roots, on purpose: WM_APP_DIR is the image's own bundles, and
+ * /root/apps is where pkg unpacks what the user installed - and /root is the
+ * only place that survives a reboot. Scanning just the first meant a package
+ * installed from the Store could never be launched. */
+static const char *const APP_ROOTS[] = { WM_APP_DIR, "/root/apps" };
+
+static int scan_root(WmApp *out, int n, int max, const char *root) {
+    DIR *d = opendir(root);
+    if (!d) return n;
     struct dirent *e;
     while ((e = readdir(d)) && n < max) {
         if (e->d_name[0] == '.') continue;
         char path[512];
-        snprintf(path, sizeof(path), "%s/%s/manifest", WM_APP_DIR, e->d_name);
+        snprintf(path, sizeof(path), "%s/%s/manifest", root, e->d_name);
         FILE *f = fopen(path, "r");
         if (!f) continue;
 
@@ -323,9 +333,23 @@ int wms_scan_apps(WmApp *out, int max) {
         n++;
     }
     closedir(d);
-    /* readdir order is arbitrary; sort so the launcher is stable */
-    qsort(out, (size_t)n, sizeof(WmApp), cmp_app);
     return n;
+}
+
+int wms_scan_apps(WmApp *out, int max) {
+    int n = 0;
+    for (unsigned i = 0; i < sizeof(APP_ROOTS) / sizeof(APP_ROOTS[0]); i++)
+        n = scan_root(out, n, max, APP_ROOTS[i]);
+    /* readdir order is arbitrary; sort so the launcher is stable. Two roots
+     * can hold the same id: the image's copy wins, so drop the later one. */
+    qsort(out, (size_t)n, sizeof(WmApp), cmp_app);
+    int keep = 0;
+    for (int i = 0; i < n; i++) {
+        if (keep > 0 && !strcmp(out[keep - 1].id, out[i].id)) continue;
+        if (keep != i) out[keep] = out[i];
+        keep++;
+    }
+    return keep;
 }
 
 /* ---------------------------------------------------------- sandbox
@@ -466,6 +490,13 @@ static void sandbox_child(const char *exe, const char *id, int net) {
 
     setenv("MYSTIC_SOCKET", "/run/mystic/wm.sock", 1);
     setenv("MYSTIC_APP_ID", id, 1);
+    {
+        /* the text scale is a desktop setting; a client app cannot read
+         * /etc/mystic from inside its jail, so it travels in the env */
+        char sc[32];
+        snprintf(sc, sizeof(sc), "%.3f", (double)ui_scale_get());
+        setenv("MYSTIC_UI_SCALE", sc, 1);
+    }
     setenv("HOME", "/tmp", 1);
     setenv("TMPDIR", "/tmp", 1);
 }

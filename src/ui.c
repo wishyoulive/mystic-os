@@ -68,6 +68,17 @@ void ui_scale_load(const char *path) {
 }
 
 /* a scaled pixel metric, rounded so 1px borders stay 1px */
+/* An app runs in its own process (and its own jail, with no /etc/mystic),
+ * so it cannot read ui.conf. The window server knows the scale and exports
+ * it in the environment; this applies it without the UI_BASE factor, which
+ * the parent already included. */
+void ui_scale_set_effective(float v) {
+    if (!isfinite(v) || v <= 0.0f) return;
+    ui_scale = v / UI_BASE;
+    if (ui_scale < 0.8f) ui_scale = 0.8f;
+    if (ui_scale > 1.6f) ui_scale = 1.6f;
+}
+
 int ui_px(int base) {
     int v = (int)(base * ui_scale + 0.5f);
     return v < 1 ? 1 : v;

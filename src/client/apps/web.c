@@ -39,7 +39,8 @@
  *      q            quit (when the address bar is not focused)
  *  Mouse
  *      click the bar to edit, click a numbered link to follow it,
- *      click the scroll bar to jump
+ *      click the scroll bar to jump, and the wheel scrolls the page
+ *      three lines per notch (positive = up, as the server sends it)
  *
  *  Every number shown at runtime is measured: byte counts come from
  *  the socket, status from the server's status line, milliseconds
@@ -102,11 +103,38 @@
 #define WEB_CONNECT_MS  6000          /* bounded connect()             */
 #define WEB_IO_SECS     10            /* bounded send()/recv()         */
 
-/* window bands, in window-local pixels */
-#define HEAD_H 56
-#define FOOT_H 20
-#define CGAP   4     /* pixels between the address field and the page  */
-#define SBAR   8     /* gutter on the right holding the scroll bar     */
+/* Window bands, in *design* pixels. Nothing here is used raw: the
+ * accessors further down pass every one of them through ui_px(), so the
+ * header, the page and the status bar grow together with the fonts that
+ * sit in them. ui_px() is called at each use and never cached in a
+ * static, which is what keeps this file honest when the desktop's text
+ * scale changes under it. */
+#define HEAD_D   56   /* title row + address field + gap below it     */
+#define FOOT_D   20   /* the status bar                              */
+#define CGAP_D    4   /* gap between the address field and the page  */
+#define SBAR_D    8   /* gutter on the right holding the scroll bar  */
+#define MX_D     24   /* the one left/right margin of the whole window */
+
+/* The parts of the header band, in design pixels. head_h() is composed
+ * from them so the address field always fits inside the band it sits in,
+ * at any scale, instead of being positioned by a second magic number. */
+#define ADDR_Y_D   28  /* top of the address field                    */
+#define ADDR_H_D   22  /* its height                                  */
+#define HEAD_GAP_D  6  /* space under the field, inside the band       */
+#define TITLE_Y_D   7  /* top of the title row                        */
+#define BADGE_Y_D   6  /* top of the "http only" badge                */
+#define BADGE_H_D  16  /* the badge's height                          */
+#define BADGE_PAD_D 7  /* its horizontal padding                      */
+
+/* The document's vertical rhythm, in design pixels. The parser stores
+ * these on the atoms; layout applies the text scale when it places a
+ * line, so a heading keeps its proportions when the desktop is zoomed.
+ * One value above and one below every heading is what puts them on the
+ * same grid, instead of the 10/7 px split the tags used to ask for. */
+#define GAP_BLOCK_D       6   /* <p>, <div>, <ul> ...                 */
+#define GAP_LI_D          2   /* list items follow each other closely */
+#define GAP_HEAD_D       16   /* space above any heading              */
+#define GAP_AFTER_HEAD_D 10   /* space below any heading              */
 
 /* Palette. A client app owns its pixels, so it carries its own
  * colours, picked to sit next to the desktop theme. */
@@ -1174,6 +1202,8 @@ typedef struct {
     int         in_title;
     int         skip;            /* inside <script>/<style>       */
     int         level;           /* 0 body, 1..6 heading          */
+    int         prev_level;      /* level of the last atom emitted; its
+                                  * AF_BREAK decides the gap below it */
     int         in_link;         /* link index, -1 when outside   */
     int         pending_break;
     int         pending_gap;
@@ -1193,8 +1223,18 @@ static void html_atom(Html *h, const char *text, long len, int flags, int link) 
     a->text[len] = 0;
     a->level = (u8)h->level;
     a->flags = (u8)flags;
-    a->gap = (u8)((flags & AF_BREAK) ? (h->pending_gap > 255 ? 255 : h->pending_gap) : 0);
+    int gap = 0;
+    if (flags & AF_BREAK) {
+        gap = h->pending_gap;
+        /* A heading is followed by its own space, never by whatever the
+         * next block happened to ask for: that is what makes the space
+         * below every heading the same and puts them on one grid. */
+        if (h->prev_level && gap < GAP_AFTER_HEAD_D) gap = GAP_AFTER_HEAD_D;
+        if (gap > 255) gap = 255;
+    }
+    a->gap = (u8)gap;
     a->link = (int16_t)link;
+    h->prev_level = h->level;
 }
 
 /* Ending a word is where the break/space state is spent. */
@@ -1388,15 +1428,18 @@ static void html_tag(Html *h, const Tag *t) {
             return;
         }
         if (n[0] == 'h' && n[1] >= '1' && n[1] <= '6' && !n[2]) {
-            html_break(h, 6);       /* flush the heading while it is still one */
+            /* The space under a heading comes from GAP_AFTER_HEAD_D in
+             * html_atom(), which remembers that the previous line was a
+             * heading. Asking for a block gap here would only be a
+             * second, competing number. */
+            html_break(h, 0);       /* flush the heading while it is still one */
             h->level = 0;
             return;
         }
-        if (!strcmp(n, "li")) { html_break(h, 2); return; }
-        if (!strcmp(n, "p")) { html_break(h, 6); return; }
+        if (!strcmp(n, "li")) { html_break(h, GAP_LI_D); return; }
+        if (!strcmp(n, "p")) { html_break(h, GAP_BLOCK_D); return; }
         if (!strcmp(n, "td") || !strcmp(n, "th")) { html_end_word(h, 0); h->pending_space = 1; return; }
-        if (is_block_tag(n)) { html_break(h, 2); return; }
-        return;
+        if (is_block_tag(n)) { html_break(h, GAP_BLOCK_D); return; }
     }
 
     /* open tags */
@@ -1405,7 +1448,7 @@ static void html_tag(Html *h, const Tag *t) {
     if (!strcmp(n, "script") || !strcmp(n, "style")) { h->skip = 1; return; }
     if (!strcmp(n, "a")) { html_end_word(h, 0); html_add_link(h, t); return; }
     if (!strcmp(n, "li")) {
-        html_break(h, 2);
+        html_break(h, GAP_LI_D);
         html_end_word(h, 0);
         h->pending_break = 1;
         html_atom(h, "\xE2\x80\xA2", 3, AF_BREAK, -1);   /* a real bullet */
@@ -1416,11 +1459,13 @@ static void html_tag(Html *h, const Tag *t) {
     }
     if (n[0] == 'h' && n[1] >= '1' && n[1] <= '6' && !n[2]) {
         h->level = n[1] - '0';
-        html_break(h, h->level <= 2 ? 10 : 7);
+        /* one gap above every heading, whatever its level: h1 and h6 sit
+         * on the same grid and only their font size differs */
+        html_break(h, GAP_HEAD_D);
         return;
     }
     if (!strcmp(n, "br")) { html_break(h, 0); return; }
-    if (!strcmp(n, "p")) { html_break(h, 6); return; }
+    if (!strcmp(n, "p")) { html_break(h, GAP_BLOCK_D); return; }
     if (!strcmp(n, "td") || !strcmp(n, "th")) {
         html_end_word(h, 0);
         h->pending_space = 1;
@@ -1434,7 +1479,7 @@ static void html_tag(Html *h, const Tag *t) {
         html_atom_word(h, alt, (long)strlen(alt), h->in_link, 0);
         return;
     }
-    if (is_block_tag(n)) { html_break(h, 2); return; }
+    if (is_block_tag(n)) { html_break(h, GAP_BLOCK_D); return; }
 }
 
 /* Turn a body of HTML into atoms. `title` receives the <title> text
@@ -1538,6 +1583,14 @@ static void lay_emit(Layout *L, int ai, int start, int len, float x, float w, in
     if (lh > L->height) L->height = lh;
 }
 
+/* A design gap in screen pixels. This is the only place where the
+ * document's vertical rhythm meets the desktop's text scale, so a scale
+ * change re-spaces the next layout without rebuilding the document. */
+static int layout_gap(int design) {
+    if (design <= 0) return 0;
+    return ui_px(design);
+}
+
 static void lay_flush(Layout *L) {
     Doc *d = L->d;
     if (L->first_seg >= 0 && L->segs_in_line > 0 && d->nline < WEB_MAX_LINES) {
@@ -1545,7 +1598,9 @@ static void lay_flush(Layout *L) {
         ln->first = (u32)L->first_seg;
         ln->n = (u16)L->segs_in_line;
         ln->h = (u16)(L->height > 0 ? L->height : 12);
-        ln->gap = (u16)L->gap;
+        /* The document starts flush with the content rectangle: a heading
+         * gap at the very top is not a margin, it is an offset. */
+        ln->gap = (u16)(d->nline == 1 ? 0 : layout_gap(L->gap));
         L->y += ln->gap;
         ln->y = L->y;
         L->y += ln->h;
@@ -1708,6 +1763,69 @@ typedef struct {
     int  dirty, last_buttons;
 } Web;
 
+/* ------------------------------------------------------------ geometry
+ * One set of numbers for the whole window, each of them a *design* size
+ * pushed through ui_px() at the moment it is needed. None of them is
+ * stored, so nothing here can go stale when the text scale changes:
+ * the header band, the page rectangle and the status bar all re-derive
+ * themselves from the current scale on every frame, exactly like the
+ * fonts inside them (font_get applies the scale too).
+ * ------------------------------------------------------------ */
+static int head_h(void) {
+    /* the address field, plus the space under it: the band can never be
+     * shorter than the thing it holds */
+    return ui_px(ADDR_Y_D) + ui_px(ADDR_H_D) + ui_px(HEAD_GAP_D);
+}
+
+static int foot_h(void)   { return ui_px(FOOT_D); }
+static int page_mx(void)  { return ui_px(MX_D); }
+static int sbar_w(void)   { return ui_px(SBAR_D); }
+
+typedef struct { int x, y, w, h; } PageRect;
+
+/* The rectangle the document lives in, between the header band and the
+ * status bar, inset by the one content margin. render() draws here and
+ * handle_mouse() tests clicks here; both call this, so a click can never
+ * address a rectangle that was drawn somewhere else. */
+static PageRect page_rect(const Web *w) {
+    PageRect r;
+    r.x = page_mx();
+    r.y = head_h() + ui_px(CGAP_D);
+    r.w = w->w - 2 * page_mx();
+    r.h = w->h - r.y - foot_h();
+    if (r.w < 40) r.w = 40;
+    if (r.h < 20) r.h = 20;
+    /* never run past the pixels we own, however small the window got */
+    if (r.x + r.w > w->w) r.w = w->w - r.x;
+    if (r.y + r.h > w->h) r.h = w->h - r.y;
+    if (r.w < 1) r.w = 1;
+    if (r.h < 1) r.h = 1;
+    return r;
+}
+
+/* Is the window big enough to hold a header, a page and a status bar?
+ * render() and handle_mouse() both ask first: if they disagreed, a click
+ * could land in a page that was never drawn. */
+static int layout_ok(const Web *w) {
+    if (w->w < 160) return 0;
+    if (w->w <= 2 * page_mx()) return 0;
+    return w->h >= head_h() + foot_h() + ui_px(MX_D);
+}
+
+/* The address field, in window pixels. draw_header() paints it and
+ * handle_mouse() hit-tests it through this one function. */
+static int addr_field_rect(const Web *w, float *fx, float *fy,
+                           float *fw, float *fh) {
+    float x = (float)page_mx();
+    float width = (float)(w->w - 2 * page_mx());
+    if (width < 40.0f) return 0;
+    *fx = x;
+    *fy = (float)ui_px(ADDR_Y_D);
+    *fw = width;
+    *fh = (float)ui_px(ADDR_H_D);
+    return 1;
+}
+
 /* Draw text, cut with ".." when it cannot fit in maxw pixels. */
 static void draw_fit(Surface *s, Font *f, float x, float y, float maxw,
                      const char *text, u32 color) {
@@ -1830,27 +1948,41 @@ static void draw_header(Surface *s, Web *w) {
     Font *fd = font_get(FONT_REGULAR, 11);
     if (!ft || !fd) return;
 
+    const int mx = page_mx();
     const char *title = w->title[0] ? w->title : (w->url[0] ? w->url : "Browser");
     const char *badge = "http only";
-    float bw = font_width(fd, badge);
-    float badge_x = (float)w->w - bw - 22.0f;
 
-    draw_fit(s, ft, 12.0f, 6.0f, badge_x - 20.0f, title, C_TEXT);
-    if (badge_x > 60.0f) {
-        gfx_rrect_aa(s, badge_x, 5.0f, bw + 14.0f, 16.0f, 8.0f,
+    /* The badge is the right-hand end of the title row, so the title is
+     * cut to whatever is left of it - and both sit on the same margins
+     * as the document below. */
+    float bp = (float)ui_px(BADGE_PAD_D);
+    float badge_w = font_width(fd, badge) + 2.0f * bp;
+    float badge_h = (float)ui_px(BADGE_H_D);
+    float badge_x = (float)(w->w - mx) - badge_w;
+    float badge_y = (float)ui_px(BADGE_Y_D);
+
+    float title_max = badge_x - (float)mx - (float)ui_px(12);
+    if (title_max < (float)ui_px(24)) title_max = (float)(w->w - 2 * mx);
+    draw_fit(s, ft, (float)mx, (float)ui_px(TITLE_Y_D), title_max, title, C_TEXT);
+    if (badge_x > (float)mx + (float)ui_px(24)) {
+        gfx_rrect_aa(s, badge_x, badge_y, badge_w, badge_h, badge_h * 0.5f,
                      WITH_A(C_ACCENT, 0x22), WITH_A(C_ACCENT, 0x55), 1.0f);
-        font_draw(s, fd, badge_x + 7.0f, 7.0f, badge, C_ACCENT);
+        font_draw(s, fd, badge_x + bp,
+                  badge_y + (badge_h - font_height(fd)) * 0.5f, badge, C_ACCENT);
     }
 
     /* address bar */
-    float fx = 10.0f, fy = 28.0f, fw = (float)w->w - 20.0f, fh = 22.0f;
+    float fx, fy, fw, fh;
+    if (!addr_field_rect(w, &fx, &fy, &fw, &fh)) return;
     u32 border = w->edit_focus ? WITH_A(C_ACCENT, 0xAA) : C_EDGE;
-    gfx_rrect_aa(s, fx, fy, fw, fh, 5.0f, C_FIELD, border, 1.0f);
+    gfx_rrect_aa(s, fx, fy, fw, fh, (float)ui_px(5), C_FIELD, border, 1.0f);
 
+    float pad = (float)ui_px(8);
+    float ty = fy + (fh - font_height(fd)) * 0.5f;   /* centred in the field */
     const char *text = w->edit[0] ? w->edit : "";
-    float inner = fw - 12.0f;
+    float inner = fw - 2.0f * pad;
     if (!text[0] && !w->edit_focus) {
-        font_draw(s, fd, fx + 6.0f, fy + 4.0f, "Tab, then type an http address", C_FAINT);
+        font_draw(s, fd, fx + pad, ty, "Tab, then type an http address", C_FAINT);
     } else {
         /* While typing, the end of the address is what matters, so when
          * it is longer than the field we show its tail. Walking back from
@@ -1876,14 +2008,15 @@ static void draw_header(Surface *s, Web *w) {
                 i = j;
             }
             show = text + i;
-            font_draw(s, fd, fx + 6.0f, fy + 4.0f, "<", C_FAINT);
+            font_draw(s, fd, fx + pad, ty, "<", C_FAINT);
         }
-        float tx0 = fx + (show != text ? 13.0f : 6.0f);
-        font_draw(s, fd, tx0, fy + 4.0f, show[0] ? show : "<",
+        float tx0 = fx + (show != text ? pad + (float)ui_px(7) : pad);
+        font_draw(s, fd, tx0, ty, show[0] ? show : "<",
                   show[0] ? C_TEXT : C_FAINT);
         if (w->edit_focus && w->caret_on) {
             float tw = font_width(fd, show);
-            surf_fill(s, (int)(tx0 + tw) + 1, (int)fy + 4, 1, 14, C_ACCENT);
+            surf_fill(s, (int)(tx0 + tw) + 1, (int)ty, 1,
+                      (int)font_height(fd), C_ACCENT);
         }
     }
 }
@@ -1891,9 +2024,14 @@ static void draw_header(Surface *s, Web *w) {
 static void draw_footer(Surface *s, Web *w) {
     Font *fd = font_get(FONT_REGULAR, 11);
     if (!fd) return;
-    if (w->h < HEAD_H + FOOT_H + 8) return;
+    if (!layout_ok(w)) return;
 
-    surf_blend(s, 10, w->h - FOOT_H, w->w - 20, 1, color_alpha(C_TEXT, 0.10f));
+    const int mx = page_mx();
+    const int bar = foot_h();
+
+    /* the hairline and both ends of the status line sit on exactly the
+     * margins the document uses, so the window has one gutter, not two */
+    surf_blend(s, mx, w->h - bar, w->w - 2 * mx, 1, color_alpha(C_TEXT, 0.10f));
 
     char left[WEB_ERR_MAX + 64];
     if (w->state == ST_LOADING)
@@ -1916,28 +2054,32 @@ static void draw_footer(Surface *s, Web *w) {
         snprintf(right, sizeof(right), "%ld bytes", w->raw_bytes);
     }
 
-    float fy = (float)(w->h - FOOT_H) + 3.0f;
+    float fy = (float)(w->h - bar) + ((float)bar - font_height(fd)) * 0.5f;
     float rw = font_width(fd, right);
     u32 lc = C_ACCENT;
     if (w->state == ST_ERROR) lc = C_ERR;
     else if (w->state != ST_LOADING) lc = color_alpha(C_TEXT, 0.55f);
-    draw_fit(s, fd, 10.0f, fy, (float)w->w - rw - 26.0f, left, lc);
-    font_draw(s, fd, (float)w->w - 10.0f - rw, fy, right, color_alpha(C_TEXT, 0.40f));
+    draw_fit(s, fd, (float)mx, fy,
+             (float)(w->w - 2 * mx) - rw - (float)ui_px(12), left, lc);
+    font_draw(s, fd, (float)(w->w - mx) - rw, fy, right,
+              color_alpha(C_TEXT, 0.40f));
 }
 
 static void draw_scrollbar(Surface *v, Web *w) {
     if (w->doc.doc_h <= 0 || w->view_h <= 0) return;
     if ((int)w->doc.doc_h <= w->view_h) return;
 
+    int barw = ui_px(3);
+    int minthumb = ui_px(12);
     int track_h = v->h;
     int thumb = (int)((float)track_h * (float)w->view_h / (float)w->doc.doc_h);
-    if (thumb < 12) thumb = 12;
+    if (thumb < minthumb) thumb = minthumb;
     if (thumb > track_h) thumb = track_h;
     int span = track_h - thumb;
     int off = 0;
     if (w->max_scroll > 0) off = span * w->scroll / w->max_scroll;
-    gfx_rrect_aa(v, (float)v->w - 6.0f, (float)off, 3.0f, (float)thumb, 1.5f,
-                 WITH_A(C_TEXT, 0x55), 0, 0);
+    gfx_rrect_aa(v, (float)(v->w - ui_px(6)), (float)off, (float)barw,
+                 (float)thumb, (float)barw * 0.5f, WITH_A(C_TEXT, 0x55), 0, 0);
 }
 
 static void draw_start(Surface *v, Web *w) {
@@ -1946,12 +2088,13 @@ static void draw_start(Surface *v, Web *w) {
     Font *fm = font_get(FONT_MONO, 11);
     if (!fb || !fd || !fm) return;
 
-    float x = 12.0f;
-    int y = 8;
+    (void)w;
+    float x = 0.0f;                    /* the view is already inset */
+    int y = 0;
     font_draw(v, fb, x, (float)y, "Browser", C_HEAD);
-    y += (int)font_height(fb) + 4;
+    y += (int)font_height(fb) + ui_px(GAP_BLOCK_D);
     font_draw(v, fd, x, (float)y, "Plain HTTP on port 80. No https, no scripts, no images.", C_TEXT);
-    y += (int)font_height(fd) + 10;
+    y += (int)font_height(fd) + ui_px(GAP_AFTER_HEAD_D);
 
     static const char *keys[][2] = {
         { "Tab",          "focus the address bar (Tab again to leave it)" },
@@ -1959,24 +2102,26 @@ static void draw_start(Surface *v, Web *w) {
         { "Backspace",    "back, when the address bar is not focused" },
         { "j k  Up Down", "scroll a line" },
         { "PgUp PgDn",    "scroll a page (Space too)" },
+        { "Wheel",        "scroll three lines per notch" },
         { "Home End",     "top or bottom of the page" },
         { "Ctrl+R",       "reload" },
         { "q",            "quit, when the address bar is not focused" },
     };
+    float col = (float)ui_px(116);
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         font_draw(v, fm, x, (float)y, keys[i][0], C_ACCENT);
-        font_draw(v, fd, x + 116.0f, (float)y, keys[i][1], C_DIM);
-        y += (int)font_height(fm) + 1;
+        font_draw(v, fd, x + col, (float)y, keys[i][1], C_DIM);
+        y += (int)font_height(fm) + ui_px(2);
     }
 
-    y += 8;
+    y += ui_px(GAP_AFTER_HEAD_D);
     font_draw(v, fd, x, (float)y, "Links are numbered [1] and you can click them.", C_TEXT);
-    y += (int)font_height(fd) + 6;
+    y += (int)font_height(fd) + ui_px(GAP_BLOCK_D);
     font_draw(v, fd, x, (float)y, "Try:", C_DIM);
-    y += (int)font_height(fd) + 2;
-    font_draw(v, fm, x + 8.0f, (float)y, "http://example.com/", C_LINK);
-    y += (int)font_height(fm) + 1;
-    font_draw(v, fm, x + 8.0f, (float)y, "http://www.iana.org/help/example-domains", C_LINK);
+    y += (int)font_height(fd) + ui_px(2);
+    font_draw(v, fm, x + (float)ui_px(8), (float)y, "http://example.com/", C_LINK);
+    y += (int)font_height(fm) + ui_px(2);
+    font_draw(v, fm, x + (float)ui_px(8), (float)y, "http://www.iana.org/help/example-domains", C_LINK);
 }
 
 static void draw_error(Surface *v, Web *w) {
@@ -1984,22 +2129,24 @@ static void draw_error(Surface *v, Web *w) {
     Font *fd = font_get(FONT_REGULAR, 12);
     if (!fb || !fd) return;
 
-    int y = 10;
-    font_draw(v, fb, 12.0f, (float)y, "This page could not be loaded", C_ERR);
-    y += (int)font_height(fb) + 6;
-    y += draw_wrapped(v, fd, 12.0f, (float)y, (float)v->w - 24.0f, w->error, C_TEXT, 5);
-    y += 8;
+    float x = 0.0f;                    /* the view is already inset */
+    float mw = (float)v->w;
+    int y = 0;
+    font_draw(v, fb, x, (float)y, "This page could not be loaded", C_ERR);
+    y += (int)font_height(fb) + ui_px(GAP_BLOCK_D);
+    y += draw_wrapped(v, fd, x, (float)y, mw, w->error, C_TEXT, 5);
+    y += ui_px(GAP_BLOCK_D);
     if (w->pending[0])
-        y += draw_wrapped(v, fd, 12.0f, (float)y, (float)v->w - 24.0f, w->pending, C_DIM, 3);
-    y += 8;
-    draw_wrapped(v, fd, 12.0f, (float)y, (float)v->w - 24.0f,
+        y += draw_wrapped(v, fd, x, (float)y, mw, w->pending, C_DIM, 3);
+    y += ui_px(GAP_BLOCK_D);
+    draw_wrapped(v, fd, x, (float)y, mw,
                  "Backspace goes back, Tab lets you type another address.", C_FAINT, 2);
 }
 
 static void render(Web *w) {
     MClient *c = w->c;
     if (!c || !c->px) return;
-    if (w->w < 120 || w->h < HEAD_H + FOOT_H + 24) return;
+    if (!layout_ok(w)) return;
 
     Surface s;
     s.px = c->px;
@@ -2010,28 +2157,25 @@ static void render(Web *w) {
     gfx_gradient(&s, 0, 0, w->w, w->h, C_BG_TOP, C_BG_BOT);
     draw_header(&s, w);
 
-    int cx = 10;
-    int cy = HEAD_H + CGAP;
-    int cw = w->w - 10 - 18;
-    int ch = w->h - cy - FOOT_H;
-    if (cw < 40) cw = 40;
-    if (ch < 20) ch = 20;
-    if (cw > w->w - cx) cw = w->w - cx;
-    if (ch > w->h - cy) ch = w->h - cy;
+    /* the one content rectangle: same numbers draw_header() and
+     * handle_mouse() use */
+    PageRect r = page_rect(w);
+    int cx = r.x, cy = r.y, cw = r.w, ch = r.h;
 
     w->view_w = cw;
     w->view_h = ch;
 
     /* the page wraps in the space left over by the scroll bar */
-    int tw = cw - SBAR;
+    int tw = cw - sbar_w();
     if (tw < 40) tw = 40;
     if (tw != w->laid_w) {
         doc_layout(&w->doc, &real_metrics, tw);
         w->laid_w = tw;
-        if (w->scroll > w->max_scroll) w->scroll = w->max_scroll;
     }
     w->max_scroll = (int)w->doc.doc_h - ch;
     if (w->max_scroll < 0) w->max_scroll = 0;
+    if (w->scroll > w->max_scroll) w->scroll = w->max_scroll;
+    if (w->scroll < 0) w->scroll = 0;
 
     /* A view Surface that starts at the content origin: everything
      * drawn into it is clipped to the content rectangle, exactly, so
@@ -2270,8 +2414,7 @@ static void handle_key(Web *w, int key, int mods) {
         if (key == K_HOME || key == K_END || key == K_UP || key == K_DOWN ||
             key == K_PAGEUP || key == K_PAGEDOWN)
             return;                                /* nothing to scroll */
-    }
-    switch (key) {
+    }    switch (key) {
         case K_UP:       scroll_to(w, w->scroll - scroll_step()); break;
         case K_DOWN:     scroll_to(w, w->scroll + scroll_step()); break;
         case K_PAGEUP:   scroll_to(w, w->scroll - w->view_h * 9 / 10); break;
@@ -2327,25 +2470,24 @@ static void handle_mouse(Web *w, int x, int y, int buttons) {
     if (!(buttons & 1)) return;
     if (prev & 1) return;                     /* only the press edge acts */
 
-    if (y >= 28 && y < 50 && x >= 10 && x < w->w - 10) {
+    float fx, fy, fw, fh;
+    if (addr_field_rect(w, &fx, &fy, &fw, &fh) &&
+        x >= (int)fx && x < (int)(fx + fw) && y >= (int)fy && y < (int)(fy + fh)) {
         w->edit_focus = 1;
         w->caret_on = 1;
         w->dirty = 1;
         return;
     }
-    if (y < HEAD_H || y >= w->h - FOOT_H) return;
+    if (!layout_ok(w)) return;
 
-    int cx = 10, cy = HEAD_H + CGAP;
-    int cw = w->w - 10 - 18;
-    int ch = w->h - cy - FOOT_H;
-    if (cw < 40 || ch < 20) return;
-    if (x < cx || x >= cx + cw || y < cy || y >= cy + ch) return;
+    PageRect r = page_rect(w);
+    if (x < r.x || x >= r.x + r.w || y < r.y || y >= r.y + r.h) return;
 
-    int lx = x - cx, ly = y - cy;
+    int lx = x - r.x, ly = y - r.y;
 
-    if (lx >= cw - SBAR) {                    /* the scroll bar */
-        if (w->doc.doc_h > (u32)ch) {
-            int track = ch;
+    if (lx >= r.w - sbar_w()) {               /* the scroll bar */
+        if (w->doc.doc_h > (u32)r.h) {
+            int track = r.h;
             float frac = (float)ly / (float)track;
             if (frac < 0) frac = 0;
             if (frac > 1) frac = 1;
@@ -2356,6 +2498,17 @@ static void handle_mouse(Web *w, int x, int y, int buttons) {
 
     int link = link_at(w, lx, ly);
     if (link >= 0) follow_link(w, link);
+}
+
+/* The wheel, in notches, positive when the user scrolled up. One notch is
+ * WHEEL_LINES body lines - a few, so a page is crossed in a handful of
+ * flicks - and scroll_to() clamps every request to [0, max_scroll] as it
+ * was last measured by render(), so this can never scroll into empty
+ * space or mark the frame dirty without having moved something. */
+static void handle_wheel(Web *w, int notches) {
+    if (notches == 0) return;
+    if (w->state != ST_PAGE && w->state != ST_LOADING) return;
+    scroll_to(w, w->scroll - notches * scroll_step() * WHEEL_LINES);
 }
 
 /* Last resort: if we cannot even allocate our state, say so on screen
