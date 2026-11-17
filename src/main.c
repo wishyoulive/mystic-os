@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define THEME_DIR "/etc/mystic/themes"
@@ -425,7 +426,7 @@ static void draw_desktop(Surface *s, const Theme *th) {
         }
 
         int cx0 = cur->x + 1, cy0 = cur->y + tb + 1;
-        int cw0 = cur->w - 2, ch0 = cur->h - tb - 3;
+        int cw0 = cur->w - 2, ch0 = cur->h - tb - 2;
 
         if (cur->kind == WIN_TERM && cur->term) {
             Font *fm = font_get(FONT_REGULAR, 12);
@@ -440,14 +441,22 @@ static void draw_desktop(Surface *s, const Theme *th) {
                  * a snap) writes past the end of the surface - a real crash. */
                 int cw1 = cw0 < cl->w ? cw0 : cl->w;
                 int ch1 = ch0 < cl->h ? ch0 : cl->h;
-                int sx0 = cx0 < 0 ? -cx0 : 0;
-                int sy0 = cy0 < 0 ? -cy0 : 0;
-                if (cx0 + cw1 > s->w) cw1 = s->w - cx0;
-                if (cy0 + ch1 > s->h) ch1 = s->h - cy0;
-                if (sx0 < cw1) {
-                    for (int row = sy0; row < ch1; row++)
-                        memcpy(s->px + (size_t)(cy0 + row) * s->stride + cx0,
-                               cl->px + (size_t)row * cl->stride, (size_t)cw1 * 4);
+                /* Shift the *source* when the destination starts off-screen.
+                 * Clamping only the right/bottom edges still wrote before the
+                 * buffer for a window placed at a negative origin. */
+                int sx0 = (cx0 < 0) ? -cx0 : 0;
+                int sy0 = (cy0 < 0) ? -cy0 : 0;
+                int dx = cx0 + sx0;
+                int dy = cy0 + sy0;
+                if (cw1 > cl->w - sx0) cw1 = cl->w - sx0;
+                if (ch1 > cl->h - sy0) ch1 = cl->h - sy0;
+                if (dx + cw1 > s->w) cw1 = s->w - dx;
+                if (dy + ch1 > s->h) ch1 = s->h - dy;
+                if (cw1 > 0 && ch1 > 0) {
+                    for (int row = 0; row < ch1; row++)
+                        memcpy(s->px + (size_t)(dy + row) * s->stride + dx,
+                               cl->px + (size_t)(sy0 + row) * cl->stride + sx0,
+                               (size_t)cw1 * 4);
                 }
             }
         }
@@ -485,6 +494,19 @@ static void draw_desktop(Surface *s, const Theme *th) {
         }
         if (open)
             gfx_rrect_aa(s, ix + (float)isz / 2 - 2, iy + (float)isz + 3, 4, 4, 2, th->accent, 0, 0);
+
+        /* the icon's name, above it, while hovered */
+        if (hovered) {
+            Font *ft = font_get(FONT_MEDIUM, 11);
+            float lw = font_width(ft, DOCK[i].label);
+            float bx = ix + (float)isz / 2 - lw / 2 - 7;
+            float by = (float)dy - 24;
+            if (bx < 4) bx = 4;
+            if (bx + lw + 14 > (float)s->w) bx = (float)s->w - lw - 18;
+            gfx_rrect_aa(s, bx, by, lw + 14, 19, 9, color_alpha(th->window_bg, 0.96f),
+                         th->panel_border, 1.0f);
+            font_draw(s, ft, bx + 7, by + 4, DOCK[i].label, th->text);
+        }
     }
 
     if (launcher_open) {
@@ -747,9 +769,10 @@ static int handle_click(void) {
         win_focus(hit);
         int tb = 40;
         int lx = mx - hit->x, ly = my - hit->y;
-        /* red closes, yellow minimises */
-        if (ly < tb && lx >= 14 && lx < 24) { win_close(hit); return 1; }
-        if (ly < tb && lx >= 32 && lx < 42) { hit->hidden = 1; return 1; }
+        /* red closes, yellow minimises - only on the dots themselves, which
+         * sit at y+15..y+25; a full-height hit box killed windows by accident */
+        if (ly >= 13 && ly < 27 && lx >= 14 && lx < 24) { win_close(hit); return 1; }
+        if (ly >= 13 && ly < 27 && lx >= 32 && lx < 42) { hit->hidden = 1; return 1; }
         /* bottom-right corner resizes */
         if (lx >= hit->w - 18 && ly >= hit->h - 18) {
             resize_win = (int)(hit - wins);
@@ -1028,6 +1051,18 @@ int main(void) {
             }
         }
 
+        /* releases: the protocol carries a press flag that was always 1, so a
+         * client could never tell when a key went back up */
+        {
+            Window *top = win_top();
+            if (top && top->kind == WIN_CLIENT && top->client >= 0 && input.nkeys_up) {
+                WmClient *cl = &clients[top->client];
+                int mods = (input.shift ? 1 : 0) | (input.ctrl ? 2 : 0) | (input.alt ? 4 : 0);
+                for (int i = 0; i < input.nkeys_up; i++)
+                    wms_notify_key(cl, input.keys_up[i], mods, 0);
+            }
+        }
+
         /* text is delivered once per frame, not per key */
         {
             Window *top = win_top();
@@ -1089,6 +1124,8 @@ int main(void) {
                     w->h = nh;
                     if (w->app && w->app->vt && w->app->vt->resize)
                         w->app->vt->resize(w->app, w->w - 2, w->h - 42);
+                    else if (w->kind == WIN_CLIENT && w->client >= 0)
+                        wms_notify_resize(&clients[w->client], w->w - 2, w->h - 42);
                     dirty = 1;
                 }
             }
@@ -1106,8 +1143,26 @@ int main(void) {
         }
         (void)mouse_prev;
 
+        /* launched apps exit without anyone noticing otherwise: one zombie
+         * per launch for the whole session */
+        while (waitpid(-1, NULL, WNOHANG) > 0) { }
+
         /* window server: accept connections, bind windows, mark frames dirty */
         wms_poll(clients, WM_MAX_CLIENTS);
+
+        /* A client that exited leaves its slot free; the window that was bound
+         * to that slot must close with it, or the next client to take the slot
+         * renders into the ghost and closing the ghost kills the newcomer. */
+        for (int i = 0; i < MAX_WINDOWS; i++) {
+            Window *w = &wins[i];
+            if (!w->used || w->kind != WIN_CLIENT) continue;
+            if (w->client < 0 || w->client >= WM_MAX_CLIENTS) continue;
+            if (!clients[w->client].used) {
+                w->client = -1;          /* stop it from killing a reused slot */
+                win_close(w);
+                dirty = 1;
+            }
+        }
         for (int i = 0; i < WM_MAX_CLIENTS; i++) {
             WmClient *cl = &clients[i];
             if (!cl->used) continue;

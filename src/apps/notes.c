@@ -65,6 +65,7 @@ typedef struct {
      * failure; otherwise it holds the real strerror() text and the
      * footer shows it instead of "saved". */
     char   err[128];
+    int    err_is_save; /* err came from a failed write, not a load  */
     int    partial;    /* the buffer is only part of the file on disk */
     int    confirm;    /* warned once; the next Ctrl+S may overwrite  */
     /* Escape-sequence reader. An escape can be split over two key
@@ -361,10 +362,13 @@ static void erase_forward(Notes *n) {
     note_pcol(n);
 }
 
-/* Record a failed operation. errno must still be the failing call's. */
-static void save_error(Notes *n, const char *op) {
+/* Record a failed operation. errno must still be the failing call's.
+ * is_save separates "we tried to write and could not" from "we could
+ * not read the file at startup": the footer words them differently. */
+static void note_error(Notes *n, const char *op, int is_save) {
     int e = errno;
     snprintf(n->err, sizeof(n->err), "%s: %s", op, strerror(e));
+    n->err_is_save = is_save;
 }
 
 /* Replace NOTES_PATH atomically: write the whole buffer to a sibling
@@ -403,14 +407,15 @@ static void save(Notes *n) {
     /* The temp sits in the same directory as the target, which is what
      * makes the rename atomic (a different filesystem would not be). */
     if (snprintf(tmp, sizeof(tmp), "%s.tmp", NOTES_PATH) >= (int)sizeof(tmp)) {
-        snprintf(n->err, sizeof(n->err), "save: temp path too long");
+        snprintf(n->err, sizeof(n->err), "temp path too long");
+        n->err_is_save = 1;
         n->dirty = 1;
         return;
     }
 
     fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) {
-        save_error(n, "open .tmp");
+        note_error(n, "open .tmp", 1);
         n->dirty = 1;
         return;
     }
@@ -419,7 +424,7 @@ static void save(Notes *n) {
         ssize_t w = write(fd, n->buf + off, (size_t)n->len - off);
         if (w < 0) {
             if (errno == EINTR) continue;
-            save_error(n, "write .tmp");
+            note_error(n, "write .tmp", 1);
             close(fd);
             unlink(tmp);
             n->dirty = 1;
@@ -429,6 +434,7 @@ static void save(Notes *n) {
             snprintf(n->err, sizeof(n->err),
                      "write .tmp: stopped after %ld of %d bytes",
                      (long)off, n->len);
+            n->err_is_save = 1;
             close(fd);
             unlink(tmp);
             n->dirty = 1;
@@ -441,21 +447,21 @@ static void save(Notes *n) {
      * they are gone - which is exactly what happened the first time
      * this was tested. */
     if (fsync(fd) != 0) {
-        save_error(n, "fsync .tmp");
+        note_error(n, "fsync .tmp", 1);
         close(fd);
         unlink(tmp);
         n->dirty = 1;
         return;
     }
     if (close(fd) != 0) {       /* close reports deferred write errors */
-        save_error(n, "close .tmp");
+        note_error(n, "close .tmp", 1);
         unlink(tmp);
         n->dirty = 1;
         return;
     }
 
     if (rename(tmp, NOTES_PATH) != 0) {
-        save_error(n, "rename");
+        note_error(n, "rename", 1);
         unlink(tmp);
         n->dirty = 1;
         return;
@@ -571,16 +577,21 @@ static void notes_init(App *a, int w, int h) {
             /* A partial read is not the file. Never let a later Ctrl+S
              * turn a half-read buffer into the whole file. */
             snprintf(n->err, sizeof(n->err), "read: %s", strerror(rerr));
+            n->err_is_save = 0;
             n->partial = 1;
             n->dirty = 1;
         } else if (have_st && (long)st.st_size > (long)got) {
             snprintf(n->err, sizeof(n->err),
-                     "disk has %ld bytes, loaded %d - Ctrl+S overwrites",
+                     "disk has %ld bytes, loaded %d - Ctrl+S asks first",
                      (long)st.st_size, (int)got);
+            n->err_is_save = 0;
             n->partial = 1;
             n->dirty = (got == 0) ? 1 : 0;
         }
     } else {
+        /* errno belongs to the failed fopen; capture it before strlen,
+         * memcpy or snprintf get a chance to overwrite it. */
+        int oerr = errno;
         const char *welcome =
             "Notes.\n\n"
             "Type here. Backspace works.\n"
@@ -595,8 +606,9 @@ static void notes_init(App *a, int w, int h) {
         /* ENOENT is simply "no notes yet". Anything else means a file
          * is there and we could not read it, so say so and treat the
          * buffer as partial: Ctrl+S will ask before replacing it. */
-        if (errno != ENOENT) {
-            save_error(n, NOTES_PATH);
+        if (oerr != ENOENT) {
+            snprintf(n->err, sizeof(n->err), "%s: %s", NOTES_PATH, strerror(oerr));
+            n->err_is_save = 0;
             n->partial = 1;
         }
     }
@@ -732,7 +744,8 @@ static void notes_draw(App *a, Surface *s, int x, int y, int w, int h, const The
     int unsaved = n->dirty || (n->disk_len >= 0 && n->disk_len != (long)n->len);
     if (n->err[0]) {
         /* A real failure with a real errno: say that, never "saved". */
-        snprintf(foot, sizeof(foot), "not saved - %s", n->err);
+        snprintf(foot, sizeof(foot), "%s%s",
+                 n->err_is_save ? "not saved - " : "warning - ", n->err);
     } else if (n->disk_len < 0) {
         snprintf(foot, sizeof(foot), "%d bytes buf  -  no file on disk  -  Ctrl+S saves", n->len);
     } else if (unsaved) {
@@ -778,11 +791,13 @@ static void notes_key(App *a, const char *bytes, int count) {
         if (n->esc && esc_feed(n, c, fr, fd)) continue;
         if (code == 0x1B) { n->esc = 1; continue; }
 
-        /* One keypress that is not Ctrl+S cancels an "overwrite the
+        /* Any editing key that is not Ctrl+S cancels an "overwrite the
          * bigger file?" warning: the user has touched the document
          * since the warning, so it has to be earned again. This sits
          * above the edit path on purpose - an edit dropped because the
-         * buffer is full still counts as an attempt to change it. */
+         * buffer is full still counts as an attempt to change it.
+         * (Escape sequences were already consumed above, and moving the
+         * caret without editing leaves the warning standing.) */
         if (code != 0x13) n->confirm = 0;
 
         if (code == 0x13) {                        /* Ctrl+S */

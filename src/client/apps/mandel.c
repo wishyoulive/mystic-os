@@ -20,10 +20,17 @@
  *
  *      nu = n + 1 - log2(log2(|z|))
  *
- *  and nu indexes a 256-entry sine palette (interpolated between
- *  entries, so the ramp is continuous rather than 256 flat bands).
+ *  nu then addresses a 256-entry sine palette, interpolated between
+ *  entries so the ramp is continuous rather than 256 flat bands.
+ *  The address is sqrt(nu)*32 rather than nu itself because escape
+ *  counts pile up at the low end: on the default view 77% of the
+ *  pixels escape before n = 8 and only 0.7% get past 32. Colour by
+ *  nu directly and those 77% all land in the first tenth of the
+ *  ramp and the picture is one flat wash. The square root spreads
+ *  the crowded end across the palette and still puts nu = 64 (the
+ *  cap) at the top of it.
  *
- *  Rendering is progressive. A whole 420x278 frame is ~117k pixels
+ *  Rendering is progressive. A whole 420x274 frame is ~115k pixels
  *  at up to 64 iterations each; doing it in one go would freeze the
  *  window for a noticeable moment. Instead one band of BAND_ROWS
  *  rows is computed per loop turn, the events are drained in between,
@@ -72,20 +79,31 @@
 #define IMG_MAX_W 512
 #define IMG_MAX_H 384
 
-#define FOOT_H 42          /* three 10px text lines and their padding */
+/* Footer geometry. Lato at 10px measures 14.00px tall (8.23 ascent,
+ * 5.77 descent), so three lines need 42px; 46 leaves two above and two
+ * below. At 42 the descenders of the last line were cut off by the
+ * bottom edge of the window, which is why these are separate numbers
+ * and not a guess. */
+#define FOOT_H  46
+#define FOOT_L1  2
+#define FOOT_L2 16
+#define FOOT_L3 30
 
 /* The starting view: centred a little left of the origin so the
- * whole set sits comfortably, 2.6 imaginary units tall. 420x278 of
- * aspect 1.51 then spans about 3.9 units horizontally. */
+ * whole set sits comfortably, 2.6 imaginary units tall. 420x274 of
+ * aspect 1.53 then spans about 4.0 units horizontally. */
 #define BASE_CRE  (-0.6)
 #define BASE_CIM  (0.0)
 #define BASE_SPAN (2.6)
 
-/* Zoom limits. 2.6/0.00026 is 10000x in; below that 64 iterations
- * cannot tell neighbouring pixels apart, so the picture would be a
- * blob rather than the set. 26 units out is 0.1x. */
-#define MIN_SPAN (0.00026)
-#define MAX_SPAN (26.0)
+/* Zoom limits. 2.6 / 0.00127 is about 2000x in, and that is as far as
+ * 64 iterations can honestly go: at 4000x only a third of the frame
+ * still escapes and at 10000x all but 2% of it collapses into "inside",
+ * i.e. the picture would be a black rectangle rather than the set. The
+ * zoom stops while the picture is still true. 13 units out is 0.2x,
+ * enough to see the set in context without it shrinking to a dot. */
+#define MIN_SPAN (0.00127)
+#define MAX_SPAN (13.0)
 
 /* evdev key codes (input-event-codes.h): KEY_Q == 16, KEY_R == 19.
  * The server forwards raw codes, the same ones paint.c switches on. */
@@ -104,11 +122,15 @@ static const u32 C_ACCENT = RGB(0x4F, 0xD1, 0xC5);
 static const u32 C_INSIDE = RGB(0x06, 0x04, 0x0C);   /* inside the set   */
 
 /* ------------------------------------------------------------ palette
- * 256 colours, built once from three sine phases a third of a turn
- * apart, then scaled by a rising luminance ramp: escape counts just
- * outside the set stay dark and the crowded bands near the boundary
- * are the bright ones. sqrt-ish gamma on the way to 8 bits so the
- * mid tones do not grey out.
+ * 256 colours, built once from three sine phases and a luminance
+ * ramp. The phases are a third of a turn apart, so the whole hue
+ * circle is walked exactly once, and they are offset by 0.58 so the
+ * dark end comes out the deep blue the rest of the system uses
+ * instead of the olive green that phase zero lands on. Luminance
+ * climbs as t^0.7 over the same t, so the far-outside escapes fade
+ * into the background and the crowded bands near the boundary are
+ * the warm, bright ones. 0.75 gamma on the way to 8 bits because a
+ * straight scale greys the mid tones out.
  */
 #define PAL_N 256
 static u32 PAL[PAL_N];
@@ -116,16 +138,16 @@ static u32 PAL[PAL_N];
 static void palette_build(void) {
     for (int i = 0; i < PAL_N; i++) {
         double t = (double)i / (double)PAL_N;      /* 0 .. 1 across the ramp */
-        double r = 0.5 + 0.5 * sin(TAU * (t * 2.0 + 0.00));
-        double g = 0.5 + 0.5 * sin(TAU * (t * 2.0 + 0.34));
-        double b = 0.5 + 0.5 * sin(TAU * (t * 2.0 + 0.67));
-        double lum = 0.16 + 0.84 * t;              /* dark -> bright */
-        r *= lum;
-        g *= lum;
-        b *= lum;
-        int ir = (int)(255.0 * pow(r, 0.85) + 0.5);
-        int ig = (int)(255.0 * pow(g, 0.85) + 0.5);
-        int ib = (int)(255.0 * pow(b, 0.85) + 0.5);
+        double r = 0.5 + 0.5 * sin(TAU * (t + 0.58));
+        double g = 0.5 + 0.5 * sin(TAU * (t + 0.75));
+        double b = 0.5 + 0.5 * sin(TAU * (t + 0.92));
+        double lum = pow(t, 0.7);                  /* nothing at t=0 */
+        r = pow(r * lum, 0.75);
+        g = pow(g * lum, 0.75);
+        b = pow(b * lum, 0.75);
+        int ir = (int)(255.0 * r + 0.5);
+        int ig = (int)(255.0 * g + 0.5);
+        int ib = (int)(255.0 * b + 0.5);
         if (ir > 255) ir = 255;
         if (ig > 255) ig = 255;
         if (ib > 255) ib = 255;
@@ -183,14 +205,13 @@ static double escape_time(double cr, double ci) {
 }
 
 /* nu -> colour, interpolating between palette entries so the bands
- * are a continuous ramp instead of 256 steps. */
+ * are a continuous ramp instead of 256 steps. sqrt(nu)*32 maps the
+ * whole range 0..MAX_ITER onto 0..PAL_N and pushes the crowd at the
+ * low end out across the palette instead of into its first tenth. */
 static u32 shade(double nu) {
     if (nu < 0.0) return C_INSIDE;
 
-    /* four palette turns across the whole iteration range: with a cap
-     * of 64 that is one turn per 16 iterations, enough for the bands
-     * next to the boundary to stay distinct without turning to mush */
-    double f = nu * 4.0;
+    double f = sqrt(nu) * 32.0;
     int i0 = (int)f;
     if (i0 < 0) i0 = 0;
     if (i0 > PAL_N - 1) i0 = PAL_N - 1;
@@ -237,6 +258,10 @@ static void clamp_view(void) {
 }
 
 static void layout(void) {
+    /* a client area taller than the buffer plus a footer would leave a
+     * dead strip between the picture and the footer, so cap it here */
+    if (M.h > IMG_MAX_H + FOOT_H) M.h = IMG_MAX_H + FOOT_H;
+
     M.fw = M.w;
     M.fh = M.h - FOOT_H;
     M.footer_y = M.h - FOOT_H;
@@ -319,8 +344,9 @@ static void draw(MClient *c, Font *fmed, Font *freg) {
     /* the rows that exist for this view; a partial frame shows only
      * what has actually been computed, never an older picture */
     if (M.fw > 0 && M.fh > 0 && M.rows_done > 0) {
+        int rows = M.rows_done < M.fh ? M.rows_done : M.fh;   /* never past the picture */
         Surface im = { M.img, IMG_MAX_W, IMG_MAX_H, IMG_MAX_W };
-        surf_push(&s, 0, 0, &im, 0, 0, M.fw, M.rows_done);
+        surf_push(&s, 0, 0, &im, 0, 0, M.fw, rows);
     }
 
     int pct = 100;
@@ -361,18 +387,18 @@ static void draw(MClient *c, Font *fmed, Font *freg) {
     char tim[32];
 
     if (M.have_frame) snprintf(tim, sizeof(tim), "%.2f ms", M.last_ms);
-    else              snprintf(tim, sizeof(tim), "rendering");
+    else              snprintf(tim, sizeof(tim), "--");
 
     snprintf(line, sizeof(line), "re %+.9f   im %+.9f   zoom %.2fx",
              M.cre, M.cim, BASE_SPAN / M.span);
-    font_draw(&s, fmed, 8, (float)(fy + 4), line, C_TEXT);
+    font_draw(&s, fmed, 8, (float)(fy + FOOT_L1), line, C_TEXT);
 
     snprintf(line, sizeof(line), "iter cap %d   last frame %s   %d%%",
              MAX_ITER, tim, pct);
-    font_draw(&s, freg, 8, (float)(fy + 17), line, C_DIM);
+    font_draw(&s, freg, 8, (float)(fy + FOOT_L2), line, C_DIM);
 
     snprintf(line, sizeof(line), "click zoom in   right-click zoom out   r reset   q quit");
-    font_draw(&s, freg, 8, (float)(fy + 29), line, C_DIM);
+    font_draw(&s, freg, 8, (float)(fy + FOOT_L3), line, C_DIM);
 }
 
 /* ------------------------------------------------------------ main */

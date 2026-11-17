@@ -7,6 +7,7 @@
 #include "mystic.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +27,7 @@ typedef struct {
     int      sel;
     int      w, h;
     int      scroll;
+    char     status[64];  /* real result of the last apply_theme() */
 } Settings;
 
 static void read_file(const char *path, char *out, size_t n) {
@@ -41,15 +43,22 @@ static void read_file(const char *path, char *out, size_t n) {
     fclose(f);
 }
 
+/* One line at a time. The old token loop required three fields per line
+ * (key, number, unit) and stopped at the first line that had fewer, so any
+ * key below a two-field entry such as "HugePages_Total: 0" read as 0. */
 static long mem_kb(const char *key) {
     FILE *f = fopen("/proc/meminfo", "r");
     if (!f) return 0;
-    char k[64], unit[16];
-    long v;
-    while (fscanf(f, "%63s %ld %15s", k, &v, unit) == 3)
-        if (!strcmp(k, key)) { fclose(f); return v; }
+    size_t klen = strlen(key);
+    char line[256];
+    long v = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, key, klen) != 0) continue;
+        v = strtol(line + klen, NULL, 10);
+        break;
+    }
     fclose(f);
-    return 0;
+    return v;
 }
 
 static int cmp_name(const void *a, const void *b) {
@@ -64,12 +73,18 @@ static void scan_themes(Settings *s) {
     while ((e = readdir(d)) != NULL && s->count < MAX_THEMES) {
         size_t len = strlen(e->d_name);
         if (len < 7 || strcmp(e->d_name + len - 6, ".theme")) continue;
+        /* ThemeRow::file is what the sort order and the name fallback use, so
+         * a name that does not fit would be stored truncated and the row
+         * would read as a theme that does not exist. Skip it instead of
+         * listing a row that cannot work. (A .theme entry is <= NAME_MAX.) */
+        if (len >= sizeof(s->rows[0].file)) continue;
 
         ThemeRow *r = &s->rows[s->count];
         snprintf(r->file, sizeof(r->file), "%s", e->d_name);
         snprintf(r->name, sizeof(r->name), "%s", e->d_name);   /* fallback */
+        r->y = -1.0f;                 /* not on screen until draw lays it out */
 
-        char path[256], line[256];
+        char path[320], line[256];
         snprintf(path, sizeof(path), "/etc/mystic/themes/%s", e->d_name);
         FILE *f = fopen(path, "r");
         if (f) {
@@ -88,6 +103,9 @@ static void scan_themes(Settings *s) {
             }
             fclose(f);
         }
+        /* "name =" present but empty: keep the file name rather than write
+         * an empty line, which no theme's name can ever match. */
+        if (!r->name[0]) snprintf(r->name, sizeof(r->name), "%s", r->file);
         s->count++;
     }
     closedir(d);
@@ -109,12 +127,45 @@ static void settings_free(App *a) {
     a->state = NULL;
 }
 
+/* The desktop re-reads /etc/mystic/current-theme once a second and matches
+ * the first line against Theme::name - the "name =" field inside the theme
+ * file (main.c:1178-1186, docs/ARCHITECTURE.md 3.6), not its file name.
+ * This used to write ThemeRow::file ("1-obsidian.theme"), which matched no
+ * theme, so choosing one did nothing. Write the name, and report the real
+ * result: fopen/fprintf/fflush/fclose were all unchecked before. */
 static void apply_theme(Settings *s) {
     if (s->sel < 0 || s->sel >= s->count) return;
+    const ThemeRow *r = &s->rows[s->sel];
     FILE *f = fopen("/etc/mystic/current-theme", "w");
-    if (!f) return;
-    fprintf(f, "%s\n", s->rows[s->sel].file);
-    fclose(f);
+    if (!f) {
+        snprintf(s->status, sizeof(s->status), "not saved: %s", strerror(errno));
+        return;
+    }
+    errno = 0;
+    int ok = fprintf(f, "%s\n", r->name) > 0;
+    if (ok && fflush(f) != 0) ok = 0;
+    if (fclose(f) != 0) ok = 0;
+    if (ok)
+        snprintf(s->status, sizeof(s->status), "theme: %s", r->name);
+    else
+        snprintf(s->status, sizeof(s->status), "not saved: %s",
+                 strerror(errno ? errno : EIO));
+}
+
+/* Clip to the rectangle we were given. The window manager hands over the
+ * whole scene surface (main.c:434), so keeping pixels inside the app rect
+ * is the app's job. Coordinates below stay absolute; shortening the
+ * surface to the rect's right/bottom edge makes the bounds check inside
+ * every gfx_ and font_draw call reject anything past it, and negative x/y
+ * is rejected there too. */
+static Surface rect_clip(Surface *s, int x, int y, int w, int h) {
+    Surface c = *s;
+    int right = x + w, bottom = y + h;
+    if (right < 0) right = 0;
+    if (bottom < 0) bottom = 0;
+    if (right < c.w) c.w = right;
+    if (bottom < c.h) c.h = bottom;
+    return c;
 }
 
 static void settings_draw(App *a, Surface *s, int x, int y, int w, int h, const Theme *th) {
@@ -122,6 +173,9 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h, const 
     if (!st) return;
     st->w = w;
     st->h = h;
+
+    Surface clip = rect_clip(s, x, y, w, h);
+    s = &clip;
 
     Font *fh = font_get(FONT_MEDIUM, 13);
     Font *fr = font_get(FONT_REGULAR, 11);
@@ -145,9 +199,11 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h, const 
     long used = total - avail;
     if (used < 0) used = 0;
     float frac = total > 0 ? (float)used / (float)total : 0;
-    gfx_rrect_aa(s, (float)x + 6, py, (float)w - 12, 7, 3.5f, color_alpha(th->text, 0.10f), 0, 0);
+    float mw = (float)w - 12;
+    if (mw < 1.0f) mw = 1.0f;
+    gfx_rrect_aa(s, (float)x + 6, py, mw, 7, 3.5f, color_alpha(th->text, 0.10f), 0, 0);
     if (frac > 0.01f)
-        gfx_rrect_aa(s, (float)x + 6, py, ((float)w - 12) * frac, 7, 3.5f, th->accent, 0, 0);
+        gfx_rrect_aa(s, (float)x + 6, py, mw * frac, 7, 3.5f, th->accent, 0, 0);
     py += 12;
     snprintf(line, sizeof(line), "  %ld MB used of %ld MB", used / 1024, total / 1024);
     font_draw(s, fr, (float)x + 6, py, line, th->text_dim);
@@ -156,32 +212,69 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h, const 
     font_draw(s, fh, (float)x + 6, py, "Theme", th->text);
     py += 20;
 
-    for (int i = 0; i < st->count; i++) {
-        ThemeRow *r = &st->rows[i];
-        r->y = py;
-        int selected = (i == st->sel);
+    /* The list scrolls inside the height that is really left. The System
+     * block is pinned to the bottom and drawn only when a whole theme row
+     * still fits above it; the old code drew every row, then System, then
+     * the hint at fixed offsets, so with more themes than fit (or a window
+     * dragged to its 280x160 minimum) they were painted over the frame and
+     * the desktop. SYS_H = gap 8 + title 20 + kernel 18 + uptime 18 + hint 14. */
+    const float SYS_H = 78.0f;
+    float theme_bottom = (float)(y + h) - 6.0f;
+    int have_sys = (theme_bottom - py) >= (SYS_H + ROW_H);
+    if (have_sys) theme_bottom -= SYS_H;
+
+    int vis = (int)((theme_bottom - py) / ROW_H);
+    if (vis < 0) vis = 0;
+    if (vis > st->count) vis = st->count;
+
+    /* keep the selected row inside the visible window */
+    if (st->count > 0) {
+        if (st->sel < 0) st->sel = 0;
+        if (st->sel >= st->count) st->sel = st->count - 1;
+        if (st->sel < st->scroll) st->scroll = st->sel;
+        if (st->sel >= st->scroll + vis) st->scroll = st->sel - vis + 1;
+        if (st->scroll > st->count - vis) st->scroll = st->count - vis;
+        if (st->scroll < 0) st->scroll = 0;
+    } else {
+        st->scroll = 0;
+    }
+
+    /* Rows that are not on screen are not hittable: clicks arrive in
+     * app-local coordinates and y < 0 cannot be one. */
+    for (int i = 0; i < st->count; i++) st->rows[i].y = -1.0f;
+    for (int i = 0; i < vis; i++) {
+        int idx = st->scroll + i;
+        if (idx >= st->count) break;
+        ThemeRow *r = &st->rows[idx];
+        r->y = py - (float)y;         /* local, because that is what clicks get */
+        int selected = (idx == st->sel);
         if (selected)
             gfx_rrect_aa(s, (float)x + 4, py - 2, (float)w - 8, ROW_H, 4.0f,
                          color_alpha(th->accent, 0.20f), 0, 0);
-        snprintf(line, sizeof(line), "%d   %s", i + 1, r->name);
+        snprintf(line, sizeof(line), "%d   %s", idx + 1, r->name);
         font_draw(s, fr, (float)x + 10, py, line, selected ? th->text : th->text_dim);
         py += ROW_H;
     }
 
-    py += 8;
-    font_draw(s, fh, (float)x + 6, py, "System", th->text);
-    py += 20;
-    read_file("/proc/sys/kernel/osrelease", line, sizeof(line));
-    char buf[160];
-    snprintf(buf, sizeof(buf), "  kernel %s", line);
-    font_draw(s, fr, (float)x + 6, py, buf, th->text_dim);
-    py += 18;
-    read_file("/proc/uptime", line, sizeof(line));
-    snprintf(buf, sizeof(buf), "  up %d s", atoi(line));
-    font_draw(s, fr, (float)x + 6, py, buf, th->text_dim);
-    py += 18;
-    font_draw(s, fd, (float)x + 6, py, "  press 1-9 or click to switch theme",
-              color_alpha(th->text, 0.40f));
+    if (have_sys) {
+        py += 8;
+        font_draw(s, fh, (float)x + 6, py, "System", th->text);
+        py += 20;
+        read_file("/proc/sys/kernel/osrelease", line, sizeof(line));
+        char buf[160];
+        snprintf(buf, sizeof(buf), "  kernel %s", line);
+        font_draw(s, fr, (float)x + 6, py, buf, th->text_dim);
+        py += 18;
+        read_file("/proc/uptime", line, sizeof(line));
+        snprintf(buf, sizeof(buf), "  up %d s", atoi(line));
+        font_draw(s, fr, (float)x + 6, py, buf, th->text_dim);
+        py += 18;
+    }
+    if (py + 12.0f <= (float)(y + h))
+        font_draw(s, fd, (float)x + 6, py,
+                  st->status[0] ? st->status : "press 1-9 or click to switch theme",
+                  st->status[0] ? color_alpha(th->accent, 0.80f)
+                                : color_alpha(th->text, 0.40f));
 }
 
 static void settings_key(App *a, const char *bytes, int n) {
@@ -205,7 +298,9 @@ static void settings_click(App *a, int x, int y, int buttons) {
     (void)x; (void)buttons;
     if (!s) return;
     for (int i = 0; i < s->count; i++) {
-        if ((float)y >= s->rows[i].y - 2 && (float)y < s->rows[i].y + ROW_H) {
+        float ry = s->rows[i].y;
+        if (ry < 0.0f) continue;      /* scrolled out of view: not hittable */
+        if ((float)y >= ry - 2.0f && (float)y < ry + ROW_H) {
             s->sel = i;
             apply_theme(s);
             return;

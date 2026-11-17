@@ -18,6 +18,7 @@ typedef struct {
 
 static void sysinfo_init(App *a, int w, int h) {
     SysInfo *s = calloc(1, sizeof(SysInfo));
+    if (!s) return;                 /* app_draw/app_click see state == NULL */
     s->w = w; s->h = h;
     a->state = s;
 }
@@ -27,21 +28,47 @@ static void sysinfo_free(App *a) {
     a->state = NULL;
 }
 
+/* One line at a time. The old token loop required three fields per line
+ * (key, number, unit) and stopped at the first line that had fewer, so any
+ * key below a two-field entry such as "HugePages_Total: 0" read as 0. */
 static long read_kb(const char *key) {
     FILE *f = fopen("/proc/meminfo", "r");
     if (!f) return 0;
-    char k[64], unit[16];
-    long v;
-    while (fscanf(f, "%63s %ld %15s", k, &v, unit) == 3)
-        if (!strcmp(k, key)) { fclose(f); return v; }
+    size_t klen = strlen(key);
+    char line[256];
+    long v = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, key, klen) != 0) continue;
+        v = strtol(line + klen, NULL, 10);
+        break;
+    }
     fclose(f);
-    return 0;
+    return v;
+}
+
+/* Clip to the rectangle we were given. The window manager hands over the
+ * whole scene surface (main.c:434), so keeping pixels inside the app rect
+ * is the app's job. Coordinates below stay absolute; shortening the
+ * surface to the rect's right/bottom edge makes the bounds check inside
+ * every gfx_ and font_draw call reject anything past it, and negative x/y
+ * is rejected there too. */
+static Surface rect_clip(Surface *s, int x, int y, int w, int h) {
+    Surface c = *s;
+    int right = x + w, bottom = y + h;
+    if (right < 0) right = 0;
+    if (bottom < 0) bottom = 0;
+    if (right < c.w) c.w = right;
+    if (bottom < c.h) c.h = bottom;
+    return c;
 }
 
 static void sysinfo_draw(App *a, Surface *s, int x, int y, int w, int h, const Theme *th) {
     SysInfo *st = a->state;
     if (!st) return;
     st->w = w; st->h = h;
+
+    Surface clip = rect_clip(s, x, y, w, h);
+    s = &clip;
 
     Font *fh = font_get(FONT_MEDIUM, 17);
     Font *fr = font_get(FONT_REGULAR, 12);
@@ -53,11 +80,13 @@ static void sysinfo_draw(App *a, Surface *s, int x, int y, int w, int h, const T
     long total = read_kb("MemTotal:");
     long avail = read_kb("MemAvailable:");
     long used = total - avail;
+    if (used < 0) used = 0;
 
     /* memory bar */
     font_draw(s, fh, (float)x + 4, py, "Memory", th->text);
     py += 26;
     float bw = (float)w - 8;
+    if (bw < 1.0f) bw = 1.0f;
     gfx_rrect_aa(s, (float)x + 4, py, bw, 8, 4, color_alpha(th->text, 0.10f), 0, 0);
     float frac = total > 0 ? (float)used / (float)total : 0.0f;
     if (frac > 1.0f) frac = 1.0f;
@@ -89,9 +118,12 @@ static void sysinfo_draw(App *a, Surface *s, int x, int y, int w, int h, const T
     font_draw(s, fh, (float)x + 4, py, "Processes", th->text);
     py += 24;
 
-    /* a few real processes, from /proc/<pid>/comm */
+    /* A few real processes, from /proc/<pid>/comm. Stop when the rect is
+     * full instead of running the rows over the window frame: the old code
+     * drew all six and then did nothing in a `if (py > y + h) ;` stub. */
     int shown = 0;
     for (int pid = 1; pid < 200 && shown < 6; pid++) {
+        if (py + 14.0f > (float)(y + h)) break;     /* no room for a row */
         char path[64], name[64];
         snprintf(path, sizeof(path), "/proc/%d/comm", pid);
         FILE *p = fopen(path, "r");
@@ -106,8 +138,6 @@ static void sysinfo_draw(App *a, Surface *s, int x, int y, int w, int h, const T
         }
         fclose(p);
     }
-    if (py > (float)(y + h) - 6)
-        ; /* clipping is the window manager's job */
 }
 
 static void sysinfo_click(App *a, int x, int y, int buttons) {
