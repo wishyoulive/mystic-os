@@ -436,8 +436,10 @@ int main(void) {
                 key_bytes(buf, &n);
                 if (n) term_key(top->term, buf, n);
                 if (input.text_len) term_key(top->term, input.text, input.text_len);
-            } else if (top->app && input.text_len) {
-                app_key(top->app, input.text, input.text_len);
+            } else if (top->app) {
+                if (input.text_len) app_key(top->app, input.text, input.text_len);
+                if (input.key == 14) app_key(top->app, "\b", 1);   /* Backspace */
+                if (input.key == 28) app_key(top->app, "\n", 1);   /* Enter */
             }
         }
 
@@ -467,7 +469,22 @@ int main(void) {
         }
 
         long now = (long)time(NULL);
-        if (now != last_tick) { last_tick = now; dirty = 1; }
+        if (now != last_tick) {
+            last_tick = now;
+            dirty = 1;
+            /* another app can ask for a theme by writing this file */
+            FILE *tf = fopen("/etc/mystic/current-theme", "r");
+            if (tf) {
+                char want[64] = {0};
+                if (fgets(want, sizeof(want), tf)) {
+                    char *nl = strchr(want, '\n');
+                    if (nl) *nl = 0;
+                    for (int i = 0; i < theme_count; i++)
+                        if (!strcmp(want, themes[i].name)) theme_index = i;
+                }
+                fclose(tf);
+            }
+        }
         if (input.mouse_dx || input.mouse_dy) dirty = 1;
 
         if (dirty) {

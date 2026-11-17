@@ -16,12 +16,14 @@ framebuffer. No X11, no Wayland, no GPU driver.
 | | |
 |---|---|
 | Boot | 0.43 s to userspace (hardware accelerated in a VM) |
+| Disk | 64 MB virtio disk, FAT, formatted on first boot; `/root` persists |
 | Memory | ~62 MB used of 216 MB, including kernel + rootfs |
 | Image | 6.5 MB rootfs, 13 MB kernel |
 | Graphics | bochs/simpledrm framebuffer, 1280×800, 32bpp |
 | Text | real TrueType rasterising (Lato), antialiased |
 | Themes | three, switched live with the number keys |
-| Input | evdev keyboard + mouse, drag windows |
+| Input | evdev keyboard + mouse, drag windows, dock launching |
+| Apps | Terminal (real pty + sh), Files, Settings, Monitor, Notes |
 
 Press `1` `2` `3` to switch theme. Drag the title bar to move the window.
 
