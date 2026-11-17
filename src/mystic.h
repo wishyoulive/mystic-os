@@ -36,11 +36,23 @@ typedef struct {
     u32 *px;
     int  w, h;
     int  stride;      /* pixels per row */
+    /* Optional clip rectangle. cx1 <= cx0 means "no clip". An app is given
+     * its own window rect as the clip, so a bug in its layout cannot paint
+     * over the wallpaper or the neighbouring windows. */
+    int  cx0, cy0, cx1, cy1;
 } Surface;
 
+static inline void surf_clip(Surface *s, int x, int y, int w, int h) {
+    s->cx0 = x; s->cy0 = y; s->cx1 = x + w; s->cy1 = y + h;
+}
+static inline void surf_unclip(Surface *s) { s->cx0 = s->cy0 = s->cx1 = s->cy1 = 0; }
+
 static inline void surf_set(Surface *s, int x, int y, u32 c) {
-    if ((unsigned)x < (unsigned)s->w && (unsigned)y < (unsigned)s->h)
+    if ((unsigned)x < (unsigned)s->w && (unsigned)y < (unsigned)s->h) {
+        if (s->cx1 > s->cx0 &&
+            (x < s->cx0 || x >= s->cx1 || y < s->cy0 || y >= s->cy1)) return;
         s->px[(size_t)y * s->stride + x] = c;
+    }
 }
 
 void surf_fill(Surface *s, int x, int y, int w, int h, u32 c);

@@ -1,0 +1,20 @@
+# Mono - greyscale only, every channel equal (r == g == b on every line).
+# No blur and almost no glow: flat surfaces, crisp glyph edges, nothing to
+# mush the text. Maximum legibility, and the cheapest theme to compose.
+# Measured with the WCAG formula in docs/THEMES.md:
+#   body text 13.92:1 on window_bg, dim text 7.16:1, accent 18.73:1.
+name          = Mono
+dark          = 1
+bg_top        = #0E0E0E
+bg_bottom     = #1A1A1A
+accent        = #FFFFFF
+glow          = #6E6E6E
+glow_strength = 0.25
+panel         = #B31F1F1F
+panel_border  = #4DFFFFFF
+text          = #DEDEDE
+text_dim      = #A0A0A0
+window_bg     = #121212
+window_border = #66FFFFFF
+corner        = 6
+blur          = 0.0

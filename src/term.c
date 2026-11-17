@@ -135,6 +135,22 @@ static void cell_floor(float *cw, float *ch) {
     *ch = (*ch > 8.0f) ? *ch : 8.0f;
 }
 
+/* Trim a label so it fits a width, with ".." where it had to be cut: the
+ * scrolled-back pill is text in a pill that may itself have been narrowed to
+ * the window, so the string has to be fitted, not clipped by the surface. */
+static void fit_label(Font *f, const char *src, char *out, size_t cap, float maxw) {
+    snprintf(out, cap, "%s", src);
+    if (maxw <= 0.0f) { out[0] = 0; return; }
+    if (font_width(f, out) <= maxw) return;
+    size_t n = strlen(src);
+    while (n > 0) {
+        n--;
+        snprintf(out, cap, "%.*s..", (int)n, src);
+        if (font_width(f, out) <= maxw) return;
+    }
+    out[0] = 0;
+}
+
 /* ---------------------------------------------------------- screen */
 static Cell *cell_at(Term *t, int x, int y) {
     if (x < 0 || x >= t->cols || y < 0 || y >= t->rows) return NULL;
@@ -1018,19 +1034,29 @@ void term_draw(Term *t, Surface *s, int x, int y, int w, int h,
          * taller than its own pill and hung past the bottom of the window -
          * exactly the kind of thing that makes the terminal look like it
          * ignored the text-size setting. */
-        char ind[48];
+        char ind[48], label[48];
         snprintf(ind, sizeof(ind), "  scrolled back %d lines  ", t->scroll);
+        float inset = (float)ui_px(6);
         float ink = font_height(fr) / 1.4f;
-        float ih = ink + (float)ui_px(6);
-        float iw = font_width(fr, ind) + (float)ui_px(12);
+        float ih = ink + inset;
+        float iw = font_width(fr, ind) + 2.0f * inset;
         float limit = (float)w - 2.0f * (float)ui_px(4);
         if (iw > limit) iw = limit;
+        if (iw < 0.0f) iw = 0.0f;
         if (ih > (float)h) ih = (float)h;
         float ix = (float)x + ((float)w - iw) * 0.5f;
         float iy = (float)(y + h) - ih - (float)ui_px(4);
+        /* The pill may have been narrowed to fit the window, so the label is
+         * fitted to the pill's inner width rather than clipped by the surface:
+         * at scale 1.6 and the 318 px minimum client width JetBrains Mono puts
+         * the full 27-character string at ~331 px (0.4545 em per glyph at
+         * 27 px) against a ~286 px inner width, so a full-width draw would
+         * leave the pill and be clipped by the window edges. */
+        fit_label(fr, ind, label, sizeof(label), iw - 2.0f * inset);
         if (ih > 1.0f)
             gfx_rrect_aa(s, ix, iy, iw, ih, ih * 0.5f, 0xCC000000u, 0, 0);
-        font_draw(s, fr, ix + (float)ui_px(6), iy + (ih - ink) * 0.5f, ind, 0xFFCCCCCCu);
+        if (label[0])
+            font_draw(s, fr, ix + inset, iy + (ih - ink) * 0.5f, label, 0xFFCCCCCCu);
     }
 
     /* cursor */

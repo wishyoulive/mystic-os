@@ -38,6 +38,12 @@ void surf_fill(Surface *s, int x, int y, int w, int h, u32 c) {
     int y0 = y < 0 ? 0 : y;
     int x1 = x + w > s->w ? s->w : x + w;
     int y1 = y + h > s->h ? s->h : y + h;
+    if (s->cx1 > s->cx0) {          /* clipped to a window's content rect */
+        if (x0 < s->cx0) x0 = s->cx0;
+        if (y0 < s->cy0) y0 = s->cy0;
+        if (x1 > s->cx1) x1 = s->cx1;
+        if (y1 > s->cy1) y1 = s->cy1;
+    }
     if (x1 <= x0 || y1 <= y0) return;
     for (int yy = y0; yy < y1; yy++) {
         u32 *row = s->px + (size_t)yy * s->stride;
@@ -53,6 +59,13 @@ void surf_blend(Surface *s, int x, int y, int w, int h, u32 c) {
     int y0 = y < 0 ? 0 : y;
     int x1 = x + w > s->w ? s->w : x + w;
     int y1 = y + h > s->h ? s->h : y + h;
+    /* honour the clip rectangle, so an app cannot paint outside its window */
+    if (s->cx1 > s->cx0) {
+        if (x0 < s->cx0) x0 = s->cx0;
+        if (y0 < s->cy0) y0 = s->cy0;
+        if (x1 > s->cx1) x1 = s->cx1;
+        if (y1 > s->cy1) y1 = s->cy1;
+    }
     if (a == 255) { surf_fill(s, x0, y0, x1 - x0, y1 - y0, c | 0xFF000000u); return; }
     int r = GET_R(c), g = GET_G(c), b = GET_B(c);
     int ia = 255 - a;

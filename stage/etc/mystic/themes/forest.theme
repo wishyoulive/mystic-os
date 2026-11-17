@@ -1,0 +1,18 @@
+# Forest - deep moss greens and warm parchment text; low glow, soft corners.
+# Measured with the WCAG formula in docs/THEMES.md:
+#   body text 15.18:1 on window_bg, dim text 7.81:1, accent 9.39:1.
+name          = Forest
+dark          = 1
+bg_top        = #07110A
+bg_bottom     = #122A1A
+accent        = #E0B36B
+glow          = #2F5D3A
+glow_strength = 0.35
+panel         = #A6122317
+panel_border  = #2E9CCB9A
+text          = #F1EAD9
+text_dim      = #9EAF94
+window_bg     = #0C1810
+window_border = #33A8C79A
+corner        = 20
+blur          = 1.0

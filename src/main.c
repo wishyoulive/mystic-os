@@ -44,6 +44,44 @@ static int topbar_h(void) { return ui_px(34); }     /* screen top bar   */
 /* F12: the dots, the title text and the click targets all hang off this one
  * vertical centre, so nothing drifts when the text scale changes the bar. */
 static int traffic_y(int bar_h) { return (bar_h - DOT_SZ) / 2; }
+/* A bundle used to be a letter in a box ("C", "F", "2"), which is why the
+ * launcher looked unfinished. Each known app now has the same kind of drawn
+ * icon the built-ins have; anything unknown still falls back to its initial. */
+static void icon_terminal(Surface*,float,float,float,u32);
+static void icon_folder(Surface*,float,float,float,u32);
+static void icon_gear(Surface*,float,float,float,u32);
+static void icon_clock(Surface*,float,float,float,u32);
+static void icon_paint(Surface*,float,float,float,u32);
+static void icon_life(Surface*,float,float,float,u32);
+static void icon_mandel(Surface*,float,float,float,u32);
+static void icon_sysmon(Surface*,float,float,float,u32);
+static void icon_calc(Surface*,float,float,float,u32);
+static void icon_grid(Surface*,float,float,float,u32);
+static void icon_bars(Surface*,float,float,float,u32);
+static void icon_pencil(Surface*,float,float,float,u32);
+static void icon_web(Surface*,float,float,float,u32);
+static void icon_2048(Surface*,float,float,float,u32);
+static void icon_sysinfo(Surface*,float,float,float,u32);
+typedef void (*IconFn)(Surface *, float, float, float, u32);
+static IconFn icon_for_bundle(const char *id) {
+    if (!id)                       return NULL;
+    if (!strcmp(id, "clock"))      return icon_clock;
+    if (!strcmp(id, "files"))      return icon_folder;
+    if (!strcmp(id, "g2048"))      return icon_2048;
+    if (!strcmp(id, "life"))       return icon_life;
+    if (!strcmp(id, "mandel"))     return icon_mandel;
+    if (!strcmp(id, "paint"))      return icon_paint;
+    if (!strcmp(id, "sysmon"))     return icon_sysmon;
+    if (!strcmp(id, "web"))        return icon_web;
+    if (!strcmp(id, "sysinfo"))    return icon_sysinfo;
+    if (!strcmp(id, "settings"))   return icon_gear;
+    if (!strcmp(id, "monitor"))    return icon_bars;
+    if (!strcmp(id, "notes"))      return icon_pencil;
+    if (!strcmp(id, "store"))      return icon_grid;
+    if (!strcmp(id, "calc"))       return icon_calc;
+    return NULL;
+}
+
 /* The dock is as wide as the windows in it. Ten windows at Huge text were
  * wider than an 800px screen, and the icons painted off the left edge could
  * not be clicked at all. dock_rect() lowers this percentage until the bar
@@ -233,6 +271,15 @@ static void icon_web(Surface *s, float x, float y, float sz, u32 fg) {
     gfx_line(s, cx - r * 0.62f, cy + r * 0.72f, cx + r * 0.62f, cy + r * 0.72f, sz * 0.05f, fg);
 }
 
+static void icon_sysinfo(Surface *s, float x, float y, float sz, u32 fg) {
+    /* an info "i" in a rounded panel: the System app is a read-out, not a gear */
+    gfx_rrect_aa(s, x + sz * 0.18f, y + sz * 0.12f, sz * 0.64f, sz * 0.76f, sz * 0.10f,
+                 0, fg, sz * 0.055f);
+    float cx = x + sz * 0.5f;
+    gfx_rrect(s, cx - sz * 0.035f, y + sz * 0.26f, sz * 0.07f, sz * 0.10f, sz * 0.02f, fg);
+    gfx_rrect(s, cx - sz * 0.035f, y + sz * 0.42f, sz * 0.07f, sz * 0.24f, sz * 0.02f, fg);
+}
+
 static void icon_2048(Surface *s, float x, float y, float sz, u32 fg) {
     float q = sz * 0.27f;
     float ox = x + (sz - 2 * q - sz * 0.10f) / 2, oy = y + (sz - 2 * q - sz * 0.10f) / 2;
@@ -240,22 +287,6 @@ static void icon_2048(Surface *s, float x, float y, float sz, u32 fg) {
     gfx_rrect(s, ox + q + sz * 0.10f, oy, q, q, sz * 0.06f, fg);
     gfx_rrect(s, ox, oy + q + sz * 0.10f, q, q, sz * 0.06f, fg);
     gfx_rrect(s, ox + q + sz * 0.10f, oy + q + sz * 0.10f, q, q, sz * 0.06f, fg);
-}
-
-/* A bundle used to be a letter in a box ("C", "F", "2"), which is why the
- * launcher looked unfinished. Each known app now has the same kind of drawn
- * icon the built-ins have; anything unknown still falls back to its initial. */
-typedef void (*IconFn)(Surface *, float, float, float, u32);
-static IconFn icon_for_bundle(const char *id) {
-    if (!strcmp(id, "clock"))      return icon_clock;
-    if (!strcmp(id, "files"))      return icon_folder;
-    if (!strcmp(id, "g2048"))      return icon_2048;
-    if (!strcmp(id, "life"))       return icon_life;
-    if (!strcmp(id, "mandel"))     return icon_mandel;
-    if (!strcmp(id, "paint"))      return icon_paint;
-    if (!strcmp(id, "sysmon"))     return icon_sysmon;
-    if (!strcmp(id, "web"))        return icon_web;
-    return NULL;
 }
 
 static void icon_bars(Surface *s, float x, float y, float sz, u32 fg) {
@@ -278,21 +309,13 @@ static void icon_pencil(Surface *s, float x, float y, float sz, u32 fg) {
 
 typedef void (*IconFn)(Surface *, float, float, float, u32);
 
+/* One table decides an app's icon, wherever it is drawn. There used to be a
+ * second table here for the dock, and it disagreed: web and g2048 fell through
+ * to a gear, so the same app had two different icons. */
 static IconFn icon_for_id(const char *id, int is_term) {
     if (is_term) return icon_terminal;
-    if (!id) return icon_gear;
-    if (!strcmp(id, "files"))    return icon_folder;
-    if (!strcmp(id, "settings")) return icon_gear;
-    if (!strcmp(id, "monitor"))  return icon_bars;
-    if (!strcmp(id, "notes"))    return icon_pencil;
-    if (!strcmp(id, "store"))    return icon_grid;
-    if (!strcmp(id, "calc"))     return icon_calc;
-    if (!strcmp(id, "clock"))    return icon_clock;
-    if (!strcmp(id, "paint"))    return icon_paint;
-    if (!strcmp(id, "life"))     return icon_life;
-    if (!strcmp(id, "mandel"))   return icon_mandel;
-    if (!strcmp(id, "sysmon"))   return icon_sysmon;
-    return icon_gear;
+    IconFn fn = icon_for_bundle(id);
+    return fn ? fn : icon_gear;
 }
 
 static IconFn icon_for_window(Window *w) {
@@ -805,9 +828,25 @@ static void draw_desktop(Surface *s, const Theme *th) {
             if (ch_cell < 8.0f) ch_cell = 8.0f;
             term_draw(cur->term, s, cx0, cy0, cw0, ch0, fm, cw_cell, ch_cell);
         } else if (cur->app) {
+            /* an app draws into the whole surface, so give it the window as
+             * its clip: a layout bug in one app must not paint over the
+             * wallpaper or over the window underneath */
+            surf_clip(s, cx0, cy0, cw0, ch0);
             app_draw(cur->app, s, cx0, cy0, cw0, ch0, th);
+            surf_unclip(s);
         } else if (cur->kind == WIN_CLIENT && cur->client >= 0) {
             WmClient *cl = &clients[cur->client];
+            /* An app that died - or never connected - used to leave an empty
+             * rectangle, which looks like the whole desktop is broken. Say so
+             * instead: the frame is drawn, the message explains it. */
+            if (!cl->used || !cl->px) {
+                Font *fm = font_get(FONT_MEDIUM, 13);
+                const char *msg = "this app has stopped - open it again";
+                float mw = font_width(fm, msg);
+                font_draw(s, fm, (float)cx0 + ((float)cw0 - mw) * 0.5f,
+                          (float)cy0 + (float)ch0 * 0.5f - font_height(fm),
+                          msg, color_alpha(th->text, 0.65f));
+            }
             if (cl->used && cl->px) {
                 /* Clip to the client's buffer AND to the screen. Without the
                  * screen clamp a window dragged above the top edge (resize or
@@ -1288,8 +1327,9 @@ int dot_y = traffic_y(tb);
             return 1;
         }
 
-        /* title bar = drag */
-        if (ly < tb) {
+        /* title bar = drag, but only with the left button: a right click on
+         * the bar is a context menu request, not a drag */
+        if (ly < tb && (input.buttons & 1)) {
             drag_win = (int)(hit - wins);
             drag_gen = hit->gen;            /* F9: remember which window, not just the slot */
             drag_dx = lx;
@@ -1618,7 +1658,10 @@ int main(void) {
                 }
             }
         }
-        if (input.clicked & 1) { if (handle_click()) dirty = 1; }
+        /* bit 1 is the left button, bit 2 the right (src/input.c maps
+         * BTN_RIGHT to it). Only the left button used to be dispatched, so a
+         * right click did nothing anywhere in the system. */
+        if (input.clicked & 3) { if (handle_click()) dirty = 1; }
         if (input.released & 1) {
             if (drag_win >= 0 && wins[drag_win].used && wins[drag_win].gen == drag_gen) {
                 Window *w = &wins[drag_win];

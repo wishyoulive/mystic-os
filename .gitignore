@@ -17,3 +17,6 @@ stage/lib/modules/
 stage/usr/share/fonts/*.ttf
 stage/sbin/
 stage/usr/lib/
+
+# agent scratch space
+.work/
