@@ -139,6 +139,22 @@ def _decodepoint(s):
     return point
 
 
+_IDENTITY = bytes([1]) + bytes(31)
+
+
+def _small_order(point):
+    """True for the 8 points of order 1, 2, 4 and 8: [8]P is the identity.
+
+    Those points make the verification equation degenerate - the identity
+    public key "verifies" S = 0, R = identity for every message - so they
+    are rejected, exactly as the C verifier does.
+    """
+    q = point
+    for _ in range(3):
+        q = _edwards(q, q)
+    return _encodepoint(q) == _IDENTITY
+
+
 def _secret_expand(seed):
     """(clamped scalar, nonce prefix) from a 32-byte seed."""
     if len(seed) != 32:
@@ -173,9 +189,11 @@ def verify(message, signature, pub):
     s = int.from_bytes(signature[32:], "little")
     if s >= L:                       # non-canonical S would be malleable
         return False
-    a_point = _decodepoint(pub)
+    a_point = _decodepoint(pub)      # also rejects a non-canonical y >= p
     r_point = _decodepoint(r_enc)
     if a_point is None or r_point is None:
+        return False
+    if _small_order(a_point) or _small_order(r_point):
         return False
     k = int.from_bytes(hashlib.sha512(r_enc + pub + message).digest(), "little") % L
     left = _scalarmult(_B, s)
@@ -343,6 +361,20 @@ def cmd_selftest(_args):
         if verify(msg, malleable, want_pub):
             print("vector %d: non-canonical S accepted" % n)
             fails += 1
+    # Encodings a weaker verifier accepts: the non-canonical y = p key and
+    # the identity key both "verify" R = identity, S = 0 for any message.
+    for name, pk, msg in (
+            ("non-canonical y = p key",
+             bytes.fromhex("edffffffffffffffffffffffffffffffff"
+                           "ffffffffffffffffffffffffffffff7f"),
+             b"forged under a non-canonical key"),
+            ("identity key", _IDENTITY, b"forged with the identity key"),
+            ("low-order R", want_pub, b"low-order R under a real key")):
+        forged = bytes([1]) + bytes(63)          # R = identity, S = 0
+        if verify(msg, forged, pk):
+            print("selftest: accepted the %s" % name)
+            fails += 1
+
     if fails:
         print("selftest: %d failure(s)" % fails)
         return 1

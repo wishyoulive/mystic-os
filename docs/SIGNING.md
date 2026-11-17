@@ -51,6 +51,11 @@ These are the honest limits, not a wish list:
   enforcement is the sha256, not the size.
 * **Availability is not protected.** An attacker can still block, delay or
   404 the repository. That is a denial of service, not a forgery.
+* **The Store's browsing list is still unauthenticated.** Installation is
+  gated (the Store only asks for a *name*, and `pkg install` re-verifies the
+  index before it looks that name up), but the rows the Store *shows* come
+  from a plain `wget` copy of the index written by the desktop. See section
+  5 for the exact lines and the one-line fix, and section 8 for the risk.
 
 ---
 
@@ -222,6 +227,40 @@ install. There is no `--insecure` flag.
 
 ---
 
+### The Store's copy of the index is not authenticated yet
+
+`pkg` writes its verified index to `/tmp/pkg/index.tsv` and also copies it
+to `/run/mystic/repo.index` (`stage/usr/bin/pkg:319-321`). The Store window
+does not read `pkg`'s copy: it reads `/run/mystic/repo.index`
+(`src/apps/store.c:163`, opened at `:741` and `:755`), and the desktop
+overwrites that file with a plain, unverified
+`wget -q -T 10 -O /run/mystic/repo.index http://10.0.2.2:8000/index.tsv`
+on first run (`src/main.c:1854-1857`) and on every Refresh
+(`src/main.c:1865-1868`). Nothing on that path checks a signature.
+
+Consequence: the Store's *list* - names, versions, sizes, descriptions,
+the installed/update hints - is attacker-chosen on an untrusted network.
+Installing is still gated: the Store writes only the chosen *name* to
+`/run/mystic/install.request` (`src/apps/store.c:1590`), the desktop
+validates it (`src/main.c:404-422`) and `pkg install` re-fetches and
+re-verifies the signed index before it looks the name up, refusing one
+that is not there (`stage/usr/bin/pkg:325-336`, `:421`). So the worst
+case today is a misleading row or a denied install, not code execution -
+but it is a hole in this story and it is listed in section 8.
+
+The fix belongs in `src/main.c`, which this worker does not own. Either:
+
+1. replace both `wget` commands (`src/main.c:1854-1857` and
+   `:1865-1868`) with
+   `execl("/bin/sh", "sh", "-c", "pkg update", (char *)NULL);` so `pkg`
+   is the only writer of `/run/mystic/repo.index`; or
+2. leave the fetch in `main.c` but have the Store read
+   `/tmp/pkg/index.tsv` and only after `ed25519-verify` accepts
+   `/tmp/pkg/index.tsv.sig` against `/etc/mystic/repo.pub`.
+
+Option 1 is one line per site and makes the Store exactly as trustworthy
+as the installer. Until it lands, section 8 carries the risk.
+
 ## 6. The verifier
 
 `src/tools/ed25519.c` — one file, no dependencies, no `libcrypto`:
@@ -237,11 +276,19 @@ install. There is no `--insecure` flag.
 * **Canonical `S` is enforced** (`S < L`). Without it `(R, S)` and
   `(R, S + L)` would both verify — signature malleability. The self test
   checks that `S + L` is rejected.
-* The public key encoding is rejected if `y >= p` or the point is not on
-  the curve; `R` is compared as bytes.
-* `--selftest` runs the RFC 8032 §7.1 vectors 1–3 and, for each, a
-  corrupted signature, a corrupted message and a non-canonical `S` that
-  must all be rejected.
+* **Canonical `y` is enforced** for both `A` and `R` (`y < p`). The 32
+  bytes `ed ff .. ff 7f` encode `y = p`, which is the same point as
+  `y = 0`: without this check one point has several valid encodings.
+* **Low-order points are refused** for both `A` and `R` (`[8]P` is the
+  identity). Without that test the identity public key "verifies"
+  `R = identity, S = 0` for *every* message - a signature that verifies
+  under a key nobody holds. Honest signatures never land in the set:
+  `R = [r]B` for a uniform `r` does so with probability about 2^-252.
+* Both points must be on the curve, and `R` is compared as bytes.
+* `--selftest` runs the RFC 8032 section 7.1 vectors 1-3 (a corrupted
+  signature for each, a corrupted message for the two non-empty ones, a
+  non-canonical `S` for each) and three forged encodings that must all
+  be rejected: the `y = p` key, the identity key, and a low-order `R`.
 
 It is built by `tools/build-desktop.sh` and installed as
 `/usr/bin/ed25519-verify`:
@@ -281,8 +328,8 @@ run, so the hex differs run to run — the pass/fail lines do not).
 $ python tools/sign-index.py keygen --seed .../repo.key --pub .../index.pub
 seed      : .../repo.key (mode 0600, keep it off any shared machine)
 public key: .../index.pub (32 raw bytes)
-public hex: b2ea75cdbc189cca463d6507e25c4db873fb00ef57ece0a95720c161bfe62a55
-fingerprint: sha256 f53a7e00d12aeb986126edb7361b94922afcbd8d5c97e12c1eb251dccd51c634
+public hex: 8d0384abc175f22fe9ec73facb993d043394827850887f69acc7bfdcd7df4395
+fingerprint: sha256 f096707757adebf412e3877655ec96ea9e1e1c38edafe83b90b8eb2efceeb201
 ```
 
 ### Sign a sample index and verify it
@@ -291,12 +338,12 @@ fingerprint: sha256 f53a7e00d12aeb986126edb7361b94922afcbd8d5c97e12c1eb251dccd51
 $ python tools/sign-index.py sign --seed .../repo.key --in .../repo/index.tsv --pub .../index.pub
 signed    : .../repo/index.tsv (158 bytes)
 signature : .../repo/index.tsv.sig (64 raw bytes)
-public hex: b2ea75cdbc189cca463d6507e25c4db873fb00ef57ece0a95720c161bfe62a55
-fingerprint: sha256 f53a7e00d12aeb986126edb7361b94922afcbd8d5c97e12c1eb251dccd51c634
+public hex: 8d0384abc175f22fe9ec73facb993d043394827850887f69acc7bfdcd7df4395
+fingerprint: sha256 f096707757adebf412e3877655ec96ea9e1e1c38edafe83b90b8eb2efceeb201
 
 $ python tools/sign-index.py verify --pub .../index.pub --in .../repo/index.tsv --sig .../repo/index.tsv.sig
 ok: signature verifies over 158 bytes of .../repo/index.tsv
-key fingerprint: sha256 f53a7e00d12aeb986126edb7361b94922afcbd8d5c97e12c1eb251dccd51c634
+key fingerprint: sha256 f096707757adebf412e3877655ec96ea9e1e1c38edafe83b90b8eb2efceeb201
 python exit=0
 
 $ .work/sign/ed25519-verify.exe .../index.pub .../repo/index.tsv .../repo/index.tsv.sig
@@ -334,7 +381,7 @@ fetching index from http://repo.test/index.tsv
 fetching signature from http://repo.test/index.tsv.sig
 pkg: SIGNATURE VERIFICATION FAILED for .../cache/index.tsv.part
 pkg:   key       : .../index.pub
-pkg:   fingerprint: sha256 f53a7e00d12aeb986126edb7361b94922afcbd8d5c97e12c1eb251dccd51c634
+pkg:   fingerprint: sha256 f096707757adebf412e3877655ec96ea9e1e1c38edafe83b90b8eb2efceeb201
 pkg:   signature : .../cache/index.tsv.sig.part
 pkg: the index was altered in transit, or it was signed with a key this
 pkg: image does not trust. Either way it is not used.
@@ -347,9 +394,46 @@ pkg exit=1 (1 = refused)
 
 ```
 $ ... pkg update
-1 packages (signature ok, key sha256 f53a7e00d12aeb986126edb7361b94922afcbd8d5c97e12c1eb251dccd51c634)
+1 packages (signature ok, key sha256 f096707757adebf412e3877655ec96ea9e1e1c38edafe83b90b8eb2efceeb201)
 pkg exit=0 (0 = accepted)
 ```
+
+### Forged *encodings* are rejected too, not just forged bytes
+
+A verifier that only tests curve membership accepts signatures that were
+never signed. Both cases below returned **exit 0** against the earlier
+build (`pt_unpack_neg` with no canonical-`y` and no low-order test):
+
+```
+# the two forged encodings, built from bytes so nothing here is magic
+$ python -c "open('pk_y_eq_p.bin','wb').write(bytes.fromhex('ed' + 'ff'*30 + '7f'))"
+$ python -c "open('pk_identity.bin','wb').write(bytes([1]) + bytes(31))"
+$ python -c "open('sig_y_eq_p.bin','wb').write(bytes([1]) + bytes(63))"
+$ python -c "open('sig_identity.bin','wb').write(bytes([1]) + bytes(63))"
+$ printf "forged under a non-canonical key" > msg1.txt
+$ printf "forged with the identity key"     > msg2.txt
+
+# the earlier build, which tested only curve membership:
+$ ed25519-verify pk_y_eq_p.bin   msg1.txt sig_y_eq_p.bin   ; echo exit=$?
+exit=0          <-- y = p accepted as a key
+$ ed25519-verify pk_identity.bin msg2.txt sig_identity.bin ; echo exit=$?
+exit=0          <-- identity key accepted
+
+# today:
+$ ed25519-verify pk_y_eq_p.bin   msg1.txt sig_y_eq_p.bin   ; echo exit=$?
+invalid
+exit=1          <-- y >= p is not a canonical key encoding
+$ ed25519-verify pk_identity.bin msg2.txt sig_identity.bin ; echo exit=$?
+invalid
+exit=1          <-- the identity key is low-order
+$ ed25519-verify --selftest
+selftest: ok
+```
+
+Those three cases are now compiled into `--selftest` (including the
+low-order `R`), so the property is enforced by a test rather than
+asserted in prose, and `.work/sign/crosscheck.py` feeds the same three
+encodings to both implementations and requires both to reject them.
 
 ### Test coverage actually run
 
@@ -369,8 +453,10 @@ pkg exit=0 (0 = accepted)
   key, wrote `index.pub`, and `pkg` then listed all eight rows
   (`8 packages (signature ok, ...)`) and installed one of them with a
   matching sha256.
-* `ed25519-verify --selftest` — RFC 8032 vectors 1–3 plus three negative
-  cases each: `selftest: ok`.
+* `ed25519-verify --selftest` — RFC 8032 vectors 1-3 plus a corrupted
+  signature each, a corrupted message for the two non-empty vectors, a
+  non-canonical `S` each, and the three forged encodings (`y = p` key,
+  identity key, low-order `R`): `selftest: ok`.
 * `python tools/sign-index.py selftest` — the same vectors through the
   Python implementation: `selftest: ok`.
 
@@ -394,6 +480,7 @@ selftest: ok
 | Mirror blocks or delays | Installs fail | Expected; availability is not a security property here. |
 | Cache directory pre-created by uid 1000 | Index swapped between check and read | `prepare_cache` refuses a foreign-owned cache; `/tmp/pkg` is root-owned 0755. |
 | `tar` extracting as root | Files written outside the install dir | `tar_members_ok` rejects absolute and `..` members before extraction. |
+| Store "Available" list is unauthenticated | Names, versions, sizes and descriptions shown in the Store are attacker-chosen over plain HTTP; installs are still gated because `pkg` re-verifies before looking up the name | **Not mitigated yet**: `src/main.c:1854-1857` and `:1865-1868` write `/run/mystic/repo.index` with plain `wget`. Make `pkg update` the only writer, or have the Store verify before reading (see section 5). |
 
 ---
 

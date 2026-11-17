@@ -26,6 +26,12 @@
  *  Correctness is not asserted, it is checked: --selftest runs the
  *  RFC 8032 section 7.1 vectors plus negative cases, and the build
  *  is cross-checked against an independent Python implementation.
+ *
+ *  Verification is strict, because "a wrong signature fails" has to hold
+ *  for odd inputs too: S < L (no malleability), y < p for both A and R
+ *  (one point, one encoding), both points on the curve, and neither of low
+ *  order (the identity key would otherwise "verify" S = 0, R = identity
+ *  for every message). --selftest pins all of those shut.
  * ============================================================ */
 
 #include <stdint.h>
@@ -445,6 +451,51 @@ static int pt_unpack_neg(gf r[4], const u8 p[32])
     return 0;
 }
 
+/* The encoded y must be its canonical representative: y < p. Without this
+ * check "ed ff .. ff 7f" (y = p) decodes to the same point as y = 0, so a
+ * single point would have several valid encodings. ~6 lines, and it closes
+ * the "same key, different bytes" class outright. */
+static int y_is_canonical(const u8 enc[32])
+{
+    static const u8 P_BYTES[32] = {
+        0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f
+    };
+    u8 y[32];
+    int i;
+
+    memcpy(y, enc, 32);
+    y[31] &= 0x7f;                 /* drop the x sign bit */
+    for (i = 31; i >= 0; --i) {
+        if (y[i] < P_BYTES[i]) return 1;
+        if (y[i] > P_BYTES[i]) return 0;
+    }
+    return 0;                      /* y == p is not canonical */
+}
+
+/* The eight points of order 1, 2, 4 and 8 all satisfy [8]P = identity.
+ * They make the verification equation degenerate: with the identity key,
+ * R = identity and S = 0 satisfies [S]B = R + [h]A for every message, which
+ * is a signature that verifies under a key nobody holds. Honest signatures
+ * never land here (R = [r]B for a uniform r hits one with probability
+ * ~2^-252), so they are rejected outright. */
+static int pt_small_order(gf p[4])
+{
+    static const u8 IDENTITY[32] = {1};
+    gf q[4];
+    u8 enc[32];
+    int i;
+
+    for (i = 0; i < 4; i++) gf_copy(q[i], p[i]);
+    pt_add(q, q);                  /* 2P */
+    pt_add(q, q);                  /* 4P */
+    pt_add(q, q);                  /* 8P */
+    pt_pack(enc, q);
+    return ct_verify32(enc, IDENTITY) == 0;
+}
+
 /* ------------------------------------------------------------------
  * Scalar arithmetic modulo L
  * ------------------------------------------------------------------ */
@@ -496,14 +547,24 @@ static int scalar_canonical(const u8 s[32])
  * ------------------------------------------------------------------ */
 
 /* pk[32], sig = R[32] || S[32], plus a SHA-512 context already fed
- * exactly R || A || M. The context is consumed. 0 = valid, -1 = invalid. */
+ * exactly R || A || M. The context is consumed. 0 = valid, -1 = invalid.
+ *
+ * Every encoding is rejected unless it is the canonical one: S < L, y < p
+ * for both A and R, both points on the curve, and neither of low order.
+ * Those are the checks that make "a wrong signature fails" true for odd
+ * inputs as well as for plain bit flips. */
 static int ed25519_hash_verify(const u8 pk[32], const u8 sig[64], Sha512 *ctx)
 {
     u8 h[64], rcheck[32];
-    gf p[4], q[4];
+    gf p[4], q[4], rp[4];
 
-    if (!scalar_canonical(sig + 32)) return -1;
-    if (pt_unpack_neg(q, pk)) return -1;
+    if (!scalar_canonical(sig + 32)) return -1;   /* S < L  (no malleability) */
+    if (!y_is_canonical(pk)) return -1;           /* A's y < p             */
+    if (!y_is_canonical(sig)) return -1;          /* R's y < p             */
+    if (pt_unpack_neg(q, pk)) return -1;          /* A is on the curve     */
+    if (pt_small_order(q)) return -1;             /* A is not low order    */
+    if (pt_unpack_neg(rp, sig)) return -1;        /* R is on the curve     */
+    if (pt_small_order(rp)) return -1;            /* R is not low order    */
 
     sha512_final(ctx, h);
     scalar_reduce(h);
@@ -695,6 +756,50 @@ static int selftest(void)
         if (ed25519_verify(pk, bad, msg, (size_t)mlen) == 0) {
             fprintf(stderr, "selftest: vector %u accepted a non-canonical S\n", (unsigned)v);
             fails++;
+        }
+    }
+
+    /* Encodings a weaker verifier accepts and this one must not. Both cases
+     * below verified (exit 0) before the canonical-y and small-order checks
+     * existed, so they are the regression test for those checks. */
+    {
+        u8 pk[32], sig[64];
+        const char *m1 = "forged under a non-canonical key";
+        const char *m2 = "forged with the identity key";
+        const char *m3 = "low-order R under a real key";
+        int i;
+
+        /* y = p: the non-canonical encoding of y = 0 */
+        memset(pk, 0, sizeof(pk));
+        pk[0] = 0xed;
+        for (i = 1; i < 31; i++) pk[i] = 0xff;
+        pk[31] = 0x7f;
+        memset(sig, 0, sizeof(sig));
+        sig[0] = 1;                                    /* R = identity, S = 0 */
+        if (ed25519_verify(pk, sig, (const u8 *)m1, strlen(m1)) == 0) {
+            fprintf(stderr, "selftest: accepted a non-canonical y = p public key\n");
+            fails++;
+        }
+
+        /* the identity public key: [S]B == R + [h]A for every message at S = 0 */
+        memset(pk, 0, sizeof(pk));
+        pk[0] = 1;
+        if (ed25519_verify(pk, sig, (const u8 *)m2, strlen(m2)) == 0) {
+            fprintf(stderr, "selftest: accepted the identity public key\n");
+            fails++;
+        }
+
+        /* a real key with a low-order R */
+        if (unhex(VECTORS[0].pk, pk, 32) != 32) {
+            fprintf(stderr, "selftest: vector 0 public key is malformed\n");
+            fails++;
+        } else {
+            memset(sig, 0, sizeof(sig));
+            sig[0] = 1;                                /* R = identity, S = 0 */
+            if (ed25519_verify(pk, sig, (const u8 *)m3, strlen(m3)) == 0) {
+                fprintf(stderr, "selftest: accepted a low-order R\n");
+                fails++;
+            }
         }
     }
 
