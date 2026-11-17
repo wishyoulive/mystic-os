@@ -1,14 +1,20 @@
 /* ============================================================
  *  Mystic OS - apps/store.c
- *  "Apps": one window, two sections.
+ *  "Apps": one window that really manages packages.
+ *
+ *  Live tree note: this file is C only and talks to the kernel with
+ *  opendir/readdir/lstat/stat/unlink/rmdir/open/read/write; it never
+ *  invents a number. Every size, version, percentage and error string
+ *  below is read from the disk or from errno at the moment it is shown.
  *
  *  Installed - the bundles that are already on the disk, read with
- *  readdir() from /usr/share/mystic/apps and /root/apps (that is
- *  where `pkg install` unpacks them).  A directory counts as a
- *  bundle when it holds a readable 'manifest'; the manifest is
- *  parsed the way src/wmsrv.c parses it (name/desc/exec, one '='
- *  per line) and the size shown is the real st_size of
- *  <dir>/<id>/<exec>.
+ *  readdir() from /usr/share/mystic/apps and /root/apps (that is where
+ *  `pkg install` unpacks them).  A directory counts as a bundle when it
+ *  holds a readable 'manifest'; the manifest is parsed the way
+ *  src/wmsrv.c parses it (name/desc/exec/version, one '=' per line).
+ *  The size shown is the REAL installed size: every regular file under
+ *  <root>/<id>, summed with lstat().  The payload is stat()ed too so a
+ *  bundle whose exec is missing is drawn dimmed instead of pretending.
  *
  *  Available - the packages the repository advertises, read from
  *  /run/mystic/repo.index.  The index is the same TSV the installer
@@ -16,62 +22,126 @@
  *
  *      name<TAB>version<TAB>size<TAB>sha256<TAB>file<TAB>description
  *
- *  A package whose name is also an installed bundle (a directory in
- *  either bundle root) is painted as 'installed' and Enter will not
- *  offer it again.
+ *  The size column is the compressed tarball's size in bytes.  The file
+ *  column is the tarball's name, and that is what makes real install
+ *  progress possible (see below).
  *
- *  This window never forks and never installs by itself.  It asks
- *  the desktop, which owns the privileged work:
+ *  SEARCH - '/' focuses a filter box over every row's name and
+ *  description (and therefore also over the derived tag, which is a
+ *  word from the description).  Typing filters live; Enter keeps the
+ *  filter and leaves the box; Ctrl+U clears it; Backspace edits it.
+ *  There is no Escape path because src/main.c closes the window on Esc
+ *  before any app sees it.
+ *
+ *  TAG COLUMN - the repository has no category field, so this window
+ *  will not invent one.  The tag is the first significant word of the
+ *  row's own description, lower-cased and prefixed with '#'
+ *  (#browser, #clock, #game).  "Significant" means: a run of ASCII
+ *  letters, 3..15 long, that is not in TAG_STOP - a fixed list of
+ *  function words and of the leading adjectives this repository's
+ *  descriptions use ("real", "live", ...).  The tag is therefore always
+ *  a substring of the published description; a row whose description
+ *  has no such word shows no tag at all.  Nothing here maps a name to a
+ *  category the data does not contain.
+ *
+ *  UNINSTALL - 'x' on an Installed row asks first; only 'y' removes.
+ *  It deletes /root/apps/<id> and NOTHING else: the path is built from
+ *  the validated id, the walk uses lstat() and never follows a symlink,
+ *  and a bundle that lives in /usr/share/mystic/apps (the image) is
+ *  refused, because that tree belongs to the OS and not to pkg.
+ *  The confirmation names the id, so a selection that moves underneath
+ *  the prompt cannot change what is removed.
+ *
+ *  VERSIONS - the installed version is the manifest's "version =" line.
+ *  When a manifest has no such line the index's version is shown with a
+ *  '~' in front, so the reader can tell whose number it is.  "1.0>1.1"
+ *  means the installed manifest and the index disagree.  'U' compares
+ *  every installed bundle against the index and reports real counts in
+ *  the footer (available updates, image bundles that differ but cannot
+ *  be replaced, manifests with no version line); it also asks the
+ *  desktop for a fresh index, because comparing against a stale cache
+ *  would be a guess.
+ *
+ *  UPDATE INSTALL - 'i' (or Enter on an Available row) asks the desktop
+ *  to run `pkg install <name>` for a package that is missing or whose
+ *  index version differs.  An image bundle is refused: the launcher
+ *  gives the image's copy priority (src/wmsrv.c: "the image's copy
+ *  wins"), so replacing /root/apps/<id> would change nothing a person
+ *  can see.
+ *
+ *  INSTALL PROGRESS - the Store cannot see pkg's stdout, but it can see
+ *  pkg's download file.  stage/usr/bin/pkg caches in /tmp/pkg and writes
+ *  <cache>/<file>.part while wget is transferring, so:
+ *
+ *      downloaded = st_size("/tmp/pkg/<file>.part")
+ *      total      = the index row's size column
+ *      percent    = 100 * downloaded / total, clamped to 99 while the
+ *                   transfer is still running
+ *
+ *  The TEXT never says 100% before <root>/<name>/manifest appears: a
+ *  finished download is not an installed package.  The phases are all
+ *  decided by stat(): .part present -> downloading; .part gone but
+ *  <file> present -> the tarball is cached (or finished), which proves
+ *  the download is complete, so pkg is verifying/unpacking and the strip
+ *  is full while the label says exactly that; neither -> pkg has not
+ *  started (it may still be fetching the index).  No phase is fabricated:
+ *  if the file column or the size column is missing, the window says
+ *  "waiting" or shows bytes without a percentage instead of a made-up bar.
+ *
+ *  This window never forks and never installs by itself.  It asks the
+ *  desktop, which owns the privileged work:
  *
  *    Enter on an Installed row -> /run/mystic/launch.request   (one id)
- *    Enter on an Available row -> /run/mystic/install.request   (one name)
+ *    Enter/i on an Available row -> /run/mystic/install.request (one name)
  *    'r' or the Refresh button -> /run/mystic/repo.refresh      ("refresh")
  *
  *  The desktop validates the install name against [a-z0-9-]{1,32}
  *  before running `pkg install <name>`.  This file applies the same
- *  rule twice: a row whose name would fail it is never listed, so
- *  the single line written to install.request can only ever be a
- *  name the desktop accepts.
+ *  rule twice: a row whose name would fail it is never listed, so the
+ *  single line written to install.request can only ever be a name the
+ *  desktop accepts.
  *
- *  An install is asynchronous: pkg downloads, verifies and unpacks
- *  over there. The window watches the bundle root for the new
- *  directory, counts the seconds while it waits, and after
- *  STORE_INSTALL_TIMEOUT_SEC gives up with a plain "did not finish"
- *  and offers the row again - a request that never completes must
- *  not sit in the status line for ever.
+ *  MANIFEST VERSION LINE - this file only READS "version =".  The files
+ *  outside this one that would need it are listed in the final report,
+ *  not edited here: every stage/usr/share/mystic/apps/<id>/manifest, and
+ *  the minimal manifest that stage/usr/bin/pkg writes when a package
+ *  ships without one.
  *
  *  Two coordinate spaces: draw() gets this window's origin on the
- *  compositor surface and paints at origin + local, while click()
- *  gets APP-LOCAL coordinates (src/main.c: app_draw(cur->app, s,
- *  cx0, cy0, ...) vs app_click(hit->app, lx - 1, ly - tb - 1, ...)).
- *  Every rectangle in here - the Refresh button, the row band, each
+ *  compositor surface and paints at origin + local, while click() gets
+ *  APP-LOCAL coordinates (src/main.c: app_draw(cur->app, s, cx0, cy0,
+ *  ...) vs app_click(hit->app, lx - 1, ly - tb - 1, ...)).  Every
+ *  rectangle in here - Refresh, the search box, the row band, each
  *  column edge - is app-local, so the painter adds the origin and the
- *  hit-test never does. That is the rule src/apps/files.c spells out;
- *  mixing the two only looks right while the window sits at (0,0).
+ *  hit-test never does.
  *
- *  Geometry comes from one layout_store() Layout: the gutter, the
- *  icon box, the row height and every column edge are measured from
- *  the real fonts and ui_px(), and the lines are centred with the
- *  face's own ascent (line_top()). draw(), key(), click() and the wheel
- *  all read that one Layout, so they cannot disagree about where a row
- *  is - and nothing is a hand-tuned padding constant.
+ *  Geometry comes from one layout_store() Layout: the gutter, the icon
+ *  box, the row height and every column edge are measured from the real
+ *  fonts and ui_px(), and the lines are centred with the face's own
+ *  ascent (line_top()). draw(), key(), click() and the wheel all read
+ *  that one Layout, so they cannot disagree about where a row is.
  *
  *  Rows carry a drawn mark: a parcel for a package that can be
  *  installed, a tick for one already on the disk (sections carry the
  *  same marks so the list explains itself). Both are geometry built
  *  from the theme's accent - no images.
  *
- *  Keys:  j/k or Up/Down  move        Enter  launch / install
+ *  Keys:  j/k or Up/Down  move        Enter  launch / install / update
  *         Home/End/g/G    first/last  PgUp/PgDn  by a screen
+ *         /               search      Ctrl+U  clear the filter
  *         r               refresh the repo index
- *  Mouse: click the Refresh button, click a row to select it, click
- *         the selected row again to activate it. The wheel scrolls the
- *         list by WHEEL_ROWS rows a notch and keeps the selection inside
- *         the window (positive = up).
+ *         x               uninstall   (then y confirms, any other key
+ *                                      cancels)
+ *         i               install / update the selected package
+ *         U               check for updates (index vs installed)
+ *  Mouse: click the Refresh button, the search box, its x, or a row;
+ *         click the selected row again to activate it. The wheel
+ *         scrolls whole rows and keeps the selection in the window.
  * ============================================================ */
 #include "mystic.h"
 #include "ipc.h"
 
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
@@ -79,6 +149,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 /* Every path this window touches. The -D overrides exist so the host
  * harness can point the app at a scratch tree instead of the real /run. */
@@ -100,13 +171,17 @@
 #ifndef STORE_LAUNCH_REQUEST
 #define STORE_LAUNCH_REQUEST "/run/mystic/launch.request"
 #endif
+/* pkg's cache: stage/usr/bin/pkg uses CACHE="${MYSTIC_CACHE:-/tmp/pkg}".
+ * The image never overrides MYSTIC_CACHE, so /tmp/pkg is the real path. */
+#ifndef STORE_PKG_CACHE
+#define STORE_PKG_CACHE "/tmp/pkg"
+#endif
 
 /* how long an install may run before the window stops claiming it is
- * running (pkg's own wget timeout is 300 s; a local repo answers in
- * seconds, so a minute and a half of silence means it did not happen) */#ifndef STORE_INSTALL_TIMEOUT_SEC
-/* pkg allows 300 s per network read (stage/usr/bin/pkg) and the
- * browser package is 573 MB, so a shorter deadline would declare a
- * healthy download dead and offer the row again mid-transfer. */
+ * running (pkg's own wget timeout is 300 s per read; the browser package
+ * is 573 MB, so a shorter deadline would declare a healthy download dead
+ * and offer the row again mid-transfer). */
+#ifndef STORE_INSTALL_TIMEOUT_SEC
 #define STORE_INSTALL_TIMEOUT_SEC 900.0
 #endif
 
@@ -117,25 +192,39 @@
 #define INST_MAX (2 * WM_MAX_APPS)   /* both bundle roots together */
 #define DISP_MAX (INST_MAX + PKG_MAX + 6)
 
+/* A directory entry's name we are willing to build a path from. The
+ * uninstall walk refuses anything with a slash or a dot-dot, so the only
+ * path it can ever remove is STORE_ROOT_APPS/<one safe segment>. */
+#define SEG_MAX 32
+#define VERSION_MAX 24
+#define TAG_MAX 16
+
 /* Rows the wheel moves per notch. A count, not a pixel size: it moves
  * whole entries, so it follows the text scale for free. */
 #define WHEEL_ROWS 3
 
 typedef struct {
-    char id[32];
+    char id[SEG_MAX];
     char name[64];
     char desc[DESC_LINE];
     char exe[128];
-    long size;          /* st_size of <dir>/<id>/<exe>, 0 if unreadable */
-    int  have_size;
-    int  from_root;     /* came from /root/apps, where pkg installs */
+    char version[VERSION_MAX];   /* manifest "version =", "" when absent */
+    char tag[TAG_MAX];           /* #word from the description, "" if none */
+    long long total;             /* bytes of the ACTIVE bundle tree */
+    long long root_total;        /* bytes under /root/apps/<id>, 0 if none */
+    int  nfiles;                 /* regular files in the active tree */
+    int  have_size;              /* the exec was stat()able: the row can launch */
+    int  in_image;               /* a copy in STORE_APP_DIR */
+    int  in_root;                /* a copy in STORE_ROOT_APPS (pkg's root) */
 } StoreApp;
 
 typedef struct {
-    char name[33];   /* pkg names may be 32 chars + NUL */
-    char version[24];
+    char name[SEG_MAX + 1];      /* pkg names may be 32 chars + NUL */
+    char version[VERSION_MAX];
     char desc[DESC_LINE];
-    long size;          /* bytes, the index's size column */
+    char file[64];               /* index column 5: tarball basename */
+    char tag[TAG_MAX];
+    long long size;              /* bytes, the index's size column */
     int  have_size;
 } Pkg;
 
@@ -146,10 +235,13 @@ enum { D_SECT = 1, D_APP, D_PKG, D_MSG };
  * package, a tick for anything already on the disk */
 enum { MARK_NONE = 0, MARK_PKG, MARK_CHECK };
 
+/* what the version column is showing, for its colour */
+enum { VC_NONE = 0, VC_PLAIN, VC_INDEX, VC_UPDATE };
+
 typedef struct {
     int         kind;
     int         idx;    /* D_APP: inst[] index, D_PKG: avail[] index,
-                           D_SECT: how many rows the section holds */
+                           D_SECT: how many rows the section shows */
     const char *msg;    /* D_SECT label / D_MSG text (static or Store-owned) */
     unsigned char mark; /* MARK_*: the icon a section title carries */
 } Disp;
@@ -174,11 +266,28 @@ typedef struct {
     int      scroll;
     int      w, h;
 
+    /* the search box. filter is ASCII only: the keys arrive as bytes and
+     * names/descriptions are UTF-8, but a byte-wise case-folded match is
+     * still a real match for the ASCII text these files hold. */
+    char     filter[64];
+    int      filter_len;
+    int      search_focus;
+    int      nshown;         /* selectable rows the filter left visible */
+    int      nsh_inst, nsh_avail;
+
+    /* an uninstall waiting for its yes/no */
+    char     confirm_id[SEG_MAX];
+    int      confirm_keep_image;
+
     char     error[128];     /* why the bundle directory could not be read */
-    char     status[128];    /* result of the last request we wrote */
-    char     pending[32];    /* name asked for, until its directory appears */
-    double   pending_since;  /* CLOCK_MONOTONIC when that request was written,
-                                0 when nothing is in flight */
+    char     status[192];    /* result of the last request, or progress */
+    char     pending[SEG_MAX];    /* name asked for, until its manifest appears */
+    char     pending_file[64];    /* tarball name from the index row */
+    long long pending_total;      /* index bytes, -1 when the row has none */
+    long long pending_part;       /* last .part size seen, -1 when absent */
+    int       pending_phase;      /* 0 waiting, 1 downloading, 2 verifying */
+    double    pending_since;      /* CLOCK_MONOTONIC when the request was written,
+                                     0 when nothing is in flight */
 
     char     dlines[DESC_MAXLINES][DESC_LINE];  /* wrapped description */
     int      dn;
@@ -198,10 +307,20 @@ static int pkg_name_ok(const char *n) {
     return 1;
 }
 
+/* A path segment from readdir that is safe to append to a root: no
+ * separator, no traversal, short enough for the id buffers. */
+static int safe_seg(const char *n) {
+    if (!n || !n[0] || strlen(n) >= SEG_MAX) return 0;
+    if (!strcmp(n, ".") || !strcmp(n, "..")) return 0;
+    if (strchr(n, '/') || strchr(n, '\\')) return 0;
+    return 1;
+}
+
 /* ------------------------------------------------------------
  * Manifest parsing - identical rules to wms_scan_apps() in
  * src/wmsrv.c: strip the newline, split on the first '=', trim
- * spaces around the key, take the value verbatim.
+ * spaces around the key, take the value verbatim. "version" is the one
+ * key wmsrv.c ignores and this window needs; a missing line is "".
  * ------------------------------------------------------------ */
 static int read_manifest(const char *dir, StoreApp *a) {
     char path[512];
@@ -219,6 +338,8 @@ static int read_manifest(const char *dir, StoreApp *a) {
     while (fgets(line, sizeof(line), f)) {
         char *nl = strchr(line, '\n');
         if (nl) *nl = 0;
+        char *cr = strchr(line, '\r');
+        if (cr) *cr = 0;
         char *eq = strchr(line, '=');
         if (!eq) continue;
         *eq = 0;
@@ -227,9 +348,12 @@ static int read_manifest(const char *dir, StoreApp *a) {
         while (*v == ' ') v++;
         char *ke = k + strlen(k);
         while (ke > k && ke[-1] == ' ') *--ke = 0;
-        if (!strcmp(k, "name"))      snprintf(a->name, sizeof(a->name), "%s", v);
-        else if (!strcmp(k, "desc")) snprintf(a->desc, sizeof(a->desc), "%s", v);
-        else if (!strcmp(k, "exec")) snprintf(a->exe,  sizeof(a->exe),  "%s", v);
+        char *ve = v + strlen(v);
+        while (ve > v && ve[-1] == ' ') *--ve = 0;
+        if (!strcmp(k, "name"))         snprintf(a->name, sizeof(a->name), "%s", v);
+        else if (!strcmp(k, "desc"))    snprintf(a->desc, sizeof(a->desc), "%s", v);
+        else if (!strcmp(k, "exec"))    snprintf(a->exe, sizeof(a->exe), "%s", v);
+        else if (!strcmp(k, "version")) snprintf(a->version, sizeof(a->version), "%s", v);
     }
     fclose(f);
 
@@ -238,19 +362,48 @@ static int read_manifest(const char *dir, StoreApp *a) {
     return 1;
 }
 
-/* The payload is a real file on disk; its size is what we show. */
-static void probe_payload(const char *dir, StoreApp *a) {
+/* ------------------------------------------------------------
+ * Real sizes. tree_scan() sums the st_size of every regular file
+ * under a bundle with lstat(), so a symlink contributes nothing but
+ * the link itself (it is not followed) and a device file contributes
+ * nothing either. That is the installed size the disk is using.
+ * ------------------------------------------------------------ */
+static void tree_scan(const char *path, int depth, long long *bytes, int *files) {
+    if (depth > 24) return;                 /* a pathological tree, not a bundle */
+    DIR *d = opendir(path);
+    if (!d) return;
+
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        char child[512];
+        int n = snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
+        if (n < 0 || n >= (int)sizeof(child)) continue;
+        struct stat st;
+        if (lstat(child, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            tree_scan(child, depth + 1, bytes, files);
+        } else if (S_ISREG(st.st_mode)) {
+            *bytes += (long long)st.st_size;
+            (*files)++;
+        }
+    }
+    closedir(d);
+}
+
+/* The payload is a real file on disk; its size is what we show. The
+ * bundle total is the tree above, not the payload alone. */
+static void probe_bundle(const char *dir, StoreApp *a) {
     char path[512];
     snprintf(path, sizeof(path), "%s/%s/%s", dir, a->id, a->exe);
 
     struct stat st;
-    if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
-        a->size = (long)st.st_size;
-        a->have_size = 1;
-    } else {
-        a->size = 0;
-        a->have_size = 0;
-    }
+    a->have_size = (stat(path, &st) == 0 && S_ISREG(st.st_mode)) ? 1 : 0;
+
+    snprintf(path, sizeof(path), "%s/%s", dir, a->id);
+    a->total = 0;
+    a->nfiles = 0;
+    tree_scan(path, 0, &a->total, &a->nfiles);
 }
 
 static int app_before(const StoreApp *a, const StoreApp *b) {
@@ -277,6 +430,104 @@ static void sort_pkgs(Pkg *e, int n) {
         while (j >= 0 && pkg_before(&key, &e[j])) { e[j + 1] = e[j]; j--; }
         e[j + 1] = key;
     }
+}
+
+/* ------------------------------------------------------------
+ * Lookups. Both lists are tiny (<= 64 + 64) and every caller needs the
+ * answer for the row it is painting, so a linear scan is the honest and
+ * cheapest thing here.
+ * ------------------------------------------------------------ */
+static int find_pkg(const Store *s, const char *name) {
+    for (int i = 0; i < s->navail; i++)
+        if (!strcmp(s->avail[i].name, name)) return i;
+    return -1;
+}
+
+static int find_inst(const Store *s, const char *name) {
+    for (int i = 0; i < s->ninst; i++)
+        if (!strcmp(s->inst[i].id, name)) return i;
+    return -1;
+}
+
+/* ------------------------------------------------------------
+ * The tag column. No category field exists in index.tsv, so the only
+ * truthful classification is one that comes out of the description
+ * itself. This takes the first significant word: 3..15 ASCII letters,
+ * not a function word and not one of the leading adjectives used by the
+ * descriptions in this repository. The result is always a substring of
+ * the description; if there is no such word the tag is empty and the
+ * column shows nothing. It never maps a package to an invented category.
+ * ------------------------------------------------------------ */
+static int tag_stop(const char *w, int n) {
+    static const char *STOP[] = {
+        /* articles, pronouns, auxiliaries, prepositions */
+        "a", "an", "the", "this", "that", "these", "those", "its", "it",
+        "is", "are", "be", "of", "for", "with", "and", "or", "no", "not",
+        "to", "in", "on", "at", "by", "from", "as",
+        /* leading adjectives / filler these descriptions open with */
+        "own", "runs", "run", "running", "built", "real", "live", "simple",
+        "small", "tiny", "little", "fast", "new", "full", "basic",
+        "installed", "mystic", "os", "app"
+    };
+    for (size_t i = 0; i < sizeof(STOP) / sizeof(STOP[0]); i++) {
+        if ((int)strlen(STOP[i]) != n) continue;
+        int same = 1;
+        for (int k = 0; k < n; k++)
+            if (tolower((unsigned char)w[k]) != STOP[i][k]) { same = 0; break; }
+        if (same) return 1;
+    }
+    return 0;
+}
+
+static void derive_tag(const char *desc, char *out, size_t outsz) {
+    out[0] = 0;
+    if (!desc || !desc[0] || outsz < 2) return;
+
+    const char *p = desc;
+    while (*p) {
+        while (*p && !isalpha((unsigned char)*p)) p++;
+        const char *w = p;
+        while (*p && isalpha((unsigned char)*p)) p++;
+        int n = (int)(p - w);
+        if (n < 3 || n > TAG_MAX - 1) continue;
+        if (tag_stop(w, n)) continue;
+        for (int i = 0; i < n; i++) out[i] = (char)tolower((unsigned char)w[i]);
+        out[n] = 0;
+        return;
+    }
+}
+
+static void compute_tags(Store *s) {
+    for (int i = 0; i < s->navail; i++)
+        derive_tag(s->avail[i].desc, s->avail[i].tag, sizeof(s->avail[i].tag));
+    for (int i = 0; i < s->ninst; i++) {
+        int p = find_pkg(s, s->inst[i].id);
+        derive_tag(p >= 0 ? s->avail[p].desc : s->inst[i].desc,
+                   s->inst[i].tag, sizeof(s->inst[i].tag));
+    }
+}
+
+/* ------------------------------------------------------------
+ * A row matches when the filter is a case-insensitive substring of its
+ * name or of its description. The tag is derived from the description,
+ * so it needs no separate test.
+ * ------------------------------------------------------------ */
+static int contains_ci(const char *hay, const char *needle) {
+    if (!hay || !needle || !needle[0]) return 1;
+    size_t nl = strlen(needle);
+    for (const char *p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nl && p[i] &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i]))
+            i++;
+        if (i == nl) return 1;
+    }
+    return 0;
+}
+
+static int row_match(const Store *s, const char *name, const char *desc) {
+    if (!s->filter[0]) return 1;
+    return contains_ci(name, s->filter) || contains_ci(desc, s->filter);
 }
 
 /* ------------------------------------------------------------
@@ -310,18 +561,32 @@ static void build_disp(Store *s) {
             snprintf(keep, sizeof(keep), "p:%s", s->avail[d->idx].name);
     }
 
+    /* the column is computed from the descriptions the filter is about
+     * to look at, so a rescan and a new filter can never leave a stale
+     * word in it */
+    compute_tags(s);
+
+    int hit_inst = 0, hit_avail = 0;
+    for (int i = 0; i < s->ninst; i++)
+        if (row_match(s, s->inst[i].name, s->inst[i].desc)) hit_inst++;
+    for (int i = 0; i < s->navail; i++)
+        if (row_match(s, s->avail[i].name, s->avail[i].desc)) hit_avail++;
+
     s->ndisp = 0;
     s->sel = -1;
 
-    disp_push(s, D_SECT, s->ninst, "Installed");
+    disp_push(s, D_SECT, hit_inst, "Installed");
     if (s->ndisp > 0) s->disp[s->ndisp - 1].mark = MARK_CHECK;
     if (s->ninst == 0)
         disp_push(s, D_MSG, 0, "no app bundles installed");
+    else if (hit_inst == 0)
+        disp_push(s, D_MSG, 0, "no installed bundle matches");
     else
         for (int i = 0; i < s->ninst; i++)
-            disp_push(s, D_APP, i, NULL);
+            if (row_match(s, s->inst[i].name, s->inst[i].desc))
+                disp_push(s, D_APP, i, NULL);
 
-    disp_push(s, D_SECT, s->navail, "Available");
+    disp_push(s, D_SECT, hit_avail, "Available");
     if (s->ndisp > 0) s->disp[s->ndisp - 1].mark = MARK_PKG;
     if (s->index_state == 0)
         disp_push(s, D_MSG, 0, "no index - press r to fetch it");
@@ -329,9 +594,16 @@ static void build_disp(Store *s) {
         disp_push(s, D_MSG, 0, s->index_err);
     else if (s->navail == 0)
         disp_push(s, D_MSG, 0, "the index lists no packages");
+    else if (hit_avail == 0)
+        disp_push(s, D_MSG, 0, "no index package matches");
     else
         for (int i = 0; i < s->navail; i++)
-            disp_push(s, D_PKG, i, NULL);
+            if (row_match(s, s->avail[i].name, s->avail[i].desc))
+                disp_push(s, D_PKG, i, NULL);
+
+    s->nsh_inst = hit_inst;
+    s->nsh_avail = hit_avail;
+    s->nshown = hit_inst + hit_avail;
 
     /* same row as before, when it still exists */
     if (keep[0]) {
@@ -367,12 +639,35 @@ static void build_disp(Store *s) {
  * Reading the two things this window knows about: the bundles on
  * disk, and the index the desktop downloaded.
  * ------------------------------------------------------------ */
+static long long root_total(const char *id) {
+    char path[512];
+    long long bytes = 0;
+    int files = 0;                 /* only the byte total is shown for a shadowed copy */
+    snprintf(path, sizeof(path), "%s/%s", STORE_ROOT_APPS, id);
+    tree_scan(path, 0, &bytes, &files);
+    return bytes;
+}
+
 static void add_bundle(Store *s, const char *dir, const char *id, int from_root) {
-    if (s->ninst >= INST_MAX) return;
     if (!id[0] || strlen(id) >= sizeof(s->inst[0].id)) return;
     if (strchr(id, '/')) return;
-    for (int i = 0; i < s->ninst; i++)
-        if (!strcmp(s->inst[i].id, id)) return;      /* already listed */
+
+    for (int i = 0; i < s->ninst; i++) {
+        if (strcmp(s->inst[i].id, id)) continue;
+        /* The image root is scanned first, so the active record (name,
+         * desc, version, sizes) is the image's copy - which is also the
+         * copy src/wmsrv.c launches when both roots hold the id. A root
+         * copy found later only adds the facts the uninstall prompt
+         * needs: that it exists and how much removing it would free. */
+        if (from_root) {
+            s->inst[i].in_root = 1;
+            s->inst[i].root_total = root_total(id);
+        } else {
+            s->inst[i].in_image = 1;
+        }
+        return;
+    }
+    if (s->ninst >= INST_MAX) return;
 
     StoreApp *a = &s->inst[s->ninst];
     memset(a, 0, sizeof(*a));
@@ -382,8 +677,9 @@ static void add_bundle(Store *s, const char *dir, const char *id, int from_root)
     if (!read_manifest(dir, a) && !from_root) return;
     if (!a->desc[0] && from_root)
         snprintf(a->desc, sizeof(a->desc), "installed by pkg");
-    a->from_root = from_root;
-    probe_payload(dir, a);
+    if (from_root) a->in_root = 1; else a->in_image = 1;
+    probe_bundle(dir, a);
+    if (from_root) a->root_total = a->total;
     s->ninst++;
 }
 
@@ -471,6 +767,7 @@ static void load_index(Store *s) {
         char *cr = strchr(line, '\r');
         if (cr) *cr = 0;
         if (!line[0]) continue;
+        if (line[0] == '#') continue;          /* index_ok() allows comments */
 
         char *field[6];
         int nf = 0;
@@ -492,11 +789,18 @@ static void load_index(Store *s) {
         if (nf > 1) snprintf(k->version, sizeof(k->version), "%s", field[1]);
         if (nf > 2) {
             char *end = NULL;
-            long v = strtol(field[2], &end, 10);
+            long long v = strtoll(field[2], &end, 10);
             if (end && end != field[2] && v > 0) {
                 k->size = v;
                 k->have_size = 1;
             }
+        }
+        /* column 5 is the tarball's basename; anything with a separator
+         * or a dot-dot is not a name pkg would accept either, so it is
+         * kept only for display and never used to build a cache path */
+        if (nf > 4 && field[4][0] && !strchr(field[4], '/') &&
+            strcmp(field[4], ".") && strcmp(field[4], "..")) {
+            snprintf(k->file, sizeof(k->file), "%s", field[4]);
         }
         if (nf > 5) snprintf(k->desc, sizeof(k->desc), "%s", field[5]);
         s->navail++;
@@ -547,59 +851,181 @@ static void sync_index(Store *s) {
                  s->navail, s->navail == 1 ? "" : "s");
 }
 
-/* `pkg install` unpacks into /root/apps. Until that directory shows up the
- * row stays available; once it does, the bundle list and the marks follow.
- * A request that never produces a directory is not allowed to report
- * "installing ..." for ever: see STORE_INSTALL_TIMEOUT_SEC. */
+/* ------------------------------------------------------------
+ * Sizes and versions, printed the same way everywhere.
+ * ------------------------------------------------------------ */
+static void human_size(long long b, char *out, size_t outsz) {
+    if (b < 0)                 snprintf(out, outsz, "?");
+    else if (b >= 1024LL * 1024 * 1024)
+        snprintf(out, outsz, "%.1f GB", (double)b / 1073741824.0);
+    else if (b >= 1024LL * 1024)
+        snprintf(out, outsz, "%.1f MB", (double)b / 1048576.0);
+    else if (b >= 1024)
+        snprintf(out, outsz, "%.1f KB", (double)b / 1024.0);
+    else
+        snprintf(out, outsz, "%lld B", b);
+}
+
+static long long file_size(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
+    return (long long)st.st_size;
+}
+
+/* The version cell. VC_UPDATE means the installed manifest and the index
+ * disagree; VC_INDEX means there is no "version =" line in the installed
+ * manifest and the '~' marks the number as the index's, not the disk's. */
+static int version_cell(const Store *s, int kind, int idx, char *out, size_t outsz) {
+    out[0] = 0;
+    if (kind == D_PKG) {
+        const Pkg *p = &s->avail[idx];
+        int ii = find_inst(s, p->name);
+        if (ii >= 0 && s->inst[ii].version[0] && p->version[0] &&
+            strcmp(s->inst[ii].version, p->version)) {
+            snprintf(out, outsz, "%s>%s", s->inst[ii].version, p->version);
+            return VC_UPDATE;
+        }
+        if (!p->version[0]) { snprintf(out, outsz, "-"); return VC_NONE; }
+        snprintf(out, outsz, "%s", p->version);
+        return VC_PLAIN;
+    }
+    if (kind != D_APP) return VC_NONE;
+
+    const StoreApp *a = &s->inst[idx];
+    int p = find_pkg(s, a->id);
+    if (a->version[0]) {
+        if (p >= 0 && s->avail[p].version[0] &&
+            strcmp(a->version, s->avail[p].version)) {
+            snprintf(out, outsz, "%s>%s", a->version, s->avail[p].version);
+            return VC_UPDATE;
+        }
+        snprintf(out, outsz, "%s", a->version);
+        return VC_PLAIN;
+    }
+    if (p >= 0 && s->avail[p].version[0]) {
+        snprintf(out, outsz, "~%s", s->avail[p].version);
+        return VC_INDEX;
+    }
+    snprintf(out, outsz, "-");
+    return VC_NONE;
+}
+
+/* A real update needs a pkg-managed bundle: the image's copy is the one
+ * the launcher runs, so replacing the /root/apps copy would be invisible. */
+static int has_update(const Store *s, const StoreApp *a) {
+    if (!a->in_root || a->in_image || !a->version[0]) return 0;
+    int p = find_pkg(s, a->id);
+    return p >= 0 && s->avail[p].version[0] &&
+           strcmp(a->version, s->avail[p].version) != 0;
+}
+
+/* ------------------------------------------------------------
+ * Install polling. Every number in this function comes from stat() on
+ * the files pkg itself writes (stage/usr/bin/pkg):
+ *
+ *     /tmp/pkg/<file>.part  while wget is transferring
+ *     /tmp/pkg/<file>       after the rename; sha256 then tar unpack
+ *     <root>/<name>/manifest  only when the bundle is complete
+ *
+ * The percentage is downloaded/total where total is the index's size
+ * column for that exact row; it is capped at 99 until the manifest
+ * exists, because a downloaded tarball is not an installed package.
+ * ------------------------------------------------------------ */
 static void poll_install(Store *s) {
     if (!s->pending[0]) return;
 
-    /* success is a real directory, in pkg's own root or in the image root
-     * (a bundle can also land there, and that is where the launcher looks) */
+    /* success is a real manifest, in pkg's own root or in the image root */
     const char *roots[2] = { STORE_ROOT_APPS, STORE_APP_DIR };
     char path[512];
     struct stat st;
     for (int i = 0; i < 2; i++) {
-        /* pkg creates the directory BEFORE it untars into it, so a bare
-         * directory means "download in progress", not "installed". Wait for
-         * the manifest, which is what makes the bundle launchable. */
         snprintf(path, sizeof(path), "%s/%s/manifest", roots[i], s->pending);
         if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
-            char done[sizeof(s->pending)];
+            char done[SEG_MAX];
             snprintf(done, sizeof(done), "%s", s->pending);
             s->pending[0] = 0;
+            s->pending_file[0] = 0;
+            s->pending_total = -1;
+            s->pending_part = -1;
+            s->pending_phase = 0;
             s->pending_since = 0.0;
+
             scan_installed(s);
-            snprintf(s->status, sizeof(s->status), "installed %s", done);
+
+            long long bytes = 0;
+            int files = 0;
+            int ii = find_inst(s, done);
+            if (ii >= 0) { bytes = s->inst[ii].total; files = s->inst[ii].nfiles; }
+            char hb[24];
+            human_size(bytes, hb, sizeof(hb));
+            snprintf(s->status, sizeof(s->status), "installed %s - %d file%s, %s on disk",
+                     done, files, files == 1 ? "" : "s", hb);
             return;
         }
     }
 
-    /* still running. There is no timer to be called back on, so the wait is
-     * measured on the monotonic clock here and shown as it grows. */
+    /* still running: look at pkg's own cache */
+    long long part = -1, tarball = -1;
+    if (s->pending_file[0]) {
+        snprintf(path, sizeof(path), "%s/%s.part", STORE_PKG_CACHE, s->pending_file);
+        part = file_size(path);
+        snprintf(path, sizeof(path), "%s/%s", STORE_PKG_CACHE, s->pending_file);
+        tarball = file_size(path);
+    }
+    s->pending_part = part;
+    s->pending_phase = part >= 0 ? 1 : (tarball >= 0 ? 2 : 0);
+
     if (s->pending_since > 0.0) {
         struct timespec ts;
         if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
             double now = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
             double waited = now - s->pending_since;
             if (waited < 0.0) waited = 0.0;
+            long secs = (long)waited;
 
             if (waited >= STORE_INSTALL_TIMEOUT_SEC) {
                 /* the desktop forked pkg and nothing arrived: say so, stop
-                 * claiming progress, and leave the row installable again.
-                 * The deadline needs CLOCK_MONOTONIC - the same clock
-                 * src/main.c and src/apps/files.c time themselves with - so
-                 * if the kernel cannot tell time nothing here can either. */
+                 * claiming progress, and leave the row installable again. */
                 snprintf(s->status, sizeof(s->status),
                          "install of %s did not finish - Enter retries; run pkg to see why",
                          s->pending);
                 s->pending[0] = 0;
+                s->pending_file[0] = 0;
+                s->pending_total = -1;
+                s->pending_part = -1;
+                s->pending_phase = 0;
                 s->pending_since = 0.0;
                 return;
             }
-            if (waited >= 1.0)
+
+            char hpart[24], htotal[24];
+            if (s->pending_phase == 1) {
+                human_size(part, hpart, sizeof(hpart));
+                if (s->pending_total > 0) {
+                    human_size(s->pending_total, htotal, sizeof(htotal));
+                    int pct = 0;
+                    if (s->pending_total > 0) {
+                        pct = (int)((double)part * 100.0 / (double)s->pending_total);
+                        if (pct < 0) pct = 0;
+                        if (pct > 99) pct = 99;   /* 100% only when it is installed */
+                    }
+                    snprintf(s->status, sizeof(s->status),
+                             "installing %s - %s / %s (%d%%), %lds",
+                             s->pending, hpart, htotal, pct, secs);
+                } else {
+                    snprintf(s->status, sizeof(s->status),
+                             "installing %s - %s downloaded, %lds",
+                             s->pending, hpart, secs);
+                }
+            } else if (s->pending_phase == 2) {
+                human_size(tarball, hpart, sizeof(hpart));
                 snprintf(s->status, sizeof(s->status),
-                         "installing %s... %lds", s->pending, (long)waited);
+                         "installing %s - %s downloaded, verifying/unpacking, %lds",
+                         s->pending, hpart, secs);
+            } else {
+                snprintf(s->status, sizeof(s->status),
+                         "installing %s - waiting for pkg, %lds", s->pending, secs);
+            }
         }
     }
 }
@@ -619,13 +1045,16 @@ static void poll_install(Store *s) {
  * The horizontal grid, left to right:
  *
  *   pad_x | ICON | icon_gap | NAME (name_w, measured from the widest
- *         real name) | gap | DESCRIPTION (flexible) | gap | SIZE
- *         (right-aligned in size_col) | gap | TAG (right-aligned in
- *         tag_col) | pad_x
+ *         real name) | gap | DESCRIPTION (flexible) | gap | VERSION
+ *         (right-aligned in ver_col) | gap | SIZE (right-aligned in
+ *         size_col) | gap | TAG (#word, right-aligned in tag_col) | pad_x
  *
  * Columns are dropped from the right when the window cannot hold them
- * (tag first, then size, then the description), so the name keeps its
- * measured width and two columns can never overlap.
+ * (tag first, then version, then size, then the description), so the
+ * name keeps its measured width and two columns can never overlap.
+ *
+ * Above the list sits the search box: the same gutter, a magnifier, the
+ * filter text and - when there is one - the clear mark.
  * ------------------------------------------------------------ */
 typedef struct {
     Font *fp;          /* title + section labels: medium 12 */
@@ -637,15 +1066,21 @@ typedef struct {
 
     int row_h, line_h, head_h, foot_h, band_h, band_pad, nlines, rows;
     int hint_h, rule;          /* rule: hairline thickness, ui_px(1) */
+    int prog_h;                /* install progress strip, ui_px(2) */
+
+    int filter_y, filter_h, filter_x, filter_w;
+    int filter_icon, filter_text_x, filter_clear_x, filter_clear_w;
+
     int list_y, list_bot, band_top, err_y;
 
     /* the column grid */
     int name_x, name_w, desc_x, desc_w;
-    int size_right, size_col, tag_right, tag_col;
-    int show_size, show_tag, show_desc;
+    int ver_right, ver_col, size_right, size_col, tag_right, tag_col;
+    int show_ver, show_size, show_tag, show_desc;
 
     /* text tops, from the face that draws each line */
-    int title_dy, row_dy, small_row_dy, hint_dy, desc_dy, foot_dy, btn_text_dy;
+    int title_dy, row_dy, small_row_dy, hint_dy, desc_dy, foot_dy;
+    int btn_text_dy, filter_dy;
 
     /* the Refresh button in the header: the icon->label gap and the
      * label's own offset are fields, so the painter never re-derives them */
@@ -667,8 +1102,7 @@ static int iceil(float v) {
  * size, which is font_height()/1.4 (src/font.c draws in a 1.4*size
  * line box). So centring the ink box is (band - font_height/1.4)/2, and
  * font_draw()'s baseline then lands font_ascent() below that top:
- * caps and descenders sit equally inside the row. The other apps use
- * the same rule, so "centred" means the same thing everywhere. */
+ * caps and descenders sit equally inside the row. */
 static int line_top(Font *f, int band) {
     int ink;
     if (!f || band <= 0) return 0;
@@ -680,7 +1114,7 @@ static int line_top(Font *f, int band) {
 /* The description band gives up lines before it gives up rows: it shows
  * as many of DESC_MAXLINES as still leave two whole rows (or all it can
  * on a window too short for that). The hint line always has its slot -
- * it is what tells the owner that Enter writes a request. */
+ * it is what tells the owner what the selected row can do. */
 static int layout_store(Layout *L, const Store *st, int w, int h) {
     memset(L, 0, sizeof(*L));
     if (w < 1 || h < 1) return 0;
@@ -701,6 +1135,7 @@ static int layout_store(Layout *L, const Store *st, int w, int h) {
     L->row_xpad  = L->pad_x / 2;
     L->row_ypad  = ui_px(1);
     L->rule      = ui_px(1);
+    L->prog_h    = ui_px(2);
     L->band_pad  = ui_px(4);
     L->btn_pad   = ui_px(6);
     L->btn_icon  = ui_px(12);
@@ -724,6 +1159,18 @@ static int layout_store(Layout *L, const Store *st, int w, int h) {
     if (L->icon_sz < ui_px(10)) L->icon_sz = ui_px(10);
     L->icon_x = L->pad_x;
     L->name_x = L->icon_x + L->icon_sz + L->icon_gap;
+
+    /* ---- the search box ----------------------------------- */
+    L->filter_y      = L->head_h;
+    L->filter_h      = fh_d + 2 * ui_px(4);
+    L->filter_x      = L->pad_x;
+    L->filter_w      = w - 2 * L->pad_x;
+    L->filter_icon   = ui_px(11);
+    L->filter_text_x = L->filter_x + ui_px(5) + L->filter_icon + ui_px(6);
+    L->filter_clear_w = L->filter_icon + ui_px(4);
+    L->filter_clear_x = L->filter_x + L->filter_w - ui_px(4) - L->filter_clear_w;
+    L->filter_dy     = L->filter_h / 2 - iround(font_height(L->fd) / 1.4f) / 2;
+    if (L->filter_dy < 0) L->filter_dy = 0;
 
     /* Refresh: icon + label, both inside a box one small-font line tall
      * plus padding, centred in the header band and right-aligned on the
@@ -757,22 +1204,90 @@ static int layout_store(Layout *L, const Store *st, int w, int h) {
     }
     if (nmax < ui_px(44)) nmax = ui_px(44);
 
-    L->tag_col  = iceil(font_width(L->fd, "installed"));
-    L->size_col = iceil(font_width(L->fd, "0000.0 MB"));
+    /* the version column is measured from the real strings it will hold
+     * (including "installed>index"), so a long version is never clipped
+     * unless the whole window is too narrow to keep the column */
+    int vmax = 0;
+    for (int i = 0; i < st->ninst; i++) {
+        char v[64];
+        version_cell(st, D_APP, i, v, sizeof(v));
+        int vw = iceil(font_width(L->fd, v));
+        if (vw > vmax) vmax = vw;
+    }
+    for (int i = 0; i < st->navail; i++) {
+        char v[64];
+        version_cell(st, D_PKG, i, v, sizeof(v));
+        int vw = iceil(font_width(L->fd, v));
+        if (vw > vmax) vmax = vw;
+    }
+    if (vmax < iceil(font_width(L->fd, "0.0"))) vmax = iceil(font_width(L->fd, "0.0"));
+    L->ver_col = vmax;
+
+    /* the tag is "#word"; the cap keeps one odd long word from eating the
+     * description, and paint_row clips whatever still does not fit */
+    int tmax = 0;
+    for (int i = 0; i < st->ninst; i++)
+        if (st->inst[i].tag[0]) {
+            char t[TAG_MAX + 2];
+            snprintf(t, sizeof(t), "#%s", st->inst[i].tag);
+            int tw = iceil(font_width(L->fd, t));
+            if (tw > tmax) tmax = tw;
+        }
+    for (int i = 0; i < st->navail; i++)
+        if (st->avail[i].tag[0]) {
+            char t[TAG_MAX + 2];
+            snprintf(t, sizeof(t), "#%s", st->avail[i].tag);
+            int tw = iceil(font_width(L->fd, t));
+            if (tw > tmax) tmax = tw;
+        }
+    int tcap = iceil(font_width(L->fd, "#0123456789abc"));
+    if (tmax > tcap) tmax = tcap;
+
+    /* the size cell is measured from its real values too: "1023.9 MB" is
+     * one character wider than the reference, and a fixed column would let
+     * it run into the version cell */
+    int smax = iceil(font_width(L->fd, "0000.0 MB"));
+    for (int i = 0; i < st->ninst; i++) {
+        char h[24];
+        human_size(st->inst[i].total, h, sizeof(h));
+        int sw = iceil(font_width(L->fd, h));
+        if (sw > smax) smax = sw;
+    }
+    for (int i = 0; i < st->navail; i++) {
+        if (!st->avail[i].have_size) continue;
+        char h[24];
+        human_size(st->avail[i].size, h, sizeof(h));
+        int sw = iceil(font_width(L->fd, h));
+        if (sw > smax) smax = sw;
+    }
+
+    L->tag_col  = tmax;
+    L->size_col = smax;
     int desc_min = ui_px(70);
 
-    L->show_tag = L->show_size = L->show_desc = 1;
+    L->show_tag = L->show_ver = L->show_size = L->show_desc = 1;
     int right = content_right;
     L->tag_right = right;
     right -= L->tag_col + L->gap;
     L->size_right = right;
     right -= L->size_col + L->gap;
+    L->ver_right = right;
+    right -= L->ver_col + L->gap;
 
     L->desc_x = L->name_x + nmax + L->gap;
     L->desc_w = right - L->desc_x;
 
     if (L->desc_w < desc_min) {                 /* drop the tag column */
         L->show_tag = 0;
+        right = content_right;
+        L->size_right = right;
+        right -= L->size_col + L->gap;
+        L->ver_right = right;
+        right -= L->ver_col + L->gap;
+        L->desc_w = right - L->desc_x;
+    }
+    if (L->desc_w < desc_min) {                 /* then the version column */
+        L->show_ver = 0;
         right = content_right;
         L->size_right = right;
         right -= L->size_col + L->gap;
@@ -794,7 +1309,7 @@ static int layout_store(Layout *L, const Store *st, int w, int h) {
 
     /* ---- vertical bands ----------------------------------- */
     int err_line = st->error[0] ? L->row_h : 0;
-    int usable = h - L->head_h - L->foot_h - err_line;
+    int usable = h - L->head_h - L->filter_h - L->foot_h - err_line;
     int hint_slot = L->hint_h;
 
     L->nlines = 0;
@@ -824,8 +1339,8 @@ static int layout_store(Layout *L, const Store *st, int w, int h) {
         L->nlines = 0;
     }
 
-    L->err_y    = L->head_h;
-    L->list_y   = L->head_h + err_line;
+    L->err_y    = L->head_h + L->filter_h;
+    L->list_y   = L->head_h + L->filter_h + err_line;
     L->band_top = h - L->foot_h - L->band_h;
     L->list_bot = L->band_top;
     if (L->list_bot < L->list_y) L->list_bot = L->list_y;
@@ -863,6 +1378,27 @@ static void draw_clipped(Surface *s, Font *f, float x, float y, float maxw,
     buf[cut] = '.';
     buf[cut + 1] = '.';
     buf[cut + 2] = 0;
+    font_draw(s, f, x, y, buf, color);
+}
+
+/* The search box scrolls rather than clipping its tail: the caret is
+ * always where the next character goes, so the end of the text is the
+ * part worth keeping. */
+static void draw_tail(Surface *s, Font *f, float x, float y, float maxw,
+                      const char *text, u32 color) {
+    if (!text || !text[0] || maxw < 4.0f) return;
+
+    char buf[96];
+    size_t len = strlen(text);
+    size_t start = 0;
+    float dots = font_width(f, "..");
+    while (start < len && font_width(f, text + start) > maxw - dots) start++;
+    if (start == 0) {
+        font_draw(s, f, x, y, text, color);
+        return;
+    }
+    if (len - start > sizeof(buf) - 4) start = len - (sizeof(buf) - 4);
+    snprintf(buf, sizeof(buf), "..%s", text + start);
     font_draw(s, f, x, y, buf, color);
 }
 
@@ -1003,7 +1539,9 @@ static int write_line(const char *path, const char *value, char *err, size_t err
     return 1;
 }
 
-static void request_refresh(Store *s) {
+/* Returns 1 when the request was written, so check-for-updates can say
+ * whether a fresh index is on its way or the write failed. */
+static int request_refresh(Store *s) {
     char err[128];
     int ok = write_line(STORE_REPO_REFRESH, "refresh", err, sizeof(err));
 
@@ -1013,10 +1551,62 @@ static void request_refresh(Store *s) {
 
     if (!ok) {
         snprintf(s->status, sizeof(s->status), "%s", err);
-        return;
+        return 0;
     }
     snprintf(s->status, sizeof(s->status),
              "refresh requested - the desktop fetches the index");
+    return 1;
+}
+
+/* Ask for one package. The name and the tarball's basename are copied
+ * from the index row that was just displayed, so the progress poll below
+ * looks at exactly the file pkg is about to write. */
+static void start_install(Store *s, const Pkg *k) {
+    if (s->pending[0]) {
+        snprintf(s->status, sizeof(s->status),
+                 "already installing %s - wait for it", s->pending);
+        return;
+    }
+    if (!pkg_name_ok(k->name)) {      /* belt and braces: load_index filtered */
+        snprintf(s->status, sizeof(s->status), "refusing package name");
+        return;
+    }
+
+    int ii = find_inst(s, k->name);
+    if (ii >= 0 && s->inst[ii].in_image) {
+        snprintf(s->status, sizeof(s->status),
+                 "the image's copy of %s is what launches; pkg installs to %s, "
+                 "which it shadows", k->name, STORE_ROOT_APPS);
+        return;
+    }
+    if (ii >= 0 && s->inst[ii].version[0] && k->version[0] &&
+        !strcmp(s->inst[ii].version, k->version)) {
+        snprintf(s->status, sizeof(s->status), "%s is already at version %s",
+                 k->name, s->inst[ii].version);
+        return;
+    }
+
+    char err[128];
+    if (!write_line(STORE_INSTALL_REQUEST, k->name, err, sizeof(err))) {
+        snprintf(s->status, sizeof(s->status), "%s", err);
+        return;
+    }
+
+    snprintf(s->pending, sizeof(s->pending), "%s", k->name);
+    snprintf(s->pending_file, sizeof(s->pending_file), "%s", k->file);
+    s->pending_total = k->have_size ? k->size : -1;
+    s->pending_part = -1;
+    s->pending_phase = 0;
+    s->pending_since = 0.0;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        s->pending_since = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+
+    if (ii >= 0)
+        snprintf(s->status, sizeof(s->status), "updating %s to %s...",
+                 k->name, k->version[0] ? k->version : "the index version");
+    else
+        snprintf(s->status, sizeof(s->status), "installing %s...", k->name);
 }
 
 static void activate(Store *s) {
@@ -1029,8 +1619,7 @@ static void activate(Store *s) {
     if (d->kind == D_APP) {
         StoreApp *a = &s->inst[d->idx];
         /* Both roots are launchable: wms_scan_apps() reads the image root
-         * AND /root/apps, which is where pkg unpacks. (It used to read only
-         * the first, so a package installed here could not be started.) */
+         * AND /root/apps, which is where pkg unpacks. */
         char err[128];
         if (!write_line(STORE_LAUNCH_REQUEST, a->id, err, sizeof(err))) {
             snprintf(s->status, sizeof(s->status), "%s", err);
@@ -1043,35 +1632,14 @@ static void activate(Store *s) {
 
     if (d->kind == D_PKG) {
         Pkg *k = &s->avail[d->idx];
-        if (is_installed(s, k->name)) {
+        int ii = find_inst(s, k->name);
+        int differs = ii >= 0 && s->inst[ii].version[0] && k->version[0] &&
+                      strcmp(s->inst[ii].version, k->version) != 0;
+        if (is_installed(s, k->name) && !differs) {
             snprintf(s->status, sizeof(s->status), "already installed: %s", k->name);
             return;
         }
-        /* One install at a time. Enter repeats (input.c pushes autorepeat),
-         * so without this, holding the key forks a pkg per repeat and they
-         * all write the same download file. */
-        if (s->pending[0]) {
-            snprintf(s->status, sizeof(s->status),
-                     "already installing %s - wait for it", s->pending);
-            return;
-        }
-        if (!pkg_name_ok(k->name)) {      /* belt and braces: load_index filtered */
-            snprintf(s->status, sizeof(s->status), "refusing package name");
-            return;
-        }
-        char err[128];
-        if (!write_line(STORE_INSTALL_REQUEST, k->name, err, sizeof(err))) {
-            snprintf(s->status, sizeof(s->status), "%s", err);
-            return;
-        }
-        snprintf(s->status, sizeof(s->status), "installing %s...", k->name);
-        snprintf(s->pending, sizeof(s->pending), "%s", k->name);
-        /* start the wait on the monotonic clock; poll_install() drops the
-         * claim again if no bundle appears within the timeout */
-        struct timespec ts;
-        s->pending_since = 0.0;
-        if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
-            s->pending_since = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+        start_install(s, k);
         return;
     }
 
@@ -1079,8 +1647,253 @@ static void activate(Store *s) {
 }
 
 /* ------------------------------------------------------------
- * Drawing
+ * Check for updates: compare every installed manifest version with the
+ * index version for the same id. The index may be old, so this also asks
+ * the desktop for a fresh one; the result shown is the comparison that
+ * could be made right now, not a promise about the next index.
  * ------------------------------------------------------------ */
+static void check_updates(Store *s) {
+    int upd = 0, img = 0, nov = 0;
+    char first[96];
+    first[0] = 0;
+
+    for (int i = 0; i < s->ninst; i++) {
+        const StoreApp *a = &s->inst[i];
+        if (!a->version[0]) { nov++; continue; }
+        int p = find_pkg(s, a->id);
+        if (p < 0 || !s->avail[p].version[0]) continue;
+        if (!strcmp(a->version, s->avail[p].version)) continue;
+        if (a->in_image) {
+            img++;
+        } else if (a->in_root) {
+            upd++;
+            if (!first[0])
+                snprintf(first, sizeof(first), ": %s %s>%s", a->id,
+                         a->version, s->avail[p].version);
+        }
+    }
+
+    int fresh = request_refresh(s);     /* this rescans the disk too */
+
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "checked %d installed against %d in the index: %d update%s%s%s%s",
+             s->ninst, s->navail, upd, upd == 1 ? "" : "s", first,
+             img ? " - image copies differ, pkg cannot replace them" : "",
+             nov ? " - manifests with no version = are skipped" : "");
+    if (fresh && (int)strlen(msg) + 26 < (int)sizeof(msg))
+        strncat(msg, " - fetching the index", sizeof(msg) - strlen(msg) - 1);
+    else if (!fresh && (int)strlen(msg) + 32 < (int)sizeof(msg))
+        strncat(msg, " - refresh request failed (press r)", sizeof(msg) - strlen(msg) - 1);
+
+    snprintf(s->status, sizeof(s->status), "%s", msg);
+}
+
+/* ------------------------------------------------------------
+ * Uninstall. rm_tree() only ever receives STORE_ROOT_APPS/<id> where id
+ * is a validated display-list bundle: no '/', no "..". It removes the
+ * directory contents with lstat(), never follows a symlink (a link is
+ * unlinked, not descended into), and rmdir()s the directory itself.
+ * The image root is never passed to it - that is the OS's tree.
+ * ------------------------------------------------------------ */
+static int rm_tree(const char *path, int depth, long long *bytes, int *files,
+                   char *err, size_t errsz) {
+    if (depth > 24) {
+        snprintf(err, errsz, "%s: nesting too deep", path);
+        return 0;
+    }
+    DIR *d = opendir(path);
+    if (!d) {
+        snprintf(err, errsz, "%s: %s", path, strerror(errno));
+        return 0;
+    }
+
+    int ok = 1;
+    struct dirent *de;
+    while (ok && (de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        char child[512];
+        int n = snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
+        if (n < 0 || n >= (int)sizeof(child)) {
+            snprintf(err, errsz, "%s: path too long", path);
+            ok = 0;
+            break;
+        }
+        struct stat st;
+        if (lstat(child, &st) != 0) {
+            snprintf(err, errsz, "%s: %s", child, strerror(errno));
+            ok = 0;
+            break;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            ok = rm_tree(child, depth + 1, bytes, files, err, errsz);
+        } else {
+            /* a symlink is unlinked, never followed; only a regular file
+             * contributes bytes, and st_size of a link is not disk used */
+            if (unlink(child) != 0) {
+                snprintf(err, errsz, "%s: %s", child, strerror(errno));
+                ok = 0;
+                break;
+            }
+            if (S_ISREG(st.st_mode)) {
+                *bytes += (long long)st.st_size;
+                (*files)++;
+            }
+        }
+    }
+    closedir(d);
+    if (!ok) return 0;
+
+    if (rmdir(path) != 0) {
+        snprintf(err, errsz, "%s: %s", path, strerror(errno));
+        return 0;
+    }
+    return 1;
+}
+
+static void do_uninstall(Store *s) {
+    char id[SEG_MAX];
+    snprintf(id, sizeof(id), "%s", s->confirm_id);
+    int keep_image = s->confirm_keep_image;
+    s->confirm_id[0] = 0;
+    s->confirm_keep_image = 0;
+
+    if (!safe_seg(id)) {
+        snprintf(s->status, sizeof(s->status), "refusing an unsafe bundle name");
+        return;
+    }
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", STORE_ROOT_APPS, id);
+
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        snprintf(s->status, sizeof(s->status), "%s: %s", path, strerror(errno));
+        scan_installed(s);           /* the row was stale: drop it */
+        return;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        snprintf(s->status, sizeof(s->status), "%s is not a directory - refusing", path);
+        scan_installed(s);
+        return;
+    }
+
+    long long bytes = 0;
+    int files = 0;
+    char err[192];
+    if (!rm_tree(path, 0, &bytes, &files, err, sizeof(err))) {
+        snprintf(s->status, sizeof(s->status), "removal stopped: %s", err);
+        scan_installed(s);           /* show whatever is left, honestly */
+        return;
+    }
+
+    scan_installed(s);
+    char hb[24];
+    human_size(bytes, hb, sizeof(hb));
+    snprintf(s->status, sizeof(s->status), "removed %s - %d file%s, %s freed%s",
+             id, files, files == 1 ? "" : "s", hb,
+             keep_image ? " (the image copy stays)" : "");
+}
+
+/* ------------------------------------------------------------
+ * Hints and the version cell's strings.
+ * ------------------------------------------------------------ */
+static void confirm_prompt(const Store *s, char *out, size_t outsz) {
+    snprintf(out, outsz, "Remove %s from %s?  y = remove, n = cancel",
+             s->confirm_id, STORE_ROOT_APPS);
+}
+
+static void hint_for(const Store *s, int sel, char *out, size_t outsz) {
+    out[0] = 0;
+    if (s->confirm_id[0]) {
+        confirm_prompt(s, out, outsz);
+        return;
+    }
+    if (s->search_focus) {
+        snprintf(out, outsz,
+                 "typing filters the list - Enter keeps it - Ctrl+U clears it");
+        return;
+    }
+    if (sel < 0 || sel >= s->ndisp) {
+        snprintf(out, outsz, "r: fetch the index - U: check for updates - /: search");
+        return;
+    }
+
+    const Disp *d = &s->disp[sel];
+    if (d->kind == D_APP) {
+        const StoreApp *a = &s->inst[d->idx];
+        int p = find_pkg(s, a->id);
+        char vnote[80];
+        vnote[0] = 0;
+        if (!a->version[0] && p >= 0 && s->avail[p].version[0])
+            snprintf(vnote, sizeof(vnote),
+                     " - manifest has no version = (~%s is the index's)",
+                     s->avail[p].version);
+
+        if (a->in_root && a->in_image) {
+            char hb[24];
+            human_size(a->root_total, hb, sizeof(hb));
+            snprintf(out, outsz,
+                     "Enter: launch (image copy) - x removes the %s %s copy%s",
+                     hb, STORE_ROOT_APPS, vnote);
+        } else if (a->in_root) {
+            if (has_update(s, a)) {
+                char rb[40];
+                rb[0] = 0;
+                if (s->avail[p].have_size) {
+                    char hb[24];
+                    human_size(s->avail[p].size, hb, sizeof(hb));
+                    snprintf(rb, sizeof(rb), " (%s on the repo)", hb);
+                }
+                snprintf(out, outsz,
+                         "Enter: launch - x: remove - i: update to %s%s%s",
+                         s->avail[p].version, rb, vnote);
+            } else {
+                snprintf(out, outsz, "Enter: launch - x: remove from %s%s",
+                         STORE_ROOT_APPS, vnote);
+            }
+        } else {
+            snprintf(out, outsz,
+                     "Enter: launch - shipped with the image; x cannot remove it%s",
+                     vnote);
+        }
+        return;
+    }
+
+    if (d->kind == D_PKG) {
+        const Pkg *k = &s->avail[d->idx];
+        int ii = find_inst(s, k->name);
+        if (ii < 0) {
+            if (k->have_size) {
+                char hb[24];
+                human_size(k->size, hb, sizeof(hb));
+                if (k->version[0])
+                    snprintf(out, outsz, "Enter: install %s %s (%s on the repo)",
+                             k->name, k->version, hb);
+                else
+                    snprintf(out, outsz, "Enter: install %s (%s on the repo)",
+                             k->name, hb);
+            } else {
+                snprintf(out, outsz, "Enter: install %s", k->name);
+            }
+            return;
+        }
+        const StoreApp *a = &s->inst[ii];
+        if (a->in_image) {
+            snprintf(out, outsz,
+                     "%s is installed from the image - Enter does nothing", k->name);
+        } else if (a->version[0] && k->version[0] &&
+                   strcmp(a->version, k->version)) {
+            snprintf(out, outsz, "Enter or i: update %s %s -> %s",
+                     k->name, a->version, k->version);
+        } else {
+            snprintf(out, outsz, "%s is installed - Enter does nothing", k->name);
+        }
+        return;
+    }
+
+    snprintf(out, outsz, "r: fetch the index - /: search");
+}
 
 /* ------------------------------------------------------------
  *  The two row marks. Both are geometry - the same rounded-rect and
@@ -1140,6 +1953,22 @@ static void draw_refresh_icon(Surface *s, float x, float y, float sz, u32 c) {
     gfx_polygon(s, head, 3, c);
 }
 
+/* a magnifier for the search box: a ring and a handle */
+static void draw_search_icon(Surface *s, float x, float y, float sz, u32 c) {
+    float r = sz * 0.28f;
+    float cx = x + sz * 0.40f, cy = y + sz * 0.40f;
+    gfx_rrect_aa(s, cx - r, cy - r, r * 2.0f, r * 2.0f, r, 0, c, sz * 0.10f);
+    gfx_line(s, cx + r * 0.70f, cy + r * 0.70f,
+                x + sz * 0.92f, y + sz * 0.92f, sz * 0.11f, c);
+}
+
+/* the clear mark at the right end of the search box */
+static void draw_clear_icon(Surface *s, float cx, float cy, float sz, u32 c) {
+    float r = sz * 0.26f;
+    gfx_line(s, cx - r, cy - r, cx + r, cy + r, sz * 0.10f, c);
+    gfx_line(s, cx + r, cy - r, cx - r, cy + r, sz * 0.10f, c);
+}
+
 /* One painted line. `x` is the window's origin (the painter is the only
  * side that adds it); `ry` is the row's top in the compositor's surface.
  * Every number comes from the Layout the hit-test also uses, so the row a
@@ -1196,6 +2025,22 @@ static void paint_row(Surface *s, const Layout *L, const Theme *th,
     float name_x  = fx + (float)L->name_x;
     float name_w  = (float)L->name_w;
 
+    /* the version cell is shared by both row kinds; the function says
+     * what kind of number it is (VC_INDEX/VC_UPDATE) so the colour can
+     * tell the truth about it */
+    char ver[64];
+    int vkind = version_cell(st, d->kind, d->idx, ver, sizeof(ver));
+    u32 vcol = color_alpha(th->text, 0.55f);
+    if (vkind == VC_UPDATE) vcol = color_alpha(th->accent, 0.90f);
+    else if (vkind == VC_INDEX) vcol = color_alpha(th->text, 0.40f);
+    else if (vkind == VC_NONE) vcol = color_alpha(th->text, 0.30f);
+
+    char sz[32];
+    long long size = 0;
+    int have_size = 0;
+    const char *tag = "";
+    int dim_name = 0;
+
     if (d->kind == D_APP) {
         const StoreApp *e = &st->inst[d->idx];
 
@@ -1204,73 +2049,72 @@ static void paint_row(Surface *s, const Layout *L, const Theme *th,
         draw_check_icon(s, fx + (float)L->icon_x, (float)iy,
                         (float)L->icon_sz, th->accent,
                         e->have_size ? 0.90f : 0.55f);
+        size = e->total;
+        have_size = e->nfiles > 0;
+        tag = e->tag;
+        dim_name = !e->have_size;
+    } else {
+        /* D_PKG: what the index offers */
+        const Pkg *k = &st->avail[d->idx];
+        int ins = is_installed(st, k->name);
 
-        char sz[32];
-        if (e->have_size)
-            snprintf(sz, sizeof(sz), "%.1f KB", (double)e->size / 1024.0);
+        if (ins)
+            draw_check_icon(s, fx + (float)L->icon_x, (float)iy,
+                            (float)L->icon_sz, th->accent, 0.60f);
         else
-            snprintf(sz, sizeof(sz), "no payload");
-        if (L->show_size) {
-            float sw = font_width(L->fd, sz);
-            font_draw(s, L->fd, fx + (float)L->size_right - sw, small_y, sz,
-                      color_alpha(th->text, e->have_size ? 0.55f : 0.35f));
-        }
+            draw_pkg_icon(s, fx + (float)L->icon_x, (float)iy,
+                          (float)L->icon_sz, th->accent, selected ? 1.0f : 0.85f);
+        size = k->have_size ? k->size : -1;
+        have_size = k->have_size;
+        tag = k->tag;
+        dim_name = ins;
+    }
 
-        if (L->show_tag && e->from_root) {         /* installed by pkg */
-            const char *tag = "pkg";
-            float tw = font_width(L->fd, tag);
-            font_draw(s, L->fd, fx + (float)L->tag_right - tw, small_y, tag,
-                      color_alpha(th->accent, 0.55f));
-        }
+    if (have_size) human_size(size, sz, sizeof(sz));
+    else           snprintf(sz, sizeof(sz), "?");
 
+    if (L->show_ver && ver[0])
+        font_draw(s, L->fd, fx + (float)L->ver_right - font_width(L->fd, ver),
+                  small_y, ver, vcol);
+
+    if (L->show_size) {
+        float sw = font_width(L->fd, sz);
+        font_draw(s, L->fd, fx + (float)L->size_right - sw, small_y, sz,
+                  color_alpha(th->text, have_size ? 0.55f : 0.35f));
+    }
+
+    if (L->show_tag && tag[0]) {
+        char t[TAG_MAX + 2];
+        snprintf(t, sizeof(t), "#%s", tag);
+        float tw = font_width(L->fd, t);
+        float tagw = (float)L->tag_col;
+        /* a tag longer than the measured column is clipped INSIDE the
+         * column, starting at its left edge, so it can never paint over
+         * the size cell when a description yields an unusually long word */
+        float tagx = fx + (float)L->tag_right - (tw < tagw ? tw : tagw);
+        draw_clipped(s, L->fd, tagx, small_y, tagw, t,
+                     color_alpha(th->accent, dim_name ? 0.40f : 0.60f));
+    }
+
+    if (d->kind == D_APP) {
         if (!L->show_desc)
             name_w = fx + (float)w - (float)L->pad_x - name_x;
-        draw_clipped(s, L->fr, name_x, name_y, name_w, e->name,
+        draw_clipped(s, L->fr, name_x, name_y, name_w, st->inst[d->idx].name,
                      selected ? th->text : th->text_dim);
         return;
     }
 
-    /* D_PKG: what the index offers */
     const Pkg *k = &st->avail[d->idx];
-    int ins = is_installed(st, k->name);
-
-    if (ins)
-        draw_check_icon(s, fx + (float)L->icon_x, (float)iy,
-                        (float)L->icon_sz, th->accent, 0.60f);
-    else
-        draw_pkg_icon(s, fx + (float)L->icon_x, (float)iy,
-                      (float)L->icon_sz, th->accent, selected ? 1.0f : 0.85f);
-
-    char sz[32];
-    if (!k->have_size)
-        snprintf(sz, sizeof(sz), "?");
-    else if (k->size >= 1048576)
-        snprintf(sz, sizeof(sz), "%.1f MB", (double)k->size / 1048576.0);
-    else
-        snprintf(sz, sizeof(sz), "%ld KB", (k->size + 1023) / 1024);
-    if (L->show_size) {
-        float sw = font_width(L->fd, sz);
-        font_draw(s, L->fd, fx + (float)L->size_right - sw, small_y, sz,
-                  color_alpha(th->text, k->have_size ? 0.55f : 0.35f));
-    }
-
-    if (L->show_tag && ins) {
-        const char *tag = "installed";
-        float tw = font_width(L->fd, tag);
-        font_draw(s, L->fd, fx + (float)L->tag_right - tw, small_y, tag,
-                  color_alpha(th->accent, 0.70f));
-    }
-
     if (L->show_desc)
         draw_clipped(s, L->fd, fx + (float)L->desc_x, small_y,
                      (float)L->desc_w, k->desc,
-                     color_alpha(th->text, ins ? 0.30f : 0.50f));
+                     color_alpha(th->text, dim_name ? 0.30f : 0.50f));
     else
         name_w = fx + (float)w - (float)L->pad_x - name_x;
 
     draw_clipped(s, L->fr, name_x, name_y, name_w, k->name,
-                 ins ? color_alpha(th->text, 0.55f)
-                     : (selected ? th->text : th->text_dim));
+                 dim_name ? color_alpha(th->text, 0.55f)
+                          : (selected ? th->text : th->text_dim));
 }
 
 static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const Theme *th) {
@@ -1280,7 +2124,7 @@ static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const The
     st->h = h;
     if (w < 40 || h < 40) return;
 
-    /* bring the two sources up to date before laying them out */
+    /* bring the two live sources up to date before laying them out */
     poll_install(st);
     sync_index(st);
 
@@ -1308,6 +2152,60 @@ static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const The
     }
     surf_blend(s, x + L.pad_x, y + L.head_h - L.rule, w - 2 * L.pad_x,
                L.rule, th->panel_border);
+
+    /* ---- the search box ---------------------------------- */
+    {
+        int by = y + L.filter_y + ui_px(2);
+        int bh = L.filter_h - 2 * ui_px(2);
+        if (bh < ui_px(10)) bh = ui_px(10);
+        gfx_rrect_aa(s, (float)(x + L.filter_x), (float)by,
+                     (float)L.filter_w, (float)bh, (float)L.radius,
+                     color_alpha(th->panel_border, 0.35f),
+                     st->search_focus ? color_alpha(th->accent, 0.75f)
+                                      : color_alpha(th->panel_border, 0.60f),
+                     1.0f);
+
+        int iy = by + (bh - L.filter_icon) / 2;
+        draw_search_icon(s, (float)(x + L.filter_x + ui_px(5)), (float)iy,
+                         (float)L.filter_icon, color_alpha(th->text, 0.50f));
+
+        float tx = (float)(x + L.filter_text_x);
+        float ty = (float)by + (float)L.filter_dy;
+        float avail = (float)(x + L.filter_clear_x) - tx - (float)L.gap;
+        if (avail < 8.0f) avail = 8.0f;
+
+        if (st->filter[0]) {
+            float tw = font_width(L.fd, st->filter);
+            if (tw <= avail) {
+                font_draw(s, L.fd, tx, ty, st->filter, th->text);
+                if (st->search_focus)
+                    surf_blend(s, (int)(tx + tw + 2.0f), by + ui_px(3),
+                               ui_px(2), bh - 2 * ui_px(3),
+                               color_alpha(th->accent, 0.90f));
+            } else {
+                draw_tail(s, L.fd, tx, ty, avail, st->filter, th->text);
+                if (st->search_focus)
+                    surf_blend(s, (int)(tx + avail - 2.0f), by + ui_px(3),
+                               ui_px(2), bh - 2 * ui_px(3),
+                               color_alpha(th->accent, 0.90f));
+            }
+        } else {
+            const char *ph = st->search_focus ? "type to filter" : "press / to search";
+            draw_clipped(s, L.fd, tx, ty, avail, ph,
+                         color_alpha(th->text, st->search_focus ? 0.50f : 0.35f));
+            if (st->search_focus)
+                surf_blend(s, (int)(tx + font_width(L.fd, ph) + 2.0f),
+                           by + ui_px(3), ui_px(2), bh - 2 * ui_px(3),
+                           color_alpha(th->accent, 0.90f));
+        }
+
+        if (st->filter[0]) {
+            float cxp = (float)(x + L.filter_clear_x + L.filter_clear_w / 2);
+            float cyp = (float)by + (float)bh * 0.5f;
+            draw_clear_icon(s, cxp, cyp, (float)L.filter_icon,
+                            color_alpha(th->text, 0.55f));
+        }
+    }
 
     /* ---- the error line, when the bundle root could not be read */
     if (st->error[0])
@@ -1363,70 +2261,102 @@ static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const The
                              (float)text_w, st->dlines[i],
                              color_alpha(th->text, 0.85f));
 
-            /* the hint: what Enter will ask the desktop to do */
-            char hint[128];
+            /* the hint: what Enter / x / i will ask the desktop to do, or
+             * the live uninstall prompt when one is armed */
+            char hint[192];
+            hint_for(st, sel, hint, sizeof(hint));
             int hy = content_y + L.nlines * L.line_h + L.hint_dy;
-            if (st->disp[sel].kind == D_PKG) {
-                const Pkg *k = &st->avail[st->disp[sel].idx];
-                if (is_installed(st, k->name))
-                    snprintf(hint, sizeof(hint), "%s is installed - Enter does nothing",
-                             k->name);
-                else if (k->version[0])
-                    snprintf(hint, sizeof(hint), "Enter: pkg install %s (v%s)",
-                             k->name, k->version);
-                else
-                    snprintf(hint, sizeof(hint), "Enter: pkg install %s", k->name);
-            } else {
-                const StoreApp *e = &st->inst[st->disp[sel].idx];
-                if (e->from_root)
-                    snprintf(hint, sizeof(hint),
-                             "%s is in %s - the launcher reads %s",
-                             e->id, STORE_ROOT_APPS, STORE_APP_DIR);
-                else
-                    snprintf(hint, sizeof(hint),
-                             "Enter: ask the desktop to launch %s", e->id);
-            }
             draw_clipped(s, L.fd, (float)(x + L.pad_x), (float)hy,
-                         (float)text_w, hint, color_alpha(th->text, 0.40f));
+                         (float)text_w, hint,
+                         st->confirm_id[0] ? color_alpha(th->accent, 0.95f)
+                                           : color_alpha(th->text, 0.40f));
         } else {
+            char hint[192];
+            hint_for(st, -1, hint, sizeof(hint));
             int hy = content_y + L.hint_dy;
             draw_clipped(s, L.fd, (float)(x + L.pad_x), (float)hy,
-                         (float)text_w, "r: fetch the package index",
-                         color_alpha(th->text, 0.40f));
+                         (float)text_w, hint, color_alpha(th->text, 0.40f));
         }
     }
 
-    /* ---- footer: how much is installed and offered, plus the outcome.
-     * A status that does not fit beside the counts gets the whole line - a
-     * failure message that is never painted would be worse than a lost
-     * count. */
+    /* ---- footer: counts, the outcome, the index's age and - while an
+     * install runs - the real download progress. A status that does not
+     * fit beside the counts gets the whole line: a failure message that is
+     * never painted would be worse than a lost count. */
     {
         int fy = y + h - L.foot_h;
         surf_blend(s, x, fy, w, L.foot_h, th->panel);
-        surf_blend(s, x + L.pad_x, fy, w - 2 * L.pad_x, L.rule,
-                   th->panel_border);
+
+        /* the progress strip sits on the footer's top edge, over the rule */
+        if (st->pending[0]) {
+            float frac = 0.0f;
+            if (st->pending_phase == 2) frac = 1.0f;
+            else if (st->pending_phase == 1 && st->pending_total > 0) {
+                frac = (float)((double)st->pending_part / (double)st->pending_total);
+                if (frac < 0.0f) frac = 0.0f;
+                if (frac > 0.995f) frac = 0.995f;   /* the text caps at 99% */
+            }
+            int trackw = w - 2 * L.pad_x;
+            surf_blend(s, x + L.pad_x, fy, trackw, L.prog_h,
+                       color_alpha(th->accent, 0.14f));
+            int fw = (int)((float)trackw * frac);
+            if (fw > 0)
+                surf_blend(s, x + L.pad_x, fy, fw, L.prog_h,
+                           color_alpha(th->accent, 0.70f));
+        } else {
+            surf_blend(s, x + L.pad_x, fy, w - 2 * L.pad_x, L.rule,
+                       th->panel_border);
+        }
 
         float ty = (float)fy + (float)L.foot_dy;
-        char foot[96];
-        snprintf(foot, sizeof(foot), "%d installed - %d available%s",
-                 st->ninst, st->navail,
-                 st->index_state == 0 ? " - no index" : "");
 
-        float tw = st->status[0] ? font_width(L.fr, st->status) : 0.0f;
-        if (st->status[0] &&
-            tw + font_width(L.fr, foot) + (float)(2 * L.gap) < (float)w) {
-            font_draw(s, L.fr, (float)(x + w - L.pad_x) - tw, ty, st->status,
-                      color_alpha(th->accent, 0.55f));
+        char left[160];
+        if (st->filter[0]) {
+            snprintf(left, sizeof(left), "%d of %d rows - \"%s\"",
+                     st->nshown, st->ninst + st->navail, st->filter);
+        } else {
+            char age[24];
+            age[0] = 0;
+            if (st->index_state == 1) {
+                long long t = (long long)time(NULL) - st->index_mtime;
+                if (t < 0) t = 0;
+                if (t < 60) snprintf(age, sizeof(age), "%llds", t);
+                else if (t < 3600) snprintf(age, sizeof(age), "%lldm", t / 60);
+                else snprintf(age, sizeof(age), "%lldh", t / 3600);
+            }
+            if (st->index_state == 0)
+                snprintf(left, sizeof(left), "%d installed - %d available - no index",
+                         st->ninst, st->navail);
+            else if (st->index_state < 0)
+                snprintf(left, sizeof(left), "%d installed - %d available - index unreadable",
+                         st->ninst, st->navail);
+            else
+                snprintf(left, sizeof(left), "%d installed - %d available - index %s",
+                         st->ninst, st->navail, age);
+        }
+
+        char prompt[192];
+        prompt[0] = 0;
+        if (st->confirm_id[0]) confirm_prompt(st, prompt, sizeof(prompt));
+        const char *right = prompt[0] ? prompt : st->status;
+
+        float tw = right[0] ? font_width(L.fr, right) : 0.0f;
+        if (right[0] &&
+            tw + font_width(L.fr, left) + (float)(2 * L.gap) < (float)w) {
+            font_draw(s, L.fr, (float)(x + w - L.pad_x) - tw, ty, right,
+                      prompt[0] ? color_alpha(th->accent, 0.95f)
+                                : color_alpha(th->accent, 0.55f));
             draw_clipped(s, L.fr, (float)(x + L.pad_x), ty,
-                         (float)w - tw - (float)(L.pad_x + L.gap), foot,
+                         (float)w - tw - (float)(L.pad_x + L.gap), left,
                          color_alpha(th->text, 0.45f));
-        } else if (st->status[0]) {
+        } else if (right[0]) {
             draw_clipped(s, L.fr, (float)(x + L.pad_x), ty,
-                         (float)(w - 2 * L.pad_x), st->status,
-                         color_alpha(th->accent, 0.55f));
+                         (float)(w - 2 * L.pad_x), right,
+                         prompt[0] ? color_alpha(th->accent, 0.95f)
+                                   : color_alpha(th->accent, 0.55f));
         } else {
             draw_clipped(s, L.fr, (float)(x + L.pad_x), ty,
-                         (float)(w - 2 * L.pad_x), foot,
+                         (float)(w - 2 * L.pad_x), left,
                          color_alpha(th->text, 0.45f));
         }
     }
@@ -1462,9 +2392,35 @@ static void sel_last(Store *s) {
         if (disp_selectable(&s->disp[i])) { s->sel = i; return; }
 }
 
+static void filter_changed(Store *s) {
+    s->filter_len = (int)strlen(s->filter);
+    build_disp(s);
+}
+
+static void filter_clear(Store *s) {
+    s->filter[0] = 0;
+    s->filter_len = 0;
+    filter_changed(s);
+}
+
+/* Arm the uninstall prompt for a bundle id. Only /root/apps is ever
+ * removable; the caller has already checked that a root copy exists. */
+static void arm_uninstall(Store *s, const StoreApp *a) {
+    if (!safe_seg(a->id)) {
+        snprintf(s->status, sizeof(s->status), "refusing an unsafe bundle name");
+        return;
+    }
+    snprintf(s->confirm_id, sizeof(s->confirm_id), "%s", a->id);
+    s->confirm_keep_image = a->in_image;
+    s->search_focus = 0;
+    snprintf(s->status, sizeof(s->status),
+             "remove %s from %s? y = remove, n = cancel",
+             a->id, STORE_ROOT_APPS);
+}
+
 static void store_key(App *a, const char *bytes, int n) {
     Store *s = a->state;
-    if (!s) return;
+    if (!s || !bytes) return;
 
     Layout L;
     int rows = 1;
@@ -1473,7 +2429,23 @@ static void store_key(App *a, const char *bytes, int n) {
     for (int i = 0; i < n; i++) {
         unsigned char c = (unsigned char)bytes[i];
 
-        if (c == 0x1B) {                       /* arrow / Home / End / Page runs */
+        /* 1. an armed uninstall owns the keyboard. Only 'y' removes; any
+         * other byte cancels, so holding Enter can never delete anything.
+         * The rest of the batch is consumed too: the answer must not turn
+         * into a second command. */
+        if (s->confirm_id[0]) {
+            if (c == 'y' || c == 'Y') {
+                do_uninstall(s);
+            } else {
+                s->confirm_id[0] = 0;
+                s->confirm_keep_image = 0;
+                snprintf(s->status, sizeof(s->status), "uninstall cancelled");
+            }
+            return;
+        }
+
+        /* 2. escape runs: the same navigation in both modes */
+        if (c == 0x1B) {
             if (i + 2 < n && bytes[i + 1] == '[') {
                 switch (bytes[i + 2]) {
                     case 'A': move_sel(s, -1); break;
@@ -1495,6 +2467,37 @@ static void store_key(App *a, const char *bytes, int n) {
             continue;
         }
 
+        /* 3. the search box: printable bytes edit the filter, Enter keeps
+         * it, Ctrl+U clears it, Backspace deletes one byte. Nothing else
+         * reaches the list while the box has focus. */
+        if (s->search_focus) {
+            if (c == '\n' || c == '\r' || c == '\t') {
+                s->search_focus = 0;
+                continue;
+            }
+            if (c == 0x08 || c == 0x7f) {
+                if (s->filter_len > 0) {
+                    s->filter[--s->filter_len] = 0;
+                    filter_changed(s);
+                }
+                continue;
+            }
+            if (c == 0x15) {                    /* Ctrl+U */
+                filter_clear(s);
+                continue;
+            }
+            if (c >= 0x20 && c < 0x7f) {
+                if (s->filter_len < (int)sizeof(s->filter) - 1) {
+                    s->filter[s->filter_len++] = (char)c;
+                    s->filter[s->filter_len] = 0;
+                    filter_changed(s);
+                }
+                continue;
+            }
+            continue;
+        }
+
+        /* 4. commands */
         switch (c) {
             case 'j': move_sel(s, +1); break;
             case 'k': move_sel(s, -1); break;
@@ -1502,7 +2505,63 @@ static void store_key(App *a, const char *bytes, int n) {
             case 'G': sel_last(s); break;
             case 0x01: sel_first(s); break;                         /* Ctrl+A */
             case 0x05: sel_last(s); break;                          /* Ctrl+E */
+
+            case '/':
+                s->search_focus = 1;
+                break;
+
+            case 0x15:                                              /* Ctrl+U */
+                filter_clear(s);
+                break;
+
+            case 0x08: case 0x7f:
+                if (s->filter_len > 0) {
+                    s->filter[--s->filter_len] = 0;
+                    filter_changed(s);
+                }
+                break;
+
             case 'r': request_refresh(s); break;
+
+            case 'U':
+                check_updates(s);
+                break;
+
+            case 'x': case 'X': {
+                if (s->sel < 0 || s->sel >= s->ndisp) break;
+                Disp *d = &s->disp[s->sel];
+                if (d->kind == D_APP) {
+                    const StoreApp *e = &s->inst[d->idx];
+                    if (!e->in_root)
+                        snprintf(s->status, sizeof(s->status),
+                                 "%s is in %s - only %s bundles are removable",
+                                 e->id, STORE_APP_DIR, STORE_ROOT_APPS);
+                    else
+                        arm_uninstall(s, e);
+                } else if (d->kind == D_PKG) {
+                    int ii = find_inst(s, s->avail[d->idx].name);
+                    if (ii >= 0 && s->inst[ii].in_root) arm_uninstall(s, &s->inst[ii]);
+                    else snprintf(s->status, sizeof(s->status),
+                                  "%s has no copy in %s",
+                                  s->avail[d->idx].name, STORE_ROOT_APPS);
+                }
+                break;
+            }
+
+            case 'i': case 'I': {
+                if (s->sel < 0 || s->sel >= s->ndisp) break;
+                Disp *d = &s->disp[s->sel];
+                int p = -1;
+                if (d->kind == D_PKG) p = d->idx;
+                else if (d->kind == D_APP) p = find_pkg(s, s->inst[d->idx].id);
+                if (p < 0)
+                    snprintf(s->status, sizeof(s->status),
+                             "the index has no package for this row");
+                else
+                    start_install(s, &s->avail[p]);
+                break;
+            }
+
             case '\n':
             case '\r': activate(s); break;
             default: break;
@@ -1545,9 +2604,7 @@ static void store_wheel(App *a, int notches) {
 
     /* Keep the selection exactly where it is while it is still in view.
      * When the view has passed it, take the nearest selectable row at the
-     * edge the view came towards - the top for a downward scroll, the
-     * bottom for an upward one - so one notch never throws the highlight
-     * across the whole window. */
+     * edge the view came towards. */
     if (s->sel < lo) {
         for (int i = lo; i <= hi; i++)
             if (disp_selectable(&s->disp[i])) { s->sel = i; break; }
@@ -1562,6 +2619,15 @@ static void store_click(App *a, int x, int y, int buttons) {
     if (!s) return;
     if (buttons && !(buttons & 1)) return;      /* left button only */
 
+    /* an armed uninstall is dismissed by any click; the click must not
+     * also act on a row behind the prompt */
+    if (s->confirm_id[0]) {
+        s->confirm_id[0] = 0;
+        s->confirm_keep_image = 0;
+        snprintf(s->status, sizeof(s->status), "uninstall cancelled");
+        return;
+    }
+
     Layout L;
     if (!layout_store(&L, s, s->w, s->h)) return;
 
@@ -1570,6 +2636,18 @@ static void store_click(App *a, int x, int y, int buttons) {
     if (L.btn_w > 0 && x >= L.btn_x && x < L.btn_x + L.btn_w &&
         y >= L.btn_y && y < L.btn_y + L.btn_h) {
         request_refresh(s);
+        return;
+    }
+
+    /* the search box owns its whole band; its clear mark is a target */
+    if (y >= L.filter_y && y < L.filter_y + L.filter_h) {
+        if (s->filter_len > 0 &&
+            x >= L.filter_clear_x && x < L.filter_clear_x + L.filter_clear_w) {
+            filter_clear(s);
+            s->search_focus = 1;
+            return;
+        }
+        s->search_focus = 1;
         return;
     }
 
@@ -1608,6 +2686,8 @@ static void store_init(App *a, int w, int h) {
     s->sel = -1;
     s->wrap_w = -1;
     s->index_size = -1;
+    s->pending_total = -1;
+    s->pending_part = -1;
     load_index(s);
     scan_installed(s);           /* ends with build_disp() */
     a->state = s;

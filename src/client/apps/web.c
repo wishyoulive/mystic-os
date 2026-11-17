@@ -23,10 +23,17 @@
  *       is wider than the whole line
  *    6. draw the lines, scroll them, and follow links you click
  *
- *  There is no HTTPS: this browser speaks plain HTTP on port 80 and
- *  it says "http only" in the title bar. It also has no JavaScript,
- *  no CSS and no images - it renders text, which is the honest
- *  description of what is implemented.
+ *  HTTPS is real. http:// and https:// take the same path through the
+ *  HTTP code: only the transport differs. https:// runs over a TLS 1.2
+ *  session (src/client/tls.c) with SNI, chain validation against the
+ *  Mozilla roots in /etc/ssl/certs/ca-bundle.crt, a host-name check and
+ *  an expiry check. A bare host name typed in the address bar means
+ *  https://, exactly as it does in a modern browser. The title row shows
+ *  a lock and the scheme, and the status bar shows the negotiated TLS
+ *  version, cipher suite, certificate CN and expiry date.
+ *
+ *  It still has no JavaScript, no CSS and no images - it renders text,
+ *  which is the honest description of what is implemented.
  *
  *  Keys
  *      Tab          focus / leave the address bar
@@ -61,6 +68,7 @@
  * ============================================================ */
 #include "../mystic_client.h"
 #include "../../mystic.h"
+#include "../tls.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -68,6 +76,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#if !defined(WEB_HOST_TEST) && !defined(WEB_DRAW_ONLY)
+/* The TLS implementation is a single translation unit (see tls.c). It is
+ * pulled in only where the socket layer exists, so the host test builds
+ * stay socket-free. */
+#include "../tls.c"
+#endif
 
 #ifndef WEB_HOST_TEST
 #include <signal.h>
@@ -289,7 +304,8 @@ static long now_ms(void) {
 
 /* Build "scheme://host[:port]path" from a parsed address. */
 static void url_make(const Url *u, char *out, size_t osz) {
-    if (!strcmp(u->port, "80"))
+    const char *defport = u->https ? "443" : "80";
+    if (!strcmp(u->port, defport))
         snprintf(out, osz, "%s://%s%s", u->scheme, u->host, u->path);
     else
         snprintf(out, osz, "%s://%s:%s%s", u->scheme, u->host, u->port, u->path);
@@ -328,8 +344,11 @@ static void path_clean(char *p) {
  * message a person can act on. */
 static int url_parse(const char *in, Url *u, char *err, size_t esz) {
     memset(u, 0, sizeof(*u));
-    snprintf(u->scheme, sizeof(u->scheme), "http");
-    snprintf(u->port, sizeof(u->port), "80");
+    /* A bare host name means https, the way a modern browser reads it.
+     * An explicit http:// switches to port 80 and plain HTTP. */
+    snprintf(u->scheme, sizeof(u->scheme), "https");
+    u->https = 1;
+    snprintf(u->port, sizeof(u->port), "443");
     snprintf(u->path, sizeof(u->path), "/");
 
     const char *p = in;
@@ -346,12 +365,13 @@ static int url_parse(const char *in, Url *u, char *err, size_t esz) {
         for (int i = 0; i < n; i++) sc[i] = (char)lower(p[i]);
         sc[n] = 0;
         if (!strcmp(sc, "http")) {
-            /* plain */
+            u->https = 0;
+            snprintf(u->port, sizeof(u->port), "80");
         } else if (!strcmp(sc, "https")) {
-            snprintf(u->scheme, sizeof(u->scheme), "https");
             u->https = 1;
+            snprintf(u->port, sizeof(u->port), "443");
         } else {
-            snprintf(err, esz, "%s:// is not supported - this browser speaks http only", sc);
+            snprintf(err, esz, "%s:// is not supported - this browser speaks http:// and https://", sc);
             return -1;
         }
         snprintf(u->scheme, sizeof(u->scheme), "%s", sc);
@@ -366,7 +386,7 @@ static int url_parse(const char *in, Url *u, char *err, size_t esz) {
             for (const char *q = colon + 1; *q && *q != '/'; q++)
                 if (!isdigit((unsigned char)*q)) { digits = 0; break; }
             if (!digits) {
-                snprintf(err, esz, "unsupported address - this browser speaks http only");
+                snprintf(err, esz, "unsupported address - use http:// or https://");
                 return -1;
             }
         }
@@ -464,20 +484,16 @@ static int url_parse(const char *in, Url *u, char *err, size_t esz) {
     return 0;
 }
 
-/* The one rule about what this browser may fetch. Parsing an https
- * address succeeds (it is a real address), but fetching it does not:
- * there is no TLS in this process, so it must say so rather than
- * pretend. Used by the UI, by the loader and by the fetch loop. */
+/* The one rule about what this browser may fetch: http and https, and
+ * nothing else. https is a real fetch through src/client/tls.c. Used by
+ * the UI, by the loader and by the fetch loop, so none of them can
+ * disagree about what is reachable. */
 static int url_fetchable(const Url *u, char *err, size_t esz) {
-    if (u->https || !strcmp(u->scheme, "https")) {
-        snprintf(err, esz, "https:// is not supported - this browser speaks plain http only");
-        return 0;
-    }
-    if (strcmp(u->scheme, "http")) {
-        snprintf(err, esz, "%s:// is not supported - this browser speaks http only", u->scheme);
-        return 0;
-    }
-    return 1;
+    if (u->https || !strcmp(u->scheme, "https") || !strcmp(u->scheme, "http"))
+        return 1;
+    snprintf(err, esz, "%s:// is not supported - this browser speaks http:// and https://",
+             u->scheme);
+    return 0;
 }
 
 /* Resolve a link or a Location: header against the page it came from.
@@ -523,7 +539,8 @@ static int url_resolve(const Url *base, const char *href, char *out, size_t osz,
     }
 
     char authority[WEB_HOST_MAX + 16];
-    if (!strcmp(base->port, "80"))
+    const char *defport = base->https ? "443" : "80";
+    if (!strcmp(base->port, defport))
         snprintf(authority, sizeof(authority), "%s://%s", base->scheme, base->host);
     else
         snprintf(authority, sizeof(authority), "%s://%s:%s", base->scheme, base->host, base->port);

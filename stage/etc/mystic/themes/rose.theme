@@ -1,0 +1,19 @@
+# Rose - a light theme in warm pink and sand. text_dim is opaque on purpose:
+# a 60%-alpha grey over a light body lands at 4.1:1 (Porcelain measures that),
+# an opaque warm grey holds 5.8:1. Measured with docs/THEMES.md:
+#   body text 13.48:1 on window_bg, dim text 5.80:1, accent 6.69:1.
+name          = Rose
+dark          = 0
+bg_top        = #FDF4EF
+bg_bottom     = #F2DDD4
+accent        = #9C3352
+glow          = #FFF1F4
+glow_strength = 0.85
+panel         = #D8FFF6F2
+panel_border  = #336B4A52
+text          = #3B2530
+text_dim      = #7A5A63
+window_bg     = #FFF9F6
+window_border = #2E6B4A52
+corner        = 16
+blur          = 1.0

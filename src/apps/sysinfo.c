@@ -210,7 +210,8 @@ static void fmt_uptime(char *out, size_t cap, double secs) {
 /* meminfo is several values from one file, so it is read in one pass. The
  * ok bits are per value: a kernel without MemAvailable must say so for that
  * row only, not replace the whole panel with a placeholder. */
-enum { MEM_TOTAL = 1, MEM_FREE = 2, MEM_AVAIL = 4, MEM_CACHED = 8, MEM_SWAP = 16 };
+enum { MEM_TOTAL = 1, MEM_FREE = 2, MEM_AVAIL = 4, MEM_CACHED = 8,
+       MEM_SWAP = 16, MEM_SWAP_FREE = 32 };
 typedef struct {
     long total, free_kb, avail, cached, swap_total, swap_free;
     int  ok;
@@ -233,11 +234,13 @@ static void mem_read(Mem *m) {
         } else if (!strncmp(line, "SwapTotal:", 10)) {
             m->swap_total = strtol(line + 10, NULL, 10); m->ok |= MEM_SWAP;
         } else if (!strncmp(line, "SwapFree:", 9)) {
-            m->swap_free = strtol(line + 9, NULL, 10);
+            m->swap_free = strtol(line + 9, NULL, 10); m->ok |= MEM_SWAP_FREE;
         }
-        if ((m->ok & (MEM_TOTAL | MEM_FREE | MEM_AVAIL | MEM_CACHED | MEM_SWAP)) ==
-            (MEM_TOTAL | MEM_FREE | MEM_AVAIL | MEM_CACHED | MEM_SWAP))
-            break;
+        /* No early break: the order of keys in /proc/meminfo is not part of any
+         * contract, and stopping as soon as a subset is present is exactly how
+         * SwapFree used to be skipped (SwapFree comes after SwapTotal), which
+         * made every machine with swap look 100% swapped. The file is short;
+         * reading all of it cannot get the order wrong. */
     }
     fclose(f);
 }
@@ -395,9 +398,12 @@ static void facts_read(Facts *f) {
     f->fs_ok = fs_of(SI_DISK, f->fs_dev, sizeof(f->fs_dev), f->fs_type, sizeof(f->fs_type),
                      f->fs_mnt, sizeof(f->fs_mnt)) == 0;
     if (!f->fs_ok) {
+        /* /proc/mounts could not be read, so none of the three is known - the
+         * mount POINT included, even though SI_DISK is the path we asked about:
+         * printing "/root" as a "Mount" would be a claim we did not read. */
         snprintf(f->fs_dev, sizeof(f->fs_dev), "unreadable");
         snprintf(f->fs_type, sizeof(f->fs_type), "unreadable");
-        snprintf(f->fs_mnt, sizeof(f->fs_mnt), "%s", SI_DISK);
+        snprintf(f->fs_mnt, sizeof(f->fs_mnt), "unreadable");
     }
     char size[32] = { 0 }, bpp[16] = { 0 };
     int have_size = slurp(SI_FB_SIZE, size, sizeof(size)) == 0;
@@ -549,11 +555,15 @@ static void build_rows(Row *rows, int *n, const Facts *f) {
 
     add_head(rows, n, "CPU");
     add_row(rows, n, "Processor", f->cpu);
-    if (f->cores > 0)
-        snprintf(v, sizeof(v), "%d logical, %ld online", f->cores,
-                 online > 0 ? online : (long)f->cores);
-    else
+    if (f->cores <= 0)
         snprintf(v, sizeof(v), "unreadable");
+    else if (online > 0)
+        snprintf(v, sizeof(v), "%d logical, %ld online", f->cores, online);
+    else
+        /* sysconf() failed: the logical count is still a real reading, the
+         * online count is not, so it is reported as missing rather than copied
+         * from the logical count. */
+        snprintf(v, sizeof(v), "%d logical, online unreadable", f->cores);
     add_row(rows, n, "Cores", v);
     double l1, l5, l15;
     int run = -1, threads = -1;
@@ -589,10 +599,13 @@ static void build_rows(Row *rows, int *n, const Facts *f) {
     add_row(rows, n, "Available", v);
     if (m.ok & MEM_CACHED) fmt_kb(v, sizeof(v), m.cached); else snprintf(v, sizeof(v), "unreadable");
     add_row(rows, n, "Cached", v);
-    if (!(m.ok & MEM_SWAP)) snprintf(v, sizeof(v), "unreadable");
+    if ((m.ok & (MEM_SWAP | MEM_SWAP_FREE)) != (MEM_SWAP | MEM_SWAP_FREE))
+        snprintf(v, sizeof(v), "unreadable");
     else if (m.swap_total <= 0) snprintf(v, sizeof(v), "none");
     else {
-        fmt_kb(a, sizeof(a), m.swap_total - m.swap_free);
+        long swap_used = m.swap_total - m.swap_free;
+        if (swap_used < 0) swap_used = 0;
+        fmt_kb(a, sizeof(a), swap_used);
         fmt_kb(b, sizeof(b), m.swap_total);
         snprintf(v, sizeof(v), "%s of %s", a, b);
     }

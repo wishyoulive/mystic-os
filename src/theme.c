@@ -1,35 +1,68 @@
 /* ============================================================
  *  Mystic OS - theme.c
- *  Themes are plain text files, one setting per line, so anyone
- *  can write one without touching code:
+ *
+ *  A theme is a plain text file, one "key = value" per line:
  *
  *      name    = Obsidian
  *      bg_top  = #0B0F1A
  *      accent  = #7AA2F7
  *      corner  = 14
+ *
+ *  Every key is optional. A file that leaves one out, or whose value
+ *  does not parse, keeps the built-in default for that key, and the
+ *  parser says which file and which key on stderr. A typo therefore
+ *  never silently changes the look of the desktop, and a half-written
+ *  theme can never leave text at an unreadable colour.
+ *
+ *  Colours are #RRGGBB or #AARRGGBB (the '#' is optional, "0x" works
+ *  too). A '#' at the start of a value is a colour; a '#' after white
+ *  space is a comment. Numbers are decimal.
+ *
+ *  docs/THEMES.md has the full key set, the contrast targets every
+ *  shipped theme is measured against, and how to add one.
  * ============================================================ */
 #include "mystic.h"
 
 #include <dirent.h>
+#include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static u32 parse_color(const char *v, u32 fallback) {
-    while (*v == ' ' || *v == '\t') v++;
-    if (*v == '#') v++;
-    else if (v[0] == '0' && (v[1] == 'x' || v[1] == 'X')) v += 2;
-    char *end = NULL;
-    unsigned long n = strtoul(v, &end, 16);
-    if (end == v) return fallback;
-    if (strlen(v) >= 8) return (u32)n;              /* AARRGGBB */
-    return WITH_A((u32)n, 0xFF);                    /* RRGGBB   */
-}
+/* theme_load_all() reads at most this many directory entries, and fills at
+ * most THEME_MAX of them. A caller whose array is smaller is told exactly
+ * how many files it dropped, instead of losing them silently. */
+#define THEME_SCAN_MAX 256
+#define THEME_MAX      32
+#define THEME_LINE_MAX 512
+#define THEME_WARN_MAX 32      /* per file: a corrupt file cannot flood stderr */
 
-static float parse_float(const char *v, float fallback) {
-    char *end = NULL;
-    float f = strtof(v, &end);
-    return (end == v) ? fallback : f;
+typedef struct {
+    const char *path;
+    int         line;          /* 0 when the problem is the file, not a line */
+    int         warned;
+} Src;
+
+/* Every diagnostic goes through here so it always names the file, the line
+ * when there is one, and the key. */
+static void twarn_at(Src *s, const char *key, const char *fmt, ...) {
+    if (s->warned > THEME_WARN_MAX) return;
+    if (s->warned == THEME_WARN_MAX) {
+        s->warned++;
+        fprintf(stderr, "theme: %s: too many problems in this file, "
+                        "further warnings suppressed\n", s->path);
+        return;
+    }
+    s->warned++;
+    if (s->line > 0) fprintf(stderr, "theme: %s:%d: ", s->path, s->line);
+    else             fprintf(stderr, "theme: %s: ", s->path);
+    if (key && key[0]) fprintf(stderr, "key '%s': ", key);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
 }
 
 static void defaults(Theme *t) {
@@ -51,56 +84,225 @@ static void defaults(Theme *t) {
     t->dark = 1;
 }
 
+/* ---------------------------------------------------------- values ---- */
+
+static int hexval(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* The whole token has to be hex: "#0B0F1A;" is an error, not a colour, and
+ * neither is "#12345". Six digits are RRGGBB (opaque), eight are AARRGGBB. */
+static int parse_color(const char *v, u32 *out) {
+    while (*v == ' ' || *v == '\t') v++;
+    if (*v == '#') v++;
+    else if (v[0] == '0' && (v[1] == 'x' || v[1] == 'X')) v += 2;
+    int digits = 0;
+    while (hexval((unsigned char)v[digits]) >= 0) digits++;
+    const char *p = v + digits;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p || (digits != 6 && digits != 8)) return 0;
+    u32 c = (u32)strtoul(v, NULL, 16);
+    *out = (digits == 8) ? c : WITH_A(c, 0xFF);
+    return 1;
+}
+
+static int parse_float(const char *v, float *out) {
+    char *end = NULL;
+    float f = strtof(v, &end);
+    if (end == v) return 0;
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end) return 0;
+    *out = f;
+    return 1;
+}
+
+static int parse_flag(const char *v, int *out) {
+    char *end = NULL;
+    long n = strtol(v, &end, 10);
+    if (end == v) return 0;
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end || (n != 0 && n != 1)) return 0;
+    *out = (int)n;
+    return 1;
+}
+
+static void set_color(Src *s, const char *key, const char *v, u32 *dst) {
+    u32 c;
+    if (parse_color(v, &c)) { *dst = c; return; }
+    twarn_at(s, key, "malformed colour '%s' (want #RRGGBB or #AARRGGBB), "
+                     "keeping #%08X", v, *dst);
+}
+
+static void set_num(Src *s, const char *key, const char *v, float *dst,
+                    float lo, float hi) {
+    float f;
+    if (!parse_float(v, &f)) {
+        twarn_at(s, key, "malformed number '%s', keeping %g", v, (double)*dst);
+        return;
+    }
+    if (f != f) {                                   /* NaN: strtof("nan") */
+        twarn_at(s, key, "not a number, keeping %g", (double)*dst);
+        return;
+    }
+    if (f < lo || f > hi) {
+        float c = (f < lo) ? lo : hi;
+        twarn_at(s, key, "%g is outside %g..%g, using %g",
+                 (double)f, (double)lo, (double)hi, (double)c);
+        f = c;
+    }
+    *dst = f;
+}
+
+static void set_flag(Src *s, const char *key, const char *v, int *dst) {
+    int n;
+    if (parse_flag(v, &n)) { *dst = n; return; }
+    twarn_at(s, key, "malformed flag '%s' (want 0 or 1), keeping %d", v, *dst);
+}
+
+/* ------------------------------------------------------------ keys ---- */
+
+enum {
+    K_NAME, K_DARK, K_BG_TOP, K_BG_BOTTOM, K_ACCENT, K_GLOW,
+    K_GLOW_STRENGTH, K_PANEL, K_PANEL_BORDER, K_TEXT, K_TEXT_DIM,
+    K_WINDOW_BG, K_WINDOW_BORDER, K_CORNER, K_BLUR, K_COUNT
+};
+
+static const char *const key_name[K_COUNT] = {
+    "name",         "dark",        "bg_top",       "bg_bottom",
+    "accent",       "glow",        "glow_strength","panel",
+    "panel_border", "text",        "text_dim",     "window_bg",
+    "window_border","corner",      "blur"
+};
+
+/* The keys a theme is expected to set. The rest have defaults that are safe
+ * on any background (the glow, the two border alphas, the corner radius and
+ * the blur strength). These nine decide whether the theme is readable, so a
+ * missing one is worth a warning even though the default still works. */
+static const unsigned REQUIRED =
+    (1u << K_NAME) | (1u << K_DARK) | (1u << K_BG_TOP) | (1u << K_BG_BOTTOM) |
+    (1u << K_ACCENT) | (1u << K_PANEL) | (1u << K_TEXT) | (1u << K_TEXT_DIM) |
+    (1u << K_WINDOW_BG);
+
 int theme_load(Theme *t, const char *path) {
+    if (!t) return -1;
     defaults(t);
+    if (!path) return -1;
+
     FILE *f = fopen(path, "r");
     if (!f) return -1;
 
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        char *hash = strchr(line, '#');
-        /* a '#' may start a colour, so only treat it as a comment when
-           it is not immediately followed by 6 or 8 hex digits */
-        if (hash) {
-            int hex = 1;
-            for (int i = 1; i <= 8; i++) {
-                char c = hash[i];
-                if (c == 0 || c == '\n') break;
-                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
-                    hex = 0; break;
-                }
-            }
-            if (!hex) *hash = 0;
+    Src src = { path, 0, 0 };
+    unsigned seen = 0;
+    int first = 1;
+    char line[THEME_LINE_MAX];
+
+    while (fgets(line, sizeof line, f)) {
+        src.line++;
+        size_t len = strlen(line);
+
+        if (first) {                       /* a UTF-8 BOM from a text editor */
+            first = 0;
+            if (len >= 3 && (unsigned char)line[0] == 0xEF &&
+                (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF)
+                memmove(line, line + 3, len - 2);
+            len = strlen(line);
         }
-        char *eq = strchr(line, '=');
-        if (!eq) continue;
+
+        /* fgets() split an over-long line into two lines, and the second half
+         * would parse as junk. Throw the rest of the line away instead. */
+        if (len == sizeof line - 1 && line[len - 1] != '\n' && !feof(f)) {
+            twarn_at(&src, NULL, "line longer than %d bytes, ignored",
+                     THEME_LINE_MAX - 1);
+            int c;
+            while ((c = fgetc(f)) != EOF && c != '\n') { }
+            continue;
+        }
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = 0;
+
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '#') continue;            /* blank or comment */
+
+        char *eq = strchr(p, '=');
+        if (!eq) {
+            twarn_at(&src, NULL, "no '=' - expected 'key = value', line ignored");
+            continue;
+        }
         *eq = 0;
-        char *key = line;
-        char *val = eq + 1;
-        while (*key == ' ' || *key == '\t') key++;
+
+        char *key = p;
         char *kend = key + strlen(key);
         while (kend > key && (kend[-1] == ' ' || kend[-1] == '\t')) *--kend = 0;
-        while (*val == ' ' || *val == '\t') val++;
-        char *vend = val + strlen(val);
-        while (vend > val && (vend[-1] == '\n' || vend[-1] == '\r' || vend[-1] == ' ')) *--vend = 0;
 
-        if      (!strcmp(key, "name"))          snprintf(t->name, sizeof(t->name), "%s", val);
-        else if (!strcmp(key, "bg_top"))        t->bg_top = parse_color(val, t->bg_top);
-        else if (!strcmp(key, "bg_bottom"))     t->bg_bottom = parse_color(val, t->bg_bottom);
-        else if (!strcmp(key, "accent"))        t->accent = parse_color(val, t->accent);
-        else if (!strcmp(key, "glow"))          t->glow = parse_color(val, t->glow);
-        else if (!strcmp(key, "glow_strength")) t->glow_strength = parse_float(val, t->glow_strength);
-        else if (!strcmp(key, "panel"))         t->panel = parse_color(val, t->panel);
-        else if (!strcmp(key, "panel_border"))  t->panel_border = parse_color(val, t->panel_border);
-        else if (!strcmp(key, "text"))          t->text = parse_color(val, t->text);
-        else if (!strcmp(key, "text_dim"))      t->text_dim = parse_color(val, t->text_dim);
-        else if (!strcmp(key, "window_bg"))     t->window_bg = parse_color(val, t->window_bg);
-        else if (!strcmp(key, "window_border")) t->window_border = parse_color(val, t->window_border);
-        else if (!strcmp(key, "corner"))        t->corner = parse_float(val, t->corner);
-        else if (!strcmp(key, "blur"))          t->blur = parse_float(val, t->blur);
-        else if (!strcmp(key, "dark"))          t->dark = (int)parse_float(val, (float)t->dark);
+        char *val = eq + 1;
+        while (*val == ' ' || *val == '\t') val++;
+        /* A '#' after white space starts a comment; a '#' at the start of the
+         * value is the colour prefix, so "accent = #FF00FF # magenta" works. */
+        for (char *q = val; *q; q++) {
+            if (*q == '#' && q > val && (q[-1] == ' ' || q[-1] == '\t')) {
+                *q = 0;
+                break;
+            }
+        }
+        char *vend = val + strlen(val);
+        while (vend > val && (vend[-1] == ' ' || vend[-1] == '\t')) *--vend = 0;
+
+        int k = -1;
+        for (int i = 0; i < K_COUNT; i++)
+            if (!strcmp(key, key_name[i])) { k = i; break; }
+        if (k < 0) {
+            twarn_at(&src, NULL, "unknown key '%s', ignored (see docs/THEMES.md)",
+                     key);
+            continue;
+        }
+        if (seen & (1u << k))
+            twarn_at(&src, key, "appears more than once, the last value wins");
+        seen |= 1u << k;
+
+        switch (k) {
+        case K_NAME:
+            if (!val[0]) {
+                twarn_at(&src, key, "empty name, keeping '%s'", t->name);
+            } else {
+                if (strlen(val) >= sizeof t->name)
+                    twarn_at(&src, key, "name longer than %d bytes, truncated",
+                             (int)sizeof t->name - 1);
+                snprintf(t->name, sizeof t->name, "%s", val);
+            }
+            break;
+        case K_DARK:          set_flag(&src, key, val, &t->dark);          break;
+        case K_BG_TOP:        set_color(&src, key, val, &t->bg_top);       break;
+        case K_BG_BOTTOM:     set_color(&src, key, val, &t->bg_bottom);    break;
+        case K_ACCENT:        set_color(&src, key, val, &t->accent);       break;
+        case K_GLOW:          set_color(&src, key, val, &t->glow);         break;
+        case K_GLOW_STRENGTH:
+            set_num(&src, key, val, &t->glow_strength, 0.0f, 1.0f);
+            break;
+        case K_PANEL:         set_color(&src, key, val, &t->panel);        break;
+        case K_PANEL_BORDER:  set_color(&src, key, val, &t->panel_border); break;
+        case K_TEXT:          set_color(&src, key, val, &t->text);         break;
+        case K_TEXT_DIM:      set_color(&src, key, val, &t->text_dim);     break;
+        case K_WINDOW_BG:     set_color(&src, key, val, &t->window_bg);    break;
+        case K_WINDOW_BORDER: set_color(&src, key, val, &t->window_border);break;
+        case K_CORNER:        set_num(&src, key, val, &t->corner, 0.0f, 48.0f); break;
+        case K_BLUR:          set_num(&src, key, val, &t->blur, 0.0f, 1.0f);    break;
+        default: break;
+        }
     }
+
+    int read_error = ferror(f);
     fclose(f);
+    if (read_error) twarn_at(&src, NULL, "read error before end of file");
+
+    src.line = 0;
+    for (int i = 0; i < K_COUNT; i++) {
+        if (!(REQUIRED & (1u << i)) || (seen & (1u << i))) continue;
+        twarn_at(&src, key_name[i], "missing, keeping the built-in default");
+    }
 
     /* ----------------------------------------------------------------
      * A window body is the surface an app's pixels and text are drawn on,
@@ -124,31 +326,82 @@ static int cmp_str(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-/* Read every *.theme in a directory, in filename order so the numbering
- * in the filenames is the order the user sees. */
+/* Read every *.theme in a directory, in filename order so the numbering in
+ * the filenames is the order the user sees (and the order Ctrl+1..9 uses).
+ * A file that cannot be opened is reported and skipped; the slots after it
+ * are filled by the next file, so one unreadable theme does not blank the
+ * rest of the list. */
 int theme_load_all(Theme *list, int max, const char *dir) {
+    if (!list || !dir || max < 1) return 0;
+    if (max > THEME_MAX) {
+        fprintf(stderr, "theme: %s: asked for %d themes, the hard ceiling is "
+                        "%d\n", dir, max, THEME_MAX);
+        max = THEME_MAX;
+    }
+
     DIR *d = opendir(dir);
     if (!d) return 0;
 
-    char *names[64];
-    int count = 0;
+    char *names[THEME_SCAN_MAX];
+    int count = 0, too_many = 0;
     struct dirent *e;
-    while ((e = readdir(d)) && count < 64) {
+    while ((e = readdir(d))) {
         size_t len = strlen(e->d_name);
         if (len < 7 || strcmp(e->d_name + len - 6, ".theme")) continue;
-        names[count++] = strdup(e->d_name);
+        if (count == THEME_SCAN_MAX) { too_many = 1; break; }
+        names[count] = strdup(e->d_name);
+        if (!names[count]) break;          /* out of memory: keep what we have */
+        count++;
     }
     closedir(d);
+
     if (count == 0) return 0;
+    if (too_many)
+        fprintf(stderr, "theme: %s: more than %d theme files, the rest were "
+                        "ignored\n", dir, THEME_SCAN_MAX);
 
-    qsort(names, (size_t)count, sizeof(names[0]), cmp_str);
+    qsort(names, (size_t)count, sizeof names[0], cmp_str);
 
-    int n = 0;
-    for (int i = 0; i < count && n < max; i++) {
+    int n = 0, skipped = 0;
+    char lost[4][64];                  /* first few names, for the warning */
+    int lost_shown = 0;
+    for (int i = 0; i < count; i++) {
+        if (n >= max) {
+            if (lost_shown < 4) {
+                snprintf(lost[lost_shown], sizeof lost[0], "%s", names[i]);
+                lost_shown++;
+            }
+            skipped++;
+            free(names[i]);
+            continue;
+        }
+
         char path[700];
-        snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
-        if (theme_load(&list[n], path) == 0) n++;
+        int len = snprintf(path, sizeof path, "%s/%s", dir, names[i]);
+        if (len < 0 || (size_t)len >= sizeof path) {
+            fprintf(stderr, "theme: %s/%s: path too long, skipped\n",
+                    dir, names[i]);
+            free(names[i]);
+            continue;
+        }
+        int rc = theme_load(&list[n], path);
+        if (rc == 0) {
+            n++;
+        } else {
+            int err = errno;
+            fprintf(stderr, "theme: %s: cannot read (%s), skipped\n",
+                    path, strerror(err));
+        }
         free(names[i]);
+    }
+
+    if (skipped > 0) {
+        fprintf(stderr, "theme: %s: %d of %d theme file(s) not loaded - the "
+                        "caller only has %d slots (raise the Theme array, see "
+                        "docs/THEMES.md):", dir, skipped, count, max);
+        for (int i = 0; i < lost_shown; i++) fprintf(stderr, " %s", lost[i]);
+        if (skipped > lost_shown) fprintf(stderr, " and %d more", skipped - lost_shown);
+        fputc('\n', stderr);
     }
     return n;
 }
