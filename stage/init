@@ -8,21 +8,30 @@
 #
 #  probe mode exists so the build can verify the OS without a
 #  human watching a screen:   ./image.sh probe
+#
+#  /dev/vda is either a dm-crypt volume with ext4 inside it
+#  (docs/ENCRYPTION.md, tools/mkenc.sh) or a plain ext4 made by
+#  an older build. Both boot; the messages say which one it is.
 # ============================================================
 
-/bin/mount -t proc     none /proc
-/bin/mount -t sysfs    none /sys
-/bin/mount -t devtmpfs none /dev
-# pty support: without devpts forkpty() cannot open the slave side
-mkdir -p /dev/pts
-/bin/mount -t devpts none /dev/pts 2>/dev/null
-/bin/hostname mystic
-export PATH=/sbin:/usr/sbin:/bin:/usr/bin
-mkdir -p /root /run/mystic /tmp /var/log /dev/shm 2>/dev/null
-# shared memory for the display protocol
-/bin/mount -t tmpfs none /dev/shm 2>/dev/null
-
-KV=$(uname -r)
+# ------------------------------------------------------------
+# Pseudo-filesystems. Separated from the boot body so the disk
+# logic below can be sourced by tools/mkenc.sh's simulation
+# without mounting anything on the build machine.
+# ------------------------------------------------------------
+mount_pseudo() {
+    /bin/mount -t proc     none /proc
+    /bin/mount -t sysfs    none /sys
+    /bin/mount -t devtmpfs none /dev
+    # pty support: without devpts forkpty() cannot open the slave side
+    mkdir -p /dev/pts
+    /bin/mount -t devpts none /dev/pts 2>/dev/null
+    /bin/hostname mystic
+    export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+    mkdir -p /root /run/mystic /tmp /var/log /dev/shm 2>/dev/null
+    # shared memory for the display protocol
+    /bin/mount -t tmpfs none /dev/shm 2>/dev/null
+}
 
 # ------------------------------------------------------------
 # Drivers. Alpine ships them as modules, so the first thing
@@ -39,11 +48,6 @@ load_modules() {
     done
 }
 
-# The disk is a real block device. On first boot it has no filesystem,
-# so we make one - after that we just mount it. Everything in /root then
-# survives a reboot, which is the difference between a demo and an OS.
-# Bring up the first network interface and get a DHCP lease. Written only
-# if an interface exists, so a machine without one still boots.
 setup_net() {
     [ -d /sys/class/net/eth0 ] || { echo "net: no eth0"; return 0; }
     ip link set eth0 up 2>/dev/null
@@ -78,11 +82,147 @@ save_settings() {
     sync
 }
 
-setup_disk() {
-    [ -b /dev/vda ] || { echo "disk: no /dev/vda"; return 0; }
-    mkdir -p /root
-    if mount -t ext4 /dev/vda /root 2>/dev/null; then
-        echo "disk: mounted /dev/vda (ext4) on /root"
+# ============================================================
+#  Disk: dm-crypt + ext4
+#
+#  The kernel side is CONFIG_BLK_DEV_DM=m + CONFIG_DM_CRYPT=m
+#  (verified in build/cache/linux-virt-*/boot/config-*), with
+#  aes and xts built in, so no crypto module is needed. The
+#  userspace side is stage/sbin/mystic-dmcrypt, a static musl
+#  binary that speaks the dm-ioctl ABI directly - no dmsetup,
+#  no libdevmapper, no libcryptsetup. tools/mkenc.sh builds it,
+#  stages the two modules and creates the key file.
+#
+#  Nothing below invents a fact: every branch either reads a
+#  header written by mystic-dmcrypt or takes the same path this
+#  script took before encryption existed.
+# ============================================================
+CRYPT_DEV=${MYSTIC_DISK:-/dev/vda}
+CRYPT_NAME=${MYSTIC_MAP:-mystic-root}
+CRYPT_KEY=${MYSTIC_KEY:-/etc/mystic/luks.key}
+CRYPT_HELPER=${MYSTIC_DMCRYPT:-/sbin/mystic-dmcrypt}
+CRYPT_MAP=/dev/mapper/$CRYPT_NAME
+DM_CONTROL=${MYSTIC_DM_CONTROL:-/dev/mapper/control}
+MKFS=${MYSTIC_MKFS:-/sbin/mkfs.ext4}
+CRYPT_LOG=${MYSTIC_CRYPT_LOG:-/tmp/crypt.log}
+CRYPT_STATUS=none
+
+disk_present() { [ -b "$CRYPT_DEV" ]; }
+
+# ext4 in the image is the only mkfs we have. $MYSTIC_MKFS exists so
+# tools/mkenc.sh can point the boot-path simulation at a fake one.
+mkfs_ext4() {
+    [ -x "$MKFS" ] || { echo "disk: no mkfs.ext4 in the image"; return 1; }
+    "$MKFS" -q -F "$1" >/dev/null 2>&1
+}
+
+# dm_mod creates /dev/mapper/control when it registers; devtmpfs normally
+# creates the node itself, but a module loaded before devtmpfs would not.
+crypt_modules() {
+    command -v modprobe >/dev/null 2>&1 && modprobe dm_mod 2>/dev/null
+    command -v modprobe >/dev/null 2>&1 && modprobe dm_crypt 2>/dev/null
+    [ -e "$DM_CONTROL" ] && return 0
+    [ -d "$(dirname "$DM_CONTROL")" ] || mkdir -p "$(dirname "$DM_CONTROL")" 2>/dev/null
+    [ -e "$DM_CONTROL" ]
+}
+
+# prints one of:
+#   "crypt <version> <fingerprint>"  our header, dm-crypt loaded, ready
+#   "locked:<reason>"                our header, but it cannot be opened now
+#   blank                            first 4 KiB of the device is zero
+#   foreign                          something else is on it
+#   "unavailable:<reason>"           no helper, so nothing can be known
+#   error                            the device could not be read
+# A disk carrying our header is NEVER handed to the plain path: a failed
+# module load must not turn into mkfs.ext4 over an encrypted volume.
+crypt_state() {
+    if [ ! -x "$CRYPT_HELPER" ]; then
+        echo "unavailable:no $CRYPT_HELPER in the image"
+        return 0
+    fi
+    probe_out=$("$CRYPT_HELPER" probe "$CRYPT_DEV" 2>/dev/null)
+    probe_rc=$?
+    case "$probe_rc" in
+        0)
+            if crypt_modules; then
+                echo "$probe_out"
+            else
+                echo "locked:dm_mod/dm_crypt did not load"
+            fi
+            ;;
+        10)
+            if crypt_modules; then
+                echo blank
+            else
+                echo "unavailable:dm_mod/dm_crypt did not load"
+            fi
+            ;;
+        11) echo foreign ;;
+        *)  echo error ;;
+    esac
+}
+
+show_log() {   # show_log <indent> < file
+    while read -r line; do
+        [ -n "$line" ] && echo "$1$line"
+    done
+}
+
+# Open an existing volume and mount it. $1 is the header fingerprint.
+crypt_mount() {
+    if ! "$CRYPT_HELPER" attach "$CRYPT_NAME" "$CRYPT_DEV" "$CRYPT_KEY" >"$CRYPT_LOG" 2>&1; then
+        echo "disk: encrypted, but the key did not unlock it - $CRYPT_DEV is left untouched"
+        show_log "  " < "$CRYPT_LOG"
+        CRYPT_STATUS="locked (key does not match)"
+        return 1
+    fi
+    show_log "crypt: " < "$CRYPT_LOG"
+    if mount -t ext4 "$CRYPT_MAP" /root 2>/dev/null; then
+        echo "disk: dm-crypt unlocked, formatted ext4 mounted on /root"
+        echo "crypt: aes-xts-plain64, key fingerprint $1"
+        CRYPT_STATUS="aes-xts-plain64, key $1"
+        return 0
+    fi
+    echo "disk: dm-crypt unlocked, no ext4 inside - creating one"
+    mkfs_ext4 "$CRYPT_MAP"
+    if mount -t ext4 "$CRYPT_MAP" /root 2>/dev/null; then
+        chmod 755 /root
+        echo "disk: formatted ext4 inside dm-crypt and mounted on /root"
+        echo "crypt: aes-xts-plain64, key fingerprint $1"
+        CRYPT_STATUS="aes-xts-plain64, key $1"
+        return 0
+    fi
+    echo "disk: could not mount the dm-crypt volume"
+    CRYPT_STATUS="unlocked but not mounted"
+    return 1
+}
+
+# First boot: write the MYSTICC1 header, then open it. Only ever called on a
+# device whose first 4 KiB is zero, so no data can be lost here.
+crypt_create() {
+    if [ ! -f "$CRYPT_KEY" ]; then
+        echo "disk: no encryption key at $CRYPT_KEY - using plain ext4"
+        setup_plain_disk
+        return 0
+    fi
+    if ! "$CRYPT_HELPER" init "$CRYPT_DEV" "$CRYPT_KEY" >"$CRYPT_LOG" 2>&1; then
+        echo "disk: could not create the encrypted volume - using plain ext4"
+        show_log "  " < "$CRYPT_LOG"
+        setup_plain_disk
+        return 0
+    fi
+    show_log "crypt: " < "$CRYPT_LOG"
+    echo "disk: created dm-crypt volume on $CRYPT_DEV (aes-xts-plain64)"
+    probe_out=$("$CRYPT_HELPER" probe "$CRYPT_DEV" 2>/dev/null)
+    crypt_mount "${probe_out##* }"
+}
+
+# The pre-encryption behaviour, unchanged: mount what is there, otherwise
+# format it. Used for a plain ext4 disk and when dm-crypt is unavailable.
+setup_plain_disk() {
+    if mount -t ext4 "$CRYPT_DEV" /root 2>/dev/null; then
+        echo "disk: mounted $CRYPT_DEV (ext4) on /root"
+        CRYPT_STATUS="none (plain ext4)"
         return 0
     fi
 # KNOWN RISK (tracked in docs/CONTEXT-DUMP.md): this formats whenever the mount
@@ -90,18 +230,52 @@ setup_disk() {
 # loaded late, a busy device, a different filesystem. A safer version detected
 # ext4 by its superblock magic first, but mkfs then failed to mount on a fresh
 # disk, so it was reverted rather than left half-working.
-    echo "disk: /dev/vda did not mount, creating ext4 filesystem"
-    if [ -x /sbin/mkfs.ext4 ]; then
-        /sbin/mkfs.ext4 -q -F /dev/vda >/dev/null 2>&1
-    else
-        echo "disk: no mkfs.ext4 in the image"
-    fi
-    if mount -t ext4 /dev/vda /root 2>/dev/null; then
+    echo "disk: $CRYPT_DEV did not mount, creating ext4 filesystem"
+    mkfs_ext4 "$CRYPT_DEV"
+    if mount -t ext4 "$CRYPT_DEV" /root 2>/dev/null; then
         chmod 755 /root
         echo "disk: formatted ext4 and mounted on /root"
-    else
-        echo "disk: could not mount"
+        CRYPT_STATUS="none (plain ext4)"
+        return 0
     fi
+    echo "disk: could not mount"
+    return 1
+}
+
+setup_disk() {
+    disk_present || { echo "disk: no $CRYPT_DEV"; return 0; }
+    mkdir -p /root
+
+    crypt_state_out=$(crypt_state)
+    case "$crypt_state_out" in
+        crypt*)
+            crypt_mount "${crypt_state_out##* }"
+            return 0
+            ;;
+        locked:*)
+            # The header is there, so the data is encrypted. Formatting here
+            # would destroy it; leaving /root unmounted keeps the system up.
+            echo "disk: $CRYPT_DEV is encrypted but cannot be opened - ${crypt_state_out#locked:}"
+            echo "disk: refusing to format it, /root stays on the RAM filesystem"
+            CRYPT_STATUS="locked (${crypt_state_out#locked:})"
+            return 0
+            ;;
+        blank)
+            crypt_create
+            return 0
+            ;;
+        unavailable:*)
+            echo "disk: dm-crypt unavailable - ${crypt_state_out#unavailable:}"
+            ;;
+        foreign)
+            echo "disk: $CRYPT_DEV has no encryption header and is not blank"
+            ;;
+        *)
+            echo "disk: could not read $CRYPT_DEV"
+            ;;
+    esac
+    setup_plain_disk
+    return 0
 }
 
 probe() {
@@ -109,6 +283,7 @@ probe() {
     echo "kernel   : $(uname -r)"
     echo "uptime   : $(cut -d' ' -f1 /proc/uptime)s"
     echo "memory   : $(awk '/MemTotal/{printf "%d MB", $2/1024}' /proc/meminfo)"
+    echo "crypt    : $CRYPT_STATUS"
 
     echo "modules  : $(awk '{print $1}' /proc/modules | tr '\n' ' ')"
 
@@ -170,6 +345,18 @@ probe() {
     echo "--- end probe ---"
 }
 
+# ============================================================
+#  Boot. Everything below runs only when this file is PID 1.
+#  tools/mkenc.sh sources it with MYSTIC_INIT_LIB=1 to exercise
+#  the disk branches against a fake /dev, a fake mount and a
+#  host build of mystic-dmcrypt (see ./tools/mkenc.sh test).
+# ============================================================
+if [ "${MYSTIC_INIT_LIB:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+KV=$(uname -r)
+mount_pseudo
 load_modules
 setup_net
 setup_disk

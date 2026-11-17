@@ -371,8 +371,12 @@ listed here is visible in the source tree:
   says "no CSS and no images").
 - **The browser is plain HTTP only**: no HTTPS, no JavaScript, no CSS, no
   images, no video. It reflows HTML to text and numbers links.
-- **Packages are checksum-verified but not signed.** SHA-256 catches a corrupt
-  or truncated download; it does not prove who published it.
+- **Packages are signed, and the key ships with the image.** The repository
+  index is Ed25519-signed and checked against `/etc/mystic/repo.pub` before a
+  single row is read; every tarball is then checked against the sha256 in that
+  signed index and refused on a mismatch. This stops a hostile network or
+  mirror, but not an attacker who can rewrite the boot image and replace the
+  key with it - there is no secure-boot chain. See `docs/SIGNING.md`.
 - **It is a QEMU bundle, not an ISO.** There is no bootloader image, no
   partitioning step and no bare-metal installer. `run.sh` boots the kernel
   directly with `-kernel`/`-initrd`.

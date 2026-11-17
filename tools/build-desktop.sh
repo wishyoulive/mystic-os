@@ -23,7 +23,7 @@ fi
 echo "==> compiler: $ZIG ($("$ZIG" version))"
 
 SRC="src/main.c src/apps.c src/term.c src/sha256.c src/wmsrv.c src/ui.c src/wallpaper.c src/gfx.c src/font.c src/fb.c src/input.c src/theme.c"
-SRC="$SRC src/apps/sysinfo.c"
+SRC="$SRC src/apps/sysinfo.c src/notify.c src/clipboard.c"
 DEFS=""
 for app in files settings monitor notes store calc; do
     if [ -f "src/apps/$app.c" ]; then
@@ -50,5 +50,15 @@ echo "    $size  $(wc -l < /dev/null 2>/dev/null)$OUT"
 cp "$OUT" stage/usr/bin/mystic-desktop
 chmod +x stage/usr/bin/mystic-desktop
 cp assets/fonts/*.ttf assets/fonts/LICENSE.txt stage/usr/share/fonts/ 2>/dev/null || true
+
+# ---- the repository signature verifier ------------------------------
+# pkg will not read a package index it cannot authenticate, so this
+# binary ships in the image. It is static, has no dependencies, and
+# implements Ed25519 verification from src/tools/ed25519.c.
+echo "==> compiling ed25519-verify"
+"$ZIG" cc -target x86_64-linux-musl -Os -static -Wall -Wextra \
+    -Wno-unused-parameter -o build/ed25519-verify src/tools/ed25519.c
+cp build/ed25519-verify stage/usr/bin/ed25519-verify
+chmod +x stage/usr/bin/ed25519-verify
 
 echo "==> installed into stage/usr/bin + stage/usr/share/fonts"

@@ -12,6 +12,7 @@ build/
 .github/workflows/
 # build outputs: never commit binaries or downloaded modules
 stage/usr/bin/mystic-desktop
+stage/usr/bin/ed25519-verify
 stage/usr/share/mystic/apps/*/bin
 stage/lib/modules/
 stage/usr/share/fonts/*.ttf
