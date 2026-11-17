@@ -48,6 +48,7 @@ typedef struct {
     int   rxlen;
 
     int   w, h, stride;
+    int   maxw, maxh;      /* the buffer is this big; w/h is the window */
     char  shm_path[96];
     int   shm_fd;
     u32  *px;
@@ -68,6 +69,9 @@ typedef struct {
                         * and give the jail a resolv.conf so lookups work */
 } WmApp;
 
+/* Tell the server how big the screen is, so a client buffer can be allocated
+ * at full size: a window that is maximised needs somewhere to grow into. */
+void wms_set_screen(int w, int h);
 int  wms_start(void);                              /* listen on WM_SOCKET */
 void wms_poll(WmClient *c, int n);                  /* accept + read */
 void wms_notify_key(WmClient *c, int key, int mods, int press);

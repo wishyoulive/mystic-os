@@ -1310,6 +1310,7 @@ int dot_y = traffic_y(tb);
 /* ------------------------------------------------------------ main */
 int main(void) {
     install_fatal_handlers();
+    wms_set_screen(disp.w, disp.h);   /* client buffers are screen sized */
     if (disp_open(&disp, "/dev/fb0") < 0) return 1;
     /* the text scale must be known before the first font is requested */
     ui_scale_load("/etc/mystic/ui.conf");
