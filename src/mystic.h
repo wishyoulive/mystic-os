@@ -86,6 +86,9 @@ typedef struct {
     int   clicked, released;
     int   wheel;
     int   key;              /* last key code, 0 if none */
+    int   shift;            /* shift held on the last key event */
+    int   alt;              /* alt held on the last key event */
+    int   ctrl;             /* ctrl held on the last key event */
     int   key_pressed;      /* 0/1 */
     char  text[32];         /* printable chars typed this frame */
     int   text_len;
@@ -197,6 +200,18 @@ void  term_key(Term *t, const char *bytes, int n);
 void  term_clear_screen(Term *t);
 void  term_draw(Term *t, Surface *s, int x, int y, int w, int h,
                 Font *fr, float cw, float ch);
+void  term_scroll(Term *t, int lines);   /* positive = back in history */
+int   term_scroll_offset(Term *t);
 
 /* ------------------------------------------------------------ */
+/* ------------------------------------------------------------
+ * SHA-256 and the password file
+ * ------------------------------------------------------------ */
+void sha256(const void *data, size_t len, u8 out[32]);
+void mystic_hash_password(const u8 *salt, int salt_len, const char *password,
+                          int rounds, u8 out[32]);
+int  mystic_check_password(const char *line, const char *password);
+void mystic_make_password_line(const u8 *salt, int salt_len, const char *password,
+                               int rounds, char *out, size_t outsz);
+
 #endif /* MYSTIC_H */

@@ -122,11 +122,17 @@ static void handle_event(Input *in, struct input_event *ev, int *shift, int *ctr
                 else                { in->buttons &= ~bit; in->released |= bit; }
             } else if (ev->code == KEY_LEFTSHIFT || ev->code == KEY_RIGHTSHIFT) {
                 *shift = ev->value;
+                in->shift = ev->value;
             } else if (ev->code == KEY_LEFTCTRL || ev->code == KEY_RIGHTCTRL) {
                 *ctrl = ev->value;
+                in->ctrl = ev->value;
+            } else if (ev->code == KEY_LEFTALT || ev->code == KEY_RIGHTALT) {
+                in->alt = ev->value;
             } else {
                 if (ev->value == 1) {
                     in->key = ev->code;
+                    in->shift = *shift;
+                    in->ctrl = *ctrl;
                     in->key_pressed = 1;
                     int ch = key_to_char(ev->code, *shift);
                     /* Ctrl+letter is a control code: Ctrl+S is 0x13 */

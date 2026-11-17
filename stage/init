@@ -32,7 +32,7 @@ load_modules() {
     depmod -a "$KV" 2>/dev/null
     for m in drm drm_kms_helper ttm drm_ttm_helper drm_vram_helper \
              drm_shmem_helper drm_client_lib fb_sys_fops sysimgblt sysfillrect \
-             bochs virtio-gpu evdev psmouse              virtio_blk fat vfat nls_cp437 nls_iso8859-1; do
+             bochs virtio-gpu evdev psmouse              virtio_blk crc16 mbcache jbd2 ext4 fat vfat nls_cp437 nls_iso8859-1; do
         modprobe "$m" 2>/dev/null
     done
 }
@@ -43,14 +43,19 @@ load_modules() {
 setup_disk() {
     [ -b /dev/vda ] || { echo "disk: no /dev/vda"; return 0; }
     mkdir -p /root
-    if mount -t vfat /dev/vda /root 2>/dev/null; then
-        echo "disk: mounted /dev/vda on /root"
+    if mount -t ext4 /dev/vda /root 2>/dev/null; then
+        echo "disk: mounted /dev/vda (ext4) on /root"
         return 0
     fi
-    echo "disk: /dev/vda is unformatted, creating FAT filesystem"
-    mkfs.vfat /dev/vda >/dev/null 2>&1
-    if mount -t vfat /dev/vda /root 2>/dev/null; then
-        echo "disk: formatted and mounted on /root"
+    echo "disk: /dev/vda is unformatted, creating ext4 filesystem"
+    if [ -x /sbin/mkfs.ext4 ]; then
+        /sbin/mkfs.ext4 -q -F /dev/vda >/dev/null 2>&1
+    else
+        echo "disk: no mkfs.ext4 in the image"
+    fi
+    if mount -t ext4 /dev/vda /root 2>/dev/null; then
+        chmod 755 /root
+        echo "disk: formatted ext4 and mounted on /root"
     else
         echo "disk: could not mount"
     fi
@@ -88,6 +93,10 @@ probe() {
         n=$((n + 1))
         echo "$n" > /root/boots.txt
         echo "disk     : mounted, boot counter now $n"
+        touch /root/permtest
+        chmod 600 /root/permtest
+        chown 1000:1000 /root/permtest 2>/dev/null
+        echo "perms    : $(ls -l /root/permtest | tr -s ' ' | cut -d' ' -f1,3,4)"
         echo "          files: $(ls /root | tr '
 ' ' ')"
         sync
