@@ -99,7 +99,7 @@ docs/             CONTEXT-DUMP.md is the state of the world; read that first
 | Idle RAM | under 128 MB | ~62 MB idle, ~175 MB with the desktop and a browser |
 | Boot to desktop | under 2 s | 0.9 s in a VM |
 | Apps | Linux native, Windows via Wine | Linux native yes, Wine in progress |
-| Security | sandbox, signed packages, disk encryption | sandbox yes; signing and encryption next |
+| Security | sandbox, signed packages, disk encryption | sandbox yes; signed packages yes (`pkg` verifies an Ed25519 index signature, see `docs/SIGNING.md`); disk encryption next |
 
 ## Rules this project keeps
 

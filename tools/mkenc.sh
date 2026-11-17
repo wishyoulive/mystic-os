@@ -75,12 +75,12 @@ KO_DST=$STAGE/lib/modules/$KVER
 #  1. kernel modules
 # ====================================================================
 stage_modules() {
-    [ -n "$KO_SRC" ] || die "no unpacked kernel package in $CACHE - run ./tools/fetch-kernel.sh first"
     local n=0 rel src out
     for rel in $MODULES; do
         src=$KO_SRC/$rel.gz
         out=$KO_DST/$rel
         if [ ! -f "$out" ]; then
+            [ -n "$KO_SRC" ] || die "no unpacked kernel package in $CACHE - run ./tools/fetch-kernel.sh first"
             [ -f "$src" ] || die "missing $src (kernel package is incomplete)"
             mkdir -p "$(dirname "$out")"
             gzip -dc "$src" > "$out" || die "cannot decompress $src"
@@ -1273,7 +1273,7 @@ verify() {
 # ====================================================================
 cmd_status() {
     HOST=$(build_host_helper)
-    trap 'rm -f "$HOST"' EXIT
+    trap 'rm -f "$HOST" "${HOST%.exe}.pdb"' EXIT
     printf 'kernel modules : %s\n' "$KO_DST"
     for f in $MODULES; do
         [ -f "$KO_DST/$f" ] && printf '  present      : %s\n' "${f#kernel/}" \
@@ -1322,7 +1322,7 @@ cmd_status() {
 cmd_key() {
     [ -f "$STAGE/etc/mystic/luks.key" ] || die "no key yet - run ./tools/mkenc.sh"
     HOST=$(build_host_helper)
-    trap 'rm -f "$HOST"' EXIT
+    trap 'rm -f "$HOST" "${HOST%.exe}.pdb"' EXIT
     printf 'file        : %s\n' "$STAGE/etc/mystic/luks.key"
     printf 'length      : %s bytes\n' "$(wc -c < "$STAGE/etc/mystic/luks.key" | tr -d ' ')"
     printf 'fingerprint : %s\n' "$(key_fingerprint)"
@@ -1332,7 +1332,7 @@ cmd_key() {
 cmd_new_key() {
     [ -f "$STAGE/etc/mystic/luks.key" ] || die "no key yet - run ./tools/mkenc.sh"
     HOST=$(build_host_helper)
-    trap 'rm -f "$HOST"' EXIT
+    trap 'rm -f "$HOST" "${HOST%.exe}.pdb"' EXIT
     stamp=$(date -u +%Y%m%dT%H%M%SZ)
     mkdir -p "$WORK"
     mv "$STAGE/etc/mystic/luks.key" "$WORK/luks.key.$stamp"
@@ -1366,7 +1366,7 @@ cmd_reset_disk() {
 # script decides before those ioctls is covered.
 cmd_test() {
     HOST=$(build_host_helper)
-    trap 'rm -f "$HOST"' EXIT
+    trap 'rm -f "$HOST" "${HOST%.exe}.pdb"' EXIT
     say "selftest of the host build (hash vectors, table string, header codec)"
     "$HOST" selftest || die "host selftest failed"
     SIM=$WORK/sim
@@ -1646,7 +1646,7 @@ cmd_stage() {
     stage_modules
     build_helper
     HOST=$(build_host_helper)
-    trap 'rm -f "$HOST"' EXIT
+    trap 'rm -f "$HOST" "${HOST%.exe}.pdb"' EXIT
     say "selftest of the same code on this machine"
     "$HOST" selftest || die "selftest failed"
     stage_key

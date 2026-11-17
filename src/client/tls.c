@@ -15096,7 +15096,11 @@ static const char *br_error_text(int e, const char *host, char *buf, size_t sz) 
         case BR_ERR_X509_EXPIRED:
             return "the server's certificate has expired or is not valid yet";
         case BR_ERR_X509_NOT_TRUSTED:
-            return "the server's certificate is not signed by a trusted root in /etc/ssl/certs/ca-bundle.crt";
+            /* Name the store actually in use: $MYSTIC_CA_BUNDLE can point
+             * somewhere else, and a message naming the wrong file is a lie. */
+            snprintf(buf, sz, "the server's certificate is not signed by a trusted root in %s",
+                     (g_trust_path[0] ? g_trust_path : TLS_CA_PATHS[0]));
+            return buf;
         case BR_ERR_X509_BAD_SIGNATURE:
             return "a certificate in the server's chain has an invalid signature";
         case BR_ERR_X509_WRONG_KEY_TYPE:

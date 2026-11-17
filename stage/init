@@ -119,8 +119,12 @@ mkfs_ext4() {
 # dm_mod creates /dev/mapper/control when it registers; devtmpfs normally
 # creates the node itself, but a module loaded before devtmpfs would not.
 crypt_modules() {
-    command -v modprobe >/dev/null 2>&1 && modprobe dm_mod 2>/dev/null
-    command -v modprobe >/dev/null 2>&1 && modprobe dm_crypt 2>/dev/null
+    # dm-mod.ko is the file, dm_mod the module: busybox modprobe accepts
+    # either spelling, and this script does not get to pick which one.
+    if command -v modprobe >/dev/null 2>&1; then
+        modprobe dm-mod 2>/dev/null || modprobe dm_mod 2>/dev/null
+        modprobe dm-crypt 2>/dev/null || modprobe dm_crypt 2>/dev/null
+    fi
     [ -e "$DM_CONTROL" ] && return 0
     [ -d "$(dirname "$DM_CONTROL")" ] || mkdir -p "$(dirname "$DM_CONTROL")" 2>/dev/null
     [ -e "$DM_CONTROL" ]
@@ -269,6 +273,7 @@ setup_disk() {
             ;;
         foreign)
             echo "disk: $CRYPT_DEV has no encryption header and is not blank"
+            echo "disk: to switch to an encrypted volume run ./tools/mkenc.sh reset-disk"
             ;;
         *)
             echo "disk: could not read $CRYPT_DEV"
