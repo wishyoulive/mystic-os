@@ -131,6 +131,8 @@ static void handle_event(Input *in, struct input_event *ev, int *shift, int *ctr
             } else {
                 if (ev->value == 1) {
                     in->key = ev->code;
+                    if (in->nkeys < (int)(sizeof(in->keys) / sizeof(in->keys[0])))
+                        in->keys[in->nkeys++] = ev->code;
                     in->shift = *shift;
                     in->ctrl = *ctrl;
                     in->key_pressed = 1;
@@ -177,6 +179,7 @@ void input_frame(Input *in) {
     in->wheel = 0;
     in->key = 0;
     in->key_pressed = 0;
+    in->nkeys = 0;
     in->mouse_dx = 0;
     in->mouse_dy = 0;
     in->text_len = 0;

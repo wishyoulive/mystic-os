@@ -86,6 +86,8 @@ typedef struct {
     int   clicked, released;
     int   wheel;
     int   key;              /* last key code, 0 if none */
+    int   keys[16];         /* every key pressed this frame, in order */
+    int   nkeys;
     int   shift;            /* shift held on the last key event */
     int   alt;              /* alt held on the last key event */
     int   ctrl;             /* ctrl held on the last key event */
