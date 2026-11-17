@@ -1,0 +1,3 @@
+name = Paint
+desc = Draw with the mouse. Runs as its own process.
+exec = bin

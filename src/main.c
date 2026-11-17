@@ -53,6 +53,7 @@ static int    z_top;
 static int    drag_win = -1, drag_dx, drag_dy;
 static int    resize_win = -1;
 static int    launcher_open = 0;
+static int    launcher_sel = 0;
 
 static WmClient clients[WM_MAX_CLIENTS];
 static WmApp   bundles[WM_MAX_APPS];
@@ -219,6 +220,7 @@ static void dock_rect(int *dx, int *dy, int *dw, int *dh) {
 }
 
 static void draw_launcher(Surface *s, const Theme *th);
+static int  launcher_items(void);
 static void draw_lock_screen(Surface *s, const Theme *th);
 
 /* ------------------------------------------------------------ start button
@@ -472,7 +474,12 @@ static void draw_desktop(Surface *s, const Theme *th) {
             gfx_rrect_aa(s, ix + (float)isz / 2 - 2, iy + (float)isz + 3, 4, 4, 2, th->accent, 0, 0);
     }
 
-    if (launcher_open) draw_launcher(s, th);
+    if (launcher_open) {
+        int total = launcher_items();
+        if (launcher_sel >= total) launcher_sel = total > 0 ? total - 1 : 0;
+        if (launcher_sel < 0) launcher_sel = 0;
+        draw_launcher(s, th);
+    }
     if (locked) draw_lock_screen(s, th);
 }
 
@@ -538,8 +545,11 @@ static void draw_launcher(Surface *s, const Theme *th) {
         launcher_geom(i, &tx, &ty, &tw, &th2);
         int hovered = (input.mouse_x >= tx && input.mouse_x < tx + tw &&
                        input.mouse_y >= ty && input.mouse_y < ty + th2);
-        u32 bg = hovered ? color_alpha(th->accent, 0.22f) : color_alpha(th->text, 0.06f);
-        gfx_rrect_aa(s, (float)tx, (float)ty, (float)tw, (float)th2, 14.0f, bg, 0, 0);
+        int selected = launcher_open && (i == launcher_sel);
+        u32 bg = (hovered || selected) ? color_alpha(th->accent, selected ? 0.30f : 0.22f)
+                                       : color_alpha(th->text, 0.06f);
+        gfx_rrect_aa(s, (float)tx, (float)ty, (float)tw, (float)th2, 14.0f, bg,
+                     selected ? th->accent : 0, selected ? 1.5f : 0.0f);
 
         float isz = 52;
         const char *label;
@@ -550,9 +560,18 @@ static void draw_launcher(Surface *s, const Theme *th) {
         } else {
             /* an installed bundle: a real program from /usr/share/mystic/apps */
             int b = i - LAUNCHER_N;
-            icon_gear(s, (float)tx + (tw - isz) / 2, (float)ty + 18, isz,
-                      hovered ? th->accent : th->text);
             label = (b >= 0 && b < bundle_count) ? bundles[b].name : "?";
+            /* an installed app gets its initial in a tile: one glyph, read
+             * from its manifest name, so each app is distinguishable */
+            u32 tile_bg = hovered ? color_alpha(th->accent, 0.34f)
+                                  : color_alpha(th->text, 0.10f);
+            gfx_rrect_aa(s, (float)tx + (tw - isz) / 2, (float)ty + 18, isz, isz, 12,
+                         tile_bg, 0, 0);
+            char initial[2] = { (char)(label && label[0] ? label[0] : '?'), 0 };
+            Font *fi = font_get(FONT_SEMIBOLD, 26);
+            float iw2 = font_width(fi, initial);
+            font_draw(s, fi, (float)tx + (tw - iw2) / 2, (float)ty + 28, initial,
+                      hovered ? th->accent : th->text);
         }
 
         float lw = font_width(f12, label);
@@ -653,9 +672,9 @@ static void draw_cursor_at(Surface *s, int x, int y) {
 }
 
 /* ------------------------------------------------------------ input routing */
-static void key_bytes(char *out, int *n) {
+static void key_bytes_for(int code, char *out, int *n) {
     *n = 0;
-    switch (input.key) {
+    switch (code) {
         case 103: out[(*n)++] = 0x1B; out[(*n)++] = '['; out[(*n)++] = 'A'; return;   /* up */
         case 108: out[(*n)++] = 0x1B; out[(*n)++] = '['; out[(*n)++] = 'B'; return;   /* down */
         case 106: out[(*n)++] = 0x1B; out[(*n)++] = '['; out[(*n)++] = 'C'; return;   /* right */
@@ -730,7 +749,12 @@ static int handle_click(void) {
             return 1;
         }
         /* body */
-        if (hit->app) app_click(hit->app, lx - 1, ly - tb - 1, input.buttons);
+        if (hit->app) {
+            app_click(hit->app, lx - 1, ly - tb - 1, input.buttons);
+        } else if (hit->kind == WIN_CLIENT && hit->client >= 0) {
+            WmClient *cl = &clients[hit->client];
+            if (cl->used) wms_notify_mouse(cl, lx - 1, ly - tb - 1, input.buttons);
+        }
         return 1;
     }
 
@@ -823,7 +847,7 @@ int main(void) {
             }
         }
 
-        /* global keys */
+        /* theme keys arrive as text, so they are handled once per frame */
         for (int i = 0; i < input.text_len; i++) {
             char c = input.text[i];
             if (c >= '1' && c <= '9') {
@@ -831,84 +855,129 @@ int main(void) {
                 if (idx < theme_count) { theme_index = idx; dirty = 1; }
             }
         }
-        if (input.key == 125) {                 /* Super toggles the launcher */
-            launcher_open = !launcher_open;
-            dirty = 1;
-        } else if (launcher_open && input.key == 1) {   /* Esc closes it */
-            launcher_open = 0;
-            dirty = 1;
-        }
 
-        /* Alt+Tab cycles the window stack */
-        if (input.alt && input.key == 15 && z_top > 0) {          /* KEY_TAB */
-            Window *cur = win_top();
-            Window *next = NULL;
-            if (cur) {
-                int best = -1;
-                for (int i = 0; i < MAX_WINDOWS; i++) {
-                    if (!wins[i].used || &wins[i] == cur) continue;
-                    if (wins[i].z > best) { best = wins[i].z; next = &wins[i]; }
+        /* Every key pressed this frame, in order. Handling only the last one
+         * collapsed fast bursts: five arrow presses registered as one. */
+        for (int ki = 0; ki < input.nkeys; ki++) {
+            int k = input.keys[ki];
+
+            if (input.ctrl && input.alt && k == 38) {        /* Ctrl+Alt+L */
+                locked = 1;
+                pin_len = 0;
+                pin[0] = 0;
+                lock_msg[0] = 0;
+                input.text_len = 0;      /* the 'l' arrives as a control char */
+                dirty = 1;
+                continue;
+            }
+
+            if (k == 125) {                  /* Super toggles the launcher */
+                launcher_open = !launcher_open;
+                dirty = 1;
+                continue;
+            }
+
+            if (launcher_open) {
+                if (k == 1) { launcher_open = 0; dirty = 1; continue; }
+                if (k == 105 || k == 106 || k == 103 || k == 108) {
+                    int cols = 3, total = launcher_items(), step = 0;
+                    if (k == 105) step = -1;
+                    if (k == 106) step = 1;
+                    if (k == 103) step = -cols;
+                    if (k == 108) step = cols;
+                    int n2 = launcher_sel + step;
+                    if (n2 >= 0 && n2 < total) launcher_sel = n2;
+                    else if (step == -1 && launcher_sel == 0) launcher_sel = total - 1;
+                    else if (step == 1 && launcher_sel == total - 1) launcher_sel = 0;
+                    dirty = 1;
+                    continue;
                 }
-                if (!next) {                      /* only one window: nothing to cycle */
-                    next = NULL;
+                if (k == 28) {               /* Enter launches the selection */
+                    int idx = launcher_sel;
+                    if (idx < LAUNCHER_N) {
+                        if (LAUNCHER[idx].app_id) win_open(WIN_APP, LAUNCHER[idx].app_id);
+                        else                      win_open(WIN_TERM, NULL);
+                    } else {
+                        int b = idx - LAUNCHER_N;
+                        if (b >= 0 && b < bundle_count) {
+                            int pid = wms_launch(&bundles[b], clients, b);
+                            fprintf(stderr, "wms: launch %s pid %d", bundles[b].id, pid);
+                            fputc(10, stderr);
+                        }
+                    }
+                    launcher_open = 0;
+                    dirty = 1;
+                    continue;
                 }
             }
-            if (next) { win_focus(next); dirty = 1; }
-        }
 
-        /* F1..F5 launch, so apps are reachable without a mouse */
-        switch (input.key) {
-            case 59: win_open(WIN_TERM, NULL); dirty = 1; break;   /* F1 terminal */
-            case 60: win_open(WIN_APP, "files"); dirty = 1; break;
-            case 61: win_open(WIN_APP, "settings"); dirty = 1; break;
-            case 62: win_open(WIN_APP, "monitor"); dirty = 1; break;
-            case 63: win_open(WIN_APP, "notes"); dirty = 1; break;
-            default: break;
-        }
+            if (input.alt && k == 15 && z_top > 0) {           /* Alt+Tab */
+                Window *cur = win_top(), *next = NULL;
+                if (cur) {
+                    int best = -1;
+                    for (int i = 0; i < MAX_WINDOWS; i++) {
+                        if (!wins[i].used || &wins[i] == cur) continue;
+                        if (wins[i].z > best) { best = wins[i].z; next = &wins[i]; }
+                    }
+                }
+                if (next) { win_focus(next); dirty = 1; }
+                continue;
+            }
 
-        if (input.key == 1) {                 /* Esc */
-            Window *t = win_top();
-            if (t) { win_close(t); dirty = 1; }
-        }
+            switch (k) {                     /* F1..F5 launch */
+                case 59: win_open(WIN_TERM, NULL); dirty = 1; continue;
+                case 60: win_open(WIN_APP, "files"); dirty = 1; continue;
+                case 61: win_open(WIN_APP, "settings"); dirty = 1; continue;
+                case 62: win_open(WIN_APP, "monitor"); dirty = 1; continue;
+                case 63: win_open(WIN_APP, "notes"); dirty = 1; continue;
+                default: break;
+            }
 
-        /* focused window gets keys */
-        Window *top = win_top();
-        if (top) {
+            if (k == 1) {                    /* Esc closes the top window */
+                Window *t = win_top();
+                if (t) { win_close(t); dirty = 1; }
+                continue;
+            }
+
+            /* the focused window gets the key */
+            Window *top = win_top();
+            if (!top) continue;
             if (top->term) {
                 char buf[64];
                 int n = 0;
-                if (input.shift && (input.key == 104 || input.key == 109)) {
-                    term_scroll(top->term, input.key == 104 ? 8 : -8);
-                    dirty = 1;
+                if (input.shift && (k == 104 || k == 109)) {
+                    term_scroll(top->term, k == 104 ? 8 : -8);
                 } else {
-                    key_bytes(buf, &n);
+                    key_bytes_for(k, buf, &n);
                     if (n) term_key(top->term, buf, n);
-                }
-                if (input.text_len) {
-                    term_scroll(top->term, -(term_scroll_offset(top->term)));
-                    term_key(top->term, input.text, input.text_len);
                 }
             } else if (top->kind == WIN_CLIENT && top->client >= 0) {
                 WmClient *cl = &clients[top->client];
                 int mods = (input.shift ? 1 : 0) | (input.ctrl ? 2 : 0) | (input.alt ? 4 : 0);
-                if (input.key) wms_notify_key(cl, input.key, mods, 1);
-                if (input.text_len) wms_notify_text(cl, input.text);
-                char kb[64]; int kn = 0;
-                key_bytes(kb, &kn);
-                if (kn) wms_notify_text(cl, kb);
+                wms_notify_key(cl, k, mods, 1);
                 dirty = 1;
             } else if (top->app) {
-                if (input.text_len) app_key(top->app, input.text, input.text_len);
-                /* Arrows, Home/End, PageUp/Down and Delete must reach apps as
-                 * escape sequences or none of their key handling can run.
-                 * (Found by the files and notes workers during review; the
-                 * Enter/Backspace forwarding that used to live here duplicated
-                 * what input.text already carries.) */
                 char kb[64];
                 int kn = 0;
-                key_bytes(kb, &kn);
-                if (kn) app_key(top->app, kb, kn);
-                if (input.text_len || kn) dirty = 1;   /* or the repaint lags a second */
+                key_bytes_for(k, kb, &kn);
+                if (kn) { app_key(top->app, kb, kn); dirty = 1; }
+            }
+        }
+
+        /* text is delivered once per frame, not per key */
+        {
+            Window *top = win_top();
+            if (top && input.text_len) {
+                if (top->term) {
+                    term_scroll(top->term, -(term_scroll_offset(top->term)));
+                    term_key(top->term, input.text, input.text_len);
+                } else if (top->kind == WIN_CLIENT && top->client >= 0) {
+                    wms_notify_text(&clients[top->client], input.text);
+                    dirty = 1;
+                } else if (top->app) {
+                    app_key(top->app, input.text, input.text_len);
+                    dirty = 1;
+                }
             }
         }
 
@@ -1012,6 +1081,23 @@ int main(void) {
                 term_pump(wins[i].term);
                 dirty = 1;            /* keep it simple while terminals exist */
                 if (!term_alive(wins[i].term)) { win_close(&wins[i]); }
+            }
+        }
+
+        /* an external app needs motion, not just the press: without this a
+         * drag draws one dot (paint) and sliders never move */
+        {
+            Window *ct = win_top();
+            if (ct && ct->kind == WIN_CLIENT && ct->client >= 0) {
+                WmClient *cl = &clients[ct->client];
+                int inside = (input.mouse_x >= ct->x && input.mouse_x < ct->x + ct->w &&
+                              input.mouse_y >= ct->y && input.mouse_y < ct->y + ct->h);
+                if (cl->used && inside &&
+                    (input.buttons || (input.mouse_dx || input.mouse_dy) || input.released)) {
+                    wms_notify_mouse(cl, input.mouse_x - ct->x - 1,
+                                     input.mouse_y - ct->y - 41, input.buttons);
+                    dirty = 1;
+                }
             }
         }
 

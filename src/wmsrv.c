@@ -221,6 +221,10 @@ void wms_shutdown_client(WmClient *c) {
 }
 
 /* ---------------------------------------------------------- apps */
+static int cmp_app(const void *a, const void *b) {
+    return strcmp(((const WmApp *)a)->id, ((const WmApp *)b)->id);
+}
+
 int wms_scan_apps(WmApp *out, int max) {
     DIR *d = opendir(WM_APP_DIR);
     if (!d) return 0;
@@ -259,6 +263,8 @@ int wms_scan_apps(WmApp *out, int max) {
         n++;
     }
     closedir(d);
+    /* readdir order is arbitrary; sort so the launcher is stable */
+    qsort(out, (size_t)n, sizeof(WmApp), cmp_app);
     return n;
 }
 

@@ -1,0 +1,3 @@
+name = Files (app)
+desc = File browser running as its own process, built with the Mystic SDK
+exec = bin
