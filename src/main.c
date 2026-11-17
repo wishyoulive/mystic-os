@@ -45,6 +45,7 @@ typedef struct {
     App  *app;
     Term *term;
     int   client;        /* index into clients[] when kind == WIN_CLIENT */
+    int   hidden;        /* minimised: still alive, not drawn, not hit-tested */
     int   z;
 } Window;
 
@@ -140,7 +141,8 @@ static void icon_pencil(Surface *s, float x, float y, float sz, u32 fg) {
 static Window *win_top(void) {
     Window *best = NULL;
     for (int i = 0; i < MAX_WINDOWS; i++)
-        if (wins[i].used && (!best || wins[i].z > best->z)) best = &wins[i];
+        if (wins[i].used && !wins[i].hidden && (!best || wins[i].z > best->z))
+            best = &wins[i];
     return best;
 }
 
@@ -389,7 +391,7 @@ static void draw_desktop(Surface *s, const Theme *th) {
     for (int n = 0; n < MAX_WINDOWS; n++) {
         Window *cur = NULL;
         for (int i = 0; i < MAX_WINDOWS; i++) {
-            if (!wins[i].used) continue;
+            if (!wins[i].used || wins[i].hidden) continue;
             if (wins[i].z <= last_z) continue;
             if (!cur || wins[i].z < cur->z) cur = &wins[i];
         }
@@ -726,7 +728,7 @@ static int handle_click(void) {
     Window *hit = NULL;
     for (int i = 0; i < MAX_WINDOWS; i++) {
         Window *w = &wins[i];
-        if (!w->used) continue;
+        if (!w->used || w->hidden) continue;
         if (mx < w->x || mx >= w->x + w->w || my < w->y || my >= w->y + w->h) continue;
         if (!hit || w->z > hit->z) hit = w;
     }
@@ -734,8 +736,9 @@ static int handle_click(void) {
         win_focus(hit);
         int tb = 40;
         int lx = mx - hit->x, ly = my - hit->y;
-        /* close dot */
+        /* red closes, yellow minimises */
         if (ly < tb && lx >= 14 && lx < 24) { win_close(hit); return 1; }
+        if (ly < tb && lx >= 32 && lx < 42) { hit->hidden = 1; return 1; }
         /* bottom-right corner resizes */
         if (lx >= hit->w - 18 && ly >= hit->h - 18) {
             resize_win = (int)(hit - wins);
@@ -766,6 +769,22 @@ static int handle_click(void) {
         for (int i = 0; i < DOCK_N; i++) {
             int ix = dx + pad + i * (isz + gap);
             if (mx >= ix && mx < ix + isz) {
+                /* a minimised app of this kind comes back rather than a duplicate */
+                for (int wi = 0; wi < MAX_WINDOWS; wi++) {
+                    Window *w = &wins[wi];
+                    if (!w->used || !w->hidden) continue;
+                    int same = 0;
+                    if (DOCK[i].app_id)
+                        same = (w->app && w->app->vt && w->app->vt->id &&
+                                !strcmp(w->app->vt->id, DOCK[i].app_id));
+                    else
+                        same = (w->term != NULL);
+                    if (same) {
+                        w->hidden = 0;
+                        win_focus(w);
+                        return 1;
+                    }
+                }
                 if (DOCK[i].app_id) win_open(WIN_APP, DOCK[i].app_id);
                 else                win_open(WIN_TERM, NULL);
                 return 1;
