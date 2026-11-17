@@ -24,7 +24,7 @@ echo "==> compiler: $ZIG ($("$ZIG" version))"
 
 SRC="src/main.c src/apps.c src/term.c src/sha256.c src/wmsrv.c src/ui.c src/wallpaper.c src/gfx.c src/font.c src/fb.c src/input.c src/theme.c"
 SRC="$SRC src/shortcuts.c"
-SRC="$SRC src/apps/sysinfo.c src/notify.c src/clipboard.c"
+SRC="$SRC src/filetypes.c src/apps/sysinfo.c src/notify.c src/clipboard.c"
 DEFS=""
 for app in files settings monitor notes store calc; do
     if [ -f "src/apps/$app.c" ]; then

@@ -82,6 +82,8 @@
  * pulled in only where the socket layer exists, so the host test builds
  * stay socket-free. */
 #include "../tls.c"
+#include "../img.c"
+#include "../css.c"
 #endif
 
 #ifndef WEB_HOST_TEST
@@ -102,6 +104,7 @@
  * write into one is bounds checked - the network is not trusted.
  * ------------------------------------------------------------ */
 #define WEB_RAW_MAX     (512 * 1024)  /* response bytes we will hold   */
+#define WEB_IMG_MAX     (384 * 1024)  /* largest image we will decode  */
 #define WEB_PATH_MAX    768           /* an absolute address           */
 #define WEB_HOST_MAX    256
 #define WEB_TITLE_MAX   160
@@ -237,6 +240,18 @@ typedef struct {
     char url[WEB_PATH_MAX];
 } Link;
 
+#define WEB_MAX_IMGS 8
+
+/* One <img> the page referenced. The URL is resolved against the document
+ * base; the pixels arrive later, after the body has been fetched. */
+typedef struct {
+    char  url[WEB_PATH_MAX];
+    char  alt[96];
+    Img   pic;          /* decoded; pic.px == NULL until it is fetched   */
+    int   tried;        /* fetch attempted - do not retry every frame    */
+    int   w, h;         /* drawn size at the current width               */
+} PageImg;
+
 typedef struct {
     Atom atom[WEB_MAX_ATOMS];
     int  natom;
@@ -248,6 +263,8 @@ typedef struct {
     int  nlink;
     u32  doc_h;
     int  truncated;                  /* a cap was hit; say so in the footer */
+    PageImg img[WEB_MAX_IMGS];
+    int  nimg;
 } Doc;
 
 /* How layout measures text. The app passes the real Font objects in;
@@ -1235,6 +1252,7 @@ typedef struct {
     int  closing;
     char name[16];
     char href[WEB_PATH_MAX];
+    char src[WEB_PATH_MAX];      /* <img src>  */
     char alt[96];
 } Tag;
 
@@ -1320,6 +1338,9 @@ static int parse_tag(const char *s, long n, long *used, Tag *t) {
             } else if (!strcmp(an, "alt") && vl < (long)sizeof(t->alt)) {
                 memcpy(t->alt, s + vs, (size_t)vl);
                 t->alt[vl] = 0;
+            } else if (!strcmp(an, "src") && vl < (long)sizeof(t->src)) {
+                memcpy(t->src, s + vs, (size_t)vl);
+                t->src[vl] = 0;
             }
         }
     }
@@ -1334,6 +1355,10 @@ typedef struct {
     int         latin1;
     int         in_title;
     int         skip;            /* inside <script>/<style>       */
+    int         in_style;        /* collecting a <style> body     */
+    char       *css;             /* where that text is collected  */
+    size_t      css_cap;
+    size_t     *css_len;
     int         level;           /* 0 body, 1..6 heading          */
     int         prev_level;      /* level of the last atom emitted; its
                                   * AF_BREAK decides the gap below it */
@@ -1443,7 +1468,20 @@ static void html_atom_word(Html *h, const char *text, long len, int link, int gl
 /* Text between tags: decode entities, collapse whitespace, transcode
  * Latin-1 when the server said so. */
 static void html_text(Html *h, const char *s, long n) {
-    if (h->skip) return;
+    if (h->skip) {
+        /* A <style> body IS the stylesheet: keep it (bounded), and keep
+         * dropping <script> bodies. */
+        if (h->in_style && h->css && h->css_len) {
+            size_t room = h->css_cap - *h->css_len - 1;
+            size_t take = (size_t)n < room ? (size_t)n : room;
+            if (take) {
+                memcpy(h->css + *h->css_len, s, take);
+                *h->css_len += take;
+                h->css[*h->css_len] = 0;
+            }
+        }
+        return;
+    }
 
     long i = 0;
     while (i < n) {
@@ -1544,7 +1582,11 @@ static void html_tag(Html *h, const Tag *t) {
             h->in_title = 0;
             return;
         }
-        if (!strcmp(n, "script") || !strcmp(n, "style")) { h->skip = 0; return; }
+        if (!strcmp(n, "script") || !strcmp(n, "style")) {
+            h->skip = 0;
+            h->in_style = 0;
+            return;
+        }
         if (!strcmp(n, "a")) {
             if (h->in_link >= 0) {
                 char num[16];
@@ -1578,7 +1620,11 @@ static void html_tag(Html *h, const Tag *t) {
     /* open tags */
     if (h->in_title && (!strcmp(n, "body") || is_block_tag(n))) h->in_title = 0;
     if (!strcmp(n, "title")) { h->in_title = 1; return; }
-    if (!strcmp(n, "script") || !strcmp(n, "style")) { h->skip = 1; return; }
+    if (!strcmp(n, "script") || !strcmp(n, "style")) {
+        h->skip = 1;
+        h->in_style = !strcmp(n, "style");
+        return;
+    }
     if (!strcmp(n, "a")) { html_end_word(h, 0); html_add_link(h, t); return; }
     if (!strcmp(n, "li")) {
         html_break(h, GAP_LI_D);
@@ -1605,6 +1651,19 @@ static void html_tag(Html *h, const Tag *t) {
         return;
     }
     if (!strcmp(n, "img")) {
+        /* Keep the real source: images are fetched and decoded once the body
+         * is in, then drawn in their own band under the text. The placeholder
+         * word keeps the reading order honest when a fetch or a decode fails. */
+        fprintf(stderr, "web: img tag src='%.60s' nimg=%d\n", t->src, h->d->nimg);
+        if (t->src[0] && h->d->nimg < WEB_MAX_IMGS) {
+            PageImg *pi = &h->d->img[h->d->nimg++];
+            if (t->src[0] == '/' || strstr(t->src, "://")) {
+                snprintf(pi->url, sizeof(pi->url), "%s", t->src);
+            } else {
+                snprintf(pi->url, sizeof(pi->url), "%s", t->src);
+            }
+            snprintf(pi->alt, sizeof(pi->alt), "%s", t->alt);
+        }
         char alt[128];
         if (t->alt[0]) snprintf(alt, sizeof(alt), "[%s]", t->alt);
         else snprintf(alt, sizeof(alt), "[image]");
@@ -1618,7 +1677,8 @@ static void html_tag(Html *h, const Tag *t) {
 /* Turn a body of HTML into atoms. `title` receives the <title> text
  * (possibly empty). Returns the number of links found. */
 static int html_build(Doc *d, const char *s, long n, const Url *base,
-                      int latin1, char *title, size_t title_cap) {
+                      int latin1, char *title, size_t title_cap,
+                      char *css, size_t css_cap, size_t *css_len) {
     d->natom = 0;
     d->nseg = 0;
     d->nline = 0;
@@ -1636,6 +1696,10 @@ static int html_build(Doc *d, const char *s, long n, const Url *base,
     h.title_cap = title_cap;
     h.latin1 = latin1;
     h.in_link = -1;
+    h.css = css;
+    h.css_cap = css_cap;
+    h.css_len = css_len;
+    if (css && css_cap) { css[0] = 0; *css_len = 0; }
 
     long i = 0;
     while (i < n && !h.overflow) {
@@ -1868,6 +1932,12 @@ typedef struct {
 
     char raw[WEB_RAW_MAX];
     Doc  doc;
+    CssSheet  sheet;           /* the page's own CSS, applied by colour   */
+    int       css_ready;
+    u32       col_text;        /* resolved from the sheet, not invented   */
+    u32       col_link;
+    u32       col_head;
+    char      css_raw[8192];
 
     Url  cur;
     char url[WEB_PATH_MAX];       /* the address actually on screen    */
@@ -2087,9 +2157,48 @@ static u32 color_for_link(int isnum) {
     return isnum ? C_LINKNUM : C_LINK;
 }
 
+/* The pictures the page carried, drawn in one band under the text, scaled
+ * to the column. Same geometry function as the scroll range, so the scroll
+ * bar can never lie about how much is below the fold. */
+static int img_band_h(const Web *w, int width);
+
+static void draw_page_images(Surface *v, Web *w, int top) {
+    int y = top;
+    for (int i = 0; i < w->doc.nimg; i++) {
+        PageImg *pi = &w->doc.img[i];
+        if (!pi->pic.px) continue;
+        int ww = pi->pic.w, hh = pi->pic.h;
+        if (ww <= 0) continue;
+        if (ww > w->view_w) { hh = hh * w->view_w / ww; ww = w->view_w; }
+        for (int row = 0; row < hh; row++) {
+            int dy = y + row;
+            if (dy < 0 || dy >= v->h) continue;
+            int sy = row * pi->pic.h / (hh ? hh : 1);
+            u32 *drow = v->px + (size_t)dy * v->stride;
+            const u32 *srow = pi->pic.px + (size_t)sy * pi->pic.w;
+            for (int col = 0; col < ww; col++) {
+                int dx = col;
+                if (dx < 0 || dx >= v->w) continue;
+                int sx = col * pi->pic.w / (ww ? ww : 1);
+                drow[dx] = srow[sx];
+            }
+        }
+        y += hh;
+        Font *fc = font_get(FONT_REGULAR, 10);
+        if (fc && y + 2 < v->h + 20) {
+            const char *cap = pi->alt[0] ? pi->alt : "image";
+            font_draw(v, fc, 0, (float)y + 4, cap, color_alpha(C_TEXT, 0.7f));
+        }
+        y += ui_px(28);
+    }
+}
+
 static void draw_page_lines(Surface *v, Web *w) {
     Doc *d = &w->doc;
-    if (d->nline <= 0) return;
+    if (d->nline <= 0) {
+        draw_page_images(v, w, 0);
+        return;
+    }
 
     int first = line_at(d, (u32)w->scroll);
     for (int i = first; i < d->nline; i++) {
@@ -2109,10 +2218,13 @@ static void draw_page_lines(Surface *v, Web *w) {
             memcpy(tmp, a->text + sg->start, (size_t)len);
             tmp[len] = 0;
 
+            /* The page's own CSS decides these three colours when it sets
+             * them; otherwise the built-in defaults stand. */
             u32 col;
-            if (a->link >= 0) col = color_for_link(a->flags & AF_LINKNUM);
-            else if (a->level) col = C_HEAD;
-            else col = C_TEXT;
+            if (a->link >= 0) col = w->col_link ? w->col_link
+                                                : color_for_link(a->flags & AF_LINKNUM);
+            else if (a->level) col = w->col_head ? w->col_head : C_HEAD;
+            else col = w->col_text ? w->col_text : C_TEXT;
 
             font_draw(v, f, (float)sg->x, (float)ly, tmp, col);
 
@@ -2481,7 +2593,7 @@ static void render(Web *w) {
     SINK.h = 0;
     if (w->state == ST_START)      w->content_h = draw_start(&SINK, w, 0);
     else if (w->state == ST_ERROR) w->content_h = draw_error(&SINK, w, 0);
-    else                           w->content_h = (int)w->doc.doc_h;
+    else                           w->content_h = (int)w->doc.doc_h + img_band_h(w, tw);
 
     w->max_scroll = w->content_h - ch;
     if (w->max_scroll < 0) w->max_scroll = 0;
@@ -2504,6 +2616,8 @@ static void render(Web *w) {
         else if (w->state == ST_ERROR) draw_error(&v, w, -w->scroll);
         else                           draw_page_lines(&v, w);
 
+        if (w->state == ST_PAGE)
+            draw_page_images(&v, w, (int)w->doc.doc_h - w->scroll);
         draw_scrollbar(&v, w);
     }
     draw_footer(&s, w);
@@ -2580,6 +2694,104 @@ static void web_go(Web *w, const char *addr, int push_history) {
 
 #ifndef WEB_DRAW_ONLY
 
+/* An <img src> resolved against the page it came from. Absolute URLs pass
+ * through; "/x" and "x" both land on the page's own host. */
+static void img_url(const Url *base, const char *src, char *out, size_t n) {
+    if (strstr(src, "://")) { snprintf(out, n, "%s", src); return; }
+    /* Keep the port. The first version dropped it, so every image on a page
+     * served from a non-default port was requested from port 80 and failed. */
+    char hostport[WEB_PATH_MAX];
+    if (base->port[0] &&
+        !((!strcmp(base->scheme, "http") && !strcmp(base->port, "80")) ||
+          (!strcmp(base->scheme, "https") && !strcmp(base->port, "443")))) {
+        snprintf(hostport, sizeof(hostport), "%s:%s", base->host, base->port);
+    } else {
+        snprintf(hostport, sizeof(hostport), "%s", base->host);
+    }
+    if (src[0] == '/') {
+        snprintf(out, n, "%s://%s%s", base->scheme, hostport, src);
+        return;
+    }
+    const char *slash = strrchr(base->path, '/');
+    char dir[WEB_PATH_MAX];
+    if (slash) {
+        size_t k = (size_t)(slash - base->path) + 1;
+        if (k >= sizeof(dir)) k = sizeof(dir) - 1;
+        memcpy(dir, base->path, k); dir[k] = 0;
+    } else {
+        snprintf(dir, sizeof(dir), "/");
+    }
+    snprintf(out, n, "%s://%s%s%s", base->scheme, hostport, dir, src);
+}
+
+/* Fetch and decode the images the page referenced. Called once per load,
+ * after the body is in: the browser has exactly one connection in flight at
+ * a time, so this is the only place it can happen. A failure is recorded on
+ * that image and never stops the page from rendering. */
+/* What the stylesheet says the page's text, link and heading colours are.
+ * Only colour is taken from CSS for now - layout (floats, flex) is not
+ * something a text renderer can honour, and pretending would be worse than
+ * saying so. Falls back to the built-in defaults when the page has none. */
+static void css_apply(Web *w) {
+    if (!w->css_ready) {
+        memset(&w->sheet, 0, sizeof(w->sheet));
+        if (w->css_raw[0]) css_parse(w->css_raw, strlen(w->css_raw), &w->sheet);
+        w->css_ready = 1;
+    }
+    CssStyle body = css_for(&w->sheet, "body", NULL, NULL, NULL);
+    CssStyle link = css_for(&w->sheet, "a", NULL, NULL, NULL);
+    CssStyle head = css_for(&w->sheet, "h1", NULL, NULL, NULL);
+    w->col_text = (body.set & CSS_SET_COLOR) ? body.color : C_TEXT;
+    w->col_link = (link.set & CSS_SET_COLOR) ? link.color : C_LINK;
+    w->col_head = (head.set & CSS_SET_COLOR) ? head.color : C_HEAD;
+}
+
+static void load_images(Web *w) {
+    fprintf(stderr, "web: load_images n=%d\n", w->doc.nimg);
+    char abs[WEB_PATH_MAX];
+    static char scratch[WEB_IMG_MAX];
+    for (int i = 0; i < w->doc.nimg; i++) {
+        PageImg *pi = &w->doc.img[i];
+        if (pi->tried) continue;
+        pi->tried = 1;
+        img_url(&w->cur, pi->url, abs, sizeof(abs));
+        Url u;
+        char err[128] = {0};
+        if (url_parse(abs, &u, err, sizeof(err)) != 0) continue;
+        if (!url_fetchable(&u, err, sizeof(err))) continue;
+        Fetch f;
+        web_fetch(&f, &net_transport, &u, scratch);
+        if (!f.ok || !f.body || f.body_len <= 0) {
+            fprintf(stderr, "web: fetch failed for %.80s: %s\n", abs, f.error);
+            continue;
+        }
+        fprintf(stderr, "web: fetched %.60s %ld bytes\n", abs, f.body_len);
+        char derr[128] = {0};
+        if (img_decode((const unsigned char *)f.body, (size_t)f.body_len,
+                       &pi->pic, derr, sizeof(derr)) != 0) {
+            fprintf(stderr, "web: image %.60s: %s\n", abs, derr);
+            pi->pic.px = NULL;
+        }
+    }
+}
+
+/* Height of the image band at this width: what both the painter and the
+ * scroll range must agree on. */
+static int img_band_h(const Web *w, int width) {
+    int y = 0, shown = 0;
+    for (int i = 0; i < w->doc.nimg; i++) {
+        const PageImg *pi = &w->doc.img[i];
+        if (!pi->pic.px) continue;
+        int ww = pi->pic.w, hh = pi->pic.h;
+        if (ww > width) { hh = hh * width / (ww ? ww : 1); ww = width; }
+        y += hh + ui_px(28);        /* picture plus its caption line */
+        shown++;
+    }
+    (void)shown;
+    return y;
+}
+
+
 static void web_load(Web *w) {
     char addr[WEB_PATH_MAX];
     snprintf(addr, sizeof(addr), "%s", w->pending);
@@ -2633,13 +2845,19 @@ static void web_load(Web *w) {
     snprintf(w->charset, sizeof(w->charset), "%s", f.charset);
 
     char title[WEB_TITLE_MAX];
-    html_build(&w->doc, f.body, f.body_len, &w->cur, f.latin1, title, sizeof(title));
+    w->css_ready = 0;
+    size_t css_len = 0;
+    html_build(&w->doc, f.body, f.body_len, &w->cur, f.latin1, title, sizeof(title),
+               w->css_raw, sizeof(w->css_raw), &css_len);
+    css_apply(w);
     snprintf(w->title, sizeof(w->title), "%s", title);
 
     w->scroll = 0;
     w->laid_w = 0;                 /* force a fresh layout at this width */
     w->state = ST_PAGE;
+    load_images(w);
 }
+
 
 #endif /* !WEB_DRAW_ONLY */         /* web_load: the only part that needs sockets */
 

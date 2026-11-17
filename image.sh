@@ -53,7 +53,7 @@ fi
 
 BOOT=( -kernel "$KERNEL" -initrd "$CPIO" -m "${MYSTIC_RAM:-256}" -vga std -no-reboot
        -drive file="$DISK",format=raw,if=virtio
-       -netdev user,id=n0 -device virtio-net-pci,netdev=n0 )
+       -netdev user,id=n0 -device virtio-net-pci,netdev=n0 -device intel-hda -device hda-duplex )
 [ -n "$ACCEL" ] && BOOT+=( $ACCEL )
 
 case "${1:-run}" in

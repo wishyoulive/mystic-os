@@ -37,6 +37,7 @@ kernel/fs/fat
 kernel/lib
 kernel/fs/ext4
 kernel/fs/jbd2
+kernel/sound
 kernel/fs/nls
 "
 

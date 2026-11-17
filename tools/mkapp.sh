@@ -35,7 +35,7 @@ OUT="build/app-$APP"
 echo "==> compiling $SRC"
 # gfx.c and font.c are generic: the app draws its own pixels with them
 "$ZIG" cc -target x86_64-linux-musl -Os -static -Isrc -Isrc/client \
-    -o "$OUT" "$SRC" src/client/mystic_client.c src/gfx.c src/font.c src/ui.c -lm
+    -o "$OUT" "$SRC" src/client/mystic_client.c src/gfx.c src/font.c src/ui.c src/filetypes.c -lm
 
 DEST="stage/usr/share/mystic/apps/$APP"
 mkdir -p "$DEST"
