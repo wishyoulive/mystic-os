@@ -27,10 +27,6 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#define ROW_H   16.0f
-#define HEAD_H  26
-#define FOOT_H  16
-#define LINE_H  13
 #define DESC_LINE 256
 #define DESC_MAXLINES 3
 #define DESC_WORDS 128   /* a 255-char line cannot hold more words than this */
@@ -198,14 +194,57 @@ static void store_free(App *a) {
 }
 
 /* ------------------------------------------------------------
- * Geometry. draw() and click() must agree on where the rows are,
- * so both call this.
+ * Geometry. draw(), key() and click() must agree on where the rows
+ * are, so they all derive the vertical metrics from the fonts and
+ * share one layout function.
+ *
+ * There is no ROW_H/HEAD_H/FOOT_H/LINE_H constant any more. Every
+ * vertical size is the height of the font that draws in it plus a
+ * fixed amount of leading, which is what "leading" means: the space
+ * between baselines. font_get() is where the global text scale is
+ * applied (src/font.c:125), so a scale change moves every one of
+ * these numbers together with the glyphs: rows cannot overlap, the
+ * bands cannot cut the text, and because click() runs the very same
+ * geo_of()/layout_of() pair a click still lands on the row that was
+ * painted. Horizontal paddings stay fixed on purpose.
  * ------------------------------------------------------------ */
-static void layout_of(int h, int *rows, int *band, int *nlines) {
+typedef struct {
+    int row_h;      /* one app row            (font of the row + 4) */
+    int head_h;     /* title band + its rule  (font of the title + 12) */
+    int foot_h;     /* status line at the bottom (font of the line + 6) */
+    int line_h;     /* one wrapped description line (font + 2) */
+} Geo;
+
+static Geo geo_of(Font *fp, Font *fr) {
+    Geo g;
+    int fph = (int)(font_height(fp) + 0.5f);
+    int frh = (int)(font_height(fr) + 0.5f);
+    g.row_h  = frh + 4;
+    g.head_h = fph + 12;
+    g.foot_h = frh + 6;
+    g.line_h = frh + 2;
+    return g;
+}
+
+/* The fonts the two bodies of text in this window use, exactly as
+ * store_draw() asks for them, so every caller gets the same metrics. */
+static int geo_now(Geo *g) {
+    Font *fp = font_get(FONT_MEDIUM, 12);
+    Font *fr = font_get(FONT_REGULAR, 11);
+    if (!fp || !fr) return 0;
+    *g = geo_of(fp, fr);
+    return 1;
+}
+
+/* The nl thresholds only decide how many description lines are shown at
+ * all (3 on a tall window, 1 or none on a short one); they are not text
+ * positions. The band and the rows below are computed from the metrics. */
+static void layout_of(int h, const Geo *g, int *rows, int *band, int *nlines) {
     int nl = h >= 210 ? DESC_MAXLINES : h >= 172 ? 2 : h >= 134 ? 1 : 0;
     for (;;) {
-        int b = nl > 0 ? nl * LINE_H + LINE_H + 8 : (h >= 96 ? LINE_H + 8 : 0);
-        int r = (h - HEAD_H - FOOT_H - b) / (int)ROW_H;
+        int b = nl > 0 ? nl * g->line_h + g->line_h + 8
+                       : (h >= 96 ? g->line_h + 8 : 0);
+        int r = (h - g->head_h - g->foot_h - b) / g->row_h;
         if (r >= 1 || nl == 0) {
             *rows = r < 0 ? 0 : r;
             *band = b;
@@ -391,6 +430,8 @@ static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const The
     Font *fd = font_get(FONT_REGULAR, 10);
     if (!fp || !fr || !fd) return;
 
+    Geo g = geo_of(fp, fr);
+
     /* header: what this window is, and how many bundles it found */
     font_draw(s, fp, (float)x + 6.0f, (float)y + 5.0f, "Apps", th->text);
     {
@@ -402,16 +443,16 @@ static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const The
             font_draw(s, fr, (float)(x + w) - hw - 6.0f, (float)y + 7.0f, head,
                       color_alpha(th->text, 0.45f));
     }
-    surf_blend(s, x + 4, y + HEAD_H - 6, w - 8, 1, th->panel_border);
+    surf_blend(s, x + 4, y + g.head_h - 6, w - 8, 1, th->panel_border);
 
     int rows = 0, band = 0, nlines = 0;
-    layout_of(h, &rows, &band, &nlines);
+    layout_of(h, &g, &rows, &band, &nlines);
 
     if (st->error[0]) {
-        draw_clipped(s, fr, (float)x + 6.0f, (float)y + (float)HEAD_H,
+        draw_clipped(s, fr, (float)x + 6.0f, (float)y + (float)g.head_h,
                      (float)w - 12.0f, st->error, th->accent);
     } else if (st->count == 0) {
-        draw_clipped(s, fr, (float)x + 6.0f, (float)y + (float)HEAD_H,
+        draw_clipped(s, fr, (float)x + 6.0f, (float)y + (float)g.head_h,
                      (float)w - 12.0f, "no app bundles with a manifest here",
                      th->text_dim);
     } else {
@@ -430,10 +471,10 @@ static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const The
             if (idx >= st->count) break;
             StoreApp *e = &st->app[idx];
             int selected = (idx == st->sel);
-            float ry = (float)y + (float)HEAD_H + (float)i * ROW_H;
+            float ry = (float)y + (float)g.head_h + (float)i * (float)g.row_h;
 
             if (selected)
-                gfx_rrect_aa(s, (float)x + 3.0f, ry - 1.0f, (float)w - 6.0f, ROW_H,
+                gfx_rrect_aa(s, (float)x + 3.0f, ry - 1.0f, (float)w - 6.0f, (float)g.row_h,
                              4.0f, color_alpha(th->accent, 0.20f), 0, 0);
 
             /* payload size, right aligned, from the real st_size */
@@ -468,7 +509,7 @@ static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const The
 
     /* description band: the selected manifest's 'desc =' line, wrapped */
     if (band > 0) {
-        float by = (float)(y + h) - (float)FOOT_H - (float)band;
+        float by = (float)(y + h) - (float)g.foot_h - (float)band;
         surf_blend(s, x + 4, (int)by, w - 8, 1, th->panel_border);
         refresh_wrap(st, fr, w);
 
@@ -479,18 +520,18 @@ static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const The
                 draw_clipped(s, fr, (float)x + 6.0f, by + 5.0f, (float)w - 12.0f,
                              "this manifest has no desc = line", th->text_dim);
             for (int i = 0; i < shown; i++)
-                draw_clipped(s, fr, (float)x + 6.0f, by + 5.0f + (float)i * LINE_H,
+                draw_clipped(s, fr, (float)x + 6.0f, by + 5.0f + (float)i * (float)g.line_h,
                              (float)w - 12.0f, st->dlines[i],
                              color_alpha(th->text, 0.85f));
 
             /* the hint: this window asks, the desktop launches */
-            float hy = (float)(y + h) - (float)FOOT_H - (float)LINE_H - 3.0f;
+            float hy = (float)(y + h) - (float)g.foot_h - (float)g.line_h - 3.0f;
             char hint[96];
             snprintf(hint, sizeof(hint), "Enter or click: write %s", LAUNCH_REQUEST);
             draw_clipped(s, fd, (float)x + 6.0f, hy, (float)w - 12.0f, hint,
                          color_alpha(th->text, 0.40f));
         } else {
-            float hy = (float)(y + h) - (float)FOOT_H - (float)LINE_H - 3.0f;
+            float hy = (float)(y + h) - (float)g.foot_h - (float)g.line_h - 3.0f;
             char hint[96];
             snprintf(hint, sizeof(hint), "the desktop launches %s", LAUNCH_REQUEST);
             draw_clipped(s, fd, (float)x + 6.0f, hy, (float)w - 12.0f, hint,
@@ -500,7 +541,8 @@ static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const The
 
     /* footer: how many bundles, and the outcome of the last request */
     {
-        float fy = (float)(y + h) - 14.0f;
+        /* one line inside the derived footer band, 3 px off its bottom */
+        float fy = (float)(y + h) - font_height(fr) - 3.0f;
         const char *tail = st->status[0]
                          ? st->status
                          : "the desktop launches what /run/mystic/launch.request names";
@@ -537,8 +579,9 @@ static void store_key(App *a, const char *bytes, int n) {
     Store *s = a->state;
     if (!s) return;
 
-    int rows = 0, band = 0, nlines = 0;
-    layout_of(s->h, &rows, &band, &nlines);
+    Geo g;
+    int rows = 1, band = 0, nlines = 0;
+    if (geo_now(&g)) layout_of(s->h, &g, &rows, &band, &nlines);
     if (rows < 1) rows = 1;
 
     for (int i = 0; i < n; i++) {
@@ -587,25 +630,28 @@ static void store_click(App *a, int x, int y, int buttons) {
     if (!s) return;
     if (buttons && !(buttons & 1)) return;      /* left button only */
 
+    Geo g;
     int rows = 0, band = 0, nlines = 0;
-    layout_of(s->h, &rows, &band, &nlines);
+    if (!geo_now(&g)) return;
+    layout_of(s->h, &g, &rows, &band, &nlines);
     if (rows < 1) return;
 
     /* Only the row band owns rows. A click above the first row - the
      * "Apps" title, the "N bundles" count, or the rule under them - and a
      * click in the footer or the desc band below the list belong to no row
      * and must do nothing. This used to be `(int)(((float)y - HEAD_H) /
-     * ROW_H)`: C truncates a negative float toward zero, so y in
+     * ROW_H)` - the fixed row height this file used before the metrics
+     * became font-derived: C truncates a negative float toward zero, so y in
      * [HEAD_H - ROW_H + 1, HEAD_H - 1] (here 11..25) became row 0 and the
      * `row < 0` guard could never fire - one click on the word "Apps"
      * selected the top bundle and wrote /run/mystic/launch.request, which
      * the desktop then fork/exec'd. Reject the bands first, then divide a
      * value that is known to be >= 0, so truncation and floor agree and no
      * negative or out-of-range index can be produced. */
-    if (y < HEAD_H) return;                     /* header band */
-    if (y >= s->h - FOOT_H) return;             /* footer band */
+    if (y < g.head_h) return;                   /* header band */
+    if (y >= s->h - g.foot_h) return;           /* footer band */
 
-    int row = (y - HEAD_H) / (int)ROW_H;        /* y >= HEAD_H: exact */
+    int row = (y - g.head_h) / g.row_h;         /* y >= head_h: exact */
     if (row < 0 || row >= rows) return;         /* past the list / desc band */
     int idx = s->scroll + row;
     if (idx < 0 || idx >= s->count) return;

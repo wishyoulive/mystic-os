@@ -31,10 +31,49 @@
 #include <unistd.h>
 
 #define MAX_PROC 256
-#define ROW_H    15.0f
-#define BODY_Y   62      /* first row, local to the app */
-#define FOOT_H   15      /* key legend at the bottom */
 #define SAMPLE_S 0.35    /* shortest gap between two CPU samples */
+
+/* ------------------------------------------------------------
+ *  Geometry, derived from the fonts at draw time
+ *
+ *  There used to be a fixed ROW_H/BODY_Y/FOOT_H here. font_get() is
+ *  where the global text scale is applied (src/font.c:125), so a fixed
+ *  row height would paint the glyphs over each other and a fixed body
+ *  top would hide the first row. Every vertical position below is the
+ *  height of the font that draws in it plus a fixed leading, and
+ *  monitor_click() runs the very same geo_of()/visible_rows() pair, so
+ *  a click still selects the row that was painted.
+ * ------------------------------------------------------------ */
+typedef struct {
+    float rule_y;   /* rule under the title          */
+    float bar_y;    /* memory bar (a 6 px graphic)   */
+    float sub_y;    /* load / uptime / memory line   */
+    float col_y;    /* PID NAME CPU MEM headings     */
+    float body_y;   /* first process row, app-local  */
+    float row_h;    /* one process row               */
+    float foot_h;   /* key legend band at the bottom */
+} Geo;
+
+static Geo geo_of(Font *fh, Font *fr, Font *fd) {
+    Geo g;
+    float fhh = font_height(fh);
+    float frh = font_height(fr);
+    float fdh = font_height(fd);
+
+    g.rule_y = 4.0f + fhh + 3.0f;        /* title top pad + line + gap */
+    g.bar_y  = g.rule_y + 4.0f;
+    g.sub_y  = g.bar_y + 6.0f + 4.0f;    /* under the bar */
+    g.col_y  = g.sub_y + fdh + 3.0f;     /* one small line below */
+    g.body_y = g.col_y + fdh + 1.0f;     /* first row clears the headings */
+    g.row_h  = frh + 4.0f;
+    g.foot_h = fdh + 4.0f;
+    return g;
+}
+
+static int visible_rows(float h, const Geo *g) {
+    int rows = (int)((h - g->body_y - g->foot_h) / g->row_h);
+    return rows < 1 ? 1 : rows;
+}
 
 enum { SORT_MEM, SORT_CPU, SORT_PID };
 
@@ -358,9 +397,10 @@ static void monitor_draw(App *a, Surface *s, int x, int y, int w, int h, const T
     m->h = h;
 
     /* Keep every pixel inside the rect: the WM hands over the whole scene
-     * surface (main.c:434). The rows already derive from h, so this only
-     * bites when the rect is shorter than BODY_Y + FOOT_H, where rows is
-     * clamped to 1 and that row would otherwise land past the bottom edge. */
+     * surface (main.c:434). The rows already derive from h and the fonts,
+     * so this only bites when the rect is shorter than the header plus the
+     * legend, where visible_rows() clamps to 1 and that row would otherwise
+     * land past the bottom edge. */
     Surface clip = *s;
     int clip_r = x + w, clip_b = y + h;
     if (clip_r < 0) clip_r = 0;
@@ -377,6 +417,8 @@ static void monitor_draw(App *a, Surface *s, int x, int y, int w, int h, const T
     Font *fd = font_get(FONT_REGULAR, 10);
     if (!fh || !fr || !fd) return;
 
+    Geo geo = geo_of(fh, fr, fd);
+
     double l1;
     int threads;
     loadavg_read(&l1, &threads);
@@ -391,8 +433,7 @@ static void monitor_draw(App *a, Surface *s, int x, int y, int w, int h, const T
     fmt_uptime(up, upbuf, sizeof(upbuf));
 
     /* row window first: the cursor and scroll depend on it */
-    int rows = (int)((h - BODY_Y - FOOT_H) / ROW_H);
-    if (rows < 1) rows = 1;
+    int rows = visible_rows((float)h, &geo);
     m->rows = rows;
 
     if (m->sel >= m->count) m->sel = m->count - 1;
@@ -419,22 +460,22 @@ static void monitor_draw(App *a, Surface *s, int x, int y, int w, int h, const T
         font_draw(s, fd, (float)(x + w) - rw - 6, (float)y + 7, right,
                   color_alpha(th->text, 0.55f));
 
-    surf_blend(s, x + 4, y + 21, w - 8, 1, th->panel_border);
+    surf_blend(s, x + 4, (int)((float)y + geo.rule_y), w - 8, 1, th->panel_border);
 
     /* ---- memory bar ---- */
     float frac = total_kb > 0 ? (float)used_kb / (float)total_kb : 0.0f;
     if (frac > 1.0f) frac = 1.0f;
     if (frac < 0.0f) frac = 0.0f;
-    gfx_rrect_aa(s, (float)x + 4, (float)y + 25, (float)w - 8, 6, 3,
+    gfx_rrect_aa(s, (float)x + 4, (float)y + geo.bar_y, (float)w - 8, 6, 3,
                  color_alpha(th->text, 0.10f), 0, 0);
     if (frac > 0.01f)
-        gfx_rrect_aa(s, (float)x + 4, (float)y + 25, ((float)w - 8) * frac, 6, 3,
+        gfx_rrect_aa(s, (float)x + 4, (float)y + geo.bar_y, ((float)w - 8) * frac, 6, 3,
                      th->accent, 0, 0);
 
     /* ---- second header line: load, uptime, memory, last action ---- */
     char left[96];
     snprintf(left, sizeof(left), "load %.2f   up %s", l1, upbuf);
-    font_draw(s, fd, (float)x + 6, (float)y + 35, left, th->text_dim);
+    font_draw(s, fd, (float)x + 6, (float)y + geo.sub_y, left, th->text_dim);
 
     double now = mono_now();
     char note[96];
@@ -452,11 +493,11 @@ static void monitor_draw(App *a, Surface *s, int x, int y, int w, int h, const T
     if (note[0]) {
         float nw = font_width(fd, note);
         if (font_width(fd, left) + nw + 28.0f < (float)w)
-            font_draw(s, fd, (float)(x + w) - nw - 6, (float)y + 35, note, note_col);
+            font_draw(s, fd, (float)(x + w) - nw - 6, (float)y + geo.sub_y, note, note_col);
     }
 
     /* ---- column headings ---- */
-    float top = (float)y + 50;
+    float top = (float)y + geo.col_y;
     float pid_x = (float)x + 6;
     float name_x = (float)x + 56;
     float cpu_r = (float)(x + w) - 78;
@@ -485,16 +526,16 @@ static void monitor_draw(App *a, Surface *s, int x, int y, int w, int h, const T
         int idx = m->scroll + i;
         if (idx >= m->count) break;
         Proc *p = &m->procs[idx];
-        float ry = (float)(y + BODY_Y) + (float)i * ROW_H;
+        float ry = (float)y + geo.body_y + (float)i * geo.row_h;
         int sel = (idx == m->sel);
 
         if (sel) {
-            gfx_rrect_aa(s, (float)x + 3, ry - 1, (float)w - 6, ROW_H - 1, 3,
+            gfx_rrect_aa(s, (float)x + 3, ry - 1, (float)w - 6, geo.row_h - 1, 3,
                          color_alpha(th->accent, 0.22f),
                          color_alpha(th->accent, 0.70f), 1.0f);
             /* solid marker, so the cursor cannot be mistaken for the bar of
              * whichever row happens to hold the largest share */
-            surf_blend(s, x + 4, (int)ry, 3, (int)(ROW_H - 3),
+            surf_blend(s, x + 4, (int)ry, 3, (int)(geo.row_h - 3),
                        color_alpha(th->accent, 0.85f));
         }
 
@@ -502,7 +543,7 @@ static void monitor_draw(App *a, Surface *s, int x, int y, int w, int h, const T
         double v = m->sort == SORT_CPU ? p->cpu : (double)p->kb;
         float bw = bar_w * (float)(v / vmax);
         if (bw > 2.0f)
-            gfx_rrect_aa(s, (float)x + 9, ry + 2, bw, ROW_H - 5, 2,
+            gfx_rrect_aa(s, (float)x + 9, ry + 2, bw, geo.row_h - 5, 2,
                          color_alpha(th->accent, 0.13f), 0, 0);
 
         char buf[64];
@@ -525,8 +566,8 @@ static void monitor_draw(App *a, Surface *s, int x, int y, int w, int h, const T
     }
 
     /* ---- key legend ---- */
-    if (h - FOOT_H > BODY_Y) {
-        font_draw(s, fd, (float)x + 6, (float)(y + h) - 12,
+    if ((float)h - geo.foot_h > geo.body_y) {
+        font_draw(s, fd, (float)x + 6, (float)(y + h) - font_height(fd) - 2.0f,
                   "s sort   j/k move   shift+K kill", color_alpha(th->text, 0.40f));
     }
 }
@@ -561,11 +602,21 @@ static void monitor_click(App *a, int x, int y, int buttons) {
     Monitor *m = a->state;
     (void)x;
     if (!m || !(buttons & 1)) return;
-    int rows = m->rows > 0 ? m->rows : 1;
-    int local = y - BODY_Y;
-    if (local < 0) return;
-    int i = local / (int)ROW_H;
-    if (i >= rows) return;
+
+    /* Same fonts, same geo_of()/visible_rows() as monitor_draw(): the row
+     * that was painted under this y is the row this click selects. */
+    Font *fh = font_get(FONT_MEDIUM, 12);
+    Font *fr = font_get(FONT_REGULAR, 11);
+    Font *fd = font_get(FONT_REGULAR, 10);
+    if (!fh || !fr || !fd) return;
+
+    Geo geo = geo_of(fh, fr, fd);
+    int rows = visible_rows((float)m->h, &geo);
+
+    float local = (float)y - geo.body_y;
+    if (local < 0.0f) return;                  /* header / headings */
+    int i = (int)(local / geo.row_h);
+    if (i >= rows) return;                     /* legend / past the list */
     int idx = m->scroll + i;
     if (idx >= 0 && idx < m->count) m->sel = idx;
 }

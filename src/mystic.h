@@ -67,7 +67,7 @@ void gfx_polygon(Surface *s, const float *pts, int n, u32 color);
  * ------------------------------------------------------------ */
 typedef struct Font Font;
 
-enum { FONT_REGULAR, FONT_MEDIUM, FONT_SEMIBOLD, FONT_COUNT };
+enum { FONT_REGULAR, FONT_MEDIUM, FONT_SEMIBOLD, FONT_MONO, FONT_COUNT };
 
 int  font_init(const char *dir);                  /* dir holding the .ttf files */
 Font *font_get(int face, float size);             /* cached per face+size */
@@ -204,7 +204,12 @@ extern const AppVT app_vt_sysinfo;
  * ------------------------------------------------------------ */
 typedef struct Term Term;
 Term *term_create(int cols, int rows, const char *shell);
-void  term_destroy(Term *t);   /* close the pty, reap the shell, free the grid */
+void  term_destroy(Term *t);
+
+/* global text scale (0.8 .. 1.6), from /etc/mystic/ui.conf */
+float ui_scale_get(void);
+void  ui_scale_load(const char *path);
+int   ui_px(int base);            /* a size scaled by ui_scale, min 1 */   /* close the pty, reap the shell, free the grid */
 int   term_fd(Term *t);
 int   term_alive(Term *t);
 int   term_pump(Term *t);   /* bytes consumed; capped per call */
