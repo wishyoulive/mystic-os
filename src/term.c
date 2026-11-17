@@ -182,85 +182,154 @@ static void screen_reset(Term *t) {
     t->u8_need = 0;
     t->u8_min = 0;
     t->scroll = 0;
-    t->wrap = 0;
     clear_cells(t, 0, 0, t->cols - 1, t->rows - 1);
     t->dirty = 1;
 }
 
 /* ---------------------------------------------------------- parser */
-static void sgr(Term *t) {
-    /* params like "0;1;32" */
-    int vals[16] = {0};
-    int n = 0;
-    int cur = 0, have = 0;
-    for (int i = 0; i <= t->plen; i++) {
-        char c = (i < t->plen) ? t->params[i] : ';';
-        if (c == ';') {
-            if (n < 16) vals[n++] = have ? cur : 0;
-            cur = 0;
-            have = 0;
-        } else if (c >= '0' && c <= '9') {
-            cur = cur * 10 + (c - '0');
-            have = 1;
+
+/* A streaming reader over the collected CSI parameter bytes. Parameters are
+ * separated by ';', an empty parameter means 0 (ECMA-48). -1 means the list
+ * has ended. Digits accumulate with saturation, so a 60-digit parameter
+ * pins at TERM_PARAM_MAX instead of overflowing an int. */
+typedef struct {
+    const char *s;
+    int len;
+    int pos;            /* -1 once the list is exhausted */
+} ParamCursor;
+
+static int param_next(ParamCursor *p) {
+    if (p->pos < 0) return -1;
+    int v = 0;
+    while (p->pos < p->len && p->s[p->pos] != ';') {
+        char c = p->s[p->pos++];
+        if (c >= '0' && c <= '9' && v < TERM_PARAM_MAX) {
+            v = v * 10 + (c - '0');
+            if (v > TERM_PARAM_MAX) v = TERM_PARAM_MAX;
         }
     }
-    if (n == 0) { vals[0] = 0; n = 1; }
+    if (p->pos < p->len) p->pos++;      /* step over the ';' */
+    else                 p->pos = -1;   /* that was the last parameter */
+    return v;
+}
 
-    for (int i = 0; i < n; i++) {
-        int v = vals[i];
+/* The screen has 16 colours, so a 256-colour or truecolour SGR has to be
+ * approximated: pick the nearest palette entry by squared RGB distance. */
+static u8 nearest16(int r, int g, int b) {
+    if (r < 0) r = 0; else if (r > 255) r = 255;
+    if (g < 0) g = 0; else if (g > 255) g = 255;
+    if (b < 0) b = 0; else if (b > 255) b = 255;
+    int best = 0;
+    long best_d = -1;
+    for (int i = 0; i < 16; i++) {
+        int pr = (int)GET_R(PALETTE[i]);
+        int pg = (int)GET_G(PALETTE[i]);
+        int pb = (int)GET_B(PALETTE[i]);
+        long d = (long)(r - pr) * (r - pr) +
+                 (long)(g - pg) * (g - pg) +
+                 (long)(b - pb) * (b - pb);
+        if (best_d < 0 || d < best_d) { best_d = d; best = i; }
+    }
+    return (u8)best;
+}
+
+static u8 colour256(int idx) {
+    if (idx < 0) return 7;
+    if (idx < 16) return (u8)idx;
+    if (idx < 232) {                    /* 6x6x6 colour cube */
+        static const int lv[6] = { 0, 95, 135, 175, 215, 255 };
+        int n = idx - 16;
+        return nearest16(lv[(n / 36) % 6], lv[(n / 6) % 6], lv[n % 6]);
+    }
+    if (idx < 256) {                    /* 24-step grey ramp */
+        int v = 8 + (idx - 232) * 10;
+        return nearest16(v, v, v);
+    }
+    return 7;
+}
+
+static void sgr(Term *t) {
+    /* Parameters are consumed one at a time so that the arguments of an
+     * extended colour (38/48/58) are read as arguments, not as codes: a 0
+     * component can no longer be mistaken for a full reset, and colour
+     * codes beyond the 16th parameter are still honoured. */
+    ParamCursor p = { t->params, t->plen, 0 };
+    int v;
+    while ((v = param_next(&p)) >= 0) {
         if (v == 0) { t->fg = 7; t->bg = 0; t->bold = 0; }
         else if (v == 1) t->bold = 1;
         else if (v == 22) t->bold = 0;
-        else if ((v >= 30 && v <= 37)) t->fg = (u8)(v - 30);
+        else if (v >= 30 && v <= 37) t->fg = (u8)(v - 30);
         else if (v == 39) t->fg = 7;
-        else if ((v >= 40 && v <= 47)) t->bg = (u8)(v - 40);
+        else if (v >= 40 && v <= 47) t->bg = (u8)(v - 40);
         else if (v == 49) t->bg = 0;
-        else if ((v >= 90 && v <= 97)) t->fg = (u8)(v - 90 + 8);
-        else if ((v >= 100 && v <= 107)) t->bg = (u8)(v - 100 + 8);
-        else if (v == 38 || v == 48) {
-            /* 256-colour / truecolour - we take the simple 256 path */
+        else if (v >= 90 && v <= 97) t->fg = (u8)(v - 90 + 8);
+        else if (v >= 100 && v <= 107) t->bg = (u8)(v - 100 + 8);
+        else if (v == 38 || v == 48 || v == 58) {
             int is_fg = (v == 38);
-            i++;
-            if (i < n && vals[i] == 5 && i + 1 < n) {
-                int idx = vals[i + 1];
-                i++;
-                if (is_fg) t->fg = (idx < 16) ? (u8)idx : 7;
-                else       t->bg = (idx < 16) ? (u8)idx : 0;
+            int mode = param_next(&p);
+            if (mode == 5) {
+                int idx = param_next(&p);
+                if (idx < 0) break;
+                u8 c = colour256(idx);
+                if (is_fg) t->fg = c;
+                else if (v == 48) t->bg = c;
+            } else if (mode == 2) {
+                int r = param_next(&p);
+                int g = param_next(&p);
+                int b = param_next(&p);
+                if (r < 0 || g < 0 || b < 0) break;
+                u8 c = nearest16(r, g, b);
+                if (is_fg) t->fg = c;
+                else if (v == 48) t->bg = c;
+            } else {
+                break;      /* unknown form: the rest of the SGR is unusable */
             }
         }
     }
 }
 
-static void csi_dispatch(Term *t, char final) {
-    int p1 = 0, p2 = 0;
-    char *s = t->params;
-    if (t->plen) p1 = atoi(s);
-    char *semi = strchr(s, ';');
-    if (semi) p2 = atoi(semi + 1);
+static void csi_dispatch(Term *t, char final, int priv) {
+    t->dirty = 1;
+    if (priv) return;       /* ESC[?25h and friends: no cursor, no colour */
+
+    ParamCursor p = { t->params, t->plen, 0 };
+    int p1 = param_next(&p);
+    int p2 = param_next(&p);
+    if (p1 < 0) p1 = 0;
+    if (p2 < 0) p2 = 0;
 
     switch (final) {
         case 'H': case 'f': {
             int row = (p1 > 0 ? p1 : 1) - 1;
             int col = (p2 > 0 ? p2 : 1) - 1;
-            if (row < 0) row = 0;
-            if (row >= t->rows) row = t->rows - 1;
-            if (col < 0) col = 0;
-            if (col >= t->cols) col = t->cols - 1;
-            t->cx = col; t->cy = row;
+            cursor_set(t, col, row);
             break;
         }
-        case 'A': t->cy -= (p1 > 0 ? p1 : 1); if (t->cy < 0) t->cy = 0; break;
-        case 'B': t->cy += (p1 > 0 ? p1 : 1); if (t->cy >= t->rows) t->cy = t->rows - 1; break;
-        case 'C': t->cx += (p1 > 0 ? p1 : 1); if (t->cx >= t->cols) t->cx = t->cols - 1; break;
-        case 'D': t->cx -= (p1 > 0 ? p1 : 1); if (t->cx < 0) t->cx = 0; break;
+        case 'A': cursor_move(t, 0, -(p1 > 0 ? p1 : 1)); break;
+        case 'B': cursor_move(t, 0,  (p1 > 0 ? p1 : 1)); break;
+        case 'C': cursor_move(t,  (p1 > 0 ? p1 : 1), 0); break;
+        case 'D': cursor_move(t, -(p1 > 0 ? p1 : 1), 0); break;
+        case 'G': cursor_set(t, (p1 > 0 ? p1 : 1) - 1, t->cy); break;
+        case 'd': cursor_set(t, t->cx, (p1 > 0 ? p1 : 1) - 1); break;
         case 'J': {
             int mode = p1;
-            if (mode == 2 || mode == 3) clear_cells(t, 0, 0, t->cols - 1, t->rows - 1);
-            else if (mode == 0) {
+            if (mode == 2 || mode == 3) {
+                clear_cells(t, 0, 0, t->cols - 1, t->rows - 1);
+                if (mode == 3) {        /* 3 also drops the scrollback */
+                    t->hist_head = 0;
+                    t->hist_count = 0;
+                    t->scroll = 0;
+                }
+            } else if (mode == 0) {
                 clear_cells(t, t->cx, t->cy, t->cols - 1, t->cy);
-                if (t->cy + 1 < t->rows) clear_cells(t, 0, t->cy + 1, t->cols - 1, t->rows - 1);
+                if (t->cy + 1 < t->rows)
+                    clear_cells(t, 0, t->cy + 1, t->cols - 1, t->rows - 1);
             } else if (mode == 1) {
-                clear_cells(t, 0, 0, t->cols - 1, t->cy - 1 > 0 ? t->cy - 1 : 0);
+                /* Erase from the top of the screen to the cursor: whole rows
+                 * above the cursor, then 0..cx of the cursor row. On row 0
+                 * that is only the cells left of the cursor, not the row. */
+                if (t->cy > 0) clear_cells(t, 0, 0, t->cols - 1, t->cy - 1);
                 clear_cells(t, 0, t->cy, t->cx, t->cy);
             }
             break;
@@ -276,44 +345,128 @@ static void csi_dispatch(Term *t, char final) {
         case 'h': case 'l': break;      /* modes: ignore */
         default: break;
     }
-    t->dirty = 1;
+}
+
+/* Decode one byte of UTF-8 into cells. An overlong form, a surrogate, a
+ * codepoint above U+10FFFF or a broken/incomplete sequence becomes U+FFFD;
+ * the decoder always realigns on the offending byte. */
+static void utf8_byte(Term *t, unsigned char b) {
+again:
+    if (t->u8_need > 0) {
+        if ((b & 0xC0) == 0x80) {
+            t->u8_cp = (t->u8_cp << 6) | (u32)(b & 0x3F);
+            if (--t->u8_need == 0) {
+                u32 cp = t->u8_cp;
+                int bad = (cp < t->u8_min) || (cp > 0x10FFFFu) ||
+                          (cp >= 0xD800u && cp <= 0xDFFFu);
+                t->u8_cp = 0;
+                t->u8_min = 0;
+                put_char(t, bad ? 0xFFFDu : cp);
+            }
+            return;
+        }
+        /* Not a continuation byte: the sequence is broken. Emit one
+         * replacement char and reinterpret this byte from the start. */
+        t->u8_cp = 0;
+        t->u8_need = 0;
+        t->u8_min = 0;
+        put_char(t, 0xFFFDu);
+        goto again;
+    }
+
+    if (b < 0x80) { put_char(t, b); return; }
+    if (b >= 0xC2 && b <= 0xDF)      { t->u8_need = 1; t->u8_cp = b & 0x1Fu; t->u8_min = 0x80; }
+    else if (b >= 0xE0 && b <= 0xEF) { t->u8_need = 2; t->u8_cp = b & 0x0Fu; t->u8_min = 0x800; }
+    else if (b >= 0xF0 && b <= 0xF4) { t->u8_need = 3; t->u8_cp = b & 0x07u; t->u8_min = 0x10000; }
+    else put_char(t, 0xFFFDu);   /* 0x80..0xC1 and 0xF5..0xFF are never lead bytes */
+}
+
+static void csi_param_byte(Term *t, char c) {
+    if (t->plen < (int)sizeof(t->params) - 1) t->params[t->plen++] = c;
+    else t->csi_over = 1;       /* truncating mid-number would run a
+                                 * different sequence: drop it instead */
 }
 
 static void feed_byte(Term *t, unsigned char b) {
     switch (t->state) {
         case 0:
+            if (b >= 0x80) { utf8_byte(t, b); break; }
+            if (t->u8_need) {       /* an ASCII byte cut a multi-byte char short */
+                t->u8_cp = 0;
+                t->u8_need = 0;
+                t->u8_min = 0;
+                put_char(t, 0xFFFDu);
+            }
             if (b == 0x1B) { t->state = 1; break; }
-            if (b == 0x0D) { t->cx = 0; break; }
+            if (b == 0x0D) { t->cx = 0; t->wrap = 0; break; }
             if (b == 0x0A) { newline(t); break; }
-            if (b == 0x08) { if (t->cx > 0) t->cx--; break; }
-            if (b == 0x09) { t->cx = (t->cx + 8) & ~7; if (t->cx >= t->cols) t->cx = t->cols - 1; break; }
+            if (b == 0x08) { t->wrap = 0; if (t->cx > 0) t->cx--; break; }
+            if (b == 0x09) {
+                t->wrap = 0;
+                t->cx = (t->cx + 8) & ~7;
+                if (t->cx >= t->cols) t->cx = t->cols - 1;
+                break;
+            }
             if (b == 0x07) break;
             if (b < 32) break;
             put_char(t, b);
             break;
 
         case 1:                     /* after ESC */
-            if (b == '[') { t->state = 2; t->plen = 0; t->params[0] = 0; }
-            else if (b == ']') { t->state = 3; }
-            else if (b == '(' || b == ')') { t->state = 1; }   /* charset select: swallow */
-            else t->state = 0;
-            break;
-
-        case 2:                     /* inside CSI */
-            if ((b >= '0' && b <= '9') || b == ';' || b == '?' || b == ' ') {
-                if (t->plen < (int)sizeof(t->params) - 1) {
-                    if (b != '?') t->params[t->plen++] = (char)b;
-                }
+            if (b == '[') {
+                t->state = 2;
+                t->plen = 0;
+                t->params[0] = 0;
+                t->csi_priv = 0;
+                t->csi_over = 0;
+            } else if (b == ']') {
+                t->state = 3;
+                t->osc_len = 0;
+            } else if (b == 'c') {  /* RIS: full reset, so term_clear_screen
+                                     * is reachable from the wire */
+                screen_reset(t);
+                t->state = 0;
+            } else if (b == '(' || b == ')') {
+                t->state = 5;       /* charset select: swallow one byte */
             } else {
-                t->params[t->plen] = 0;
-                csi_dispatch(t, (char)b);
                 t->state = 0;
             }
             break;
 
-        case 3:                     /* OSC ... terminated by BEL or ST */
-            if (b == 0x07) t->state = 0;
-            else if (b == 0x1B) t->state = 1;
+        case 2:                     /* inside CSI */
+            if (b >= '0' && b <= '9') { csi_param_byte(t, (char)b); }
+            else if (b == ';') { csi_param_byte(t, ';'); }
+            else if (b == '?' || b == '>' || b == '<' || b == '=') {
+                if (t->plen == 0) t->csi_priv = 1;
+            } else if (b >= 0x20 && b <= 0x2F) {
+                /* intermediate byte (e.g. the '$' of DECRQM): ignore */
+            } else if (b >= 0x40 && b <= 0x7E) {
+                t->params[t->plen] = 0;
+                if (!t->csi_over) csi_dispatch(t, (char)b, t->csi_priv);
+                t->state = 0;
+            } else if (b == 0x1B) {
+                t->state = 1;       /* abandoned CSI */
+            } else if (b < 0x20) {
+                t->state = 0;       /* control byte aborts the sequence */
+            }
+            break;
+
+        case 3:                     /* OSC ... ends at BEL, ST or a control */
+            if (b == 0x07) { t->state = 0; }
+            else if (b == 0x1B) { t->state = 4; }
+            else if (b < 0x20) { t->state = 0; }   /* CAN/SUB/newline: abort */
+            else if (++t->osc_len > TERM_OSC_MAX) { t->state = 0; }
+            break;
+
+        case 4:                     /* ESC seen inside an OSC: want '\\' (ST) */
+            if (b == '\\') { t->state = 0; }
+            else if (b == 0x1B) { /* still waiting for the ST byte */ }
+            else if (b == 0x07 || b < 0x20) { t->state = 0; }
+            else { t->state = 3; }  /* not ST: back into the OSC string */
+            break;
+
+        case 5:                     /* one byte after ESC ( or ESC ) */
+            t->state = 0;
             break;
     }
 }
@@ -353,7 +506,7 @@ Term *term_create(int cols, int rows, const char *shell) {
         execl(shell, shell, "-i", (char *)NULL);
         _exit(127);
     }
-    if (pid < 0) { free(t->grid); free(t); return NULL; }
+    if (pid < 0) { free(t->grid); free(t->hist); free(t); return NULL; }
 
     fcntl(master, F_SETFL, fcntl(master, F_GETFL, 0) | O_NONBLOCK);
     t->fd = master;
@@ -389,8 +542,11 @@ int term_pump(Term *t) {
         break;
     }
     if (!t->alive) {
+        /* Reap once, and forget the pid so term_destroy never signals a pid
+         * that has been recycled by an unrelated process. */
         int status;
-        waitpid(t->pid, &status, WNOHANG);
+        if (t->pid > 0 && waitpid(t->pid, &status, WNOHANG) == t->pid)
+            t->pid = -1;
     }
     t->dirty = t->dirty || total > 0;
     return total;
@@ -414,9 +570,49 @@ int term_scroll_offset(Term *t) { return t ? t->scroll : 0; }
 
 void term_clear_screen(Term *t) {
     if (!t) return;
-    clear_cells(t, 0, 0, t->cols - 1, t->rows - 1);
-    t->cx = t->cy = 0;
-    t->dirty = 1;
+    screen_reset(t);
+}
+
+/* Close the pty, hang up the shell, reap it, and free the grid, the
+ * scrollback and the struct. The only correct way to throw a terminal away:
+ * close(2) alone leaks 426 KiB (88x20 grid + 88x600 scrollback) and leaves the
+ * shell running (or its zombie behind when a background job holds the slave).
+ * The reaping is bounded: a shell that ignores SIGHUP is SIGKILLed after
+ * 100 ms and waited on for at most another 100 ms, so closing a window can
+ * never wedge the desktop. */
+void term_destroy(Term *t) {
+    if (!t) return;
+
+    if (t->fd >= 0) { close(t->fd); t->fd = -1; }
+
+    if (t->pid > 0) {
+        int status;
+        int reaped = 0;
+        kill(t->pid, SIGHUP);
+        for (int i = 0; i < 20 && !reaped; i++) {
+            pid_t r = waitpid(t->pid, &status, WNOHANG);
+            if (r == t->pid || r < 0) { reaped = 1; break; }  /* r < 0: ECHILD */
+            struct timespec ts = { 0, 5 * 1000 * 1000 };      /* 5 ms */
+            nanosleep(&ts, NULL);
+        }
+        if (!reaped) {
+            kill(t->pid, SIGKILL);
+            for (int i = 0; i < 20; i++) {
+                pid_t r = waitpid(t->pid, &status, WNOHANG);
+                if (r == t->pid || r < 0) break;
+                struct timespec ts = { 0, 5 * 1000 * 1000 };
+                nanosleep(&ts, NULL);
+            }
+        }
+        t->pid = -1;
+    }
+
+    t->alive = 0;
+    free(t->grid);
+    free(t->hist);
+    t->grid = NULL;
+    t->hist = NULL;
+    free(t);
 }
 
 /* Draw the grid into a rectangle. Caller owns the frame. */
@@ -450,15 +646,26 @@ void term_draw(Term *t, Surface *s, int x, int y, int w, int h,
             u32 bg = cell_bg(c);
             if (bg != PALETTE[0]) surf_fill(s, (int)px, (int)py, (int)cw + 1, (int)ch + 1, bg);
             if (c->ch && c->ch != ' ') {
+                /* Re-encode the codepoint we decoded in feed_byte. 1, 2, 3 and
+                 * 4 byte forms; a cell can never hold a surrogate or
+                 * something above U+10FFFF, but render U+FFFD if it does. */
                 char utf[8];
                 int n = 0;
                 u32 ch2 = c->ch;
-                if (ch2 < 0x80) utf[n++] = (char)ch2;
-                else if (ch2 < 0x800) {
+                if (ch2 > 0x10FFFFu || (ch2 >= 0xD800u && ch2 <= 0xDFFFu))
+                    ch2 = 0xFFFDu;
+                if (ch2 < 0x80) {
+                    utf[n++] = (char)ch2;
+                } else if (ch2 < 0x800) {
                     utf[n++] = (char)(0xC0 | (ch2 >> 6));
                     utf[n++] = (char)(0x80 | (ch2 & 0x3F));
-                } else {
+                } else if (ch2 < 0x10000) {
                     utf[n++] = (char)(0xE0 | (ch2 >> 12));
+                    utf[n++] = (char)(0x80 | ((ch2 >> 6) & 0x3F));
+                    utf[n++] = (char)(0x80 | (ch2 & 0x3F));
+                } else {
+                    utf[n++] = (char)(0xF0 | (ch2 >> 18));
+                    utf[n++] = (char)(0x80 | ((ch2 >> 12) & 0x3F));
                     utf[n++] = (char)(0x80 | ((ch2 >> 6) & 0x3F));
                     utf[n++] = (char)(0x80 | (ch2 & 0x3F));
                 }

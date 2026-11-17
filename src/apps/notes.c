@@ -341,7 +341,6 @@ static void insert(Notes *n, char c) {
     n->cur++;
     n->len++;
     n->dirty = 1;
-    n->confirm = 0;      /* the buffer moved: ask again before clobbering */
     note_pcol(n);
 }
 
@@ -351,7 +350,6 @@ static void erase_one(Notes *n) {
     n->cur--;
     n->len--;
     n->dirty = 1;
-    n->confirm = 0;
     note_pcol(n);
 }
 
@@ -360,7 +358,6 @@ static void erase_forward(Notes *n) {
     memmove(n->buf + n->cur, n->buf + n->cur + 1, (size_t)(n->len - n->cur - 1));
     n->len--;
     n->dirty = 1;
-    n->confirm = 0;
     note_pcol(n);
 }
 
@@ -386,7 +383,7 @@ static void save(Notes *n) {
     /* The buffer holds only the first NOTES_MAX-1 bytes of a bigger
      * file: writing it back would delete the rest. Say so with the
      * real sizes first, and only overwrite on an explicit second
-     * Ctrl+S (any edit clears the confirmation). */
+     * Ctrl+S (any other keypress clears the confirmation). */
     if (n->partial) {
         struct stat st;
         if (stat(NOTES_PATH, &st) == 0 && (long)st.st_size > (long)n->len) {
@@ -780,6 +777,13 @@ static void notes_key(App *a, const char *bytes, int count) {
 
         if (n->esc && esc_feed(n, c, fr, fd)) continue;
         if (code == 0x1B) { n->esc = 1; continue; }
+
+        /* One keypress that is not Ctrl+S cancels an "overwrite the
+         * bigger file?" warning: the user has touched the document
+         * since the warning, so it has to be earned again. This sits
+         * above the edit path on purpose - an edit dropped because the
+         * buffer is full still counts as an attempt to change it. */
+        if (code != 0x13) n->confirm = 0;
 
         if (code == 0x13) {                        /* Ctrl+S */
             save(n);
