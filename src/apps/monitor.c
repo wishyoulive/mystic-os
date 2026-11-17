@@ -162,12 +162,12 @@ static void loadavg_read(double *l1, int *threads) {
     char line[256];
     if (fgets(line, sizeof(line), f)) {
         double a = 0, b = 0, c = 0;
-        int running = 0, thr = 0;
-        if (sscanf(line, "%lf %lf %lf %d/%d", &a, &b, &c, &running, &thr) == 5) {
+        int thr = 0;
+        /* field 4 is "running/threads"; we want the total */
+        if (sscanf(line, "%lf %lf %lf %*d/%d", &a, &b, &c, &thr) == 4) {
             *l1 = a;
             *threads = thr;
         }
-        (void)running;
     }
     fclose(f);
 }
@@ -526,8 +526,8 @@ static void monitor_key(App *a, const char *bytes, int n) {
             m->sort = (m->sort + 1) % 3;
             sort_procs(m);
             if (keep > 0)
-                for (int i = 0; i < m->count; i++)
-                    if (m->procs[i].pid == keep) { m->sel = i; break; }
+                for (int idx = 0; idx < m->count; idx++)
+                    if (m->procs[idx].pid == keep) { m->sel = idx; break; }
         } else if (c == 'K' || c == 'x') {
             kill_selected(m);
         }

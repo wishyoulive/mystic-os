@@ -706,8 +706,16 @@ int main(void) {
                 }
             } else if (top->app) {
                 if (input.text_len) app_key(top->app, input.text, input.text_len);
-                if (input.key == 14) app_key(top->app, "\b", 1);   /* Backspace */
-                if (input.key == 28) app_key(top->app, "\n", 1);   /* Enter */
+                /* Arrows, Home/End, PageUp/Down and Delete must reach apps as
+                 * escape sequences or none of their key handling can run.
+                 * (Found by the files and notes workers during review; the
+                 * Enter/Backspace forwarding that used to live here duplicated
+                 * what input.text already carries.) */
+                char kb[64];
+                int kn = 0;
+                key_bytes(kb, &kn);
+                if (kn) app_key(top->app, kb, kn);
+                if (input.text_len || kn) dirty = 1;   /* or the repaint lags a second */
             }
         }
 
