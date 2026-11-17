@@ -40,16 +40,20 @@ typedef struct {
     int    cur;        /* caret: byte offset in buf, 0..len          */
     int    w, h;
     int    dirty;
-    time_t saved_at;
+    int    saved_here; /* we wrote the file this session            */
+    time_t saved_at;   /* clock at that write                       */
+    time_t disk_mtime; /* st_mtime of the file as last stat'd       */
     long   disk_len;   /* st_size of the file, -1 when absent        */
     int    top;        /* index of the first visible logical line    */
     int    top_row;    /* first visible wrapped row inside that line */
+    int    fitted_w, fitted_h;  /* size top/top_row were last fitted for */
     int    pcol;       /* preferred byte column, for up/down         */
     /* Escape-sequence reader. An escape can be split over two key
      * events, so the state lives in the app, not on the stack. */
     int    esc;        /* 0 idle, 1 after ESC, 2 in CSI, 3 after ESC O */
     int    esc_param;
     int    esc_digits;
+    int    esc_mod;    /* inside the second (modifier) parameter     */
 } Notes;
 
 static const char *NOTES_PATH = "/root/notes.txt";
@@ -270,9 +274,14 @@ static void caret_page(Notes *n, Font *fr, Font *fd, int dir) {
     if (target < 0) target = 0;
     if (target > lines - 1) target = lines - 1;
 
+    /* A page moves the window, but never past the last page: on a file
+     * shorter than a screen the view stays anchored at the top. PageUp
+     * is never pulled forwards by this clamp. */
+    int max_top = lines - vis;
+    if (max_top < 0) max_top = 0;
     n->top += dir * vis;
+    if (dir > 0 && n->top > max_top) n->top = max_top;
     if (n->top < 0) n->top = 0;
-    if (n->top > lines - 1) n->top = lines - 1;
     n->top_row = 0;
 
     int start = line_start_of_index(n, target);
@@ -326,10 +335,12 @@ static void save(Notes *n) {
     fsync(fileno(f));
     fclose(f);
     n->dirty = 0;
+    n->saved_here = 1;
     n->saved_at = time(NULL);
 
     struct stat st;
     n->disk_len = (stat(NOTES_PATH, &st) == 0) ? (long)st.st_size : -1;
+    if (n->disk_len >= 0) n->disk_mtime = st.st_mtime;
 }
 
 /* ------------------------------------------------------------
@@ -366,20 +377,25 @@ static void esc_dispatch(Notes *n, int param, int final, Font *fr, Font *fd) {
 static int esc_feed(Notes *n, unsigned char c, Font *fr, Font *fd) {
     switch (n->esc) {
         case 1:
-            if (c == '[') { n->esc = 2; n->esc_param = 0; n->esc_digits = 0; return 1; }
+            if (c == '[') {
+                n->esc = 2; n->esc_param = 0; n->esc_digits = 0; n->esc_mod = 0;
+                return 1;
+            }
             if (c == 'O') { n->esc = 3; return 1; }
             n->esc = 0;
             if (c == 0x1B) { n->esc = 1; return 1; }
             return 0;
         case 2:
             if (c >= '0' && c <= '9') {
-                if (n->esc_digits < 4) {
+                /* Digits after a ';' are a modifier (Shift/Ctrl/Alt):
+                 * skipped, so ESC [ 5 ; 2 ~ is still a plain PageUp. */
+                if (!n->esc_mod && n->esc_digits < 4) {
                     n->esc_param = n->esc_param * 10 + (c - '0');
                     n->esc_digits++;
                 }
                 return 1;
             }
-            if (c == ';') return 1;             /* modifiers: ignored */
+            if (c == ';') { n->esc_mod = 1; return 1; }
             n->esc = 0;
             esc_dispatch(n, n->esc_digits ? n->esc_param : 0, c, fr, fd);
             return 1;
@@ -429,9 +445,15 @@ static void notes_init(App *a, int w, int h) {
     n->top_row = 0;
     n->pcol = 0;
     n->esc = 0;
+    n->saved_here = 0;
 
     struct stat st;
-    n->disk_len = (stat(NOTES_PATH, &st) == 0) ? (long)st.st_size : -1;
+    if (stat(NOTES_PATH, &st) == 0) {
+        n->disk_len = (long)st.st_size;
+        n->disk_mtime = st.st_mtime;
+    } else {
+        n->disk_len = -1;
+    }
     a->state = n;
 }
 
@@ -456,9 +478,23 @@ static void notes_draw(App *a, Surface *s, int x, int y, int w, int h, const The
     /* The real file, every frame. This is the only source of truth for
      * what is on the disk; it is not cached from the last save. */
     struct stat st;
-    n->disk_len = (stat(NOTES_PATH, &st) == 0) ? (long)st.st_size : -1;
+    if (stat(NOTES_PATH, &st) == 0) {
+        n->disk_len = (long)st.st_size;
+        n->disk_mtime = st.st_mtime;
+    } else {
+        n->disk_len = -1;
+    }
 
     surf_fill(s, x, y, w, h, color_mix(th->window_bg, 0xFF000000u, 0.25f));
+
+    /* The window may have been resized since the last keystroke: re-fit
+     * the scroll window before painting, or a shorter/wider window would
+     * hide the caret or leave top_row past the real row count. */
+    if (n->fitted_w != w || n->fitted_h != h) {
+        ensure_visible(n, fr, fd);
+        n->fitted_w = w;
+        n->fitted_h = h;
+    }
 
     int   lines = line_count(n);
     float gutter = gutter_width_px(n, fd);
@@ -542,9 +578,18 @@ static void notes_draw(App *a, Surface *s, int x, int y, int w, int h, const The
         snprintf(foot, sizeof(foot), "%d bytes buf  -  %ld bytes on disk  -  unsaved",
                  n->len, n->disk_len);
     } else {
-        long ago = n->saved_at ? (long)(time(NULL) - n->saved_at) : 0;
-        snprintf(foot, sizeof(foot), "%d bytes buf  -  %ld bytes on disk  -  saved %ld s ago",
-                 n->len, n->disk_len, ago);
+        long ago;
+        if (n->saved_here) {
+            /* This session wrote it: measure from our own save. */
+            ago = (long)(time(NULL) - n->saved_at);
+            snprintf(foot, sizeof(foot), "%d bytes buf  -  %ld bytes on disk  -  saved %ld s ago",
+                     n->len, n->disk_len, ago < 0 ? 0L : ago);
+        } else {
+            /* Never saved here: the age comes from the file's own mtime. */
+            ago = (long)(time(NULL) - n->disk_mtime);
+            snprintf(foot, sizeof(foot), "%d bytes buf  -  %ld bytes on disk  -  written %ld s ago",
+                     n->len, n->disk_len, ago < 0 ? 0L : ago);
+        }
     }
     if (font_width(fd, foot) > (float)(w - 16)) {   /* narrow window: shorten */
         if (n->disk_len < 0)
@@ -658,7 +703,14 @@ static void notes_click(App *a, int x, int y, int buttons) {
 
 static void notes_resize(App *a, int w, int h) {
     Notes *n = a->state;
-    if (n) { n->w = w; n->h = h; }
+    if (!n) return;
+    n->w = w;
+    n->h = h;
+    /* A resize changes the row budget: re-fit the scroll window at once,
+     * not on the next keystroke, or the caret can sit outside the band. */
+    ensure_visible(n, font_get(FONT_REGULAR, 12), font_get(FONT_REGULAR, 10));
+    n->fitted_w = w;
+    n->fitted_h = h;
 }
 
 const AppVT app_vt_notes = {

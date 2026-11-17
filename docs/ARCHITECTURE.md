@@ -125,10 +125,10 @@ Everything else is closed and logged as ignored. Both fds are opened
   `ABS_X`/`ABS_Y` set the position directly; `REL_WHEEL` accumulates `wheel`.
 * `BTN_LEFT`/`BTN_RIGHT`/`BTN_MIDDLE` set bits 1/2/4 in `buttons` plus the
   one-frame `clicked`/`released` masks.
-* Other `EV_KEY` press events set `key` (raw evdev code), `key_pressed`, `shift`
-  and `alt` (the modifier state on that event), and append a printable character
-  to `text[]` via the explicit `KEYMAP` table and `key_to_char()`. Ctrl+letter is
-  folded to a control byte (`Ctrl+S` → `0x13`).
+* Other `EV_KEY` press events set `key` (raw evdev code), `key_pressed`, and the
+  modifier state carried on that event (`shift`, `alt`, `ctrl`), and append a
+  printable character to `text[]` via the explicit `KEYMAP` table and
+  `key_to_char()`. Ctrl+letter is folded to a control byte (`Ctrl+S` → `0x13`).
 
 `input_frame()` clears the per-frame fields at the top of every loop, so a click
 is consumed exactly once. The pointer starts at (640, 400) because a relative
@@ -180,34 +180,55 @@ never has to be erased. At 1280×800 the pair costs 2 × 4.096 MB.
 
 ### 2.4 Full recompose on change
 
-There is no damage tracking. Every loop sets `dirty` for any of: a click a window
-or the dock handled, mouse motion (`mouse_dx || mouse_dy`), a key that opens or
-closes a window or changes the theme, a changed wall-clock second (`time(NULL)`),
-terminal output (`term_pump` is called for every terminal window and
-unconditionally sets `dirty`), and terminal keys/wheel scrolling. When `dirty` is
-set, the entire frame is rebuilt and presented, then `dirty = 0`. The loop ends
-with `poll(…, 16)` ms, which is the only pacing — there is no vsync and no partial
-redraw.
+There is no damage tracking. Every loop sets `dirty` for any of: a click that a
+window, the dock or the launcher handled, mouse motion (`mouse_dx || mouse_dy`), a
+key that opens or closes a window or changes the theme, a changed wall-clock
+second (`time(NULL)`), terminal output (`term_pump` is called for every terminal
+window and unconditionally sets `dirty`), and terminal keys/wheel scrolling. When
+`dirty` is set, the entire frame is rebuilt and presented, then `dirty = 0`. The
+loop ends with `poll(…, 16)` ms, which is the only pacing — there is no vsync and
+no partial redraw.
 
 `draw_desktop()` composes in this order:
 
 1. Background: `gfx_gradient` from `bg_top` to `bg_bottom`, then three
    `gfx_glow` calls (top-left, right, bottom) using the theme's `glow`/`accent`
    and `glow_strength`.
-2. Top bar, 34 px: `gfx_blur_region` over the bar (radius `18 * blur`), then a
-   55 %-alpha `panel` tint, then a 1 px `panel_border` line. Text: `"Mystic OS"`,
+2. Top bar, 34 px: `gfx_blur_region` over the bar (radius `18 * blur`), then
+   `surf_blend(…, color_alpha(th->panel, 0.55f))` — the panel colour at 55 % of
+   *its own* alpha, which works out at ≈30 % opacity with Obsidian and Aurora
+   (`panel = #8C…`: 0x8C × 0.55 → 0x4D) and ≈42 % with Porcelain (`#C0…`:
+   0xC0 × 0.55 → 0x6A) — then a 1 px `panel_border` line. Text: `"Mystic OS"`,
    the focused window's title centred, and on the right `clock_text()` +
    `mem_field("MemTotal:")`/`"MemAvailable:"` from `/proc/meminfo`, formatted as
    `HH:MM      N MB used of M MB`. `clock_text()` uses `gmtime_r`, so the clock is
    UTC.
-3. Windows, back to front (§3).
+3. Windows, back to front (§3). Each one is composed in this order:
+   `gfx_shadow(x, y, w, h, corner, 24, 0.5)` → a backdrop blur over the window
+   rect (radius `14 * blur`) → the rounded body in `window_bg` with a 1 px
+   `window_border` → a 40 px title strip tinted with the panel colour at 30 % of
+   its own alpha (`color_alpha(th->panel, 0.30f)`, ≈16 % with Obsidian/Aurora)
+   and a 1 px divider → three 10 px circles (the red one closes) → the title at
+   `x+72` → three grip strokes in the bottom-right corner → the content rectangle
+   `(x+1, y+41, w-2, h-43)` handed to `term_draw()` or `app_draw()`.
 4. Dock: `dock_rect()` gives a centred bar `DOCK_N*40 + (DOCK_N-1)*20 + 28` wide,
    68 high, 22 px above the bottom edge; `gfx_shadow`, backdrop blur (radius
    `20 * blur`), rounded `panel`, then one 40×40 icon per `DOCK[]` entry with a
    hover tint and the icon drawn by a small vector routine
    (`icon_terminal`, `icon_folder`, `icon_gear`, `icon_bars`, `icon_pencil`).
    Under an icon whose app (or, for the terminal, whose pty) is open, a 4 px
-   accent dot is drawn. If the launcher is open, `draw_launcher()` runs last.
+   accent dot is drawn. If the launcher is open, `draw_launcher()` runs after the
+   dock; if the screen is locked, `draw_lock_screen()` runs after that.
+
+Every **direct** backdrop blur in that list is guarded by `th->blur > 0`: with
+`blur = 0` the top bar, windows, dock and launcher lose their blur (the lock
+screen's fixed radius 40 is skipped too). All three shipped themes use
+`blur = 1.0`, so the radii above are the ones you actually get. The shadows are a
+separate path: `gfx_shadow()` blurs its own scratch surface inside
+`gfx_blur_region(&tmp, 0, 0, rw, rh, (int)spread)` (`src/gfx.c`) with a **fixed**
+radius equal to its `spread` argument — 24 for windows, 18 for the dock, 30 for
+the launcher, 26 for the lock panel — and it runs whether or not the theme has
+blur enabled.
 
 ### 2.5 Rounded rectangles: signed distance, not a mask
 
@@ -300,11 +321,16 @@ pass a box top and get text that sits on `y + ascent`.
 * `gfx_polygon` — scanline fill with **4 sub-scanlines per row** (vertical
   antialiasing), even-odd fill from a sorted intersection list (max 64), and
   per-pixel horizontal coverage `clamp(r - l)` weighted by `alpha/4`. The mouse
-  cursor is a 7-point polygon drawn twice (black outline, white body).
+  cursor is a 7-point polygon drawn twice: a black copy shifted by (+1.2, +1.2)
+  px, which reads as a drop shadow, then the white body on top.
 
 Everything here is scalar C on one core, per pixel. The expensive primitive is
-the blur, and it runs for the top bar, every visible window and the dock on every
-composed frame — which is exactly why it is done at quarter resolution.
+the blur: with the shipped themes (`blur = 1.0`) every composed frame blurs the
+top bar, each visible window and the dock, plus the launcher or lock screen when
+shown; a theme that sets `blur = 0` skips all of those. The shadowed elements —
+windows (24), the dock (18), the launcher (30) and the lock panel (26), but not
+the top bar — each blur a scratch surface as well, at their fixed radii. That cost
+is why the blur runs at quarter resolution.
 
 ---
 
@@ -430,6 +456,10 @@ lines and any typing resets it to live. App windows get the printable `text`,
 evdev 14 → `"\b"`, evdev 28 → `"\n"`. Every non-top window is deaf, and there is
 no focus-follows-mouse.
 
+The wheel is not routed to windows at all: `main()` finds the topmost **terminal**
+window under the pointer and calls `term_scroll(t, wheel * 3)`, so three lines per
+notch. Apps never see `input.wheel`.
+
 The theme can also be changed from disk: once per wall-clock second `main()`
 re-reads `/etc/mystic/current-theme` and matches the first line against
 `Theme::name`, which is how the Settings app is meant to ask for a theme. Note
@@ -468,29 +498,38 @@ next loop closes the window.
 
 ### 3.8 Launcher (`src/main.c`)
 
-Super (`KEY_LEFTMETA`, evdev 125) toggles a full-screen application grid.
-`LAUNCHER[]` is a list of `{ app_id, label, icon }` — a superset of `DOCK[]` that
-also exposes `sysinfo` — and `launcher_geom(i, …)` lays the tiles out in three
-columns of 128 × 118, 18 px apart, centred on the display.
+Super (`KEY_LEFTMETA`, evdev 125) toggles the launcher: a three-column tile panel
+centred over a full-screen dim. `LAUNCHER[]` is a list of `{ app_id, label, icon }`
+— a superset of `DOCK[]` that also exposes `sysinfo` — and `launcher_geom(i, …)`
+lays the tiles out in three columns of 128 × 118, 18 px apart, centred on the
+display.
 
-`draw_launcher()` darkens the whole frame with `surf_blend(0,0,w,h,0xAA000000)`,
-then paints a rounded panel with a shadow and a backdrop blur of radius `22*blur`,
-one tile per entry with hover tint, icon and label, and a `"Super or Esc closes"`
-hint underneath. A click on a tile opens the app and closes the launcher; a click
-elsewhere closes it; Esc closes it before it can reach the focused window.
+`draw_launcher()` first darkens the frame with
+`surf_blend(s, 0, 0, s->w, s->h, 0xAA000000u)`, then paints a rounded panel
+(`color_alpha(th->window_bg, 0.97f)`) with a shadow and, when `blur > 0`, a
+backdrop blur of radius `22*blur`, one tile per entry with hover tint, icon and
+label, and a `"Super or Esc closes"` hint underneath. A click on a tile opens the
+app and closes the launcher; a click elsewhere closes it; Esc closes it before it
+can reach the focused window.
 
 ### 3.9 Lock screen (`src/main.c`, `src/sha256.c`)
 
 Ctrl+Alt+L sets `locked` and clears the typed password. While `locked`, the main
-loop runs a separate branch before any global key handling: printable bytes are
-appended to `pin`, Backspace removes one, Enter calls `try_unlock()`, and every
-iteration redraws and sleeps 16 ms — no window, dock, launcher or app receives
-input, and the loop `continue`s instead of falling through.
+loop runs a separate branch before any global key handling: bytes with `c >= 32`
+from `text[]` are appended to `pin`, and control bytes in `text[]` (`\n` from
+Enter, `\b` from Backspace) are dropped by that loop because their actions are
+taken from the key code instead — evdev 14 removes the last character, evdev 28
+calls `try_unlock()`; any other non-printable key is ignored while locked. Every
+iteration also redraws and sleeps 16 ms, so no window, dock, launcher or app
+receives input, and the loop `continue`s instead of falling through.
 
-`draw_lock_screen()` blurs the whole frame (`radius 40 * blur`), dims it with
-`0xB0000000`, and paints a 380×210 panel containing the UTC clock, the caption
-"Mystic OS is locked", a password field showing one 8 px dot per character (up to
-24), an optional message line and "Enter to unlock".
+`draw_lock_screen()` blurs the whole frame at a fixed radius of 40 when
+`th->blur > 0`. Unlike the four direct backdrop blurs (top bar 18, window 14,
+dock 20, launcher 22 — all multiplied by the theme's `blur`), this radius never
+scales; the shadow blurs are fixed too, each using its own `spread`. It then dims
+the frame with `0xB0000000` and paints a 380×210 panel containing the UTC clock,
+the caption "Mystic OS is locked", a password field showing one 8 px dot per
+character (up to 24), an optional message line and "Enter to unlock".
 
 `try_unlock()` reads the first line of `/etc/mystic/passwd` and verifies it with
 `mystic_check_password()` from `src/sha256.c`. The file format is
