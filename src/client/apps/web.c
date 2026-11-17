@@ -2375,7 +2375,7 @@ static void render_fatal(MClient *c, const char *what, const char *why) {
     mc_present(c);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     MClient c;
     if (mc_open(&c, "web", "Browser", 640, 460) < 0) {
         fprintf(stderr, "web: cannot connect to the window server\n");
@@ -2410,6 +2410,13 @@ int main(void) {
     w->hist_i = -1;
     w->caret_on = 1;
     w->dirty = 1;
+
+    /* 'web http://example.com' from a terminal starts on that page. It also
+     * makes the whole load path testable without clicking anything. */
+    if (argc > 1 && argv[1] && argv[1][0]) {
+        snprintf(w->edit, sizeof(w->edit), "%s", argv[1]);
+        web_go(w, argv[1], 1);
+    }
 
     int running = 1;
     while (running) {

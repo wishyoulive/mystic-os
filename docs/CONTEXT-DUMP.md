@@ -267,3 +267,25 @@ once per navigation (downgraded), as were the symlink-host-resolution and
 2. Browser fetch (Enter), then publish the repo to a public URL and set `/etc/mystic/repo.conf`.
 3. Sandbox H1/H2/H5 (per-app uid, private `/dev/shm` with `size=`, `CLONE_NEWPID`).
 4. Encryption (dm-crypt modules are in the package), index signing (Ed25519), setup screen.
+
+## 13. THE BROWSER FETCHES REAL PAGES (verified, with a screenshot)
+
+Two real bugs, both found by driving the actual desktop in QEMU:
+
+1. **Enter was impossible in every sandboxed app.** The event stream is line
+   oriented (`sendf(c, "TEXT %s\n", ...)`), so the `\n` that Enter produces
+   terminated the message early: the app received an *empty* text event. That
+   is why typing a URL worked but Enter did nothing. `wms_notify_text` now
+   encodes line breakers as `0x01` and `mystic_client.c` decodes them.
+2. **A jailed app had no network at all.** `sandbox_child` unshared
+   `CLONE_NEWNET`, so the browser lived in an empty namespace and every lookup
+   timed out. A manifest may now declare `network = host`; the jail then keeps
+   the host namespace and gets `/etc/resolv.conf` + `/etc/hosts` bind-mounted
+   read-only. The Browser bundle declares it; games and paint do not.
+
+Evidence (build/wb8.png): `Example Domain`, the real body text, footer
+`HTTP 200  577 bytes  65 ms`, `line 1/2` — from `http://example.com/` typed into
+the address bar and submitted with Enter, in a sandboxed process.
+
+`web` also takes a URL argument now (`web http://example.com`), which is how
+this is testable without clicking.

@@ -1,3 +1,4 @@
 name = Browser
 desc = A real browser: our HTTP client and HTML renderer, no engine
 exec = bin
+network = host

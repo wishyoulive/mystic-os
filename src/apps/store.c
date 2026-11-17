@@ -33,6 +33,22 @@
  *  the single line written to install.request can only ever be a
  *  name the desktop accepts.
  *
+ *  An install is asynchronous: pkg downloads, verifies and unpacks
+ *  over there. The window watches the bundle root for the new
+ *  directory, counts the seconds while it waits, and after
+ *  STORE_INSTALL_TIMEOUT_SEC gives up with a plain "did not finish"
+ *  and offers the row again - a request that never completes must
+ *  not sit in the status line for ever.
+ *
+ *  Two coordinate spaces: draw() gets this window's origin on the
+ *  compositor surface and paints at origin + local, while click()
+ *  gets APP-LOCAL coordinates (src/main.c: app_draw(cur->app, s,
+ *  cx0, cy0, ...) vs app_click(hit->app, lx - 1, ly - tb - 1, ...)).
+ *  Every rectangle in here - btn_rect(), the row band - is app-local,
+ *  so the painter adds the origin and the hit-test never does. That
+ *  is the rule src/apps/files.c spells out; mixing the two only looks
+ *  right while the window happens to sit at (0,0).
+ *
  *  Keys:  j/k or Up/Down  move        Enter  launch / install
  *         Home/End/g/G    first/last  PgUp/PgDn  by a screen
  *         r               refresh the repo index
@@ -48,6 +64,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 /* Every path this window touches. The -D overrides exist so the host
  * harness can point the app at a scratch tree instead of the real /run. */
@@ -68,6 +85,13 @@
 #endif
 #ifndef STORE_LAUNCH_REQUEST
 #define STORE_LAUNCH_REQUEST "/run/mystic/launch.request"
+#endif
+
+/* how long an install may run before the window stops claiming it is
+ * running (pkg's own wget timeout is 300 s; a local repo answers in
+ * seconds, so a minute and a half of silence means it did not happen) */
+#ifndef STORE_INSTALL_TIMEOUT_SEC
+#define STORE_INSTALL_TIMEOUT_SEC 90.0
 #endif
 
 #define DESC_LINE 256
@@ -128,9 +152,8 @@ typedef struct {
     char     error[128];     /* why the bundle directory could not be read */
     char     status[128];    /* result of the last request we wrote */
     char     pending[32];    /* name asked for, until its directory appears */
-
-    /* the Refresh button, recorded by the painter and used by the click */
-    int      btn_x, btn_y, btn_w, btn_h;
+    double   pending_since;  /* CLOCK_MONOTONIC when that request was written,
+                                0 when nothing is in flight */
 
     char     dlines[DESC_MAXLINES][DESC_LINE];  /* wrapped description */
     int      dn;
@@ -366,11 +389,20 @@ static void scan_installed(Store *s) {
     build_disp(s);
 }
 
-/* an index row that is already on disk: /usr/share bundles and pkg's own
- * /root/apps bundles both land in inst[], so one lookup covers both */
+/* An index row that is already on disk. Two answers, in this order:
+ * a listed bundle with that id, then - the literal rule - a directory of
+ * that name inside either bundle root, even when its manifest is
+ * unreadable and it never made it into the Installed list. */
 static int is_installed(const Store *s, const char *name) {
     for (int i = 0; i < s->ninst; i++)
         if (!strcmp(s->inst[i].id, name)) return 1;
+
+    char path[512];
+    struct stat st;
+    snprintf(path, sizeof(path), "%s/%s", STORE_APP_DIR, name);
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) return 1;
+    snprintf(path, sizeof(path), "%s/%s", STORE_ROOT_APPS, name);
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) return 1;
     return 0;
 }
 
@@ -488,21 +520,57 @@ static void sync_index(Store *s) {
 }
 
 /* `pkg install` unpacks into /root/apps. Until that directory shows up the
- * row stays available; once it does, the bundle list and the marks follow. */
+ * row stays available; once it does, the bundle list and the marks follow.
+ * A request that never produces a directory is not allowed to report
+ * "installing ..." for ever: see STORE_INSTALL_TIMEOUT_SEC. */
 static void poll_install(Store *s) {
     if (!s->pending[0]) return;
 
+    /* success is a real directory, in pkg's own root or in the image root
+     * (a bundle can also land there, and that is where the launcher looks) */
+    const char *roots[2] = { STORE_ROOT_APPS, STORE_APP_DIR };
     char path[512];
-    snprintf(path, sizeof(path), "%s/%s", STORE_ROOT_APPS, s->pending);
-
     struct stat st;
-    if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) return;
+    for (int i = 0; i < 2; i++) {
+        snprintf(path, sizeof(path), "%s/%s", roots[i], s->pending);
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            char done[32];
+            snprintf(done, sizeof(done), "%s", s->pending);
+            s->pending[0] = 0;
+            s->pending_since = 0.0;
+            scan_installed(s);
+            snprintf(s->status, sizeof(s->status), "installed %s", done);
+            return;
+        }
+    }
 
-    char done[32];
-    snprintf(done, sizeof(done), "%s", s->pending);
-    s->pending[0] = 0;
-    scan_installed(s);
-    snprintf(s->status, sizeof(s->status), "installed %s", done);
+    /* still running. There is no timer to be called back on, so the wait is
+     * measured on the monotonic clock here and shown as it grows. */
+    if (s->pending_since > 0.0) {
+        struct timespec ts;
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+            double now = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+            double waited = now - s->pending_since;
+            if (waited < 0.0) waited = 0.0;
+
+            if (waited >= STORE_INSTALL_TIMEOUT_SEC) {
+                /* the desktop forked pkg and nothing arrived: say so, stop
+                 * claiming progress, and leave the row installable again.
+                 * The deadline needs CLOCK_MONOTONIC - the same clock
+                 * src/main.c and src/apps/files.c time themselves with - so
+                 * if the kernel cannot tell time nothing here can either. */
+                snprintf(s->status, sizeof(s->status),
+                         "install of %s did not finish - Enter retries; run pkg to see why",
+                         s->pending);
+                s->pending[0] = 0;
+                s->pending_since = 0.0;
+                return;
+            }
+            if (waited >= 1.0)
+                snprintf(s->status, sizeof(s->status),
+                         "installing %s... %lds", s->pending, (long)waited);
+        }
+    }
 }
 
 /* ------------------------------------------------------------
@@ -774,6 +842,19 @@ static void activate(Store *s) {
 
     if (d->kind == D_APP) {
         StoreApp *a = &s->inst[d->idx];
+        if (a->from_root) {
+            /* pkg unpacked it into its own root, and the desktop launcher
+             * reads WM_APP_DIR only (wms_scan_apps() in src/wmsrv.c and the
+             * launch lookup in src/main.c). A launch request for this id
+             * would be dropped without a word, so the row says where the
+             * bundle is instead of promising to start it. When pkg installs
+             * into the shared root - or the launcher learns to scan
+             * /root/apps - this branch and its hint can simply go. */
+            snprintf(s->status, sizeof(s->status),
+                     "%s is in %s - the launcher reads %s",
+                     a->id, STORE_ROOT_APPS, STORE_APP_DIR);
+            return;
+        }
         char err[128];
         if (!write_line(STORE_LAUNCH_REQUEST, a->id, err, sizeof(err))) {
             snprintf(s->status, sizeof(s->status), "%s", err);
@@ -801,6 +882,12 @@ static void activate(Store *s) {
         }
         snprintf(s->status, sizeof(s->status), "installing %s...", k->name);
         snprintf(s->pending, sizeof(s->pending), "%s", k->name);
+        /* start the wait on the monotonic clock; poll_install() drops the
+         * claim again if no bundle appears within the timeout */
+        struct timespec ts;
+        s->pending_since = 0.0;
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+            s->pending_since = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
         return;
     }
 
@@ -810,6 +897,30 @@ static void activate(Store *s) {
 /* ------------------------------------------------------------
  * Drawing
  * ------------------------------------------------------------ */
+
+/* The Refresh button, APP-LOCAL. draw() adds the window origin to paint
+ * it, store_click() compares the app-local pointer against it directly -
+ * one rectangle, one owner, so the two can never drift apart (the
+ * coordinate-space rule src/apps/files.c documents). Returns 0 when the
+ * button does not fit: a button that is not painted is not clickable. */
+static int btn_rect(const Geo *g, int w, int *bx, int *by, int *bw, int *bh) {
+    Font *fd = font_get(FONT_REGULAR, 10);
+    if (!fd || w < 120) return 0;
+
+    int tw = (int)(font_width(fd, "Refresh") + 0.5f);
+    int bwi = tw + 18;
+    int bhi = g->head_h - 10;
+    if (bhi < 12) bhi = 12;
+
+    int x = w - bwi - 6;
+    if (x < 48) return 0;                  /* no room right of the title */
+    *bx = x;
+    *by = 5;
+    *bw = bwi;
+    *bh = bhi;
+    return 1;
+}
+
 static void paint_row(Surface *s, Font *fr, Font *fd, const Theme *th,
                       int x, int ry, int w, int row_h, Store *st, int idx) {
     Disp *d = &st->disp[idx];
@@ -946,26 +1057,19 @@ static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const The
     /* header: what this window is, and the Refresh action */
     font_draw(s, fp, (float)x + 6.0f, (float)y + 5.0f, "Apps", th->text);
     {
-        const char *label = "Refresh";
-        float lw = font_width(fd, label);
-        int bw = (int)(lw + 18.0f);
-        int bh = g.head_h - 10;
-        if (bh < 12) bh = 12;
-        int bx = x + w - bw - 6;
-        int by = y + 5;
+        int bx, by, bw, bh;
+        if (btn_rect(&g, w, &bx, &by, &bw, &bh)) {
+            /* the rect is app-local; the painter is the one that adds (x,y) */
+            float px = (float)(x + bx);
+            float py = (float)(y + by);
 
-        /* recorded, so store_click() hit-tests exactly what was painted */
-        st->btn_x = bx;
-        st->btn_y = by;
-        st->btn_w = bw;
-        st->btn_h = bh;
-
-        gfx_rrect_aa(s, (float)bx, (float)by, (float)bw, (float)bh, 4.0f,
-                     color_alpha(th->accent, 0.18f),
-                     color_alpha(th->accent, 0.55f), 1.0f);
-        float ty = (float)by + ((float)bh - font_height(fd)) * 0.5f;
-        if (ty < (float)by) ty = (float)by;
-        font_draw(s, fd, (float)bx + 9.0f, ty, label, th->text);
+            gfx_rrect_aa(s, px, py, (float)bw, (float)bh, 4.0f,
+                         color_alpha(th->accent, 0.18f),
+                         color_alpha(th->accent, 0.55f), 1.0f);
+            float ty = py + ((float)bh - font_height(fd)) * 0.5f;
+            if (ty < py) ty = py;
+            font_draw(s, fd, px + 9.0f, ty, "Refresh", th->text);
+        }
     }
     surf_blend(s, x + 4, y + g.head_h - 6, w - 8, 1, th->panel_border);
 
@@ -1037,8 +1141,8 @@ static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const The
                 StoreApp *e = &st->inst[st->disp[sel].idx];
                 if (e->from_root)
                     snprintf(hint, sizeof(hint),
-                             "Enter: launch %s (pkg unpacked it into %s)",
-                             e->id, STORE_ROOT_APPS);
+                             "%s is in %s - the launcher reads %s",
+                             e->id, STORE_ROOT_APPS, STORE_APP_DIR);
                 else
                     snprintf(hint, sizeof(hint),
                              "Enter: ask the desktop to launch %s", e->id);
@@ -1052,25 +1156,30 @@ static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const The
         }
     }
 
-    /* footer: how much is installed and offered, plus the last outcome */
+    /* footer: how much is installed and offered, plus the last outcome.
+     * A status that does not fit beside the counts gets the whole line - a
+     * failure message that is never painted would be worse than a lost
+     * count. */
     {
         float fy = (float)(y + h) - font_height(fr) - 3.0f;
-        const char *tail = st->status;
-        float tw = tail[0] ? font_width(fr, tail) : 0.0f;
-        if (tw > 0.0f && tw + 90.0f < (float)w) {
-            font_draw(s, fr, (float)(x + w) - tw - 6.0f, fy, tail,
-                      color_alpha(th->accent, 0.55f));
-            tw += 12.0f;
-        } else {
-            tw = 0.0f;
-        }
-
         char foot[96];
         snprintf(foot, sizeof(foot), "%d installed - %d available%s",
                  st->ninst, st->navail,
                  st->index_state == 0 ? " - no index" : "");
-        draw_clipped(s, fr, (float)x + 6.0f, fy, (float)w - tw - 12.0f, foot,
-                     color_alpha(th->text, 0.45f));
+
+        float tw = st->status[0] ? font_width(fr, st->status) : 0.0f;
+        if (st->status[0] && tw + font_width(fr, foot) + 18.0f < (float)w) {
+            font_draw(s, fr, (float)(x + w) - tw - 6.0f, fy, st->status,
+                      color_alpha(th->accent, 0.55f));
+            draw_clipped(s, fr, (float)x + 6.0f, fy, (float)w - tw - 12.0f, foot,
+                         color_alpha(th->text, 0.45f));
+        } else if (st->status[0]) {
+            draw_clipped(s, fr, (float)x + 6.0f, fy, (float)w - 12.0f, st->status,
+                         color_alpha(th->accent, 0.55f));
+        } else {
+            draw_clipped(s, fr, (float)x + 6.0f, fy, (float)w - 12.0f, foot,
+                         color_alpha(th->text, 0.45f));
+        }
     }
 }
 
@@ -1159,14 +1268,18 @@ static void store_click(App *a, int x, int y, int buttons) {
     if (!s) return;
     if (buttons && !(buttons & 1)) return;      /* left button only */
 
-    /* the Refresh button: exactly the rect store_draw() recorded */
-    if (s->btn_w > 0 && x >= s->btn_x && x < s->btn_x + s->btn_w &&
-        y >= s->btn_y && y < s->btn_y + s->btn_h) {
+    /* The Refresh button. btn_rect() is app-local and so is (x,y): the draw
+     * origin must not appear in this comparison. */
+    Geo g;
+    if (!geo_now(&g)) return;
+
+    int bx = 0, by = 0, bw = 0, bh = 0;
+    if (btn_rect(&g, s->w, &bx, &by, &bw, &bh) &&
+        x >= bx && x < bx + bw && y >= by && y < by + bh) {
         request_refresh(s);
         return;
     }
 
-    Geo g;
     int rows = 0, band = 0, nlines = 0;
     if (!geo_now(&g)) return;
     layout_of(s->h, &g, &rows, &band, &nlines);

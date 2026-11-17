@@ -175,7 +175,14 @@ int mc_poll(MClient *c, MEvent *ev) {
     }
     if (!strncmp(line, "TEXT ", 5)) {
         ev->type = MC_TEXT;
-        snprintf(ev->text, sizeof(ev->text), "%s", line + 5);
+        /* 0x01 stands for a line breaker: the stream is line oriented, so a
+         * real newline inside the payload would cut the message short. */
+        {
+            size_t k = 0;
+            for (const char *q = line + 5; *q && k + 1 < sizeof(ev->text); q++)
+                ev->text[k++] = (*q == 1) ? 10 : *q;
+            ev->text[k] = 0;
+        }
         return 1;
     }
     if (!strncmp(line, "MOUSE ", 6)) {

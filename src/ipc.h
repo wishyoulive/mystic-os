@@ -64,6 +64,8 @@ typedef struct {
     char name[64];
     char desc[160];
     char exe[128];
+    int  net;          /* manifest says 'network = host': keep the host netns,
+                        * and give the jail a resolv.conf so lookups work */
 } WmApp;
 
 int  wms_start(void);                              /* listen on WM_SOCKET */
