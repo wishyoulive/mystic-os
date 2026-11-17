@@ -5,18 +5,24 @@
  *
  *      Display      the real framebuffer size
  *      Memory       the real MemTotal/MemAvailable from /proc
- *      Theme        every theme file in /etc/mystic/themes
  *      Text size    the five scales ui_scale_load() accepts
  *      Wallpaper    every wallpaper wallpaper_name() knows
+ *      Theme        every theme file in /etc/mystic/themes
  *      System       kernel release, uptime
  *      status       the real result of the last write
  *
- *  The three lists are one flat list of rows: `sel` walks Theme, then
- *  Text size, then Wallpaper. Up/Down (and j/k) move it, Enter applies
- *  the row under it, a click applies the row that was painted there,
- *  and the digits pick within whichever list the selection is in -
- *  1..9 for a theme (the behaviour this app always had), 1..5 for a
- *  text size, 1..4 for a wallpaper.
+ *  The two new controls sit directly under the facts because they are the
+ *  ones you come here to change: at the 520x360 window the app opens with,
+ *  five rows of themes used to push them past the bottom edge. The theme
+ *  list is last because it is the longest list, and it scrolls exactly the
+ *  way it always did.
+ *
+ *  The three lists are one flat list of rows, in that same order: `sel`
+ *  walks Text size, then Wallpaper, then Theme. Up/Down (and j/k) move it,
+ *  Enter applies the row under it, a click applies the row that was
+ *  painted there, and the digits pick within whichever list the selection
+ *  is in - 1..5 for a text size, 1..4 for a wallpaper, and 1..9 for a
+ *  theme, which is what this app always did.
  *
  *  Applying means writing one of the three files the desktop watches:
  *
@@ -90,10 +96,12 @@ typedef struct {
     int      w, h;
     float    scroll;             /* pixels the list is scrolled down */
     char     status[96];         /* real result of the last write */
-    /* window-local y of every flat row, or -1 when the list cannot show it.
-     * Written by the painter, read by the click handler: the hit box is the
-     * rectangle that was drawn, not a second guess at the layout. */
+    /* window-local top and bottom of every flat row's painted rectangle, or
+     * -1 when the list cannot show it. Written by the painter, read by the
+     * click handler: the hit box is the rectangle that was drawn - clipped
+     * with it at the list's edges - not a second guess at the layout. */
     float    row_y[MAX_ROWS];
+    float    row_yb[MAX_ROWS];
 } Settings;
 
 /* ---- geometry: every metric comes from the font that fills it ------------- */
@@ -108,14 +116,20 @@ static float line_h_of(Font *f) { return font_height(f) + 2.0f; }
 static float head_h_of(Font *fh) { return font_height(fh) + 4.0f; }
 
 static int flat_count(const Settings *s) {
-    return s->count + SIZE_COUNT + WALLPAPER_COUNT;
+    return SIZE_COUNT + WALLPAPER_COUNT + s->count;
 }
+
+/* The flat list is in the order the sections are drawn: every Text size row,
+ * then every Wallpaper row, then every Theme row. */
+#define ROW_WALL(k)  (SIZE_COUNT + (k))
+#define ROW_THEME(i) (SIZE_COUNT + WALLPAPER_COUNT + (i))
 
 /* 0 = Theme, 1 = Text size, 2 = Wallpaper. */
 static int section_of(const Settings *s, int sel) {
-    if (sel < s->count) return 0;
-    if (sel < s->count + SIZE_COUNT) return 1;
-    return 2;
+    (void)s;
+    if (sel < SIZE_COUNT) return 1;
+    if (sel < SIZE_COUNT + WALLPAPER_COUNT) return 2;
+    return 0;
 }
 
 /* ---- reading the facts back off the disk --------------------------------- */
@@ -219,9 +233,9 @@ static int write_line(const char *path, const char *text, int *err) {
  * against Theme::name - the "name =" field inside the theme file (main.c:1178),
  * not its file name. Writing ThemeRow::file matched no theme and did nothing;
  * this writes the name and reports the real result. */
-static void apply_theme(Settings *s) {
-    if (s->sel < 0 || s->sel >= s->count) return;
-    const ThemeRow *r = &s->rows[s->sel];
+static void apply_theme(Settings *s, int i) {
+    if (i < 0 || i >= s->count) return;
+    const ThemeRow *r = &s->rows[i];
     int err = 0;
     if (write_line(MYSTIC_CURRENT_THEME, r->name, &err))
         snprintf(s->status, sizeof(s->status), "theme: %s", r->name);
@@ -254,14 +268,13 @@ static void apply_wallpaper(Settings *s, int i) {
 /* Apply whatever row the selection is on. One place decides what a row means,
  * so a click, Enter and a digit cannot disagree about it. */
 static void activate(Settings *s) {
-    int nt = s->count;
     if (s->sel < 0) return;
-    if (s->sel < nt)
-        apply_theme(s);
-    else if (s->sel < nt + SIZE_COUNT)
-        apply_size(s, s->sel - nt);
-    else if (s->sel < nt + SIZE_COUNT + WALLPAPER_COUNT)
-        apply_wallpaper(s, s->sel - nt - SIZE_COUNT);
+    if (s->sel < SIZE_COUNT)
+        apply_size(s, s->sel);
+    else if (s->sel < SIZE_COUNT + WALLPAPER_COUNT)
+        apply_wallpaper(s, s->sel - SIZE_COUNT);
+    else
+        apply_theme(s, s->sel - SIZE_COUNT - WALLPAPER_COUNT);
 }
 
 static void move_sel(Settings *s, int delta) {
@@ -333,7 +346,10 @@ static void settings_init(App *a, int w, int h) {
     s->w = w;
     s->h = h;
     /* -1 is "no row here": 0.0f would look like a real hit box at the top */
-    for (int i = 0; i < MAX_ROWS; i++) s->row_y[i] = -1.0f;
+    for (int i = 0; i < MAX_ROWS; i++) {
+        s->row_y[i] = -1.0f;
+        s->row_yb[i] = -1.0f;
+    }
     scan_themes(s);
     a->state = s;
 }
@@ -411,27 +427,27 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h, const 
     font_draw(s, fr, (float)x + 6, py, line, th->text_dim);
     py += lh + 8.0f;
 
-    /* ---- the scrolling list: Theme, Text size, Wallpaper ---- */
+    /* ---- the scrolling list: Text size, Wallpaper, Theme ---- */
     int list_top = (int)(py + 0.5f);
 
     /* One measure pass. Offsets are relative to the top of the list, so they
      * do not depend on the window height or on the scroll position - the same
      * numbers serve the scroll clamp, the painter and the hit boxes. */
     int nt = st->count;
-    int n = nt + SIZE_COUNT + WALLPAPER_COUNT;
+    int n = flat_count(st);
     if (n > MAX_ROWS) n = MAX_ROWS;
     float head[3] = { 0.0f, 0.0f, 0.0f };
     float row[MAX_ROWS];
     for (int i = 0; i < MAX_ROWS; i++) row[i] = 0.0f;
     float cy = 0.0f;
     head[0] = cy;                    cy += hh;
-    for (int i = 0; i < nt && i < MAX_THEMES; i++)          { row[i] = cy; cy += rh; }
+    for (int i = 0; i < SIZE_COUNT; i++)       { row[i] = cy; cy += rh; }
     cy += 8.0f;
     head[1] = cy;                    cy += hh;
-    for (int i = 0; i < SIZE_COUNT; i++)      { row[nt + i] = cy; cy += rh; }
+    for (int i = 0; i < WALLPAPER_COUNT; i++)  { row[ROW_WALL(i)] = cy; cy += rh; }
     cy += 8.0f;
     head[2] = cy;                    cy += hh;
-    for (int i = 0; i < WALLPAPER_COUNT; i++) { row[nt + SIZE_COUNT + i] = cy; cy += rh; }
+    for (int i = 0; i < nt && i < MAX_THEMES; i++) { row[ROW_THEME(i)] = cy; cy += rh; }
     const float content_h = cy;
 
     /* Bottom blocks are pinned to the bottom and only drawn when they really
@@ -478,48 +494,55 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h, const 
 
     const float ly = -st->scroll;    /* list-local y of the content's top edge */
 
-    /* headings with the fact they are about, read from the file */
-    font_draw(&ls, fh, (float)x + 6, ly + head[0], "Theme", th->text);
-    font_draw(&ls, fh, (float)x + 6, ly + head[1], "Text size", th->text);
+    /* headings, each with the fact it is about, read back from the file */
     char fact[80];
+    font_draw(&ls, fh, (float)x + 6, ly + head[0], "Text size", th->text);
     if (have_scale) snprintf(fact, sizeof(fact), "now %.1fx", cur_scale);
     else            snprintf(fact, sizeof(fact), "now 1.0x (no setting)");
     font_draw(&ls, fr, (float)x + 12 + font_width(fh, "Text size"),
-              ly + head[1], fact, th->text_dim);
+              ly + head[0], fact, th->text_dim);
 
-    font_draw(&ls, fh, (float)x + 6, ly + head[2], "Wallpaper", th->text);
-    if (cur_wall >= 0)      snprintf(fact, sizeof(fact), "now %s", wallpaper_name(cur_wall));
+    font_draw(&ls, fh, (float)x + 6, ly + head[1], "Wallpaper", th->text);
+    if (cur_wall >= 0)       snprintf(fact, sizeof(fact), "now %s", wallpaper_name(cur_wall));
     else if (cur_wall == -2) snprintf(fact, sizeof(fact), "now Dusk (no setting)");
     else                     snprintf(fact, sizeof(fact), "now: unknown name");
     font_draw(&ls, fr, (float)x + 12 + font_width(fh, "Wallpaper"),
-              ly + head[2], fact, th->text_dim);
+              ly + head[1], fact, th->text_dim);
+
+    font_draw(&ls, fh, (float)x + 6, ly + head[2], "Theme", th->text);
 
     for (int i = 0; i < n; i++) {
         float ry = ly + row[i];
-        /* the hit box, in window-local coordinates - exactly the rectangle
-         * painted below, or -1 when the list cannot show the row at all */
-        if (ry + rh > 0.0f && ry < vis_h)
-            st->row_y[i] = (float)(list_top - y) + ry;
-        else
-            st->row_y[i] = -1.0f;
+        /* the painted rectangle is (ry - 2) tall enough for rh, cut off at the
+         * list's own top and bottom edges - the hit box is that same shape */
+        float top = ry - 2.0f, bot = ry + rh - 2.0f;
+        if (top < 0.0f) top = 0.0f;
+        if (bot > vis_h) bot = vis_h;
+        if (bot > top) {
+            st->row_y[i]  = (float)(list_top - y) + top;
+            st->row_yb[i] = (float)(list_top - y) + bot;
+        } else {
+            st->row_y[i] = st->row_yb[i] = -1.0f;
+        }
         if (ry + rh <= 0.0f || ry >= vis_h) continue;
 
         int selected = (i == st->sel);
         int current = 0;
         char label[128];
 
-        if (i < nt) {
-            snprintf(label, sizeof(label), "%d   %s", i + 1, st->rows[i].name);
-        } else if (i < nt + SIZE_COUNT) {
-            int k = i - nt;
+        if (i < SIZE_COUNT) {
+            int k = i;
             snprintf(label, sizeof(label), "%d   %-7s %.1fx",
                      k + 1, SIZE_LABEL[k], SIZE_VALUE[k]);
             current = fabsf(cur_scale - SIZE_VALUE[k]) < 0.005f;
-        } else {
-            int k = i - nt - SIZE_COUNT;
+        } else if (i < SIZE_COUNT + WALLPAPER_COUNT) {
+            int k = i - SIZE_COUNT;
             const char *nm = wallpaper_name(k);
             snprintf(label, sizeof(label), "%d   %s", k + 1, nm ? nm : "?");
             current = (cur_wall == k);
+        } else {
+            int t = i - SIZE_COUNT - WALLPAPER_COUNT;
+            snprintf(label, sizeof(label), "%d   %s", t + 1, st->rows[t].name);
         }
 
         if (selected)
@@ -532,6 +555,23 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h, const 
             float mk_w = font_width(fr, mk);
             font_draw(&ls, fr, (float)x + (float)w - 10.0f - mk_w, ry, mk,
                       color_alpha(th->accent, 0.85f));
+        }
+    }
+
+    /* A section below the window is never a secret: a small triangle sits at
+     * whichever edge the list continues past, in the font's own size. */
+    if (vis_h > line_h_of(fd) * 1.5f) {
+        const float t = font_height(fd) * 0.55f;
+        float mx = (float)x + (float)w - 12.0f - t;
+        if (st->scroll + vis_h < content_h - 0.5f) {
+            float my = list_bottom - t - 5.0f;
+            float dn[6] = { mx, my, mx + t, my, mx + t * 0.5f, my + t * 0.8f };
+            gfx_polygon(s, dn, 3, color_alpha(th->text, 0.45f));
+        }
+        if (st->scroll > 0.5f) {
+            float my = (float)list_top + 4.0f;
+            float up[6] = { mx, my + t * 0.8f, mx + t, my + t * 0.8f, mx + t * 0.5f, my };
+            gfx_polygon(s, up, 3, color_alpha(th->text, 0.45f));
         }
     }
 
@@ -554,7 +594,7 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h, const 
     if (have_status)
         font_draw(s, fd, (float)x + 6, status_y,
                   st->status[0] ? st->status
-                                : "Up/Down + Enter, or click a row; 1-5 in Text size",
+                                : "Up/Down + Enter, or click a row; digits pick in that list",
                   st->status[0] ? color_alpha(th->accent, 0.80f)
                                 : color_alpha(th->text, 0.40f));
 }
@@ -581,18 +621,18 @@ static void settings_key(App *a, const char *bytes, int n) {
         if (c == 'k') { move_sel(s, -1); continue; }
         if (c == 'j') { move_sel(s, +1); continue; }
 
-        /* digits pick inside the list the selection is in - the theme list
-         * keeps its old 1..9 meaning, Text size takes 1..5, Wallpaper 1..4 */
+        /* digits pick inside the list the selection is in - Text size takes
+         * 1..5, Wallpaper 1..4, and the theme list keeps its old 1..9 meaning */
         if (c >= '1' && c <= '9') {
             int idx = c - '1';
             int sec = section_of(s, s->sel);
             if (sec == 0) {
-                if (idx < s->count) { s->sel = idx; apply_theme(s); }
+                if (idx < s->count) { s->sel = ROW_THEME(idx); apply_theme(s, idx); }
             } else if (sec == 1) {
-                if (idx < SIZE_COUNT) { s->sel = s->count + idx; apply_size(s, idx); }
+                if (idx < SIZE_COUNT) { s->sel = idx; apply_size(s, idx); }
             } else {
                 if (idx < WALLPAPER_COUNT) {
-                    s->sel = s->count + SIZE_COUNT + idx;
+                    s->sel = ROW_WALL(idx);
                     apply_wallpaper(s, idx);
                 }
             }
@@ -611,11 +651,11 @@ static void settings_click(App *a, int x, int y, int buttons) {
     int n = flat_count(s);
     if (n > MAX_ROWS) n = MAX_ROWS;
     for (int i = 0; i < n; i++) {
-        float ry = s->row_y[i];
-        if (ry < 0.0f) continue;             /* not on screen, not hittable */
-        /* the painted rectangle is (ry - 2, height rh); use exactly that, so
-         * neighbouring rows cannot both claim the same pixel */
-        if ((float)y >= ry - 2.0f && (float)y < ry + rh - 2.0f) {
+        float ry = s->row_y[i], yb = s->row_yb[i];
+        if (ry < 0.0f || yb <= ry) continue;   /* not on screen, not hittable */
+        /* exactly the rectangle the painter drew for this row, clipped with it
+         * at the list's edges, so a click cannot land on a row it cannot see */
+        if ((float)y >= ry && (float)y < yb) {
             s->sel = i;
             activate(s);
             return;
