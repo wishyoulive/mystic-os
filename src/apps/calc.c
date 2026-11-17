@@ -1,48 +1,56 @@
 /* ============================================================
  *  Mystic OS - apps/calc.c
- *  "Calculator": an expression evaluator, not a keypad.
+ *  "Calculator": a complete desk calculator with a real button grid.
  *
- *  What you type is a string. Enter parses it with a recursive
- *  descent parser (real precedence, real associativity) and shows
- *  either the number or a message that names what is wrong - which
- *  parenthesis, which character, which operator, and whether the
- *  divisor was zero.
+ *  WHAT IT IS
+ *  ----------
+ *  An immediate-execution calculator, the way a desk calculator works:
+ *  one accumulator, one pending binary operator, and a display that shows
+ *  either the number being typed or a result. Every button on the screen
+ *  has a keyboard key and both call the same calc_press(), so the mouse
+ *  and the keyboard cannot drift apart:
  *
- *  Grammar, lowest precedence first:
+ *      MC  MR  M+  M-  C          k   m   a   d   c
+ *      %   CE  <-  1/x x^2        %   e   Bk  r   s
+ *      7   8   9   /   sqrt       7   8   9   /   q
+ *      4   5   6   *   +/-        4   5   6   *   n
+ *      1   2   3   -   =          1   2   3   -   = or Enter
+ *      0 (double wide)  .  +      0   .   +
  *
- *      expr    := term   (('+' | '-') term)*
- *      term    := unary  (('*' | '/' | '%') unary)*
- *      unary   := ('+' | '-') unary | primary
- *      primary := number | '(' expr ')' | 'ans'
+ *  Bk is Backspace. 'x'/'X' is also multiply, 'k' MC, 'm' MR, 'a' or
+ *  Shift+M M+, 'd' M-, 's' x^2, 'q' sqrt, 'r' 1/x, 'n' +/-. Escape is
+ *  CE when the byte reaches the app; main.c currently closes the focused
+ *  window on Esc before any app is offered it, so 'e' is the reliable CE.
  *
- *  So '*' '/' '%' bind tighter than '+' '-' (2+3*4 is 14), and the
- *  loops make each level left associative (8-3-2 is 3, not 7;
- *  8/4/2 is 1). '%' is the remainder, the same function C's fmod
- *  computes. 'ans' is the previous result - the parser is handed
- *  it, so it is a real value and not a substitution in the text.
- *  Nesting is capped at MAX_NEST levels and the cap is checked
- *  before recursing, so no input can grow the stack.
+ *  NUMBERS AND ERRORS
+ *  ------------------
+ *  All arithmetic is double. The entry is a bounded text buffer (23
+ *  characters) so the digits actually typed, including a trailing '.',
+ *  are what the value line shows; strtod() produces the double for each
+ *  operation. Division by zero, 1/0, the square root of a negative value
+ *  and any non-finite result set the error state: the value line says
+ *  "Error", the line above names the cause, and any key clears it. A
+ *  digit starts a new number afterwards, any other key resets to 0.
  *
- *  Keys:  digits . + - * / % ( )   append to the expression
- *         Enter or '='             evaluate
- *         Backspace                delete the last character
- *         c                        clear the expression
- *         'ans'                    the value of the last result
+ *  '%' with a pending operator is percent of the accumulator: 200 + 10 %
+ *  puts 20 in the entry, so = gives 220. With no operator pending it is
+ *  a plain value/100.
  *
- *  Buttons: C, (, ), /, = . '(' ')' and '/' append their token;
- *  C clears the entry and '=' evaluates it, because appending a
- *  literal 'C' or '=' would only produce a garbage-character error
- *  and those are the two meanings a calculator must have.
- *
- *  Every band in this window is measured from font_height() of the font
- *  it actually draws with, because font_get() applies the global text
- *  scale (src/font.c): at scale 1.6 a 10-point label is 22 px tall, so a
- *  fixed 14 px row stride would print one history row on top of the next.
- *  Only paddings and gaps stay nominal, and those go through ui_px().
- *
- *  The expression buffer is a fixed 64 bytes and nothing is allocated per
- *  frame; the single allocation is the state struct, made once in
- *  calc_init() and released in calc_free().
+ *  LAYOUT
+ *  ------
+ *  No pixel constant decides the geometry. The display band and the 5x6
+ *  grid are shares of the content rectangle, a cell is what is left over,
+ *  and the three font sizes (status, value, button) are the largest
+ *  nominal point sizes whose real font_height() fits those bands. That is
+ *  what keeps the app correct under the global text scale: at 1.6 the same
+ *  arithmetic asks for smaller nominal sizes and nothing overflows.
+ *  layout_calc() is the only place that knows a rectangle; the painter
+ *  draws the array it recorded and the click handler hit-tests that same
+ *  array, so a button cannot be painted anywhere its click does not land.
+ *  When the window is too short for both lines of the display and readable
+ *  buttons, the status line is dropped first, then the labels stop being
+ *  drawn rather than being printed over each other - the grid survives
+ *  because it is the whole interface.
  * ============================================================ */
 #include "mystic.h"
 
@@ -51,596 +59,802 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ---8<--- parser: everything between the markers is a pure function
- * of its arguments and is exercised on the host by a harness that
- * extracts exactly this text (see the build note in the report).
- * ---8<--- */
-#define EXPR_MAX   64      /* 63 characters + the terminating NUL */
-#define RESULT_MAX 28
-#define MSG_MAX    96
-#define MAX_NEST   16      /* recursion guard for '(' groups and unary runs */
+/* ------------------------------------------------------------
+ *  State
+ * ------------------------------------------------------------ */
+#define ENTRY_MAX  24    /* sign + digits + '.' + NUL; 23 visible chars */
+#define WHY_MAX    64
+#define TAPE_MAX   96
+#define TEXT_MAX   128
 
+/* Button ids. The ten digits are contiguous and in order, which is what
+ * lets the key handler map '7' with B_0 + ('7' - '0'). */
 enum {
-    E_OK = 0,          /* no error */
-    E_CHAR,            /* a character that has no meaning here */
-    E_NAME,            /* an identifier that is not 'ans' */
-    E_NOANS,           /* 'ans' used before any result exists */
-    E_NUMBER,          /* a malformed number */
-    E_TRAIL_OP,        /* the expression stops on an operator */
-    E_OPERAND,         /* an operator where a value belongs */
-    E_PAREN_OPEN,      /* a '(' with no ')' */
-    E_PAREN_CLOSE,     /* a ')' with no '(' */
-    E_DIV0,
-    E_MOD0,
-    E_NEST,
-    E_RANGE,
-    E_EXPECT           /* a value belongs here, input ended */
+    B_0 = 0, B_1, B_2, B_3, B_4, B_5, B_6, B_7, B_8, B_9,
+    B_DOT, B_ADD, B_SUB, B_MUL, B_DIV, B_EQ,
+    B_C, B_CE, B_BACK, B_NEG, B_PCT, B_RECIP, B_SQ, B_SQRT,
+    B_MC, B_MR, B_MPLUS, B_MMINUS,
+    B_COUNT
 };
 
-typedef struct {
-    const char *src;
-    int   pos;
-    int   err;                  /* E_*; the first error wins */
-    int   err_pos;
-    char  err_ch;               /* the offending character, 0 if none */
-    char  err_name[24];         /* the offending identifier for E_NAME */
-    double ans;
-    int   have_ans;
-} Parser;
-
-static int is_alpha(char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
-}
-
-static int is_digit(char c) { return c >= '0' && c <= '9'; }
-
-static int is_op(char c) {
-    return c == '+' || c == '-' || c == '*' || c == '/' || c == '%';
-}
-
-/* The last non-space character before `pos`, or 0 at the start. Used to
- * explain *why* a value is missing: after a '+' the input ended on an
- * operator, after a '(' it never began a value at all. */
-static char prev_nonspace(const char *s, int pos) {
-    for (int i = pos - 1; i >= 0; i--)
-        if (s[i] != ' ') return s[i];
-    return 0;
-}
-
-static void perr(Parser *p, int code, int pos, char ch) {
-    if (p->err) return;             /* keep the first, most specific error */
-    p->err = code;
-    p->err_pos = pos;
-    p->err_ch = ch;
-}
-
-/* Every message names the problem, not just "syntax error". */
-static void err_text(const Parser *p, char *msg, size_t n) {
-    switch (p->err) {
-        case E_CHAR:
-            if (p->err_ch > 32 && p->err_ch < 127)
-                snprintf(msg, n, "garbage character '%c' at %d", p->err_ch,
-                         p->err_pos + 1);
-            else
-                snprintf(msg, n, "garbage byte 0x%02X at %d",
-                         (unsigned char)p->err_ch, p->err_pos + 1);
-            break;
-        case E_NAME:
-            snprintf(msg, n, "unknown name '%s' - only 'ans' is known",
-                     p->err_name);
-            break;
-        case E_NOANS:
-            snprintf(msg, n, "'ans' has no value yet - evaluate something");
-            break;
-        case E_NUMBER:
-            if (p->err_ch == 0)
-                snprintf(msg, n, "number too long at %d", p->err_pos + 1);
-            else
-                snprintf(msg, n, "malformed number at %d", p->err_pos + 1);
-            break;
-        case E_TRAIL_OP:
-            if (p->err_ch)
-                snprintf(msg, n, "trailing operator '%c' - nothing after it",
-                         p->err_ch);
-            else
-                snprintf(msg, n, "trailing operator - the expression ends on one");
-            break;
-        case E_OPERAND:
-            snprintf(msg, n, "operator '%c' where a number is expected",
-                     p->err_ch);
-            break;
-        case E_PAREN_OPEN:
-            snprintf(msg, n, "unmatched parenthesis: the '(' at %d has no ')'",
-                     p->err_pos + 1);
-            break;
-        case E_PAREN_CLOSE:
-            snprintf(msg, n, "unmatched parenthesis: the ')' at %d has no '('",
-                     p->err_pos + 1);
-            break;
-        case E_DIV0:
-            snprintf(msg, n, "division by zero (the '/' at %d)", p->err_pos + 1);
-            break;
-        case E_MOD0:
-            snprintf(msg, n, "modulo by zero (the '%%' at %d)", p->err_pos + 1);
-            break;
-        case E_NEST:
-            snprintf(msg, n, "nested too deeply - the limit is %d levels",
-                     MAX_NEST);
-            break;
-        case E_RANGE:
-            snprintf(msg, n, "the result is out of range");
-            break;
-        default:
-            snprintf(msg, n, "a value belongs at %d, the expression ends there",
-                     p->err_pos + 1);
-            break;
-    }
-}
-
-static double parse_expr(Parser *p, int depth);
-
-/* primary := number | '(' expr ')' | 'ans'
- *
- * `depth` is the parenthesis depth; parse_expr() rejects anything above
- * MAX_NEST before it recurses, so this never runs away. */
-static double parse_primary(Parser *p, int depth) {
-    if (p->err) return 0.0;
-
-    while (p->src[p->pos] == ' ') p->pos++;
-    char c = p->src[p->pos];
-    int at = p->pos;
-
-    if (c == '(') {
-        p->pos++;
-        double v = parse_expr(p, depth + 1);
-        if (p->err) return 0.0;
-        while (p->src[p->pos] == ' ') p->pos++;
-        if (p->src[p->pos] == ')') { p->pos++; return v; }
-        /* "1+(2*3" - the group was opened and never closed */
-        perr(p, E_PAREN_OPEN, at, '(');
-        return 0.0;
-    }
-
-    if (c == ')') {
-        char prev = prev_nonspace(p->src, at);
-        /* "(1+)" is really an operator with nothing after it */
-        if (is_op(prev)) perr(p, E_TRAIL_OP, at, prev);
-        else             perr(p, E_PAREN_CLOSE, at, ')');
-        return 0.0;
-    }
-
-    if (is_digit(c) || c == '.') {
-        int start = p->pos;
-        int digits = 0, dots = 0;
-        for (;;) {
-            char d = p->src[p->pos];
-            if (is_digit(d)) { p->pos++; digits++; }
-            else if (d == '.') {
-                if (dots) { perr(p, E_NUMBER, p->pos, '.'); return 0.0; }
-                dots = 1;
-                p->pos++;
-            } else break;
-        }
-        if (!digits) { perr(p, E_NUMBER, start, c); return 0.0; }
-        int len = p->pos - start;
-        if (len >= 24) { perr(p, E_NUMBER, start, 0); return 0.0; }
-
-        char buf[24];
-        memcpy(buf, p->src + start, (size_t)len);
-        buf[len] = 0;
-        return strtod(buf, NULL);
-    }
-
-    if (is_alpha(c)) {
-        int start = p->pos;
-        while (is_alpha(p->src[p->pos])) p->pos++;
-        int len = p->pos - start;
-        if (len > (int)sizeof(p->err_name) - 1) len = (int)sizeof(p->err_name) - 1;
-        memcpy(p->err_name, p->src + start, (size_t)len);
-        p->err_name[len] = 0;
-
-        if (p->pos - start == 3 &&
-            (!strcmp(p->err_name, "ans") || !strcmp(p->err_name, "ANS"))) {
-            if (!p->have_ans) { perr(p, E_NOANS, at, 0); return 0.0; }
-            return p->ans;
-        }
-        perr(p, E_NAME, at, 0);
-        return 0.0;
-    }
-
-    if (c == 0) {
-        char prev = prev_nonspace(p->src, at);
-        if (is_op(prev))      perr(p, E_TRAIL_OP, at, prev);
-        else if (prev == '(') perr(p, E_EXPECT, at, '(');
-        else                  perr(p, E_EXPECT, at, 0);
-        return 0.0;
-    }
-
-    /* A '*' '/' or '%' here is an operator missing its left operand;
-     * anything else is a character this syntax does not use. */
-    if (c == '*' || c == '/' || c == '%') perr(p, E_OPERAND, at, c);
-    else                                  perr(p, E_CHAR, at, c);
-    return 0.0;
-}
-
-/* unary := ('+' | '-') unary | primary - and the sign run is counted
- * against the same depth budget as parentheses. */
-static double parse_unary(Parser *p, int depth) {
-    if (p->err) return 0.0;
-
-    while (p->src[p->pos] == ' ') p->pos++;
-    char c = p->src[p->pos];
-
-    if (c == '+' || c == '-') {
-        int at = p->pos;
-        p->pos++;
-        if (depth + 1 >= MAX_NEST) { perr(p, E_NEST, at, c); return 0.0; }
-        double v = parse_unary(p, depth + 1);
-        if (p->err) return 0.0;
-        return c == '-' ? -v : v;
-    }
-    return parse_primary(p, depth);
-}
-
-/* term := unary (('*' | '/' | '%') unary)* - tighter than + and -, and
- * left associative because the accumulator is updated in the loop. */
-static double parse_term(Parser *p, int depth) {
-    double v = parse_unary(p, depth);
-    if (p->err) return 0.0;
-
-    for (;;) {
-        while (p->src[p->pos] == ' ') p->pos++;
-        char c = p->src[p->pos];
-        if (!(c == '*' || c == '/' || c == '%')) return v;
-
-        int at = p->pos;
-        p->pos++;
-        double rhs = parse_unary(p, depth);
-        if (p->err) return 0.0;
-
-        if (c == '*') {
-            v *= rhs;
-        } else if (c == '/') {
-            if (rhs == 0.0) { perr(p, E_DIV0, at, '/'); return 0.0; }
-            v /= rhs;
-        } else {
-            if (rhs == 0.0) { perr(p, E_MOD0, at, '%'); return 0.0; }
-            v = fmod(v, rhs);
-        }
-    }
-}
-
-/* expr := term (('+' | '-') term)* */
-static double parse_expr(Parser *p, int depth) {
-    if (depth >= MAX_NEST) { perr(p, E_NEST, p->pos, 0); return 0.0; }
-
-    double v = parse_term(p, depth);
-    if (p->err) return 0.0;
-
-    for (;;) {
-        while (p->src[p->pos] == ' ') p->pos++;
-        char c = p->src[p->pos];
-        if (c != '+' && c != '-') return v;
-
-        p->pos++;
-        double rhs = parse_term(p, depth);
-        if (p->err) return 0.0;
-        v = (c == '+') ? v + rhs : v - rhs;
-    }
-}
-
-/* Format a result for the display: integers without a decimal point,
- * ordinary magnitudes with up to 10 significant digits, and only very
- * small or very large values in exponent form. */
-static void fmt_number(double v, char *out, size_t n) {
-    double ip = 0.0;
-    if (v == 0.0) { snprintf(out, n, "0"); return; }   /* also -0 */
-
-    double a = v < 0.0 ? -v : v;
-    if (a < 1e15 && modf(v, &ip) == 0.0) snprintf(out, n, "%.0f", v);
-    else if (a >= 1e15 || a < 1e-9)      snprintf(out, n, "%.6g", v);
-    else                                 snprintf(out, n, "%.10g", v);
-}
-
-/* Parse one whole expression. Returns 1 and *out on success, or 0 with
- * msg holding the reason. `ans` is the previous result, if there is one. */
-static int parser_eval(const char *src, double ans, int have_ans,
-                       double *out, char *msg, size_t msgsz) {
-    Parser p;
-    memset(&p, 0, sizeof p);
-    p.src = src;
-    p.ans = ans;
-    p.have_ans = have_ans;
-
-    int i = 0;
-    while (src[i] == ' ') i++;
-    if (src[i] == 0) {
-        snprintf(msg, msgsz, "empty expression - type a number first");
-        return 0;
-    }
-
-    double v = parse_expr(&p, 0);
-
-    /* Anything left over after a complete expression is an error: an
-     * extra ')' or a stray character. */
-    if (!p.err) {
-        while (src[p.pos] == ' ') p.pos++;
-        if (src[p.pos] == ')')    perr(&p, E_PAREN_CLOSE, p.pos, ')');
-        else if (src[p.pos] != 0) perr(&p, E_CHAR, p.pos, src[p.pos]);
-    }
-    if (!p.err && !isfinite(v)) perr(&p, E_RANGE, 0, 0);
-
-    if (p.err) { err_text(&p, msg, msgsz); return 0; }
-
-    *out = v;
-    return 1;
-}
-/* ---8<--- end parser ---8<--- */
-
-/* ------------------------------------------------------------
- *  The window
- * ------------------------------------------------------------ */
-#define HIST_MAX  5        /* last five evaluated expressions */
-#define PAD_N     10       /* nominal paddings: ui_px() applies the scale */
-#define BTN_GAP_N  6
-#define BTN_PAD_N  5       /* extra height inside a button */
-#define HINT_TEXT "Enter evaluates  -  c clears  -  'ans' is the last result"
+enum { OP_NONE = 0, OP_ADD, OP_SUB, OP_MUL, OP_DIV };
 
 typedef struct {
-    char expr[EXPR_MAX];     /* the fixed, bounded input line */
-    int  len;
-    char result[RESULT_MAX]; /* formatted result of the last evaluation */
-    int  have_value;
-    char err[MSG_MAX];       /* error of the last evaluation, "" if none */
-    double last;             /* the value 'ans' stands for */
-    int  have_ans;
-    int  notice;             /* a key was dropped because expr[] was full */
-
-    struct {
-        char expr[EXPR_MAX];
-        char value[RESULT_MAX];
-    } hist[HIST_MAX];        /* [0] is the most recent */
-    int nhist;
-
-    int w, h;
+    double value;          /* the number the value line stands for       */
+    double acc;            /* left operand of the pending operation      */
+    double memory;         /* MC/MR/M+/M- storage                       */
+    int    mem_set;        /* memory holds a value (draws the M badge)   */
+    int    pending;        /* OP_* - the operation waiting for '='       */
+    int    fresh;          /* the next digit starts a new entry          */
+    int    entered;        /* a number was typed since the pending op    */
+    int    error;          /* value line shows "Error" until a key       */
+    char   err[WHY_MAX];   /* what went wrong, shown on the status line  */
+    char   entry[ENTRY_MAX]; /* the digits as typed / the last result    */
+    char   tape[TAPE_MAX]; /* "a op b = r" of the last evaluation        */
+    int    have_tape;
+    int    w, h;           /* the content rectangle, for hit testing     */
 } Calc;
 
-/* Real pixel measurements, all derived from the fonts that are actually
- * drawn. layout_calc() is the only place that knows them, so the painter
- * and the hit test can never disagree. */
+/* The label is UTF-8; the faces Mystic ships (Lato, JetBrains Mono) have
+ * the multiplication, division, minus, arrow and superscript glyphs. */
+enum { S_DIGIT = 0, S_FN, S_MEM, S_OP, S_EQ };
+
 typedef struct {
-    float pad;
-    float expr_y, expr_size;      /* top of the display, its nominal size */
-    float res_y;                  /* result / error line                 */
-    float rule_y;                 /* hairline over the history           */
-    float hist_label_y;           /* the word "history"                  */
-    float hist_top, hist_h;       /* first row, and one row stride        */
-    float btn_y, btn_h, btn_w, btn_gap;
-    float hint_y;
-    int   btn_n, hist_lines;
-    int   show_expr, show_res, show_rule, show_hist, show_hint;
+    int         id;
+    int         row, col;    /* top-left cell of the button, 0-based */
+    int         rows, cols;  /* how many cells it spans              */
+    int         style;       /* S_* - which theme colours it uses    */
+    const char *label;
+} BtnDef;
+
+/* 5 columns x 6 rows = 30 cells, filled exactly by 28 buttons.
+ * 0 spans two columns; '=' spans the last two rows. This is the classic
+ * desk layout: memory across the top, digits 3x3 in the middle, a column
+ * of operators on the right, and a tall '=' where the thumb expects it. */
+static const BtnDef BTNS[] = {
+    { B_MC,     0, 0, 1, 1, S_MEM,   "MC"          },
+    { B_MR,     0, 1, 1, 1, S_MEM,   "MR"          },
+    { B_MPLUS,  0, 2, 1, 1, S_MEM,   "M+"          },
+    { B_MMINUS, 0, 3, 1, 1, S_MEM,   "M-"          },
+    { B_C,      0, 4, 1, 1, S_FN,    "C"           },
+    { B_PCT,    1, 0, 1, 1, S_FN,    "%"           },
+    { B_CE,     1, 1, 1, 1, S_FN,    "CE"          },
+    { B_BACK,   1, 2, 1, 1, S_FN,    "\xE2\x86\x90" },   /* U+2190 */
+    { B_RECIP,  1, 3, 1, 1, S_FN,    "1/x"         },
+    { B_SQ,     1, 4, 1, 1, S_FN,    "x\xC2\xB2"   },   /* x U+00B2 */
+    { B_7,      2, 0, 1, 1, S_DIGIT, "7"           },
+    { B_8,      2, 1, 1, 1, S_DIGIT, "8"           },
+    { B_9,      2, 2, 1, 1, S_DIGIT, "9"           },
+    { B_DIV,    2, 3, 1, 1, S_OP,    "\xC3\xB7"    },   /* U+00F7 */
+    { B_SQRT,   2, 4, 1, 1, S_FN,    "\xE2\x88\x9A" },  /* U+221A */
+    { B_4,      3, 0, 1, 1, S_DIGIT, "4"           },
+    { B_5,      3, 1, 1, 1, S_DIGIT, "5"           },
+    { B_6,      3, 2, 1, 1, S_DIGIT, "6"           },
+    { B_MUL,    3, 3, 1, 1, S_OP,    "\xC3\x97"    },   /* U+00D7 */
+    { B_NEG,    3, 4, 1, 1, S_FN,    "\xC2\xB1"    },   /* U+00B1 */
+    { B_1,      4, 0, 1, 1, S_DIGIT, "1"           },
+    { B_2,      4, 1, 1, 1, S_DIGIT, "2"           },
+    { B_3,      4, 2, 1, 1, S_DIGIT, "3"           },
+    { B_SUB,    4, 3, 1, 1, S_OP,    "\xE2\x88\x92" },  /* U+2212 */
+    { B_EQ,     4, 4, 2, 1, S_EQ,    "="           },
+    { B_0,      5, 0, 1, 2, S_DIGIT, "0"           },
+    { B_DOT,    5, 2, 1, 1, S_DIGIT, "."           },
+    { B_ADD,    5, 3, 1, 1, S_OP,    "+"           },
+};
+#define NBTN ((int)(sizeof BTNS / sizeof BTNS[0]))
+#define CALC_COLS 5
+#define CALC_ROWS 6
+
+/* One painted button, in coordinates local to the app rectangle. Built by
+ * layout_calc(), drawn by calc_draw() and hit-tested by calc_click(). */
+typedef struct {
+    float x, y, w, h;
+    int   id, style;
+    const char *label;
+} BtnRect;
+
+typedef struct {
+    float pad, gap;
+    int   show_status;
+
+    float disp_x, disp_y, disp_w, disp_h, disp_radius;
+
+    int   status_size;
+    float status_x, status_y, status_h;
+
+    int   value_size;
+    float value_x, value_y, value_w, value_h;
+
+    float grid_x, grid_y, cell_w, cell_h, btn_radius;
+    int   btn_size;
+
+    BtnRect btn[NBTN];
+    int     nbtn;
 } Layout;
 
-/* One geometry function for drawing *and* hit testing, so a click always
- * lands on the button that was painted. Returns 0 only when the fonts are
- * not loaded, in which case nothing can be measured or drawn. */
+/* ------------------------------------------------------------
+ *  Formatting
+ * ------------------------------------------------------------ */
+
+/* A double as the display wants it: whole numbers without a decimal
+ * point, ordinary magnitudes with up to 12 significant digits, and only
+ * genuinely huge or tiny values in exponent form. Entries above 1e15 can
+ * lose their low digits to the double - that is real double precision,
+ * not a display limit. */
+static void fmt_number(double v, char *out, size_t n) {
+    if (!out || !n) return;
+
+    if (v == 0.0) {                 /* also -0.0 */
+        snprintf(out, n, "0");
+        return;
+    }
+
+    double ip = 0.0;
+    double a = fabs(v);
+    if (a < 1e15 && modf(v, &ip) == 0.0) snprintf(out, n, "%.0f", v);
+    else if (a >= 1e15 || a < 1e-9)     snprintf(out, n, "%.8g", v);
+    else                                snprintf(out, n, "%.12g", v);
+}
+
+/* Same glyphs as the buttons, so the status line reads like the key you
+ * would have pressed. */
+static const char *op_symbol(int op) {
+    switch (op) {
+        case OP_ADD: return "+";
+        case OP_SUB: return "\xE2\x88\x92";   /* U+2212 */
+        case OP_MUL: return "\xC3\x97";       /* U+00D7 */
+        case OP_DIV: return "\xC3\xB7";       /* U+00F7 */
+        default:     return "";
+    }
+}
+
+/* Store a computed value: the double and the text on the value line stay
+ * in step because this is the only place a result is written. */
+static void entry_store(Calc *c, double v) {
+    c->value = v;
+    fmt_number(v, c->entry, sizeof c->entry);
+}
+
+/* Back to a blank calculation. Memory and the last tape are deliberately
+ * separate: C clears the calculation (MC is the memory's own clear) and
+ * the tape is erased only when the error state is cleared or C is hit. */
+static void reset_calc(Calc *c) {
+    c->value   = 0.0;
+    c->acc     = 0.0;
+    c->pending = OP_NONE;
+    c->fresh   = 0;
+    c->entered = 0;
+    c->error   = 0;
+    c->err[0]  = 0;
+    c->tape[0] = 0;
+    c->have_tape = 0;
+    snprintf(c->entry, sizeof c->entry, "0");
+}
+
+static void set_error(Calc *c, const char *why) {
+    c->error = 1;
+    snprintf(c->err, sizeof c->err, "%s", why ? why : "error");
+}
+
+/* The entry is only ever plain decimal text: no exponent, at most one
+ * dot, an optional leading sign. Backspace on a formatted result can
+ * leave a shorter number but never a malformed one. */
+static int entry_plain(const char *s) {
+    if (!s || !s[0]) return 0;
+    for (const char *p = s; *p; p++)
+        if (*p == 'e' || *p == 'E') return 0;
+    return 1;
+}
+
+/* ------------------------------------------------------------
+ *  The operations - every one is real double arithmetic
+ * ------------------------------------------------------------ */
+
+static void press_digit(Calc *c, char d) {
+    if (c->fresh || !entry_plain(c->entry)) {
+        snprintf(c->entry, sizeof c->entry, "0");
+        c->fresh = 0;
+    }
+
+    size_t len = strlen(c->entry);
+    if (!strcmp(c->entry, "0")) {
+        c->entry[0] = d;
+        c->entry[1] = 0;
+    } else if (!strcmp(c->entry, "-0")) {
+        c->entry[1] = d;
+        c->entry[2] = 0;
+    } else if (len + 1 < sizeof c->entry) {
+        c->entry[len]     = d;
+        c->entry[len + 1] = 0;
+    }
+    /* else the entry is full: the extra digit is dropped, the number that
+     * is on screen stays the number the calculator will use */
+
+    c->value   = strtod(c->entry, NULL);
+    c->entered = 1;
+}
+
+static void press_dot(Calc *c) {
+    if (c->fresh || !entry_plain(c->entry)) {
+        snprintf(c->entry, sizeof c->entry, "0");
+        c->fresh = 0;
+    }
+    size_t len = strlen(c->entry);
+    if (!strchr(c->entry, '.') && len + 1 < sizeof c->entry) {
+        c->entry[len]     = '.';
+        c->entry[len + 1] = 0;
+    }
+    c->value   = strtod(c->entry, NULL);
+    c->entered = 1;
+}
+
+/* Delete one byte of the number being shown. On a result this edits the
+ * displayed digits, which is what people expect; an exponent-form result
+ * (1.5e+20) cannot be edited digit by digit, so it clears instead of
+ * turning into something strtod would read differently. */
+static void press_back(Calc *c) {
+    if (!entry_plain(c->entry)) {
+        snprintf(c->entry, sizeof c->entry, "0");
+        c->value   = 0.0;
+        c->fresh   = 0;
+        c->entered = 1;
+        return;
+    }
+
+    size_t len = strlen(c->entry);
+    if (len > 1) {
+        len--;
+        if (len == 1 && c->entry[0] == '-') {
+            snprintf(c->entry, sizeof c->entry, "0");
+        } else {
+            c->entry[len] = 0;
+        }
+    } else {
+        snprintf(c->entry, sizeof c->entry, "0");
+    }
+
+    c->value   = strtod(c->entry, NULL);
+    c->fresh   = 0;
+    c->entered = 1;
+}
+
+/* +/- flips the sign of the entry without going through fmt_number, so
+ * "12." stays "12." and "-0" is representable while typing. */
+static void press_neg(Calc *c) {
+    size_t len = strlen(c->entry);
+    if (c->entry[0] == '-') {
+        memmove(c->entry, c->entry + 1, len);          /* includes the NUL */
+        c->value = -c->value;
+    } else if (len + 1 < sizeof c->entry) {
+        memmove(c->entry + 1, c->entry, len + 1);
+        c->entry[0] = '-';
+        c->value    = -c->value;
+    } else {
+        return;                                        /* no room for a sign */
+    }
+    c->entered = 1;
+}
+
+/* CE: clear the entry, keep the accumulator and the pending operator, so
+ * "5 + 3 CE 2 =" is 5 + 2. */
+static void press_ce(Calc *c) {
+    c->value   = 0.0;
+    c->fresh   = 0;
+    c->entered = 0;
+    snprintf(c->entry, sizeof c->entry, "0");
+}
+
+/* % of the accumulator: with an operation pending the entry becomes
+ * acc * entry / 100 (200 + 10 % -> 20, then = -> 220); with nothing
+ * pending it is entry / 100. */
+static void press_pct(Calc *c) {
+    double v = c->value;
+    if (c->pending != OP_NONE) v = c->acc * v / 100.0;
+    else                       v = v / 100.0;
+
+    if (!isfinite(v)) { set_error(c, "the percentage is out of range"); return; }
+    entry_store(c, v);
+    c->fresh   = 1;
+    c->entered = 1;
+}
+
+static void press_recip(Calc *c) {
+    if (c->value == 0.0) { set_error(c, "division by zero (1/x)"); return; }
+    double v = 1.0 / c->value;
+    if (!isfinite(v)) { set_error(c, "1/x is out of range"); return; }
+    entry_store(c, v);
+    c->fresh   = 1;
+    c->entered = 1;
+}
+
+static void press_sq(Calc *c) {
+    double v = c->value * c->value;
+    if (!isfinite(v)) { set_error(c, "the square is out of range"); return; }
+    entry_store(c, v);
+    c->fresh   = 1;
+    c->entered = 1;
+}
+
+static void press_sqrt(Calc *c) {
+    if (c->value < 0.0) { set_error(c, "square root of a negative number"); return; }
+    entry_store(c, sqrt(c->value));
+    c->fresh   = 1;
+    c->entered = 1;
+}
+
+static void press_mem(Calc *c, int id) {
+    switch (id) {
+        case B_MC:
+            c->memory  = 0.0;
+            c->mem_set = 0;
+            break;
+        case B_MR:
+            entry_store(c, c->memory);
+            c->fresh   = 1;
+            c->entered = 1;
+            break;
+        case B_MPLUS:
+        case B_MMINUS: {
+            double m = (id == B_MPLUS) ? c->memory + c->value
+                                       : c->memory - c->value;
+            if (!isfinite(m)) { set_error(c, "memory is out of range"); return; }
+            c->memory  = m;
+            c->mem_set = 1;
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+/* One place applies a pending binary operation, so '=' and a new
+ * operator cannot behave differently. Returns 0 when it set the error. */
+static int apply_op(Calc *c, double a, double b, int op, double *out) {
+    double r = 0.0;
+
+    switch (op) {
+        case OP_ADD: r = a + b; break;
+        case OP_SUB: r = a - b; break;
+        case OP_MUL: r = a * b; break;
+        case OP_DIV:
+            if (b == 0.0) { set_error(c, "division by zero"); return 0; }
+            r = a / b;
+            break;
+        default:
+            return 0;
+    }
+
+    if (!isfinite(r)) { set_error(c, "the result is out of range"); return 0; }
+    *out = r;
+    return 1;
+}
+
+static void press_op(Calc *c, int op) {
+    if (c->pending != OP_NONE && c->entered) {
+        double r = 0.0;
+        if (!apply_op(c, c->acc, c->value, c->pending, &r)) return;
+        c->acc = r;
+        entry_store(c, r);
+    } else if (c->pending == OP_NONE) {
+        c->acc = c->value;
+    }
+    /* else an operator was pressed twice in a row: the new one replaces
+     * the old one and the accumulator is unchanged */
+
+    c->pending = op;
+    c->fresh   = 1;
+    c->entered = 0;
+}
+
+static void press_eq(Calc *c) {
+    if (c->pending == OP_NONE) { c->fresh = 1; return; }
+
+    int    op = c->pending;
+    double a  = c->acc;
+    double b  = c->value;
+    double r  = 0.0;
+
+    if (!apply_op(c, a, b, op, &r)) return;
+
+    char sa[ENTRY_MAX], sb[ENTRY_MAX], sr[ENTRY_MAX];
+    fmt_number(a, sa, sizeof sa);
+    fmt_number(b, sb, sizeof sb);
+    fmt_number(r, sr, sizeof sr);
+    snprintf(c->tape, sizeof c->tape, "%s %s %s = %s",
+             sa, op_symbol(op), sb, sr);
+    c->have_tape = 1;
+
+    entry_store(c, r);
+    c->acc     = r;
+    c->pending = OP_NONE;
+    c->fresh   = 1;
+    c->entered = 0;
+}
+
+/* Every button and every key ends up here. Nothing else calls the press_*
+ * helpers, which is what keeps the two input paths honest mirrors. */
+static void calc_press(Calc *c, int id) {
+    if (!c) return;
+
+    if (c->error) {
+        reset_calc(c);
+        if (id >= B_0 && id <= B_9)      press_digit(c, (char)('0' + (id - B_0)));
+        else if (id == B_DOT)            press_dot(c);
+        return;                          /* the error was the whole meaning */
+    }
+
+    switch (id) {
+        case B_MC: case B_MR: case B_MPLUS: case B_MMINUS:
+            press_mem(c, id); break;
+        case B_C:    reset_calc(c); break;   /* memory survives C */
+        case B_CE:   press_ce(c); break;
+        case B_BACK: press_back(c); break;
+        case B_NEG:  press_neg(c); break;
+        case B_PCT:  press_pct(c); break;
+        case B_RECIP:press_recip(c); break;
+        case B_SQ:   press_sq(c); break;
+        case B_SQRT: press_sqrt(c); break;
+        case B_DOT:  press_dot(c); break;
+        case B_ADD:  press_op(c, OP_ADD); break;
+        case B_SUB:  press_op(c, OP_SUB); break;
+        case B_MUL:  press_op(c, OP_MUL); break;
+        case B_DIV:  press_op(c, OP_DIV); break;
+        case B_EQ:   press_eq(c); break;
+        default:
+            if (id >= B_0 && id <= B_9)
+                press_digit(c, (char)('0' + (id - B_0)));
+            break;
+    }
+}
+
+/* ------------------------------------------------------------
+ *  Layout: the one place that turns a rectangle into geometry
+ * ------------------------------------------------------------ */
+
+static float widest_single_label(Font *f) {
+    float widest = 0.0f;
+    if (!f) return 0.0f;
+    for (int i = 0; i < NBTN; i++) {
+        if (BTNS[i].cols != 1) continue;   /* only one-cell labels are tight */
+        float w = font_width(f, BTNS[i].label);
+        if (w > widest) widest = w;
+    }
+    return widest;
+}
+
+static float cell_height_for(float inner_h, float disp_h, float gap) {
+    float grid_h = inner_h - disp_h - gap;
+    return (grid_h - (float)(CALC_ROWS - 1) * gap) / (float)CALC_ROWS;
+}
+
 static int layout_calc(int w, int h, Layout *L) {
     memset(L, 0, sizeof *L);
 
-    Font *fres = font_get(FONT_MEDIUM, 14);
-    Font *frow = font_get(FONT_REGULAR, 11);
-    Font *fsm  = font_get(FONT_REGULAR, 10);
-    Font *fbtn = font_get(FONT_MEDIUM, 11);
-    if (!fres || !frow || !fsm || !fbtn) return 0;
-
-    float frh   = font_height(fres);   /* one result line  */
-    float frowh = font_height(frow);   /* one history row  */
-    float fsmh  = font_height(fsm);    /* label and hint   */
-    float fbth  = font_height(fbtn);   /* button label     */
-
-    float pad = (float)ui_px(PAD_N);
-    float g2  = (float)ui_px(2);
-    float g4  = (float)ui_px(4);
-    float top = (float)ui_px(6);
-    L->pad = pad;
-
-    /* The display is the one line that can shrink and still say
-     * everything, so its budget is what is left after the result, one
-     * button row and the gaps; clamped to a readable 11..20 points. */
     float scale = ui_scale_get();
-    if (scale < 0.1f) scale = 1.0f;
-    L->btn_h = fbth + (float)ui_px(BTN_PAD_N);
-    float budget = (float)h - top - frh - L->btn_h - 2.0f * g4 - g2;
-    int nominal = (int)(budget / (1.4f * scale));
-    if (nominal < 11) nominal = 11;
-    if (nominal > 20) nominal = 20;
-    L->expr_size = (float)nominal;
+    if (!(scale > 0.1f)) scale = 1.0f;
 
-    Font *fbig = font_get(FONT_SEMIBOLD, L->expr_size);
-    if (!fbig) return 0;
-    float fe = font_height(fbig);
+    Font *fs  = font_get(FONT_MEDIUM,   10);
+    Font *fvm = font_get(FONT_SEMIBOLD, 12);   /* the smallest value line */
+    Font *fsm = font_get(FONT_MEDIUM,    8);   /* the smallest button     */
+    if (!fs || !fvm || !fsm) return 0;
 
-    L->expr_y = top;
-    L->res_y  = top + fe + g2;
-    float after_res = L->res_y + frh;
+    /* Padding shrinks with the window as well as with the text scale, so
+     * a small window spends its pixels on buttons and not on margins. */
+    float pad = (float)ui_px(10);
+    float lim_w = (float)w * 0.045f;
+    float lim_h = (float)h * 0.035f;
+    if (pad > lim_w) pad = lim_w;
+    if (pad > lim_h) pad = lim_h;
+    if (pad < 2.0f)  pad = 2.0f;
 
-    L->show_expr = (w >= ui_px(40) && (float)h >= top + fe);
-    L->show_res  = ((float)h >= after_res);
+    float gap = (float)ui_px(4);
+    if (gap > pad * 0.55f) gap = pad * 0.55f;
+    if (gap < 1.0f) gap = 1.0f;
 
-    /* The five buttons are the only mouse control the app has, so they are
-     * reserved before the history. First try hint + buttons, then buttons
-     * alone; the history only gets what is still free, and the buttons
-     * themselves go only when even the smallest display plus the result
-     * line cannot share the height with them. */
-    L->btn_gap = (float)ui_px(BTN_GAP_N);
-    L->btn_w   = ((float)w - 2.0f * pad - 4.0f * L->btn_gap) / 5.0f;
+    float g2 = (float)ui_px(2);
+    if (g2 > gap) g2 = gap;
+    if (g2 < 1.0f) g2 = 1.0f;
 
-    float label_min = font_width(fbtn, "(") + (float)ui_px(8);
-    if (label_min < (float)ui_px(24)) label_min = (float)ui_px(24);
+    float inner_w = (float)w - 2.0f * pad;
+    float inner_h = (float)h - 2.0f * pad;
+    if (inner_w <= 0.0f || inner_h <= 0.0f) return 0;
 
-    for (int pass = 0; pass < 2 && L->btn_n == 0; pass++) {
-        int want_hint = (pass == 0);
-        float bottom = (float)h - g2;
+    L->pad = pad;
+    L->gap = gap;
 
-        if (want_hint) {
-            float hy = bottom - fsmh;
-            if (font_width(fsm, HINT_TEXT) > (float)w - 2.0f * pad) continue;
-            if (hy < after_res + g4) continue;
-            bottom = hy - g2;
-        }
-        float by = bottom - L->btn_h;
-        if (L->btn_w >= label_min && by >= after_res + g4) {
-            L->btn_n = 5;
-            L->btn_y = by;
-            if (want_hint) {
-                L->show_hint = 1;
-                L->hint_y    = (float)h - g2 - fsmh;
-            }
+    /* ---- vertical split: display band over the button grid ---- */
+    float status_h = font_height(fs);
+    float min_disp = 2.0f * g2 + status_h + g2 + font_height(fvm);
+    float disp_h   = inner_h * 0.26f;
+    float max_disp = inner_h * 0.44f;
+    if (disp_h < min_disp) disp_h = min_disp;
+    if (disp_h > max_disp) disp_h = max_disp;
+
+    int   show_status = 1;
+    float cell_h = cell_height_for(inner_h, disp_h, gap);
+    Font *fmin   = font_get(FONT_MEDIUM, 8);
+    float min_cell = fmin ? font_height(fmin) + 1.0f : 8.0f;
+
+    if (cell_h < min_cell) {
+        /* Not enough height for both display lines and printable rows:
+         * the status line is the least important thing in the window. */
+        float disp2 = font_height(fvm) + 2.0f * g2;
+        float cell2 = cell_height_for(inner_h, disp2, gap);
+        if (cell2 > cell_h) {
+            show_status = 0;
+            disp_h      = disp2;
+            cell_h      = cell2;
         }
     }
+    if (cell_h < 4.0f) return 0;
 
-    /* History gets whatever is left between the result and the buttons. */
-    L->rule_y = after_res + g4;
-    float rows_top = L->rule_y + g2 + fsmh + g2;
-    float rows_bottom = L->btn_n ? L->btn_y - g2
-                      : (L->show_hint ? L->hint_y - g2 : (float)h - g2);
+    float cell_w = (inner_w - (float)(CALC_COLS - 1) * gap) / (float)CALC_COLS;
+    if (cell_w < 8.0f) return 0;
 
-    int n = 0;
-    if (rows_bottom > rows_top)
-        n = (int)((rows_bottom - rows_top) / (frowh + 1.0f));
-    if (n > HIST_MAX) n = HIST_MAX;
+    /* ---- the fonts are fitted to the bands they have to live in ---- */
+    int status_size = 10;
+    int value_size  = (int)((disp_h - 2.0f * g2 - (float)ui_px(2) -
+                             (show_status ? status_h + g2 : 0.0f)) / (1.4f * scale));
+    if (value_size > 72) value_size = 72;
+    if (value_size < 12) value_size = 12;
 
-    if (n > 0) {
-        L->show_hist    = 1;
-        L->show_rule    = 1;
-        L->hist_label_y = L->rule_y + g2;
-        L->hist_top     = rows_top;
-        L->hist_h       = frowh + 1.0f;
-        L->hist_lines   = n;
+    int btn_size = (int)((cell_h - (float)ui_px(6)) / (1.4f * scale));
+    if (btn_size > 34) btn_size = 34;
+    if (btn_size < 7)  btn_size = 7;
+
+    float label_room = cell_w - (float)ui_px(2);
+    for (int tries = 0; tries < 18 && btn_size > 7; tries++) {
+        Font *fb = font_get(FONT_MEDIUM, (float)btn_size);
+        if (!fb) break;
+        if (font_height(fb) <= cell_h - 0.5f &&
+            widest_single_label(fb) <= label_room)
+            break;
+        btn_size--;
+    }
+
+    /* ---- the rectangles, recorded once for the painter and the hit test ---- */
+    L->show_status  = show_status;
+    L->disp_x       = pad;
+    L->disp_y       = pad;
+    L->disp_w       = inner_w;
+    L->disp_h       = disp_h;
+    L->disp_radius  = inner_w * 0.08f;
+    if (L->disp_radius > disp_h * 0.40f) L->disp_radius = disp_h * 0.40f;
+    if (L->disp_radius < 2.0f) L->disp_radius = 2.0f;
+
+    L->status_size = status_size;
+    L->status_x    = pad + g2;
+    L->status_y    = pad + g2;
+    L->status_h    = status_h;
+
+    L->value_size = value_size;
+    L->value_x    = pad + g2;
+    L->value_w    = inner_w - 2.0f * g2;
+    L->value_y    = pad + 2.0f * g2 + (show_status ? status_h + g2 : 0.0f);
+    L->value_h    = disp_h - 2.0f * g2 - (show_status ? status_h + g2 : 0.0f);
+
+    L->grid_x = pad;
+    L->grid_y = pad + disp_h + gap;
+    L->cell_w = cell_w;
+    L->cell_h = cell_h;
+
+    float radius = (cell_w < cell_h ? cell_w : cell_h) * 0.20f;
+    if (radius > cell_h * 0.45f) radius = cell_h * 0.45f;
+    if (radius < 1.0f) radius = 1.0f;
+    L->btn_radius = radius;
+    L->btn_size   = btn_size;
+
+    for (int i = 0; i < NBTN; i++) {
+        const BtnDef *d = &BTNS[i];
+        BtnRect *b = &L->btn[L->nbtn++];
+        b->x = L->grid_x + (float)d->col * (cell_w + gap);
+        b->y = L->grid_y + (float)d->row * (cell_h + gap);
+        b->w = (float)d->cols * cell_w + (float)(d->cols - 1) * gap;
+        b->h = (float)d->rows * cell_h + (float)(d->rows - 1) * gap;
+        b->id    = d->id;
+        b->style = d->style;
+        b->label = d->label;
     }
     return 1;
 }
 
-/* Text inside maxw pixels, cut with ".." when it has to be. */
-static void draw_clipped(Surface *s, Font *f, float x, float y, float maxw,
-                         const char *text, u32 color) {
-    if (!text || !text[0] || maxw < 6.0f) return;
+/* ------------------------------------------------------------
+ *  Drawing
+ * ------------------------------------------------------------ */
 
-    char buf[MSG_MAX + 8];
-    size_t len = strlen(text);
-    if (len >= sizeof(buf) - 4) len = sizeof(buf) - 4;
-    memcpy(buf, text, len);
-    buf[len] = 0;
+/* The longest prefix of `text` that fits in maxw, cut on a UTF-8 boundary
+ * and marked with "..". Used for the status line and for a value that is
+ * still too wide at the smallest value font. */
+static void fit_text(Font *f, const char *text, float maxw,
+                     char *out, size_t outsz) {
+    if (!out || outsz == 0) return;
+    out[0] = 0;
+    if (!f || !text || !text[0] || maxw <= 0.0f) return;
 
-    if (font_width(f, buf) <= maxw) {
-        font_draw(s, f, x, y, buf, color);
-        return;
-    }
+    size_t n = strlen(text);
+    if (n > outsz - 1) n = outsz - 1;
+    memcpy(out, text, n);
+    out[n] = 0;
+    if (font_width(f, out) <= maxw) return;
 
-    float budget = maxw - font_width(f, "..");
-    size_t cut = len;
+    float dots = font_width(f, "..");
+    size_t cut = n;
     while (cut > 0) {
-        buf[cut] = 0;
-        if (font_width(f, buf) <= budget) break;
         cut--;
+        while (cut > 0 && ((unsigned char)out[cut] & 0xC0u) == 0x80u) cut--;
+        out[cut] = 0;
+        if (font_width(f, out) + dots <= maxw) break;
     }
-    if (cut == 0) return;
-    buf[cut] = '.';
-    buf[cut + 1] = '.';
-    buf[cut + 2] = 0;
-    font_draw(s, f, x, y, buf, color);
-}
-
-/* Right aligned text that keeps its *end* visible when it is too wide -
- * the character just typed must never scroll out of sight. Returns the x
- * where the drawn text ends. */
-static float draw_tail(Surface *s, Font *f, float right, float y, float maxw,
-                       const char *text, u32 color) {
-    float tw = font_width(f, text);
-    const char *start = text;
-
-    if (tw > maxw) {
-        /* Drop characters from the front until the rest fits: the longest
-         * suffix, so the character just typed stays on screen. Starting the
-         * search at the end would accept the empty string immediately and
-         * draw nothing at all. */
-        size_t len = strlen(text);
-        size_t cut = 0;
-        while (cut < len && font_width(f, text + cut) > maxw) cut++;
-        start = text + cut;
-        tw = font_width(f, start);
+    if (cut == 0) { out[0] = 0; return; }
+    if (cut + 3 <= outsz) {
+        out[cut]     = '.';
+        out[cut + 1] = '.';
+        out[cut + 2] = 0;
     }
-
-    float sx = right - tw;
-    if (sx < right - maxw) sx = right - maxw;
-    font_draw(s, f, sx, y, start, color);
-    return sx + tw;
 }
 
-static void hist_add(Calc *c, const char *expr, const char *value) {
-    int keep = c->nhist < HIST_MAX ? c->nhist : HIST_MAX - 1;
-    for (int i = keep; i > 0; i--) c->hist[i] = c->hist[i - 1];
-    snprintf(c->hist[0].expr, sizeof c->hist[0].expr, "%s", expr);
-    snprintf(c->hist[0].value, sizeof c->hist[0].value, "%s", value);
-    if (c->nhist < HIST_MAX) c->nhist++;
-}
+/* What the status line says: the cause of an error, the expression being
+ * built, or the last completed calculation. All three are the
+ * calculator's real state, never decoration. */
+static void build_status(const Calc *c, char *buf, size_t n) {
+    if (!buf || !n) return;
+    buf[0] = 0;
 
-static int expr_append(Calc *c, char ch) {
-    if (c->len >= EXPR_MAX - 1) return 0;
-    c->expr[c->len++] = ch;
-    c->expr[c->len] = 0;
-    return 1;
-}
+    if (c->error) { snprintf(buf, n, "%s", c->err); return; }
 
-/* Editing the text makes the previous complaint stale, so it goes. */
-static void edit_changed(Calc *c) {
-    c->notice = 0;
-    c->err[0] = 0;
-    c->have_value = 0;
-    c->result[0] = 0;
-}
-
-static void calc_enter(Calc *c) {
-    double v = 0.0;
-    char msg[MSG_MAX];
-
-    c->notice = 0;
-    if (!parser_eval(c->expr, c->last, c->have_ans, &v, msg, sizeof msg)) {
-        snprintf(c->err, sizeof c->err, "%s", msg);
-        c->result[0] = 0;
-        c->have_value = 0;
+    if (c->pending != OP_NONE) {
+        char a[ENTRY_MAX];
+        fmt_number(c->acc, a, sizeof a);
+        if (c->entered)
+            snprintf(buf, n, "%s %s %s", a, op_symbol(c->pending), c->entry);
+        else
+            snprintf(buf, n, "%s %s", a, op_symbol(c->pending));
         return;
     }
 
-    c->err[0] = 0;
-    c->have_ans = 1;
-    c->last = v;
-    fmt_number(v, c->result, sizeof c->result);
-    c->have_value = 1;
-
-    /* The pair goes into the history before the line is cleared, so the
-     * expression you just evaluated is the first row under the input. */
-    hist_add(c, c->expr, c->result);
-    c->len = 0;
-    c->expr[0] = 0;
+    if (c->have_tape) snprintf(buf, n, "%s", c->tape);
 }
 
-/* 'c' clears the entry. The history and 'ans' are kept: they are the
- * calculator's memory, not part of the line being typed. */
-static void calc_clear(Calc *c) {
-    c->len = 0;
-    c->expr[0] = 0;
-    c->notice = 0;
-    c->err[0] = 0;
-    c->result[0] = 0;
-    c->have_value = 0;
+static void btn_colors(const Theme *th, int style,
+                       u32 *fill, u32 *border, u32 *label) {
+    switch (style) {
+        case S_MEM:
+            *fill   = color_alpha(th->accent, 0.13f);
+            *border = color_alpha(th->accent, 0.34f);
+            *label  = th->accent;
+            break;
+        case S_FN:
+            *fill   = color_alpha(th->text, 0.11f);
+            *border = th->panel_border;
+            *label  = th->text;
+            break;
+        case S_OP:
+            *fill   = color_alpha(th->accent, 0.20f);
+            *border = color_alpha(th->accent, 0.48f);
+            *label  = th->accent;
+            break;
+        case S_EQ:
+            *fill   = th->accent;
+            *border = th->accent;
+            *label  = th->bg_top;      /* opaque theme colour, contrasts in both */
+            break;
+        default:                       /* S_DIGIT */
+            *fill   = color_alpha(th->text, 0.055f);
+            *border = th->panel_border;
+            *label  = th->text;
+            break;
+    }
 }
+
+static void calc_draw(App *a, Surface *s, int x, int y, int w, int h,
+                      const Theme *th) {
+    Calc *c = a->state;
+    if (!c || !s || !th) return;
+    c->w = w;
+    c->h = h;
+
+    Layout L;
+    if (!layout_calc(w, h, &L)) return;
+
+    Font *fst  = L.show_status ? font_get(FONT_MEDIUM, (float)L.status_size) : NULL;
+    Font *fbtn = font_get(FONT_MEDIUM, (float)L.btn_size);
+    if (!fbtn) return;
+    if (L.show_status && !fst) return;
+
+    float ox = (float)x;
+    float oy = (float)y;
+
+    /* ---- the display recess ----
+     * A 5% text-colour wash reads as a darker well in a light theme and a
+     * lighter one in a dark theme, so one expression serves both. */
+    gfx_rrect_aa(s, ox + L.disp_x, oy + L.disp_y, L.disp_w, L.disp_h,
+                 L.disp_radius, color_alpha(th->text, 0.05f),
+                 th->panel_border, 1.0f);
+
+    /* ---- status line ---- */
+    char mem[ENTRY_MAX + 8];
+    mem[0] = 0;
+    if (c->mem_set) {
+        char m[ENTRY_MAX];
+        fmt_number(c->memory, m, sizeof m);
+        snprintf(mem, sizeof mem, "M %s", m);
+    }
+
+    if (L.show_status && fst) {
+        float memw = mem[0] ? font_width(fst, mem) + (float)ui_px(8) : 0.0f;
+        float room = L.value_w - memw;
+
+        char status[TEXT_MAX];
+        build_status(c, status, sizeof status);
+        if (status[0] && room > 2.0f) {
+            char shown[TEXT_MAX];
+            fit_text(fst, status, room, shown, sizeof shown);
+            font_draw(s, fst, ox + L.status_x, oy + L.status_y, shown,
+                      c->error ? th->accent : color_alpha(th->text, 0.55f));
+        }
+        if (mem[0] && font_width(fst, mem) <= L.value_w) {
+            float mw = font_width(fst, mem);
+            font_draw(s, fst, ox + L.value_x + L.value_w - mw,
+                      oy + L.status_y, mem, color_alpha(th->accent, 0.90f));
+        }
+    }
+
+    /* ---- the value, right aligned ----
+     * The value font is the one layout picked for the band; if the number
+     * is still wider than the window it is reduced in steps (real font
+     * metrics each time) until it fits or reaches the readable floor. */
+    const char *shown = c->error ? "Error" : c->entry;
+    int vs = L.value_size;
+    Font *fv = font_get(FONT_SEMIBOLD, (float)vs);
+    if (!fv) return;
+    float tw = font_width(fv, shown);
+    for (int tries = 0; tries < 6 && tw > L.value_w && vs > 11; tries++) {
+        int next = (int)((float)vs * L.value_w / tw);
+        if (next >= vs) next = vs - 1;
+        if (next < 11) next = 11;
+        vs = next;
+        fv = font_get(FONT_SEMIBOLD, (float)vs);
+        if (!fv) return;
+        tw = font_width(fv, shown);
+    }
+    char vtext[TEXT_MAX];
+    fit_text(fv, shown, L.value_w, vtext, sizeof vtext);
+    tw = font_width(fv, vtext);
+
+    float vy = oy + L.value_y + (L.value_h - font_height(fv)) * 0.5f;
+    if (vy < oy + L.value_y) vy = oy + L.value_y;
+    font_draw(s, fv, ox + L.value_x + L.value_w - tw, vy, vtext,
+              c->error ? th->accent : th->text);
+
+    /* ---- the buttons ---- */
+    float fbth = font_height(fbtn);
+    for (int i = 0; i < L.nbtn; i++) {
+        const BtnRect *b = &L.btn[i];
+        u32 fill, border, label;
+        btn_colors(th, b->style, &fill, &border, &label);
+
+        float bx = ox + b->x;
+        float by = oy + b->y;
+        gfx_rrect_aa(s, bx, by, b->w, b->h, L.btn_radius, fill, border, 1.0f);
+
+        float lw = font_width(fbtn, b->label);
+        if (fbth <= b->h - 1.0f && lw <= b->w - 2.0f) {
+            font_draw(s, fbtn, bx + (b->w - lw) * 0.5f,
+                      by + (b->h - fbth) * 0.5f, b->label, label);
+        }
+    }
+}
+
+/* ------------------------------------------------------------
+ *  Events
+ * ------------------------------------------------------------ */
 
 static void calc_init(App *a, int w, int h) {
     Calc *c = calloc(1, sizeof(Calc));
-    if (!c) return;              /* the draw/key/click handlers test state */
+    if (!c) return;                 /* draw/key/click all test the state */
     c->w = w;
     c->h = h;
+    reset_calc(c);
     a->state = c;
 }
 
@@ -656,6 +870,12 @@ static void calc_resize(App *a, int w, int h) {
     c->h = h;
 }
 
+/* The bytes the desktop delivers: printable text from input.text, escape
+ * runs for the navigation keys. Arrow/Home/End/PageUp report runs are not
+ * used by this app, but they must be consumed whole so their final 'A' or
+ * '~' is never mistaken for a key of its own. A bare ESC is CE - main.c
+ * intercepts Esc today, so this is the path for a desktop that forwards
+ * it later. */
 static void calc_key(App *a, const char *bytes, int n) {
     Calc *c = a->state;
     if (!c || !bytes) return;
@@ -663,41 +883,57 @@ static void calc_key(App *a, const char *bytes, int n) {
     for (int i = 0; i < n; i++) {
         unsigned char ch = (unsigned char)bytes[i];
 
-        if (ch == 0x1b) {                 /* arrow / Home / End report runs */
-            int skip = 1;
-            if (i + 1 < n && bytes[i + 1] == '[') {
-                skip = 3;
-                if (i + 3 < n && bytes[i + 3] == '~') skip = 4;
+        if (ch == 0x1b) {
+            if (i + 1 < n && (bytes[i + 1] == '[' || bytes[i + 1] == 'O')) {
+                i += 2;
+                while (i < n) {
+                    unsigned char t = (unsigned char)bytes[i];
+                    if ((t >= 'A' && t <= 'Z') || t == '~') break;
+                    i++;
+                }
+                /* a navigation key is still a key: it clears Error */
+                if (c->error) reset_calc(c);
+            } else {
+                calc_press(c, B_CE);
             }
-            i += skip - 1;
             continue;
         }
 
-        if (ch == '\n' || ch == '\r' || ch == '=') { calc_enter(c); continue; }
-
-        if (ch == '\b' || ch == 0x7f) {
-            if (c->len > 0) {
-                c->len--;
-                c->expr[c->len] = 0;
-            }
-            edit_changed(c);
-            continue;
+        switch (ch) {
+            case '\n': case '\r': case '=': calc_press(c, B_EQ);   break;
+            case '\b': case 0x7f:           calc_press(c, B_BACK); break;
+            case '\t': case ' ':
+                /* no meaning here, but every key still clears Error */
+                if (c->error) reset_calc(c);
+                break;
+            case '+':                       calc_press(c, B_ADD);  break;
+            case '-':                       calc_press(c, B_SUB);  break;
+            case '*': case 'x': case 'X':   calc_press(c, B_MUL);  break;
+            case '/':                       calc_press(c, B_DIV);  break;
+            case '.':                       calc_press(c, B_DOT);  break;
+            case '%':                       calc_press(c, B_PCT);  break;
+            case 'c': case 'C':             calc_press(c, B_C);    break;
+            case 'e': case 'E':             calc_press(c, B_CE);   break;
+            case 'r': case 'R':             calc_press(c, B_RECIP);break;
+            case 'q': case 'Q':             calc_press(c, B_SQRT); break;
+            case 's': case 'S':             calc_press(c, B_SQ);   break;
+            case 'n': case 'N': case '~':   calc_press(c, B_NEG);  break;
+            case 'm':                       calc_press(c, B_MR);   break;
+            case 'M': case 'a': case 'A':   calc_press(c, B_MPLUS);break;
+            case 'd': case 'D':             calc_press(c, B_MMINUS);break;
+            case 'k': case 'K':             calc_press(c, B_MC);   break;
+            default:
+                if (ch >= '0' && ch <= '9') {
+                    /* calc_press' error branch starts the new number with
+                     * this digit, so 9/0=7 shows 7, not 0 */
+                    calc_press(c, B_0 + (int)(ch - '0'));
+                } else if (c->error) {
+                    /* an unmapped key clears Error rather than leaving
+                     * the calculator stuck */
+                    reset_calc(c);
+                }
+                break;
         }
-
-        if (ch == 'c' || ch == 'C') { calc_clear(c); continue; }
-
-        if (ch == ' ') continue;          /* spacing is not part of the line */
-
-        if (is_digit((char)ch) || ch == '.' || is_op((char)ch) ||
-            ch == '(' || ch == ')' || is_alpha((char)ch)) {
-            if (!expr_append(c, (char)ch)) {
-                c->notice = 1;            /* the line is full; say so */
-                continue;
-            }
-            edit_changed(c);
-        }
-        /* any other byte is ignored: the display is a calculator line,
-         * not a text field, so there is nothing to complain about */
     }
 }
 
@@ -709,171 +945,13 @@ static void calc_click(App *a, int x, int y, int buttons) {
 
     Layout L;
     if (!layout_calc(c->w, c->h, &L)) return;
-    if (L.btn_n == 0) return;
-    if ((float)y < L.btn_y || (float)y >= L.btn_y + L.btn_h) return;
 
-    for (int i = 0; i < L.btn_n; i++) {
-        float bx = L.pad + (float)i * (L.btn_w + L.btn_gap);
-        if ((float)x < bx || (float)x >= bx + L.btn_w) continue;
-
-        switch (i) {
-            case 0: calc_clear(c); break;                    /* C  */
-            case 1:                                          /* (  */
-            case 2:                                          /* )  */
-            case 3:                                          /* /  */
-                if (expr_append(c, "()/"[i - 1])) edit_changed(c);
-                else c->notice = 1;
-                break;
-            default: calc_enter(c); break;                   /* =  */
-        }
+    for (int i = 0; i < L.nbtn; i++) {
+        const BtnRect *b = &L.btn[i];
+        if ((float)x < b->x || (float)x >= b->x + b->w) continue;
+        if ((float)y < b->y || (float)y >= b->y + b->h) continue;
+        calc_press(c, b->id);
         return;
-    }
-}
-
-static void calc_draw(App *a, Surface *s, int x, int y, int w, int h,
-                      const Theme *th) {
-    Calc *c = a->state;
-    if (!c || !s || !th) return;
-    c->w = w;
-    c->h = h;
-
-    Layout L;
-    if (!layout_calc(w, h, &L) || !L.show_expr) return;
-
-    Font *fbig = font_get(FONT_SEMIBOLD, L.expr_size);
-    Font *fres = font_get(FONT_MEDIUM, 14);
-    Font *frow = font_get(FONT_REGULAR, 11);
-    Font *fsm  = font_get(FONT_REGULAR, 10);
-    Font *fbtn = font_get(FONT_MEDIUM, 11);
-    if (!fbig || !fres || !frow || !fsm || !fbtn) return;
-
-    float left  = (float)x + L.pad;
-    float right = (float)(x + w) - L.pad;
-    float maxw  = right - left;
-    float fe    = font_height(fbig);
-    float fres_h = font_height(fres);
-    float fsm_h  = font_height(fsm);
-
-    /* ---- the display: right aligned, caret at the right edge ---- */
-    float caret_w = (float)ui_px(2);
-    float text_right = right - caret_w - (float)ui_px(3);
-    if (text_right < left + 1.0f) text_right = right;
-
-    if (c->len == 0) {
-        draw_tail(s, fbig, text_right, (float)y + L.expr_y, text_right - left, "0",
-                  color_alpha(th->text, 0.28f));
-    } else {
-        draw_tail(s, fbig, text_right, (float)y + L.expr_y, text_right - left,
-                  c->expr, th->text);
-    }
-    /* The caret has its own column at the right edge: the text is aligned
-     * just left of it, so it is always painted where typing continues. */
-    if (right - caret_w > left) {
-        float cy  = (float)y + L.expr_y + fe * 0.14f;
-        float chh = fe * 0.72f;
-        if (chh < 3.0f) chh = 3.0f;
-        surf_blend(s, (int)(right - caret_w), (int)cy, (int)caret_w, (int)chh,
-                   color_alpha(th->accent, 0.75f));
-    }
-
-    /* ---- result, or the reason there is none ---- */
-    if (L.show_res) {
-        float ry = (float)y + L.res_y;
-
-        /* The ans badge is an extra. It never takes width from an error
-         * message - the named error is required output - and it is only
-         * drawn when a useful amount of room is left for the message. */
-        const char *badge = NULL;
-        char ansbuf[RESULT_MAX + 8], val[RESULT_MAX];
-        float bw = 0.0f;
-        if (c->have_ans) {
-            fmt_number(c->last, val, sizeof val);
-            snprintf(ansbuf, sizeof ansbuf, "ans %s", val);
-            bw = font_width(fsm, ansbuf);
-            /* Only the room that is actually left decides: at 350 px the
-             * badge fits at every scale, and the gate is the message width,
-             * not a second fixed window width. */
-            if (!c->err[0] &&
-                bw + (float)ui_px(90) <= maxw)
-                badge = ansbuf;
-        }
-        float msgw = badge ? maxw - bw - (float)ui_px(8) : maxw;
-
-        if (c->err[0]) {
-            draw_clipped(s, fres, left, ry, msgw, c->err, th->accent);
-        } else if (c->have_value) {
-            char line[RESULT_MAX + 4];
-            snprintf(line, sizeof line, "= %s", c->result);
-            draw_clipped(s, fres, left, ry, msgw, line, th->accent);
-        } else if (c->notice) {
-            draw_clipped(s, fsm, left, ry + (fres_h - fsm_h) * 0.5f, msgw,
-                         "the line is full - 63 characters", th->text_dim);
-        }
-
-        if (badge)
-            font_draw(s, fsm, right - bw, ry + (fres_h - fsm_h) * 0.5f, badge,
-                      color_alpha(th->text, 0.40f));
-    }
-
-    if (L.show_rule)
-        surf_blend(s, (int)left, (int)((float)y + L.rule_y), (int)maxw, 1,
-                   th->panel_border);
-
-    /* ---- history: last five, most recent first ---- */
-    if (L.show_hist) {
-        font_draw(s, fsm, left, (float)y + L.hist_label_y, "history",
-                  color_alpha(th->text, 0.40f));
-
-        int lines = c->nhist < L.hist_lines ? c->nhist : L.hist_lines;
-        if (lines == 0)
-            draw_clipped(s, frow, left, (float)y + L.hist_top, maxw,
-                         "no results yet", color_alpha(th->text, 0.30f));
-        for (int i = 0; i < lines; i++) {
-            float hy = (float)y + L.hist_top + (float)i * L.hist_h;
-            char vb[RESULT_MAX + 4];
-            snprintf(vb, sizeof vb, "= %s", c->hist[i].value);
-            float vw = font_width(frow, vb);
-            float room = maxw - vw - (float)ui_px(10);
-            if (room < (float)ui_px(40)) {
-                draw_clipped(s, frow, left, hy, maxw, c->hist[i].expr,
-                             color_alpha(th->text, 0.55f));
-                continue;
-            }
-            font_draw(s, frow, right - vw, hy, vb,
-                      color_alpha(th->accent, 0.80f));
-            draw_clipped(s, frow, left, hy, room, c->hist[i].expr,
-                         color_alpha(th->text, 0.55f));
-        }
-    }
-
-    /* ---- the five buttons ---- */
-    if (L.btn_n > 0) {
-        static const char *LABEL[5] = { "C", "(", ")", "/", "=" };
-        float fbth = font_height(fbtn);
-        for (int i = 0; i < L.btn_n; i++) {
-            float bx = (float)x + L.pad + (float)i * (L.btn_w + L.btn_gap);
-            float by = (float)y + L.btn_y;
-            int accent = (i == 4);
-
-            gfx_rrect_aa(s, bx, by, L.btn_w, L.btn_h, (float)ui_px(6),
-                         accent ? color_alpha(th->accent, 0.22f)
-                                : color_alpha(th->text, 0.07f),
-                         accent ? th->accent : th->panel_border,
-                         accent ? 1.4f : 1.0f);
-
-            float lw = font_width(fbtn, LABEL[i]);
-            font_draw(s, fbtn, bx + (L.btn_w - lw) * 0.5f,
-                      by + (L.btn_h - fbth) * 0.5f, LABEL[i],
-                      accent ? th->accent : th->text);
-        }
-    }
-
-    if (L.show_hint) {
-        float hw = font_width(fsm, HINT_TEXT);
-        if (hw <= (float)w - 2.0f * L.pad)
-            font_draw(s, fsm, (float)x + ((float)w - hw) * 0.5f,
-                      (float)y + L.hint_y, HINT_TEXT,
-                      color_alpha(th->text, 0.34f));
     }
 }
 

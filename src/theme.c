@@ -44,7 +44,7 @@ static void defaults(Theme *t) {
     t->panel_border = WITH_A(RGB(0xFF, 0xFF, 0xFF), 0x1A);
     t->text = RGB(0xE8, 0xEC, 0xF6);
     t->text_dim = WITH_A(RGB(0xE8, 0xEC, 0xF6), 0x99);
-    t->window_bg = WITH_A(RGB(0x14, 0x19, 0x28), 0xD9);
+    t->window_bg = RGB(0x14, 0x19, 0x28);        /* opaque: see theme_load  */
     t->window_border = WITH_A(RGB(0xFF, 0xFF, 0xFF), 0x22);
     t->corner = 14.0f;
     t->blur = 1.0f;
@@ -101,6 +101,22 @@ int theme_load(Theme *t, const char *path) {
         else if (!strcmp(key, "dark"))          t->dark = (int)parse_float(val, (float)t->dark);
     }
     fclose(f);
+
+    /* ----------------------------------------------------------------
+     * A window body is the surface an app's pixels and text are drawn on,
+     * and the desktop paints it over a blurred copy of whatever is behind
+     * the window. A body with alpha lets that blur bleed through, and that
+     * is the haze: low-amplitude wallpaper detail sitting on top of the
+     * body colour, different under every window, softening every text edge
+     * on top of it. It also makes the in-window blur expensive for nothing.
+     *
+     * So the body is always opaque. Only the alpha is forced - a theme
+     * still chooses the colour. The surfaces that are meant to be glass
+     * (the top bar, the launcher, the lock panel) are drawn from `panel`
+     * and keep their alpha, because they sit on the wallpaper rather than
+     * under a window's text.
+     * ---------------------------------------------------------------- */
+    t->window_bg = WITH_A(t->window_bg, 0xFF);
     return 0;
 }
 

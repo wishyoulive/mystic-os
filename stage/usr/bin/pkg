@@ -3,142 +3,396 @@
 #  pkg - the Mystic OS package manager
 #
 #  Nothing large ships in the image. This fetches packages over
-#  plain HTTP from a repository index and unpacks them onto the
-#  ext4 disk, where the launcher finds them.
+#  plain HTTP(S) from a repository index and unpacks them onto
+#  the disk, where the launcher finds them.
 #
-#      pkg list                  what the repo offers
+#      pkg list                  what the repository offers
 #      pkg installed             what is on the disk
 #      pkg install <name>        download, verify, unpack
 #      pkg remove <name>         delete it
 #      pkg update                refresh the cached index
+#      pkg repo                  which repository is in use
 #
-#  Repository = a URL whose directory holds index.tsv and one
-#  .tar.gz per package:
+#  Repository layout - identical for a static host, a directory
+#  listing and GitHub release assets:
+#      <base>/index.tsv
+#      <base>/<file>
 #      name<TAB>version<TAB>size<TAB>sha256<TAB>file<TAB>description
 #
-#  The default repository is the host machine as seen by QEMU's
-#  user-mode networking (10.0.2.2), which is where
-#  tools/serve-repo.sh serves it from.
+#  The base URL, highest priority first:
+#      $MYSTIC_REPO            a one-command override
+#      $MYSTIC_REPO_CONF       default /etc/mystic/repo.conf; the first
+#                              non-comment, non-blank line holds the URL
+#      the built-in public repository (the latest GitHub release assets)
+#
+#  A failed transfer never leaves a .part file behind and always
+#  reports the HTTP status it saw.
 # ============================================================
 
-# The repository URL, highest priority first:
-#   $MYSTIC_REPO            (a shell override)
-#   /etc/mystic/repo.conf   (one URL per line, first line wins - so the GUI or
-#                            the user can point the OS at any public mirror
-#                            without touching this script)
-#   the host as QEMU's user-mode network exposes it (10.0.2.2), for development
-_default_repo() {
-    if [ -f /etc/mystic/repo.conf ]; then
-        line=$(head -1 /etc/mystic/repo.conf 2>/dev/null)
-        case "$line" in
-            http://*|https://*) echo "$line"; return ;;
-        esac
-    fi
-    echo "http://10.0.2.2:8000"
-}
-REPO="${MYSTIC_REPO:-$(_default_repo)}"
-APPS=/root/apps
-CACHE=/tmp/pkg
-INDEX=/tmp/pkg/index.tsv
+# The public default: the GitHub release that publishes the package assets
+# (index.tsv plus one .tar.gz per package). Pinned to a tag rather than
+# "latest", so an unrelated OS release cannot move the package repository out
+# from under us. Update the tag together with repo.conf when the repo release
+# is refreshed.
+BUILTIN_REPO="https://github.com/wishyoulive/mystic-os/releases/download/repo-v1"
+
+CONF="${MYSTIC_REPO_CONF:-/etc/mystic/repo.conf}"
+# MYSTIC_APPS / MYSTIC_CACHE let the script be exercised on a host (and a live
+# medium choose another root); the image always uses the defaults.
+APPS="${MYSTIC_APPS:-/root/apps}"
+CACHE="${MYSTIC_CACHE:-/tmp/pkg}"
+INDEX="$CACHE/index.tsv"
+DL_LOG="$CACHE/download.log"
+RUN_INDEX=/run/mystic/repo.index
 
 say()  { echo "$*"; }
-fail() { echo "pkg: $*" >&2; exit 1; }
+warn() { echo "pkg: $*" >&2; }
+die()  { echo "pkg: $*" >&2; exit 1; }
+
+# A transfer interrupted by a signal must not leave a .part behind either.
+PART=
+cleanup() { [ -n "$PART" ] && rm -f "$PART"; }
+trap cleanup EXIT INT TERM HUP
+
+trim() {
+    printf '%s' "$1" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+# First non-comment, non-blank line of the config that is an http(s) URL.
+conf_repo() {
+    [ -f "$CONF" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=$(printf '%s' "$line" | sed 's/[[:space:]]#.*$//')
+        line=$(trim "$line")
+        case "$line" in
+            ''|'#'*) continue ;;
+            http://*|https://*) printf '%s\n' "$line"; return 0 ;;
+        esac
+    done < "$CONF"
+    return 1
+}
+
+default_repo() {
+    if url=$(conf_repo); then
+        printf '%s\n' "$url"
+        return 0
+    fi
+    if [ -f "$CONF" ]; then
+        # The file exists but carries no URL. Do not quietly fall back to a
+        # local host: that silent fallback is exactly the bug where pkg kept
+        # asking 10.0.2.2 while the user thought it used the config.
+        warn "no http(s) URL in $CONF - using the built-in public repository"
+    fi
+    printf '%s\n' "$BUILTIN_REPO"
+}
+
+REPO="${MYSTIC_REPO:-$(default_repo)}"
+REPO=$(trim "$REPO")
+while :; do
+    case "$REPO" in
+        */) REPO=${REPO%/} ;;
+        *) break ;;
+    esac
+done
+[ -n "$REPO" ] || REPO=$BUILTIN_REPO
+case "$REPO" in
+    http://?*|https://?*) : ;;
+    *) die "repository must be an http:// or https:// URL, not '$REPO'" ;;
+esac
 
 need_tools() {
     for t in wget tar sha256sum; do
-        command -v "$t" >/dev/null 2>&1 || fail "missing tool: $t"
+        command -v "$t" >/dev/null 2>&1 || die "missing tool: $t"
     done
 }
 
-fetch_index() {
-    mkdir -p "$CACHE" "$APPS" 2>/dev/null
-    say "fetching index from $REPO"
-    wget -q -T 10 -O "$INDEX.tmp" "$REPO/index.tsv" || fail "cannot reach $REPO (is tools/serve-repo.sh running?)"
-    mv "$INDEX.tmp" "$INDEX"
-    say "$(wc -l < "$INDEX") packages"
+# Last "HTTP/1.1 404 Not Found" style status in a wget log. Busybox prints
+# the status both for -S headers and in "server returned error" lines.
+http_code_of() {
+    [ -f "$1" ] || return 0
+    sed -n 's/.*HTTP\/[0-9][0-9.]*[[:space:]]*\([0-9][0-9][0-9]\).*/\1/p' "$1" | tail -n 1
 }
 
-# index row for a package name (first match)
+download_once() {
+    PART=$2
+    rm -f "$2" "$DL_LOG"
+    wget -q -S -T "$3" -O "$2" "$1" 2>"$DL_LOG"
+}
+
+# download URL DEST TIMEOUT WHAT
+download() {
+    _what=$4
+    DL_CODE=
+    if download_once "$1" "$2" "$3"; then
+        PART=
+        return 0
+    fi
+    _code=$(http_code_of "$DL_LOG")
+    # One retry, but only for failures that can actually be transient. A 404
+    # will not turn into a 200 a second later; retrying it only delays the
+    # message the user needs.
+    case "$_code" in
+        ''|5??|429)
+            say "  $_what: retrying once..."
+            sleep 1
+            if download_once "$1" "$2" "$3"; then
+                PART=
+                return 0
+            fi
+            _code=$(http_code_of "$DL_LOG")
+            ;;
+    esac
+    rm -f "$2"
+    PART=
+    DL_CODE=$_code
+    if [ -n "$_code" ]; then
+        warn "$_what failed: HTTP $_code from $1"
+    else
+        warn "$_what failed: cannot reach $1"
+    fi
+    _why=$(grep -v 'HTTP/' "$DL_LOG" 2>/dev/null | sed '/^[[:space:]]*$/d' | tail -n 2 | tr '\n' ' ')
+    [ -n "$_why" ] && warn "  wget: $_why"
+    return 1
+}
+
+# A cached index must be a TSV. An empty repository is legal; an HTML error
+# page or a plain-text 404 is not, and must never be promoted to $INDEX.
+index_ok() {
+    [ -f "$1" ] || return 1
+    [ -s "$1" ] || return 0
+    _head=$(head -c 64 "$1" | tr -d '\r\n' | tr 'A-Z' 'a-z')
+    case "$_head" in
+        '<!doctype'*|'<html'*|'<?xml'*) return 1 ;;
+    esac
+    awk -F'\t' '
+        /^[[:space:]]*#/ { next }
+        NF == 0 { next }
+        NF < 2 { bad = 1 }
+        END { exit (bad ? 1 : 0) }
+    ' "$1"
+}
+
+fetch_index() {
+    mkdir -p "$CACHE" || die "cannot create $CACHE"
+    say "fetching index from $REPO/index.tsv"
+    if ! download "$REPO/index.tsv" "$INDEX.part" 20 "index download"; then
+        rm -f "$INDEX.part"
+        warn "the repository must publish index.tsv next to its package tarballs"
+        warn "for the local development mirror: MYSTIC_REPO=http://10.0.2.2:8000 pkg update"
+        return 1
+    fi
+    if ! index_ok "$INDEX.part"; then
+        rm -f "$INDEX.part"
+        warn "$REPO/index.tsv is not a package index (HTML error page, or a wrong path)"
+        return 1
+    fi
+    mv "$INDEX.part" "$INDEX" || { rm -f "$INDEX.part"; die "cannot write $INDEX"; }
+    _n=$(awk -F'\t' 'NF >= 2 && $1 != "" { n++ } END { print n + 0 }' "$INDEX")
+    say "$_n packages"
+    # The Store app lists "Available" from this file, so keep its copy in step
+    # whenever pkg refreshes the index.
+    if [ -d /run/mystic ]; then
+        cp "$INDEX" "$RUN_INDEX.tmp" 2>/dev/null && mv "$RUN_INDEX.tmp" "$RUN_INDEX" 2>/dev/null
+    fi
+    return 0
+}
+
+ensure_index() {
+    [ -f "$INDEX" ] && return 0
+    fetch_index
+}
+
+# index row for a package name (first match). The caller must have fetched
+# the index; nothing is captured here except the row itself.
 row_for() {
-    [ -f "$INDEX" ] || fetch_index
-    awk -F'\t' -v n="$1" '$1==n {print; exit}' "$INDEX"
+    [ -f "$INDEX" ] || return 1
+    awk -F'\t' -v n="$1" '$1 == n { print; exit }' "$INDEX"
+}
+
+human() {
+    awk -v b="${1:-0}" 'BEGIN {
+        if (b >= 1048576) printf "%.1f MB", b / 1048576;
+        else if (b >= 1024) printf "%.0f KB", b / 1024;
+        else printf "%d B", b;
+    }'
 }
 
 cmd_list() {
-    [ -f "$INDEX" ] || fetch_index
+    if ! ensure_index; then
+        warn "no package index - nothing to list"
+        return 1
+    fi
     printf '%-22s %-10s %-9s %s\n' NAME VERSION SIZE DESCRIPTION
-    awk -F'\t' '{
-        sz=$3+0;
-        if (sz > 1048576) s=sprintf("%.0f MB", sz/1048576);
-        else s=sprintf("%.0f KB", sz/1024);
-        printf "%-22s %-10s %-9s %s\n", $1, $2, s, $6
-    }' "$INDEX"
+    awk -F'\t' '
+        /^[[:space:]]*#/ { next }
+        NF < 2 || $1 == "" { next }
+        {
+            sz = $3 + 0;
+            if (sz >= 1048576) s = sprintf("%.1f MB", sz / 1048576);
+            else if (sz >= 1024) s = sprintf("%.0f KB", sz / 1024);
+            else s = sprintf("%d B", sz);
+            printf "%-22s %-10s %-9s %s\n", $1, ($2 == "" ? "-" : $2), s, $6
+        }
+    ' "$INDEX"
+    _n=$(awk -F'\t' 'NF >= 2 && $1 != "" { n++ } END { print n + 0 }' "$INDEX")
+    if [ "$_n" -eq 0 ]; then
+        say "(the repository index is empty - nothing to install yet)"
+    fi
+    return 0
 }
 
 cmd_installed() {
     say "installed in $APPS:"
     n=0
-    for d in "$APPS"/*; do
-        [ -d "$d" ] || continue
-        name=$(basename "$d")
-        if [ -f "$d/manifest" ]; then
-            desc=$(awk -F'=' '/^name/{gsub(/^ +| +$/,"",$2); print $2; exit}' "$d/manifest")
-            say "  $name  $desc"
-        else
-            say "  $name"
-        fi
-        n=$((n + 1))
-    done
+    if [ -d "$APPS" ]; then
+        for d in "$APPS"/*; do
+            [ -d "$d" ] || continue
+            name=$(basename "$d")
+            if [ -f "$d/manifest" ]; then
+                desc=$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*//p' "$d/manifest" | head -n 1 | tr -d '\r')
+                say "  $name  $desc"
+            else
+                say "  $name"
+            fi
+            n=$((n + 1))
+        done
+    fi
     [ "$n" -eq 0 ] && say "  (nothing installed yet)"
     return 0
 }
 
+# Package names end up in paths, so they are restricted the same way the
+# desktop restricts the names it passes to pkg.
+valid_name() {
+    case "$1" in
+        ''|*[!a-z0-9-]*) return 1 ;;
+        -*|.*) return 1 ;;
+    esac
+    [ "${#1}" -le 32 ] || return 1
+    return 0
+}
+
 cmd_install() {
-    name="$1"
-    [ -n "$name" ] || fail "usage: pkg install <name>"
+    name=$1
+    [ -n "$name" ] || die "usage: pkg install <name>"
+    valid_name "$name" || die "invalid package name: $name"
     need_tools
+
+    ensure_index || die "cannot read the index from $REPO"
     row=$(row_for "$name")
-    [ -n "$row" ] || fail "no such package: $name"
-    file=$(echo "$row" | cut -f5)
-    want=$(echo "$row" | cut -f4)
-    # The size field is untrusted input from an HTTP index: a row without a
-    # third field used to abort the whole install with "arithmetic syntax
-    # error" before anything was downloaded. Coerce it; a wrong MB figure is
-    # cosmetic, a dead install is not.
-    size=$(echo "$row" | cut -f3 | tr -cd '0-9')
+    if [ -z "$row" ]; then
+        # A cached index can be older than the repository; refresh once
+        # before claiming the package does not exist.
+        fetch_index >/dev/null || die "cannot refresh the index from $REPO"
+        row=$(row_for "$name")
+    fi
+    [ -n "$row" ] || die "no such package: $name (run: pkg list)"
+
+    file=$(printf '%s\n' "$row" | cut -f5)
+    want=$(printf '%s\n' "$row" | cut -f4 | tr 'A-F' 'a-f')
+    case "$file" in
+        ''|*/*|.*) die "index row for $name has an unusable file name: '$file'" ;;
+    esac
+    case "$want" in
+        *[!0-9a-f]*|'') die "index row for $name has no usable sha256" ;;
+    esac
+    [ "${#want}" -eq 64 ] || die "index row for $name has a malformed sha256"
+
+    size=$(printf '%s\n' "$row" | cut -f3 | tr -cd '0-9')
     [ -n "$size" ] || size=0
-    if [ "$size" -ge 1048576 ]; then
-        mb=$((size / 1048576))
-    else
-        mb=$((size / 1024))k
-    fi
-    say "installing $name ($file, ${mb} MB)"
+    say "installing $name ($file, $(human "$size")) from $REPO"
 
-    mkdir -p "$CACHE"
+    mkdir -p "$CACHE" "$APPS" || die "cannot create $CACHE or $APPS"
     tar_path="$CACHE/$file"
-    if [ ! -f "$tar_path" ]; then
-        wget -q -T 300 -O "$tar_path.part" "$REPO/$file" || fail "download failed"
-        mv "$tar_path.part" "$tar_path"
+    if [ -f "$tar_path" ]; then
+        got=$(sha256sum "$tar_path" | cut -d' ' -f1)
+        if [ "$got" != "$want" ]; then
+            warn "cached $file does not match the index - downloading it again"
+            rm -f "$tar_path"
+        fi
     fi
-
-    got=$(sha256sum "$tar_path" | cut -d' ' -f1)
-    [ "$got" = "$want" ] || { rm -f "$tar_path"; fail "checksum mismatch (expected $want, got $got)"; }
+    if [ ! -f "$tar_path" ]; then
+        download "$REPO/$file" "$tar_path.part" 300 "download of $file" || {
+            if [ "$DL_CODE" = 404 ]; then
+                warn "the index advertises $file, but the repository does not serve it"
+                warn "the publisher has to upload that asset (or drop the row from index.tsv)"
+            fi
+            die "download failed - nothing was installed"
+        }
+        mv "$tar_path.part" "$tar_path" || { rm -f "$tar_path.part"; die "cannot store $tar_path"; }
+        got=$(sha256sum "$tar_path" | cut -d' ' -f1)
+        if [ "$got" != "$want" ]; then
+            rm -f "$tar_path"
+            die "checksum mismatch for $file (expected $want, got $got)"
+        fi
+    fi
     say "checksum ok"
 
-    mkdir -p "$APPS/$name"
-    tar -xzf "$tar_path" -C "$APPS/$name" || fail "unpack failed"
-    [ -f "$APPS/$name/manifest" ] || printf 'name = %s\ndesc = installed by pkg\nexec = bin\n' "$name" > "$APPS/$name/manifest"
-    [ -f "$APPS/$name/bin" ] && chmod +x "$APPS/$name/bin"
+    stage="$APPS/.$name.new.$$"
+    rm -rf "$stage"
+    mkdir -p "$stage" || die "cannot create $stage"
+    if ! tar -xzf "$tar_path" -C "$stage"; then
+        rm -rf "$stage"
+        die "unpack failed - nothing was installed"
+    fi
+    if [ ! -f "$stage/manifest" ]; then
+        warn "package has no manifest - writing a minimal one"
+        printf 'name = %s\ndesc = installed by pkg\nexec = bin\n' "$name" > "$stage/manifest"
+    fi
+    exec_name=$(sed -n 's/^[[:space:]]*exec[[:space:]]*=[[:space:]]*//p' "$stage/manifest" | head -n 1 | tr -d '\r')
+    [ -n "$exec_name" ] || exec_name=bin
+    case "$exec_name" in
+        /*|*..*) exec_name=bin ;;
+    esac
+    if [ -f "$stage/$exec_name" ]; then
+        chmod +x "$stage/$exec_name" || warn "cannot mark $exec_name executable"
+    fi
+
+    # Swap the unpacked tree in only after it is complete, so a failed
+    # upgrade leaves the working installation untouched.
+    if [ -d "$APPS/$name" ]; then
+        old="$APPS/.$name.old.$$"
+        rm -rf "$old"
+        mv "$APPS/$name" "$old" || { rm -rf "$stage"; die "cannot replace $APPS/$name"; }
+        if mv "$stage" "$APPS/$name"; then
+            rm -rf "$old"
+        else
+            mv "$old" "$APPS/$name"
+            rm -rf "$stage"
+            die "cannot install $name"
+        fi
+    else
+        mv "$stage" "$APPS/$name" || { rm -rf "$stage"; die "cannot install $name"; }
+    fi
+
     say "installed $name to $APPS/$name"
     say "open the launcher (eye or Super) - it rescans the disk"
 }
 
 cmd_remove() {
-    name="$1"
-    [ -n "$name" ] || fail "usage: pkg remove <name>"
-    [ -d "$APPS/$name" ] || fail "not installed: $name"
-    rm -rf "$APPS/$name"
+    name=$1
+    [ -n "$name" ] || die "usage: pkg remove <name>"
+    valid_name "$name" || die "invalid package name: $name"
+    [ -d "$APPS/$name" ] || die "not installed: $name"
+    rm -rf "$APPS/$name" || die "cannot remove $APPS/$name"
     say "removed $name"
+}
+
+cmd_repo() {
+    say "repository: $REPO"
+    if [ -n "$MYSTIC_REPO" ]; then
+        say "  from:  \$MYSTIC_REPO"
+    elif url=$(conf_repo) && [ "${url%/}" = "$REPO" ]; then
+        say "  from:  $CONF"
+    else
+        say "  from:  built-in default"
+    fi
+    if [ -f "$INDEX" ]; then
+        _n=$(awk -F'\t' 'NF >= 2 && $1 != "" { n++ } END { print n + 0 }' "$INDEX")
+        say "  index: $_n packages cached in $INDEX"
+    else
+        say "  index: not fetched yet (run: pkg update)"
+    fi
 }
 
 case "${1:-list}" in
@@ -147,5 +401,9 @@ case "${1:-list}" in
     install)   cmd_install "$2" ;;
     remove)    cmd_remove "$2" ;;
     update)    fetch_index ;;
-    *)         echo "usage: pkg [list|installed|install <name>|remove <name>|update]" >&2; exit 1 ;;
+    repo)      cmd_repo ;;
+    *)
+        echo "usage: pkg [list|installed|install <name>|remove <name>|update|repo]" >&2
+        exit 1
+        ;;
 esac

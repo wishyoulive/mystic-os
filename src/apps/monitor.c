@@ -17,7 +17,16 @@
  *  Keys: j/k move the selection, s cycles memory -> cpu -> pid,
  *  shift+K (or x) sends SIGTERM to the selected pid. Plain 'k' stays
  *  the cursor move - that is the vim order the other apps use - which
- *  is why the kill takes the shift.
+ *  is why the kill takes the shift. The wheel walks the same cursor
+ *  three rows a notch, so the list scrolls under it.
+ *
+ *  The whole window is one column grid: every line starts on the left
+ *  margin, every number ends on the right edge of its own column, and each
+ *  column is as wide as the widest string it has to hold, measured from the
+ *  real font. The PID/CPU/MEM headings are right-aligned on exactly the
+ *  edges their values end on, so the header cannot drift from the numbers
+ *  below it at any text scale. Vertical bands come from font_height() /
+ *  font_ascent() plus ui_px(); a label is centred on its own ink box.
  * ============================================================ */
 #include "mystic.h"
 
@@ -36,37 +45,72 @@
 /* ------------------------------------------------------------
  *  Geometry, derived from the fonts at draw time
  *
- *  There used to be a fixed ROW_H/BODY_Y/FOOT_H here. font_get() is
- *  where the global text scale is applied (src/font.c:125), so a fixed
- *  row height would paint the glyphs over each other and a fixed body
- *  top would hide the first row. Every vertical position below is the
- *  height of the font that draws in it plus a fixed leading, and
- *  monitor_click() runs the very same geo_of()/visible_rows() pair, so
- *  a click still selects the row that was painted.
+ *  font_draw() takes y as the ascender line and puts the baseline
+ *  font_ascent() below it (src/font.c:229); stbtt_ScaleForPixelHeight()
+ *  makes ascent + descent exactly the nominal size (src/font.c:119) while
+ *  font_height() is size * 1.4, so one line of text covers font_height/1.4
+ *  from y. Centring that ink box is what puts a label in the middle of its
+ *  band at every text scale.
+ *
+ *  Every band below is a font line box plus ui_px() air, and every column
+ *  edge is measured from the widest string that column has to hold, so the
+ *  headings and the numbers under them share an edge at any scale. There is
+ *  no fixed pixel height or column width left in this file.
  * ------------------------------------------------------------ */
+static float ink_h(Font *f) { return font_height(f) / 1.4f; }
+
+/* Baseline of one line centred in a band, and the y font_draw() needs for a
+ * line on a given baseline. */
+static float base_y(Font *f, float top, float band_h) {
+    return top + (band_h - ink_h(f)) * 0.5f + font_ascent(f);
+}
+static float top_y(Font *f, float base) { return base - font_ascent(f); }
+
 typedef struct {
-    float rule_y;   /* rule under the title          */
-    float bar_y;    /* memory bar (a 6 px graphic)   */
-    float sub_y;    /* load / uptime / memory line   */
-    float col_y;    /* PID NAME CPU MEM headings     */
-    float body_y;   /* first process row, app-local  */
-    float row_h;    /* one process row               */
-    float foot_h;   /* key legend band at the bottom */
+    float title_y, title_h;   /* "sort: memory" band, from the top edge   */
+    float rule_y;             /* the 1 px rule under the title            */
+    float bar_y, bar_h;       /* the memory bar (a graphic)               */
+    float sub_y, sub_h;       /* load / uptime / memory line              */
+    float col_y, col_h;       /* PID NAME CPU MEM headings                */
+    float body_y;             /* first process row, app-local             */
+    float row_h;              /* one process row                          */
+    float foot_h;             /* key legend band at the bottom            */
+    float m;                  /* the one left/right margin                */
+    float pid_r;              /* right edge of the PID column             */
+    float name_x;             /* left edge of the NAME column             */
+    float cpu_r;              /* right edge of the CPU column             */
+    float mem_r;              /* right edge of the MEM column             */
+    float mem_w, cpu_w;       /* widths the columns reserve               */
+    int   have_cpu;           /* 0 when the window is too narrow for CPU  */
 } Geo;
 
-static Geo geo_of(Font *fh, Font *fr, Font *fd) {
+static Geo geo_of(int x, int w, Font *fh, Font *fr, Font *fd) {
     Geo g;
-    float fhh = font_height(fh);
-    float frh = font_height(fr);
-    float fdh = font_height(fd);
+    g.m       = (float)ui_px(12);
+    g.title_y = (float)ui_px(8);
+    g.title_h = font_height(fh) + (float)ui_px(6);
+    g.rule_y  = g.title_y + g.title_h;
+    g.bar_h   = font_height(fr) * 0.45f;
+    if (g.bar_h < 3.0f) g.bar_h = 3.0f;
+    g.bar_y   = g.rule_y + (float)ui_px(6);
+    g.sub_h   = font_height(fd) + (float)ui_px(4);
+    g.sub_y   = g.bar_y + g.bar_h + (float)ui_px(4);
+    g.col_h   = font_height(fd) + (float)ui_px(4);
+    g.col_y   = g.sub_y + g.sub_h;
+    g.row_h   = font_height(fr) + (float)ui_px(8);
+    g.body_y  = g.col_y + g.col_h;
+    g.foot_h  = font_height(fd) + (float)ui_px(6);
 
-    g.rule_y = 4.0f + fhh + 3.0f;        /* title top pad + line + gap */
-    g.bar_y  = g.rule_y + 4.0f;
-    g.sub_y  = g.bar_y + 6.0f + 4.0f;    /* under the bar */
-    g.col_y  = g.sub_y + fdh + 3.0f;     /* one small line below */
-    g.body_y = g.col_y + fdh + 1.0f;     /* first row clears the headings */
-    g.row_h  = frh + 4.0f;
-    g.foot_h = fdh + 4.0f;
+    /* column edges: each one measured from the widest string it holds, so a
+     * bigger text scale widens the column instead of overlapping it */
+    g.mem_w  = font_width(fr, "9999.9 MB");
+    g.cpu_w  = font_width(fr, "999.9%");
+    g.mem_r  = (float)(x + w) - g.m;
+    g.pid_r  = (float)x + g.m + font_width(fr, "000000");
+    g.name_x = g.pid_r + (float)ui_px(10);
+    g.cpu_r  = g.mem_r - g.mem_w - (float)ui_px(10);
+    g.have_cpu = (g.cpu_r - g.cpu_w - (float)ui_px(8)) - g.name_x >= (float)ui_px(28);
+    if (!g.have_cpu) g.cpu_r = g.mem_r - g.mem_w - (float)ui_px(10);
     return g;
 }
 
@@ -417,7 +461,8 @@ static void monitor_draw(App *a, Surface *s, int x, int y, int w, int h, const T
     Font *fd = font_get(FONT_REGULAR, 10);
     if (!fh || !fr || !fd) return;
 
-    Geo geo = geo_of(fh, fr, fd);
+    Geo geo = geo_of(x, w, fh, fr, fd);
+    const float dx = (float)x, dy = (float)y;
 
     double l1;
     int threads;
@@ -443,10 +488,11 @@ static void monitor_draw(App *a, Surface *s, int x, int y, int w, int h, const T
     if (m->scroll > m->count - rows) m->scroll = m->count - rows;
     if (m->scroll < 0) m->scroll = 0;
 
-    /* ---- header: sort mode, process and thread totals ---- */
+    /* ---- header: sort mode on the left, totals on the right ---- */
     char head[64], right[96];
     snprintf(head, sizeof(head), "sort: %s", sort_name(m->sort));
-    font_draw(s, fh, (float)x + 6, (float)y + 4, head, th->text);
+    font_draw(s, fh, dx + geo.m, top_y(fh, base_y(fh, dy + geo.title_y, geo.title_h)),
+              head, th->text);
 
     /* The list holds at most MAX_PROC; say so instead of silently showing
      * a smaller "N proc" than /proc really has. */
@@ -455,27 +501,37 @@ static void monitor_draw(App *a, Surface *s, int x, int y, int w, int h, const T
                  m->count, m->seen, threads);
     else
         snprintf(right, sizeof(right), "%d proc   %d thr", m->count, threads);
-    float rw = font_width(fd, right);
-    if (font_width(fh, head) + rw + 28.0f < (float)w)
-        font_draw(s, fd, (float)(x + w) - rw - 6, (float)y + 7, right,
-                  color_alpha(th->text, 0.55f));
+    {
+        float rw = font_width(fd, right);
+        if (font_width(fh, head) + rw + 4.0f * geo.m < (float)w)
+            font_draw(s, fd, dx + (float)w - geo.m - rw,
+                      top_y(fd, base_y(fd, dy + geo.title_y, geo.title_h)), right,
+                      color_alpha(th->text, 0.55f));
+    }
 
-    surf_blend(s, x + 4, (int)((float)y + geo.rule_y), w - 8, 1, th->panel_border);
+    surf_blend(s, x + (int)geo.m, (int)(dy + geo.rule_y),
+               w - 2 * (int)geo.m, 1, th->panel_border);
 
-    /* ---- memory bar ---- */
+    /* ---- memory bar: the same two margins as the text around it ---- */
     float frac = total_kb > 0 ? (float)used_kb / (float)total_kb : 0.0f;
     if (frac > 1.0f) frac = 1.0f;
     if (frac < 0.0f) frac = 0.0f;
-    gfx_rrect_aa(s, (float)x + 4, (float)y + geo.bar_y, (float)w - 8, 6, 3,
-                 color_alpha(th->text, 0.10f), 0, 0);
-    if (frac > 0.01f)
-        gfx_rrect_aa(s, (float)x + 4, (float)y + geo.bar_y, ((float)w - 8) * frac, 6, 3,
-                     th->accent, 0, 0);
+    {
+        float bx = dx + geo.m, bw = (float)w - 2.0f * geo.m;
+        if (bw > 1.0f) {
+            gfx_rrect_aa(s, bx, dy + geo.bar_y, bw, geo.bar_h, geo.bar_h * 0.5f,
+                         color_alpha(th->text, 0.10f), 0, 0);
+            if (frac > 0.01f)
+                gfx_rrect_aa(s, bx, dy + geo.bar_y, bw * frac, geo.bar_h,
+                             geo.bar_h * 0.5f, th->accent, 0, 0);
+        }
+    }
 
     /* ---- second header line: load, uptime, memory, last action ---- */
     char left[96];
     snprintf(left, sizeof(left), "load %.2f   up %s", l1, upbuf);
-    font_draw(s, fd, (float)x + 6, (float)y + geo.sub_y, left, th->text_dim);
+    font_draw(s, fd, dx + geo.m, top_y(fd, base_y(fd, dy + geo.sub_y, geo.sub_h)),
+              left, th->text_dim);
 
     double now = mono_now();
     char note[96];
@@ -492,28 +548,28 @@ static void monitor_draw(App *a, Surface *s, int x, int y, int w, int h, const T
     }
     if (note[0]) {
         float nw = font_width(fd, note);
-        if (font_width(fd, left) + nw + 28.0f < (float)w)
-            font_draw(s, fd, (float)(x + w) - nw - 6, (float)y + geo.sub_y, note, note_col);
+        if (font_width(fd, left) + nw + 4.0f * geo.m < (float)w)
+            font_draw(s, fd, dx + (float)w - geo.m - nw,
+                      top_y(fd, base_y(fd, dy + geo.sub_y, geo.sub_h)), note, note_col);
     }
 
-    /* ---- column headings ---- */
-    float top = (float)y + geo.col_y;
-    float pid_x = (float)x + 6;
-    float name_x = (float)x + 56;
-    float cpu_r = (float)(x + w) - 78;
-    float mem_r = (float)(x + w) - 8;
-
-    font_draw(s, fd, pid_x, top, "PID", color_alpha(th->text, 0.45f));
-    font_draw(s, fd, name_x, top, "NAME", color_alpha(th->text, 0.45f));
-    const char *chcpu = "CPU", *chmem = "MEM";
-    font_draw(s, fd, cpu_r - font_width(fd, chcpu), top, chcpu,
-              color_alpha(th->text, 0.45f));
-    font_draw(s, fd, mem_r - font_width(fd, chmem), top, chmem,
-              color_alpha(th->text, 0.45f));
+    /* ---- column headings, each on the edge its values right-align to ---- */
+    {
+        float chb = base_y(fd, dy + geo.col_y, geo.col_h);   /* shared baseline */
+        float cy = top_y(fd, chb);
+        const char *chpid = "PID", *chname = "NAME", *chcpu = "CPU", *chmem = "MEM";
+        u32 hc = color_alpha(th->text, 0.45f);
+        font_draw(s, fd, geo.pid_r - font_width(fd, chpid), cy, chpid, hc);
+        font_draw(s, fd, geo.name_x, cy, chname, hc);
+        if (geo.have_cpu)
+            font_draw(s, fd, geo.cpu_r - font_width(fd, chcpu), cy, chcpu, hc);
+        font_draw(s, fd, geo.mem_r - font_width(fd, chmem), cy, chmem, hc);
+    }
 
     /* ---- rows ---- */
-    float name_max = (float)(w - 56) - 84.0f;
-    if (name_max < 40.0f) name_max = 40.0f;
+    float name_max = (geo.have_cpu ? geo.cpu_r - geo.cpu_w : geo.cpu_r)
+                   - (float)ui_px(8) - geo.name_x;
+    if (name_max < (float)ui_px(24)) name_max = (float)ui_px(24);
 
     double vmax = 1.0;
     for (int i = 0; i < m->count; i++) {
@@ -521,53 +577,59 @@ static void monitor_draw(App *a, Surface *s, int x, int y, int w, int h, const T
         if (v > vmax) vmax = v;
     }
 
-    float bar_w = (float)w - 15.0f;   /* x+9 .. x+w-6, clear of the cursor mark */
+    float bar_x = dx + geo.m, bar_w = (float)w - 2.0f * geo.m;
+
     for (int i = 0; i < rows; i++) {
         int idx = m->scroll + i;
         if (idx >= m->count) break;
         Proc *p = &m->procs[idx];
-        float ry = (float)y + geo.body_y + (float)i * geo.row_h;
+        float ry = dy + geo.body_y + (float)i * geo.row_h;
         int sel = (idx == m->sel);
+        float ty = top_y(fr, base_y(fr, ry, geo.row_h));
 
+        /* the highlight is the full width of the window, and the cursor mark
+         * sits in the same left margin every line of this window starts on */
         if (sel) {
-            gfx_rrect_aa(s, (float)x + 3, ry - 1, (float)w - 6, geo.row_h - 1, 3,
-                         color_alpha(th->accent, 0.22f),
-                         color_alpha(th->accent, 0.70f), 1.0f);
-            /* solid marker, so the cursor cannot be mistaken for the bar of
-             * whichever row happens to hold the largest share */
-            surf_blend(s, x + 4, (int)ry, 3, (int)(geo.row_h - 3),
-                       color_alpha(th->accent, 0.85f));
+            surf_blend(s, x, (int)(ry + 0.5f), w, (int)(geo.row_h + 0.5f),
+                       color_alpha(th->accent, 0.20f));
+            surf_blend(s, x, (int)(ry + 1.0f), (int)geo.m / 3 + 1,
+                       (int)(geo.row_h - 1.5f), color_alpha(th->accent, 0.85f));
         }
 
-        /* share bar of whatever the current sort keys on */
+        /* share bar of whatever the current sort keys on, behind the row */
         double v = m->sort == SORT_CPU ? p->cpu : (double)p->kb;
         float bw = bar_w * (float)(v / vmax);
         if (bw > 2.0f)
-            gfx_rrect_aa(s, (float)x + 9, ry + 2, bw, geo.row_h - 5, 2,
+            gfx_rrect_aa(s, bar_x, ry + (float)ui_px(1), bw,
+                         geo.row_h - 2.0f * (float)ui_px(1), 2,
                          color_alpha(th->accent, 0.13f), 0, 0);
 
         char buf[64];
         snprintf(buf, sizeof(buf), "%d", p->pid);
-        font_draw(s, fr, pid_x, ry, buf, sel ? th->text : th->text_dim);
+        font_draw(s, fr, geo.pid_r - font_width(fr, buf), ty, buf,
+                  sel ? th->text : th->text_dim);
 
         char nm[32];
         snprintf(nm, sizeof(nm), "%s", p->name);
         while (strlen(nm) > 3 && font_width(fr, nm) > name_max)
             nm[strlen(nm) - 1] = 0;
-        font_draw(s, fr, name_x, ry, nm, th->text);
+        font_draw(s, fr, geo.name_x, ty, nm, th->text);
 
-        snprintf(buf, sizeof(buf), "%.1f%%", p->cpu);
-        font_draw(s, fr, cpu_r - font_width(fr, buf), ry, buf,
-                  sel ? th->text : th->text_dim);
+        if (geo.have_cpu) {
+            snprintf(buf, sizeof(buf), "%.1f%%", p->cpu);
+            font_draw(s, fr, geo.cpu_r - font_width(fr, buf), ty, buf,
+                      sel ? th->text : th->text_dim);
+        }
 
         snprintf(buf, sizeof(buf), "%.1f MB", p->kb / 1024.0);
-        font_draw(s, fr, mem_r - font_width(fr, buf), ry, buf,
+        font_draw(s, fr, geo.mem_r - font_width(fr, buf), ty, buf,
                   sel ? th->text : th->text_dim);
     }
 
-    /* ---- key legend ---- */
+    /* ---- key legend, on the same margin as everything else ---- */
     if ((float)h - geo.foot_h > geo.body_y) {
-        font_draw(s, fd, (float)x + 6, (float)(y + h) - font_height(fd) - 2.0f,
+        float fy = (float)h - geo.foot_h;
+        font_draw(s, fd, dx + geo.m, top_y(fd, base_y(fd, dy + fy, geo.foot_h)),
                   "s sort   j/k move   shift+K kill", color_alpha(th->text, 0.40f));
     }
 }
@@ -604,13 +666,15 @@ static void monitor_click(App *a, int x, int y, int buttons) {
     if (!m || !(buttons & 1)) return;
 
     /* Same fonts, same geo_of()/visible_rows() as monitor_draw(): the row
-     * that was painted under this y is the row this click selects. */
+     * that was painted under this y is the row this click selects. The click
+     * arrives in app coordinates, so the column edges are computed for a rect
+     * that starts at 0; only body_y and row_h matter for the hit test. */
     Font *fh = font_get(FONT_MEDIUM, 12);
     Font *fr = font_get(FONT_REGULAR, 11);
     Font *fd = font_get(FONT_REGULAR, 10);
     if (!fh || !fr || !fd) return;
 
-    Geo geo = geo_of(fh, fr, fd);
+    Geo geo = geo_of(0, m->w, fh, fr, fd);
     int rows = visible_rows((float)m->h, &geo);
 
     float local = (float)y - geo.body_y;
@@ -626,6 +690,18 @@ static void monitor_resize(App *a, int w, int h) {
     if (m) { m->w = w; m->h = h; }
 }
 
+/* The wheel: three rows a notch, positive notches towards the top, the same
+ * distance the terminal scrolls (main.c:1607). The cursor and the window move
+ * together, which is what keeps monitor_click()'s row index honest. */
+static void monitor_wheel(App *a, int notches) {
+    Monitor *m = a->state;
+    if (!m || !notches) return;
+    int step = notches * 3;
+    m->sel -= step;
+    if (m->sel < 0) m->sel = 0;
+    if (m->sel >= m->count) m->sel = m->count > 0 ? m->count - 1 : 0;
+}
+
 const AppVT app_vt_monitor = {
     .id = "monitor",
     .title = "Monitor",
@@ -634,5 +710,6 @@ const AppVT app_vt_monitor = {
     .key = monitor_key,
     .click = monitor_click,
     .resize = monitor_resize,
+    .wheel = monitor_wheel,
     .free = monitor_free,
 };

@@ -40,13 +40,27 @@
  *  highlight is a fact about the disk - it follows an external edit, a
  *  failed write, or a file that was never there.
  *
- *  Every vertical metric is derived from the font that draws in it, at
- *  draw time (font_get() applies the global text scale, src/font.c:125).
+ *  Every metric is derived, at draw time, from the font that draws in it and
+ *  from ui_px() - there is no bare pixel count in this file. One grid (see
+ *  grid_of(), below) drives the whole page:
+ *
+ *      lab_x                left column: every label, every heading, the
+ *                           memory bar, the status line
+ *      val_r                right column: every value, right-aligned, and
+ *                           the memory bar's right end
+ *      lab_x - gap (right)  the ordinal of a list row, in a gutter
+ *
+ *  Every band height is a font line box plus ui_px() leading: row_h for a
+ *  row, head_h for a section heading, line_h for a small line. A label is
+ *  centred in its band on its real ascent/descent, so it sits in the middle
+ *  of the rectangle whatever the text scale. A selected row is highlighted
+ *  across the full width of the window, x .. x+w.
+ *
  *  One measure pass per frame produces the row offsets, and the painter
  *  records the exact rectangle it painted for every row; settings_click()
  *  hit-tests those recorded rectangles and nothing else, so a click lands on
- *  the row that was drawn there - at any text scale. There is no fixed row
- *  height anywhere in this file.
+ *  the row that was drawn there - at any text scale. The wheel walks the same
+ *  selection three rows a notch (settings_wheel()).
  * ============================================================ */
 #include "mystic.h"
 #include "wallpaper.h"
@@ -106,16 +120,116 @@ typedef struct {
     float    row_yb[MAX_ROWS];
 } Settings;
 
-/* ---- geometry: every metric comes from the font that fills it ------------- */
+/* ---- geometry: one grid, every metric from the fonts and ui_px() ---------- */
 
-/* One list row: the row's own font line box plus 4 px of leading. */
-static float row_h_of(Font *fr) { return font_height(fr) + 4.0f; }
+/* font_draw() takes y as the ascender line and puts the baseline
+ * font_ascent() below it (src/font.c:229). stbtt_ScaleForPixelHeight() makes
+ * ascent + descent exactly the nominal size (src/font.c:119) while
+ * font_height() is size * 1.4, so the glyphs reach font_height/1.4 below y.
+ * Centring THAT box is what puts a label in the middle of its row at every
+ * text scale; centring font_height() instead leaves every label about two
+ * pixels high at the default scale, which is the ragged look this file had. */
+static float ink_h(Font *f) { return font_height(f) / 1.4f; }
 
-/* One ordinary text line: line box plus 2 px. */
-static float line_h_of(Font *f) { return font_height(f) + 2.0f; }
+/* Baseline of one line of text centred in a band, and the y font_draw() needs
+ * to put a line on that baseline. Both read the real ascent, so a 13 px
+ * heading and a 10 px value can share one band and one baseline. */
+static float base_y(Font *f, float top, float band_h) {
+    return top + (band_h - ink_h(f)) * 0.5f + font_ascent(f);
+}
+static float top_y(Font *f, float base) { return base - font_ascent(f); }
 
-/* One section heading, including the gap under it. */
-static float head_h_of(Font *fh) { return font_height(fh) + 4.0f; }
+/* Copy src into out, shortened with ".." until it fits maxw. A theme name can
+ * be wider than the column it has to sit in, and text must never run into the
+ * value column or out of the window. */
+static void fit_text(Font *f, const char *src, char *out, size_t cap, float maxw) {
+    snprintf(out, cap, "%s", src);
+    if (maxw <= 0.0f) { out[0] = 0; return; }
+    if (font_width(f, out) <= maxw) return;
+    size_t n = strlen(src);
+    while (n > 0) {
+        n--;
+        snprintf(out, cap, "%.*s..", (int)n, src);
+        if (font_width(f, out) <= maxw) return;
+    }
+    out[0] = 0;
+}
+
+/* The page on one grid. Every x is one of three edges:
+ *
+ *      lab_x                the left column: every label, every heading,
+ *                           the memory bar's left end, the status line
+ *      val_r                the right column: every value, right-aligned,
+ *                           and the memory bar's right end
+ *      lab_x - gap (right)  the ordinal of a list row, in a gutter that ends
+ *                           exactly gap pixels before the left column
+ *
+ * and every y is one of four bands: row_h, head_h, line_h and gap. The
+ * heights come from the font that fills them, the margins from ui_px(), so
+ * the grid holds at every text scale and nothing here is a bare pixel count.
+ */
+typedef struct {
+    float m;        /* page margin, inside the window's own edge       */
+    float gap;      /* air between blocks, and gutter before the label */
+    float row_h;    /* one list row / one fact row                     */
+    float head_h;   /* one section header band                         */
+    float line_h;   /* one small band (status, system lines)           */
+    float lab_x;    /* left edge of every label and heading            */
+    float val_r;    /* right edge of every value                       */
+} Grid;
+
+static Grid grid_of(int x, int w, Font *fh, Font *fr, Font *fd) {
+    Grid g;
+    g.m      = (float)ui_px(12);
+    g.gap    = (float)ui_px(8);
+    g.row_h  = font_height(fr) + (float)ui_px(8);
+    g.head_h = font_height(fh) + (float)ui_px(10);
+    g.line_h = font_height(fr) + (float)ui_px(6);
+    /* ordinal column: wide enough for the two digits the flat list can reach */
+    g.lab_x  = (float)x + g.m + font_width(fd, "00") + g.gap;
+    g.val_r  = (float)(x + w) - g.m;
+    return g;
+}
+
+/* Every row in this window goes through this one function - the facts at the
+ * top and the rows of the three lists - so the left column, the value column
+ * and the vertical centring cannot drift apart. The highlight is the full
+ * width of the window (x .. x+w) rather than a band inset inside it, the
+ * value ends at val_r, and both the big and the small font are centred in the
+ * same band by their own real metrics. */
+static void row_draw(Surface *s, Font *fr, Font *fd, const Grid *g,
+                     int x, int w, float ry, const char *num,
+                     const char *name, const char *value,
+                     int sel, int cur, const Theme *th) {
+    char nb[192], vb[96];
+    float vw = 0.0f;
+
+    snprintf(vb, sizeof(vb), "%s", value ? value : "");
+    if (vb[0]) {
+        /* a value never takes more than half the row, so the label stays
+         * readable in the 280 px minimum window */
+        fit_text(fr, vb, vb, sizeof(vb), (g->val_r - g->lab_x) * 0.5f);
+        if (vb[0]) vw = font_width(fr, vb) + g->gap;
+    }
+    fit_text(fr, name, nb, sizeof(nb), g->val_r - vw - g->lab_x);
+
+    if (sel)
+        surf_blend(s, x, (int)(ry + 0.5f), w, (int)(g->row_h + 0.5f),
+                   color_alpha(th->accent, 0.18f));
+
+    if (num && num[0]) {
+        float nw = font_width(fd, num);
+        font_draw(s, fd, g->lab_x - g->gap - nw,
+                  top_y(fd, base_y(fd, ry, g->row_h)), num,
+                  color_alpha(th->text, 0.42f));
+    }
+    font_draw(s, fr, g->lab_x, top_y(fr, base_y(fr, ry, g->row_h)), nb,
+              sel ? th->text : color_alpha(th->text, 0.85f));
+    if (vb[0])
+        font_draw(s, fr, g->val_r - font_width(fr, vb),
+                  top_y(fr, base_y(fr, ry, g->row_h)), vb,
+                  cur ? th->accent : color_alpha(th->text, 0.50f));
+}
 
 static int flat_count(const Settings *s) {
     return SIZE_COUNT + WALLPAPER_COUNT + s->count;
@@ -390,46 +504,54 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h, const 
     Font *fd = font_get(FONT_REGULAR, 10);
     if (!fh || !fr || !fd) return;
 
-    const float rh = row_h_of(fr);          /* the one row height: draw and click */
-    const float lh = line_h_of(fr);
-    const float hh = head_h_of(fh);
-    char line[256];
+    const Grid g = grid_of(x, w, fh, fr, fd);
+    char line[256], val[128];
 
     /* the facts, re-read every frame: never what we last wrote */
     float cur_scale = 1.0f;
     int have_scale = read_scale(&cur_scale);
     int cur_wall = read_wallpaper();
+    char cur_theme[64];
+    read_file(MYSTIC_CURRENT_THEME, cur_theme, sizeof(cur_theme));
 
-    float py = (float)y + 6;
+    float py = (float)y + (float)ui_px(6);
 
-    /* ---- Display ---- */
-    font_draw(s, fh, (float)x + 6, py, "Display", th->text);
-    py += hh;
+    /* ---- Display: a fact, on the same grid as every row below it ---- */
     read_file("/sys/class/graphics/fb0/virtual_size", line, sizeof(line));
-    char pix[96];
-    snprintf(pix, sizeof(pix), "  %s pixels", line);
-    font_draw(s, fr, (float)x + 6, py, pix, th->text_dim);
-    py += lh + 4.0f;
+    row_draw(s, fr, fd, &g, x, w, py, "", "Display", line, 0, 0, th);
+    py += g.row_h;
 
-    /* ---- Memory ---- */
-    font_draw(s, fh, (float)x + 6, py, "Memory", th->text);
-    py += hh;
+    /* ---- Memory: the real numbers, then the bar on its own row ---- */
     long total = mem_kb("MemTotal:"), avail = mem_kb("MemAvailable:");
     long used = total - avail;
     if (used < 0) used = 0;
-    float frac = total > 0 ? (float)used / (float)total : 0;
-    float mw = (float)w - 12;
-    if (mw < 1.0f) mw = 1.0f;
-    gfx_rrect_aa(s, (float)x + 6, py, mw, 7, 3.5f, color_alpha(th->text, 0.10f), 0, 0);
-    if (frac > 0.01f)
-        gfx_rrect_aa(s, (float)x + 6, py, mw * frac, 7, 3.5f, th->accent, 0, 0);
-    py += 12;                      /* the 7 px bar and the gap under it, not text */
-    snprintf(line, sizeof(line), "  %ld MB used of %ld MB", used / 1024, total / 1024);
-    font_draw(s, fr, (float)x + 6, py, line, th->text_dim);
-    py += lh + 8.0f;
+    float frac = total > 0 ? (float)used / (float)total : 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    snprintf(val, sizeof(val), "%ld MB of %ld MB", used / 1024, total / 1024);
+    row_draw(s, fr, fd, &g, x, w, py, "", "Memory", val, 0, 0, th);
+    py += g.row_h;
+
+    /* The bar runs from the left column to the value column - the same two
+     * edges as the text above it and the rows below it - and its thickness is
+     * a fraction of the line box, so it grows with the text instead of
+     * staying 7 px at every scale. */
+    {
+        float bx = g.lab_x, bw = g.val_r - g.lab_x;
+        float bh = font_height(fr) * 0.45f;
+        if (bh < 3.0f) bh = 3.0f;
+        float band = bh + (float)ui_px(10);      /* its own band on the grid */
+        float by = py + (band - bh) * 0.5f;
+        if (bw > 1.0f) {
+            gfx_rrect_aa(s, bx, by, bw, bh, bh * 0.5f,
+                         color_alpha(th->text, 0.10f), 0, 0);
+            if (frac > 0.005f)
+                gfx_rrect_aa(s, bx, by, bw * frac, bh, bh * 0.5f, th->accent, 0, 0);
+        }
+        py += band;
+    }
 
     /* ---- the scrolling list: Text size, Wallpaper, Theme ---- */
-    int list_top = (int)(py + 0.5f);
+    const float list_top = py + g.gap * 0.5f;
 
     /* One measure pass. Offsets are relative to the top of the list, so they
      * do not depend on the window height or on the scroll position - the same
@@ -441,26 +563,27 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h, const 
     float row[MAX_ROWS];
     for (int i = 0; i < MAX_ROWS; i++) row[i] = 0.0f;
     float cy = 0.0f;
-    head[0] = cy;                    cy += hh;
-    for (int i = 0; i < SIZE_COUNT; i++)       { row[i] = cy; cy += rh; }
-    cy += 8.0f;
-    head[1] = cy;                    cy += hh;
-    for (int i = 0; i < WALLPAPER_COUNT; i++)  { row[ROW_WALL(i)] = cy; cy += rh; }
-    cy += 8.0f;
-    head[2] = cy;                    cy += hh;
-    for (int i = 0; i < nt && i < MAX_THEMES; i++) { row[ROW_THEME(i)] = cy; cy += rh; }
+    head[0] = cy;                    cy += g.head_h;
+    for (int i = 0; i < SIZE_COUNT; i++)       { row[i] = cy; cy += g.row_h; }
+    cy += g.gap;
+    head[1] = cy;                    cy += g.head_h;
+    for (int i = 0; i < WALLPAPER_COUNT; i++)  { row[ROW_WALL(i)] = cy; cy += g.row_h; }
+    cy += g.gap;
+    head[2] = cy;                    cy += g.head_h;
+    for (int i = 0; i < nt && i < MAX_THEMES; i++) { row[ROW_THEME(i)] = cy; cy += g.row_h; }
     const float content_h = cy;
 
     /* Bottom blocks are pinned to the bottom and only drawn when they really
      * fit, so at the 280x160 minimum the rows simply get fewer instead of
      * being painted over the frame and the desktop. */
-    const float status_y  = (float)(y + h) - 6.0f - line_h_of(fd);
+    const float status_y  = (float)(y + h) - (float)ui_px(6) - g.line_h;
     const int   have_status = status_y >= (float)list_top;
-    const float bottom_limit = have_status ? status_y - 4.0f : (float)(y + h) - 4.0f;
-    const float sys_h = hh + (lh + 1.0f) * 2.0f;
+    const float bottom_limit = have_status ? status_y - g.gap * 0.5f
+                                           : (float)(y + h) - (float)ui_px(4);
+    const float sys_h = g.head_h + g.line_h * 2.0f;
     const float sys_top = bottom_limit - sys_h;
-    const int   have_sys = (sys_top - 8.0f - (float)list_top) >= rh;
-    const float list_bottom = have_sys ? sys_top - 8.0f : bottom_limit;
+    const int   have_sys = (sys_top - g.gap - (float)list_top) >= g.row_h;
+    const float list_bottom = have_sys ? sys_top - g.gap : bottom_limit;
     float vis_h = list_bottom - (float)list_top;
     if (vis_h < 0.0f) vis_h = 0.0f;
 
@@ -473,7 +596,7 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h, const 
         if (st->sel >= n) st->sel = n - 1;
         float sy = row[st->sel];
         if (sy - st->scroll < 0.0f) st->scroll = sy;
-        if (sy + rh - st->scroll > vis_h) st->scroll = sy + rh - vis_h;
+        if (sy + g.row_h - st->scroll > vis_h) st->scroll = sy + g.row_h - vis_h;
     } else {
         st->scroll = 0.0f;
     }
@@ -495,28 +618,38 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h, const 
 
     const float ly = -st->scroll;    /* list-local y of the content's top edge */
 
-    /* headings, each with the fact it is about, read back from the file */
-    char fact[80];
-    font_draw(&ls, fh, (float)x + 6, ly + head[0], "Text size", th->text);
+    /* Headings. The title is flush with the left column the rows below use,
+     * and the live value ends on the value column, on the title's own
+     * baseline - so a heading and its rows share both edges. */
+    char fact[96];
+    float hb;
+
+    hb = base_y(fh, ly + head[0], g.head_h);
+    font_draw(&ls, fh, g.lab_x, top_y(fh, hb), "Text size", th->text);
     if (have_scale) snprintf(fact, sizeof(fact), "now %.1fx", cur_scale);
     else            snprintf(fact, sizeof(fact), "now 1.0x (no setting)");
-    font_draw(&ls, fr, (float)x + 12 + font_width(fh, "Text size"),
-              ly + head[0], fact, th->text_dim);
+    fit_text(fr, fact, fact, sizeof(fact),
+             g.val_r - g.lab_x - font_width(fh, "Text size") - g.gap);
+    font_draw(&ls, fr, g.val_r - font_width(fr, fact), top_y(fr, hb), fact,
+              th->text_dim);
 
-    font_draw(&ls, fh, (float)x + 6, ly + head[1], "Wallpaper", th->text);
+    hb = base_y(fh, ly + head[1], g.head_h);
+    font_draw(&ls, fh, g.lab_x, top_y(fh, hb), "Wallpaper", th->text);
     if (cur_wall >= 0)       snprintf(fact, sizeof(fact), "now %s", wallpaper_name(cur_wall));
     else if (cur_wall == -2) snprintf(fact, sizeof(fact), "now Dusk (no setting)");
     else                     snprintf(fact, sizeof(fact), "now: unknown name");
-    font_draw(&ls, fr, (float)x + 12 + font_width(fh, "Wallpaper"),
-              ly + head[1], fact, th->text_dim);
+    fit_text(fr, fact, fact, sizeof(fact),
+             g.val_r - g.lab_x - font_width(fh, "Wallpaper") - g.gap);
+    font_draw(&ls, fr, g.val_r - font_width(fr, fact), top_y(fr, hb), fact,
+              th->text_dim);
 
-    font_draw(&ls, fh, (float)x + 6, ly + head[2], "Theme", th->text);
+    hb = base_y(fh, ly + head[2], g.head_h);
+    font_draw(&ls, fh, g.lab_x, top_y(fh, hb), "Theme", th->text);
 
     for (int i = 0; i < n; i++) {
         float ry = ly + row[i];
-        /* the painted rectangle is (ry - 2) tall enough for rh, cut off at the
-         * list's own top and bottom edges - the hit box is that same shape */
-        float top = ry - 2.0f, bot = ry + rh - 2.0f;
+        /* the hit box is the row's own band, cut off at the list's edges */
+        float top = ry, bot = ry + g.row_h;
         if (top < 0.0f) top = 0.0f;
         if (bot > vis_h) bot = vis_h;
         if (bot > top) {
@@ -525,80 +658,86 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h, const 
         } else {
             st->row_y[i] = st->row_yb[i] = -1.0f;
         }
-        if (ry + rh <= 0.0f || ry >= vis_h) continue;
+        if (ry + g.row_h <= 0.0f || ry >= vis_h) continue;
 
-        int selected = (i == st->sel);
-        int current = 0;
-        char label[128];
+        char num[8], name[128], value[48];
+        int cur = 0;
+        value[0] = 0;
 
         if (i < SIZE_COUNT) {
             int k = i;
-            snprintf(label, sizeof(label), "%d   %-7s %.1fx",
-                     k + 1, SIZE_LABEL[k], SIZE_VALUE[k]);
-            current = fabsf(cur_scale - SIZE_VALUE[k]) < 0.005f;
+            snprintf(num, sizeof(num), "%d", k + 1);
+            snprintf(name, sizeof(name), "%s", SIZE_LABEL[k]);
+            snprintf(value, sizeof(value), "%.1fx", SIZE_VALUE[k]);
+            cur = fabsf(cur_scale - SIZE_VALUE[k]) < 0.005f;
         } else if (i < SIZE_COUNT + WALLPAPER_COUNT) {
             int k = i - SIZE_COUNT;
             const char *nm = wallpaper_name(k);
-            snprintf(label, sizeof(label), "%d   %s", k + 1, nm ? nm : "?");
-            current = (cur_wall == k);
+            snprintf(num, sizeof(num), "%d", k + 1);
+            snprintf(name, sizeof(name), "%s", nm ? nm : "?");
+            cur = (cur_wall == k);
+            if (cur) snprintf(value, sizeof(value), "now");
         } else {
             int t = i - SIZE_COUNT - WALLPAPER_COUNT;
-            snprintf(label, sizeof(label), "%d   %s", t + 1, st->rows[t].name);
+            snprintf(num, sizeof(num), "%d", t + 1);
+            snprintf(name, sizeof(name), "%s", st->rows[t].name);
+            /* current-theme holds Theme::name, so that is what marks the row -
+             * read back from the file every frame, like every other value */
+            cur = (cur_theme[0] && strcmp(cur_theme, st->rows[t].name) == 0);
+            if (cur) snprintf(value, sizeof(value), "now");
         }
-
-        if (selected)
-            gfx_rrect_aa(&ls, (float)x + 4, ry - 2, (float)w - 8, rh, 4.0f,
-                         color_alpha(th->accent, 0.20f), 0, 0);
-        font_draw(&ls, fr, (float)x + 10, ry, label,
-                  selected ? th->text : (current ? th->accent : th->text_dim));
-        if (current) {               /* what the file says, right where it is */
-            const char *mk = "now";
-            float mk_w = font_width(fr, mk);
-            /* stop short of the scroll triangles in the corner */
-            font_draw(&ls, fr, (float)x + (float)w - 26.0f - mk_w, ry, mk,
-                      color_alpha(th->accent, 0.85f));
-        }
+        row_draw(&ls, fr, fd, &g, x, w, ry, num, name, value,
+                 i == st->sel, cur, th);
     }
 
     /* A section below the window is never a secret: a small triangle sits at
-     * whichever edge the list continues past, in the font's own size. */
-    if (vis_h > line_h_of(fd) * 1.5f) {
-        const float t = font_height(fd) * 0.55f;
-        float mx = (float)x + (float)w - 12.0f - t;
+     * whichever edge the list continues past, in the font's own size. It lives
+     * in the page margin to the right of the value column, so it can never sit
+     * on top of a value the way it used to. */
+    if (vis_h > g.line_h * 1.5f && font_height(fd) * 0.4f + (float)ui_px(2) <= g.m) {
+        /* small enough to sit inside the page margin, clear of the values */
+        const float t = font_height(fd) * 0.4f;
+        float mx = (float)(x + w) - t - (float)ui_px(2);
         if (st->scroll + vis_h < content_h - 0.5f) {
-            float my = list_bottom - t - 5.0f;
+            float my = list_bottom - t - (float)ui_px(4);
             float dn[6] = { mx, my, mx + t, my, mx + t * 0.5f, my + t * 0.8f };
             gfx_polygon(s, dn, 3, color_alpha(th->text, 0.45f));
         }
         if (st->scroll > 0.5f) {
-            float my = (float)list_top + 4.0f;
+            float my = (float)list_top + (float)ui_px(3);
             float up[6] = { mx, my + t * 0.8f, mx + t, my + t * 0.8f, mx + t * 0.5f, my };
             gfx_polygon(s, up, 3, color_alpha(th->text, 0.45f));
         }
     }
 
-    /* ---- System ---- */
+    /* ---- System: the same left column, its own lines ---- */
     if (have_sys) {
         py = sys_top;
-        font_draw(s, fh, (float)x + 6, py, "System", th->text);
-        py += hh;
+        font_draw(s, fh, g.lab_x, top_y(fh, base_y(fh, py, g.head_h)), "System",
+                  th->text);
+        py += g.head_h;
         read_file("/proc/sys/kernel/osrelease", line, sizeof(line));
-        char buf[160];
-        snprintf(buf, sizeof(buf), "  kernel %s", line);
-        font_draw(s, fr, (float)x + 6, py, buf, th->text_dim);
-        py += lh + 1.0f;
+        snprintf(val, sizeof(val), "kernel %s", line);
+        font_draw(s, fr, g.lab_x, top_y(fr, base_y(fr, py, g.line_h)), val,
+                  th->text_dim);
+        py += g.line_h;
         read_file("/proc/uptime", line, sizeof(line));
-        snprintf(buf, sizeof(buf), "  up %d s", atoi(line));
-        font_draw(s, fr, (float)x + 6, py, buf, th->text_dim);
+        snprintf(val, sizeof(val), "up %d s", atoi(line));
+        font_draw(s, fr, g.lab_x, top_y(fr, base_y(fr, py, g.line_h)), val,
+                  th->text_dim);
     }
 
-    /* ---- status / hint ---- */
-    if (have_status)
-        font_draw(s, fd, (float)x + 6, status_y,
-                  st->status[0] ? st->status
-                                : "Up/Down + Enter, or click a row; digits pick in that list",
+    /* ---- status / hint, on the left column and in its own band ---- */
+    if (have_status) {
+        char hint[192];
+        snprintf(hint, sizeof(hint), "%s",
+                 st->status[0] ? st->status
+                               : "Up/Down + Enter, or click a row; digits pick in that list");
+        fit_text(fd, hint, hint, sizeof(hint), g.val_r - g.lab_x);
+        font_draw(s, fd, g.lab_x, top_y(fd, base_y(fd, status_y, g.line_h)), hint,
                   st->status[0] ? color_alpha(th->accent, 0.80f)
                                 : color_alpha(th->text, 0.40f));
+    }
 }
 
 static void settings_key(App *a, const char *bytes, int n) {
@@ -666,6 +805,16 @@ static void settings_resize(App *a, int w, int h) {
     if (s) { s->w = w; s->h = h; }
 }
 
+/* The wheel: positive notches are a wheel-up, which walks the selection
+ * towards the top of the flat list. Three rows a notch, the same distance the
+ * terminal uses (main.c:1607 term_scroll(wheel * 3)); the list itself follows
+ * because the painter keeps the selected row inside the visible band. */
+static void settings_wheel(App *a, int notches) {
+    Settings *s = a->state;
+    if (!s || !notches) return;
+    move_sel(s, -notches * 3);
+}
+
 const AppVT app_vt_settings = {
     .id = "settings",
     .title = "Settings",
@@ -674,5 +823,6 @@ const AppVT app_vt_settings = {
     .key = settings_key,
     .click = settings_click,
     .resize = settings_resize,
+    .wheel = settings_wheel,
     .free = settings_free,
 };

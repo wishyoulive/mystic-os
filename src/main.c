@@ -752,7 +752,9 @@ static void draw_desktop(Surface *s, const Theme *th) {
 
         float cx = th->corner;
         gfx_shadow(s, (float)cur->x, (float)cur->y, (float)cur->w, (float)cur->h, cx, 24, 0.5f);
-        if (th->blur > 0) gfx_blur_region(s, cur->x, cur->y, cur->w, cur->h, (int)(14 * th->blur));
+        /* No per-window backdrop blur: the window body is opaque (theme.c
+         * forces the alpha off), so blurring what is underneath could never be
+         * seen. It was 1.0-4.3 ms of dead work per window. */
         gfx_rrect_aa(s, (float)cur->x, (float)cur->y, (float)cur->w, (float)cur->h, cx,
                      th->window_bg, th->window_border, 1.0f);
 
@@ -1642,8 +1644,14 @@ int main(void) {
             else {
                 int nw = input.mouse_x - w->x + 1;
                 int nh = input.mouse_y - w->y + 1;
-                if (nw < 280) nw = 280;
-                if (nh < 160) nh = 160;
+                /* Minimums that leave a client app room to draw. The client
+                 * area is h - title bar - 2, and the browser needs about 124
+                 * px at the default scale (196 at the largest) before it has a
+                 * header, a page and a status bar. At 160 px tall the content
+                 * was 118, so a window squeezed to the old minimum rendered
+                 * nothing at all. */
+                if (nw < 320) nw = 320;
+                if (nh < ui_px(200) + title_h()) nh = ui_px(200) + title_h();
                 if (nw != w->w || nh != w->h) {
                     w->w = nw;
                     w->h = nh;
