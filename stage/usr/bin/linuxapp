@@ -1,0 +1,55 @@
+#!/bin/sh
+# ============================================================
+#  linuxapp - run a glibc Linux program from an Ubuntu/Debian root
+#
+#  Our userspace is musl; Ubuntu binaries need glibc's loader. The
+#  fix is not to port anything, it is to give those binaries their
+#  own root filesystem and chroot into it. We are root, so this
+#  works today, and apt comes with it.
+#
+#      linuxapp list                 installed roots
+#      linuxapp shell <root>         a shell inside that root
+#      linuxapp run <root> <cmd...>  one command inside that root
+#
+#  Roots live in /root/roots/<name> and are plain rootfs trees
+#  unpacked from a tarball (see tools/serve-repo.sh).
+# ============================================================
+set -e
+ROOTS=/root/roots
+
+list_roots() {
+    echo "roots in $ROOTS:"
+    n=0
+    for d in "$ROOTS"/*; do
+        [ -d "$d" ] || continue
+        echo "  $(basename "$d")  $( [ -x "$d/bin/sh" ] && echo '(has /bin/sh)' || echo '(incomplete)')"
+        n=$((n + 1))
+    done
+    [ "$n" -eq 0 ] && echo "  (none - install one: pkg install ubuntu-root)"
+    return 0
+}
+
+enter() {
+    root="$1"
+    [ -d "$ROOTS/$root" ] || { echo "linuxapp: no such root: $root" >&2; exit 1; }
+    shift
+    # the root needs its own /proc /sys /dev, or tools misbehave
+    for d in proc sys dev; do
+        mkdir -p "$ROOTS/$root/$d"
+        mount --bind "/$d" "$ROOTS/$root/$d" 2>/dev/null || true
+    done
+    cp /etc/resolv.conf "$ROOTS/$root/etc/resolv.conf" 2>/dev/null || true
+    if [ -f "$ROOTS/$root/bin/bash" ]; then
+        chroot "$ROOTS/$root" /bin/bash -c "cd /root 2>/dev/null || cd /; export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin TERM=$TERM; $*"
+    else
+        chroot "$ROOTS/$root" /bin/sh -c "$*"
+    fi
+}
+
+cmd="${1:-list}"
+case "$cmd" in
+    list)  list_roots ;;
+    shell) enter "$2" 'exec /bin/bash 2>/dev/null || exec /bin/sh' ;;
+    run)   root="$2"; shift 2; enter "$root" "$@" ;;
+    *)     echo "usage: linuxapp [list|shell <root>|run <root> <cmd...>]" >&2; exit 1 ;;
+esac

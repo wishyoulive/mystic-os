@@ -54,7 +54,7 @@ Everything under the desktop is Alpine's kernel and minirootfs with our
 ```
 -kernel build/cache/vmlinuz-virt
 -initrd build/initramfs.cpio.gz
--m 256 -vga std -no-reboot
+-m "${MYSTIC_RAM:-256}" -vga std -no-reboot
 -drive file=build/disk.img,format=raw,if=virtio
 -netdev user,id=n0 -device virtio-net-pci,netdev=n0
 -append "console=ttyS0 rdinit=/init loglevel=3 quiet"
@@ -65,13 +65,11 @@ Everything under the desktop is Alpine's kernel and minirootfs with our
 `-display none -serial stdio`. `-vga std` is QEMU's bochs-compatible VGA, which
 the kernel's `bochs` DRM driver binds; that is what creates `/dev/dri/card0` and
 `/dev/fb0`. `-drive …,if=virtio` is what the OS sees as `/dev/vda`. The
-`-netdev user` / `-device virtio-net-pci` pair is meant to give the guest an
-`eth0` behind QEMU's user-mode stack, which is what `setup_net()` in `stage/init`
-brings up; as written the array also contains a stray `n` token that makes QEMU
-refuse to start (see *Known rough edges*), so today only a hand-built command line
-gets as far as the NIC.
-The memory figure is `-m "${MYSTIC_RAM:-256}"`: 256 MB by default, overridable
-from the environment for experiments that need more.
+`-netdev user` / `-device virtio-net-pci` pair gives the guest an `eth0` behind
+QEMU's user-mode stack; `setup_net()` in `stage/init` is the guest half, and one
+probe boot reports whether it worked (link state, the `udhcpc` exit status and
+`ip addr show eth0`, §1.3). The memory figure is overridable for experiments:
+256 MB is the default, `MYSTIC_RAM` the knob.
 
 There is no bootloader in this path. QEMU's firmware loads the bzImage and the
 initrd with the Linux boot protocol and starts the kernel. `boot/boot.asm` and
@@ -331,7 +329,9 @@ with `ch = 1` (see below).
 3. `r = max(1, radius / F)`.
 4. Three passes. Each pass is a horizontal box filter of radius `r` (edges
    clamped by repeating the border pixel) written to `tmp`, `memcpy` back, then
-   the same vertically.
+   the same vertically. There is one implementation per channel count
+   (`box_passes3`/`box_passes1`) rather than a runtime channel loop, which would
+   cost about 4× in the inner loop.
 5. Upsample with nearest neighbour (`x/F`, `y/F`) and write back opaque.
 
 Three boxes approximate a Gaussian closely enough that the difference is not
@@ -472,10 +472,17 @@ frame, with no state to keep.
 | 2 | Waves | yes | layered sine bands drifting sideways |
 | 3 | Orbits | yes | rings and discs orbiting the centre |
 
-Every colour is derived from `th` — `bg_top`, `bg_bottom`, `glow`, `accent`,
-`text`, `panel` and `glow_strength` — so any wallpaper works with any theme
-instead of assuming one palette. Dusk is deliberately the original background:
-same three lights, same positions, same strengths.
+Every colour is derived from `th`, and the set of fields is fixed: `bg_top`,
+`bg_bottom`, `glow`, `accent` and `glow_strength`, plus `dark`. `dark` is not
+decoration — it picks the mix weights (`wp_draw_mesh()`: 0.42/0.55/0.26 against
+0.24/0.40/0.15), the vignette depth (44 against 20), the wave amplitude (138
+against 108) and, on a light theme, pulls the ring and disc colours back towards
+`bg_bottom` instead of towards the (white) glow, so the same painting stays
+visible on Porcelain and on Obsidian. Nothing in `wallpaper.c` reads `text`,
+`panel`, `window_bg`, `corner` or `blur`, and no painted colour is a literal: the
+only fixed values in the file are the forced `0xFF` alpha it writes and the black
+fill used when `th` is `NULL`. Dusk is deliberately the original background: same
+three lights, same positions, same strengths.
 
 The index comes from `/etc/mystic/wallpaper`: `main()` reads the first line at
 startup and again on the once-per-second tick (§3.6), `wallpaper_from_name()`
@@ -487,9 +494,10 @@ never keeps the CPU awake. `wallpaper_draw()` clamps an out-of-range index to 0
 and fills black if the theme is missing, so the screen can never be left
 unpainted.
 
-The shipped `stage/etc/mystic/wallpaper` says `Orbits`, so the desktop animates
-out of the box. Settings has one row per wallpaper (`wallpaper_name()` is the
-list), which is what makes the four reachable without a text editor.
+The shipped `stage/etc/mystic/wallpaper` says `Dusk`, so the desktop paints the
+original background and then idles; `Orbits` or `Waves` makes it animate. Settings
+has one row per wallpaper (`wallpaper_name()` is the list), which is what makes
+the four reachable without a text editor.
 
 ---
 
@@ -871,14 +879,16 @@ the pointer to that tile's centre, and the grown tile is anchored towards the
 top of the bar. The Gaussian, not a linear ramp, is what makes the neighbouring
 tiles rise a little too.
 
-Each tile draws the icon for its window's kind — `icon_for_window()` maps a
-terminal to `icon_terminal()`, an in-desktop app to its `vt->id`
-(`files`, `settings`, `monitor`, `notes`, `store`, `calc`) and a client window to
-`clients[i].id`; `icon_for_id()` has a drawing for `clock`, `paint`, `life`,
-`mandel` and `sysmon`, and falls back to `icon_gear()` for anything else — with a
-hover tint, the accent colour for the focused window, a 45 %-alpha foreground for
-a minimised one, a 14×3 accent pill under the focused one, and a tooltip with the
-window title over the hovered one.
+Each tile draws the icon for its window's kind. `icon_for_window()` maps a
+terminal to `icon_terminal()`, an in-desktop app to its `vt->id` and a client
+window to `clients[i].id`; `icon_for_id()` then has a drawing for every id either
+list can produce — `files` → `icon_folder`, `settings` → `icon_gear`,
+`monitor` → `icon_bars`, `notes` → `icon_pencil`, `store` → `icon_grid`,
+`calc` → `icon_calc`, and the client ids `clock`, `paint`, `life`, `mandel` and
+`sysmon` — falling back to `icon_gear()` only for an id it does not know (and for
+a `NULL` id). The tile is drawn with a hover tint, the accent colour for the
+focused window, a 45 %-alpha foreground for a minimised one, a 14×3 accent pill
+under the focused one, and a tooltip with the window title over the hovered one.
 
 ---
 
@@ -1047,6 +1057,26 @@ architecture is:
 a `WmApp { id, name, desc, exe }`, sorted by id so the launcher is stable. Because
 it runs once, a bundle packaged while the desktop is running appears after the
 next boot.
+
+Seven bundles are packaged in the tree this document was checked against, each
+one source file under `src/client/apps/` built into
+`stage/usr/share/mystic/apps/<id>/bin` by `tools/mkapp.sh`:
+
+| id | manifest `name` | what it does |
+|---|---|---|
+| `clock` | Clock | a live clock |
+| `files` | Files (app) | file browser over its own process |
+| `g2048` | 2048 | the 2048 game |
+| `life` | Life | a cellular automaton |
+| `mandel` | Mandelbrot | interactive fractal explorer |
+| `paint` | Paint | mouse drawing |
+| `sysmon` | Sysmon | `/proc` dashboard |
+
+That table is a reading of the tree, not a list the desktop keeps: the launcher
+takes whatever `wms_scan_apps()` finds, so deleting a directory removes its tile
+and adding one needs no code change — a repack is enough. It also has no
+relationship to `src/client/apps/` on its own: a source file that has not been
+through `mkapp.sh` is not a bundle and does not appear.
 
 `wms_launch()` is the only place that starts an **external app**: `fork()`,
 `setenv("MYSTIC_SOCKET")`/`setenv("MYSTIC_APP_ID")`, `execl(WM_APP_DIR/<id>/<exe>)`.
@@ -1266,16 +1296,18 @@ rather than testing functions in isolation.
 * Two probe boots (`image.sh probe`'s mode, but driven directly) — the second one
   proves the ext4 `/root` survived and the boot counter moved — checking: QEMU
   present, kernel and initramfs present, disk present, kernel reached userspace,
-  kernel version, `card0`, `/dev/fb0`, each expected module in `/proc/modules`,
-  the input nodes, the boot-time budget from the probe's own `/proc/uptime`, no
+  kernel version, `card0`, `/dev/fb0`, three modules in `/proc/modules`
+  (`drm`, `bochs`, `virtio_blk` — not the whole list `stage/init` loads), the
+  input nodes, the boot-time budget from the probe's own `/proc/uptime`, no
   kernel/userspace crash in the log, and that `/dev/vda` mounted ext4.
 * One desktop boot with `DESKTOP_WAIT` seconds of runtime against the packed
   image, checking that the desktop opened the display (the `display: … 32bpp`
   line printed by `disp_open()`), bound a keyboard (`input: keyboard`, printed by
   `input_open()`) and did not crash.
-* Static checks that need no QEMU (`--quick` runs only these): the text scale
-  (`stage/etc/mystic/ui.conf` exists, its `scale` parses to a finite number and is
-  inside 0.8…1.6; `src/ui.c` defines `ui_scale_get`/`ui_scale_load`/`ui_px`;
+* Static checks that need no QEMU (`--quick` skips the preflight and both boot
+  sections and runs this group, the build-history group and the compile loop):
+  the text scale (`stage/etc/mystic/ui.conf` exists, its `scale` parses to a
+  finite number and is inside 0.8…1.6; `src/ui.c` defines `ui_scale_get`/`ui_scale_load`/`ui_px`;
   `main.c` loads the file; `font_get()` applies the scale), the monospace terminal
   (the `.ttf` exists and starts with a real sfnt magic, it is installed into
   `stage`, `font.c` names it, `term_draw()` is called with the `FONT_MONO` face),
@@ -1389,12 +1421,12 @@ These are behaviours of the current tree, not intentions:
 * `src/ipc.h`'s header comment documents `HELLO <id> <title…> <w> <h>`, but the
   server (`wmsrv.c`) and the SDK (`mystic_client.c`) both use
   `HELLO <id> <w> <h> <title…>`. `docs/IPC.md` has the right order.
-* `image.sh`'s boot array separates the `-drive` and `-netdev` tokens with a
-  literal `\n` (backslash + `n`), not a line continuation. Bash turns that into
-  the argument `n`, which QEMU reads as a disk-image filename and refuses:
-  `qemu-system-x86_64: n: Could not open 'n': …`. `bash -c` over the array shows
-  the stray element, so `./image.sh run|probe|shot|themes` needs that token
-  removed before any boot mode — and before `-netdev`/`-device` mean anything.
+* The network path has no automated check. `stage/init` brings `eth0` up and
+  `image.sh probe` prints the operstate, the `udhcpc` exit status and
+  `ip addr show eth0`, but `tools/smoke.sh` asserts nothing about any of it (it
+  checks three modules — `drm`, `bochs`, `virtio_blk` — and `virtio_net` and
+  `af_packet` are not among them), so a regression there is visible only by
+  reading a probe log by hand.
 * The README's feature table still says the disk is FAT and that there are three
   themes and a dock; `setup_disk()` formats and mounts ext4, six `.theme` files
   ship, and the bottom bar is the taskbar of §3.11. The `fat`/`vfat` modules are

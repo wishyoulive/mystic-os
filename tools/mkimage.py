@@ -110,7 +110,9 @@ def main():
                 is_prog = (rel == 'init' or rel.startswith(exec_dirs)
                            or rel.endswith('/bin')
                            # udhcpc execs its script directly, so it needs +x
-                           or rel.endswith('.script'))
+                           or rel.endswith('.script')
+                           # our own shell tools in usr/bin need +x too
+                           or rel.startswith('usr/bin/'))
                 mode = 0o755 if is_prog else 0o644
                 add(rel, S_IFREG | mode, int(st.st_mtime), data=open(full, 'rb').read())
 

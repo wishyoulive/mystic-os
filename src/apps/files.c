@@ -21,13 +21,14 @@
  *  ICONS are drawn geometry, in the same style as the desktop
  *  launcher's icon_folder()/icon_pencil() in src/main.c - no images.
  *  A 20x20 box (ui_px() grows it with the text scale) holds one of
- *  eight icons, chosen once per entry from the real name and st_mode:
+ *  nine marks, chosen once per entry from the real name and st_mode:
  *
  *    folder with a tab          a directory
  *    page, folded corner        a plain file (and the unknown type)
  *    page + play triangle       executable, mode & 0111
  *    page + mountain and sun    .png .jpg .jpeg .ppm .bmp .gif
- *    page + gear                config: .conf .theme .cfg .ini
+ *    page + gear                config: .conf .cfg .ini
+ *    page + palette disc        a theme: .theme
  *    page + zip teeth           .zip .gz .tgz .tar .xz .bz2
  *    page + ruled lines         .txt .md .log
  *    page + arrow               a symlink (dimmed when it dangles)
@@ -35,22 +36,28 @@
  *  The toolbar is five real buttons (Back, Up, Home, Refresh, the sort
  *  cycle) drawn as rounded rects with an icon, a label when the width
  *  allows it, a hover fill on the last pointer position the desktop
- *  reported, and a depressed state for the 140 ms after a real click
- *  (CLOCK_MONOTONIC, so it is a measured interval, not a guess). The
- *  breadcrumb line is clickable per segment and the status line carries
- *  the item count, the selected entry's name and size, and the free
- *  space statvfs() reports for the directory being shown.
+ *  reported, and a pressed fill for the frame the click causes. It is a
+ *  frame, not an animation: the desktop repaints from events (src/main.c
+ *  sets `dirty` from input, not from a timer) so an app cannot keep a
+ *  highlight alive for a while and then clear it; the press therefore
+ *  ends on the next repaint after PRESS_S, and because the pointer is
+ *  still on that button the button falls back to its hover fill instead
+ *  of staying lit. The breadcrumb line is clickable per segment and the
+ *  status line carries the item count, the selected entry's name, its
+ *  real size and the free space statvfs() reports for the directory.
  *
  *  The listing is opendir()/readdir()/lstat(), the size and stamp are the
  *  real st_size/st_mtime, the free-space figure is statvfs() on the
  *  directory being shown. Names are kept up to the 255 bytes ext4 allows.
  *
  *  SYMLINKS are shown as what they stand for: stat() supplies the target's
- *  size, mode and mtime (so an executable target gets the play mark and a
- *  link to a regular file does not inherit lstat's 0777), readlink() names
- *  the target in the footer, and a link to a directory opens like one. A
- *  dangling link is drawn as a plain page and marked "(broken link)". If
- *  opendir() fails the real strerror(errno) is drawn instead of rows.
+ *  size and mtime (so a link to a regular file does not inherit the 0777
+ *  that lstat() reports for a link), readlink() names the target in the
+ *  footer, and a link to a directory opens like one. The icon is the page
+ *  with an arrow either way - a link is a pointer, not the thing it points
+ *  at - and a dangling link draws that page dimmer and is marked
+ *  "(broken link)". If opendir() fails the real strerror(errno) is drawn
+ *  instead of rows.
  *
  *  KEYS   j/k, Up/Down   move          Enter      open (dir descends,
  *         Home/End       first/last               a file says so)
@@ -97,9 +104,14 @@ enum { SORT_NAME = 0, SORT_SIZE = 1, SORT_TIME = 2, SORT_MODES = 3 };
 /* toolbar buttons, in drawing order; TB_SORT sits on the right edge */
 enum { TB_BACK, TB_UP, TB_HOME, TB_REFRESH, TB_SORT, TB_COUNT };
 
+/* the words on those buttons (TB_SORT shows the mode it is set to) */
+static const char *const TB_LABEL[TB_COUNT] = { "Back", "Up", "Home", "Refresh", "Name" };
+
 /* Which drawn icon an entry gets - decided once per entry, at scan time,
- * from the real name and st_mode (see kind_of()). */
-enum { IC_FOLDER, IC_FILE, IC_EXEC, IC_IMAGE, IC_CONF, IC_ARCHIVE, IC_TEXT, IC_LINK };
+ * from the real name and st_mode (see kind_of()). Nine marks: folder, plain
+ * page, executable, image, config, theme, archive, text, symlink. */
+enum { IC_FOLDER, IC_FILE, IC_EXEC, IC_IMAGE, IC_CONF, IC_ARCHIVE, IC_TEXT, IC_LINK,
+       IC_THEME };
 
 /* how long a toolbar button stays visibly pressed after a real click */
 #define PRESS_S 0.14
@@ -204,9 +216,12 @@ static int ends_with_ci(const char *s, const char *suffix) {
     return 1;
 }
 
-/* Extension tables. A NULL ends each list, so has_ext() needs no count
- * to get out of step with the data. */
-static const char *const EXT_CONF[]    = { ".conf", ".theme", ".cfg", ".ini", NULL };
+/* Extension tables. A NULL ends each list, so has_ext() needs no count to
+ * get out of step with the data. A .theme is a palette rather than a set of
+ * switches, so it keeps its own disc and does not wear the gear that
+ * .conf/.cfg/.ini wear - that distinction was already in this file (and in
+ * the files-rich brief), and collapsing it would be a regression. */
+static const char *const EXT_CONF[]    = { ".conf", ".cfg", ".ini", NULL };
 static const char *const EXT_IMAGE[]   = { ".png", ".jpg", ".jpeg", ".ppm", ".bmp", ".gif", NULL };
 static const char *const EXT_ARCHIVE[] = { ".zip", ".gz", ".tgz", ".tar", ".xz", ".bz2", NULL };
 static const char *const EXT_TEXT[]    = { ".txt", ".md", ".log", NULL };
@@ -226,7 +241,8 @@ static int has_ext(const char *name, const char *const *list) {
 static int kind_of(const Entry *e) {
     if (e->is_link) return IC_LINK;
     if (e->is_dir)  return IC_FOLDER;
-    if (has_ext(e->name, EXT_CONF))    return IC_CONF;
+    if (ends_with_ci(e->name, ".theme")) return IC_THEME;   /* a palette */
+    if (has_ext(e->name, EXT_CONF))    return IC_CONF;      /* the gear */
     if (has_ext(e->name, EXT_IMAGE))   return IC_IMAGE;
     if (has_ext(e->name, EXT_ARCHIVE)) return IC_ARCHIVE;
     if (has_ext(e->name, EXT_TEXT))    return IC_TEXT;
@@ -338,7 +354,6 @@ static int layout_build(Layout *L, int w, int h) {
     /* Toolbar buttons: icon + label when the width allows it, icons only
      * when it does not. Both layouts are tried with real font widths. */
     {
-        static const char *LABEL[TB_COUNT] = { "Back", "Up", "Home", "Refresh", "Name" };
         int nat[TB_COUNT];
         /* the sort button must hold whichever mode label it will show, so
          * the box is measured against the widest of the three */
@@ -349,7 +364,7 @@ static int layout_build(Layout *L, int w, int h) {
         }
         long total = L->pad;
         for (int i = 0; i < TB_COUNT; i++) {
-            const char *lab = (i == TB_SORT) ? "Refresh" : LABEL[i];  /* widest */
+            const char *lab = (i == TB_SORT) ? "Refresh" : TB_LABEL[i];  /* widest */
             nat[i] = L->pad + L->icw + L->pad + iceil(font_width(L->ft, lab)) + L->pad;
             total += nat[i] + L->gap;
         }
@@ -479,6 +494,24 @@ static int tb_enabled(const Files *f, int i) {
     if (i == TB_UP)   return strcmp(f->path, "/") != 0;
     return 1;
 }
+
+/* ------------------------------------------------------------
+ *  Two coordinate spaces, and the rule that keeps them apart
+ *
+ *  AppVT.draw() gets the app's ORIGIN on the compositor's surface
+ *  (src/main.c: app_draw(cur->app, s, cx0, cy0, ...)) and paints with
+ *  x + local. AppVT.click() gets APP-LOCAL coordinates (app_click(hit->app,
+ *  lx - 1, ly - tb - 1, ...)), so the pointer the app stores is app-local.
+ *
+ *  Every rectangle in here - btn_x/tb_rect(), list_y/row_rect(), the crumb
+ *  spans from crumb_build() - is app-local as well. So a hit test compares
+ *  the stored pointer DIRECTLY against those rectangles and the draw origin
+ *  never enters it. Mixing the two (pointer vs x + rect) only looks right
+ *  while the window happens to sit at 0,0: it kills hover as soon as the
+ *  window is dragged right, and it lets a click on a row light up the
+ *  breadcrumb band above it. The host harness renders the app at (101,61)
+ *  to keep this from regressing.
+ * ------------------------------------------------------------ */
 
 /* ------------------------------------------------------------
  *  Breadcrumbs: built from the real path, laid out to fit w
@@ -821,11 +854,66 @@ static void tb_icon(Surface *s, int kind, float x, float y, float sz, u32 c) {
     }
 }
 
-/* 20x20 nominal box (scaled with the row) holding either a folder or a
- * page with a folded corner and a mark for the kind of file. */
+/* 20x20 nominal box (ui_px() and the row size it, so it grows with the
+ * text scale) holding a folder, or a page with a folded corner and a mark
+ * for the kind of file. The mark is what tells the eight kinds apart at a
+ * glance; the page is the same for all of them so the list still reads as
+ * one list. */
+
+/* gear - the launcher's icon_gear() idea, fattened: six thick teeth and a
+ * thick ring, which is the only way that shape survives an 8 px radius. */
+static void mark_gear(Surface *s, float cx, float cy, float r, u32 c) {
+    float w = r * 0.50f;             /* a fat ring and fat teeth survive 8 px */
+    for (int i = 0; i < 6; i++) {
+        float a = (float)i * 3.14159265f / 3.0f;
+        gfx_line(s, cx + cosf(a) * r * 0.50f, cy + sinf(a) * r * 0.50f,
+                    cx + cosf(a) * r,        cy + sinf(a) * r, w, c);
+    }
+    gfx_rrect_aa(s, cx - r * 0.48f, cy - r * 0.48f, r * 0.96f, r * 0.96f,
+                 r * 0.48f, 0, c, w);
+}
+
+/* A zipper: a vertical band with teeth alternating left and right, so the
+ * mark cannot be mistaken for the ruled lines of a text file. */
+static void mark_zip(Surface *s, float x, float y, float w, float h, u32 band) {
+    float zw = w * 0.24f;
+    float zx = x + (w - zw) * 0.5f;
+    gfx_rrect(s, zx, y, zw, h, zw * 0.35f, band);
+    for (int i = 0; i < 4; i++) {
+        float ty = y + h * (0.04f + (float)i * 0.25f);
+        float tw = w * 0.30f;
+        float tx = (i & 1) ? zx + zw * 0.55f : zx + zw * 0.45f - tw;
+        gfx_rrect(s, tx, ty, tw, h * 0.11f, h * 0.055f, band);
+    }
+}
+
+/* ruled lines, the last one short, like a page of writing */
+static void mark_rules(Surface *s, float x, float y, float w, float h, u32 c) {
+    float lh = h * 0.11f;
+    if (lh < 1.0f) lh = 1.0f;
+    for (int i = 0; i < 4; i++) {
+        float lw = (i == 3) ? w * 0.46f : w * 0.82f;
+        gfx_rrect(s, x, y + h * (0.05f + (float)i * 0.27f), lw, lh, lh * 0.5f, c);
+    }
+}
+
+/* a small arrow pointing up and to the right: "this is a pointer" */
+static void mark_arrow(Surface *s, float x, float y, float w, float h, u32 c) {
+    float th = h * 0.19f;
+    if (th < 1.0f) th = 1.0f;
+    gfx_line(s, x + w * 0.18f, y + h * 0.80f, x + w * 0.66f, y + h * 0.32f, th, c);
+    float head[6] = { x + w * 0.90f, y + h * 0.08f,
+                      x + w * 0.94f, y + h * 0.56f,
+                      x + w * 0.42f, y + h * 0.12f };
+    gfx_polygon(s, head, 3, c);
+}
+
 static void draw_entry_icon(Surface *s, const Entry *e, float x, float y, float sz,
                             int sel, const Theme *th) {
     if (sz < 6.0f) return;
+
+    /* a dangling link has no target: draw it, but plainly */
+    int broken = (e->kind == IC_LINK) && !e->link_ok;
 
     if (e->kind == IC_FOLDER) {
         u32 fg = color_alpha(th->accent, sel ? 0.98f : 0.80f);
@@ -838,8 +926,8 @@ static void draw_entry_icon(Surface *s, const Entry *e, float x, float y, float 
 
     float w = sz * 0.62f, h = sz * 0.82f, fold = w * 0.42f;
     float px = x + (sz - w) * 0.5f, py = y + (sz - h) * 0.5f;
-    u32 body = color_alpha(th->text, sel ? 0.94f : 0.72f);
-    u32 flap = color_alpha(th->text, sel ? 0.52f : 0.38f);
+    u32 body = color_alpha(th->text, sel ? 0.94f : (broken ? 0.38f : 0.72f));
+    u32 flap = color_alpha(th->text, sel ? 0.52f : (broken ? 0.22f : 0.38f));
 
     float page[10] = { px, py, px + w - fold, py, px + w, py + fold,
                        px + w, py + h, px, py + h };
@@ -847,40 +935,53 @@ static void draw_entry_icon(Surface *s, const Entry *e, float x, float y, float 
     float tri[6] = { px + w - fold, py, px + w, py + fold, px + w - fold, py + fold };
     gfx_polygon(s, tri, 3, flap);
 
-    u32 mark = color_alpha(th->accent, sel ? 0.98f : 0.85f);
-    float my = py + fold + (h - fold) * 0.16f;
-    float mh = (h - fold) * 0.64f;
+    u32 mark = color_alpha(th->accent, sel ? 0.98f : (broken ? 0.50f : 0.85f));
+    /* the mark band: below the fold, inside the page's edges, with a
+     * margin so nothing spills over the silhouette */
+    float my = py + fold + (h - fold) * 0.14f;
+    float mh = (h - fold) * 0.70f;
+    float mx = px + w * 0.15f, mw = w * 0.70f;
+
     switch (e->kind) {
-    case IC_THEME: {
-        float r = mh * 0.30f, cx = px + w * 0.5f, cy = my + mh * 0.5f;
-        gfx_rrect(s, cx - r, cy - r, r * 2.0f, r * 2.0f, r, mark);
-        break;
-    }
     case IC_CONF:
-        for (int i = 0; i < 3; i++) {
-            float lw = w * (i == 2 ? 0.36f : 0.60f);
-            gfx_rrect(s, px + w * 0.20f, my + (float)i * mh * 0.32f, lw,
-                      mh * 0.15f, mh * 0.075f, color_alpha(th->text_dim, 0.85f));
-        }
+        mark_gear(s, px + w * 0.5f, my + mh * 0.5f, mh * 0.60f, mark);
         break;
-    case IC_EXEC: {
-        float tp[6] = { px + w * 0.30f, my,
-                        px + w * 0.30f, my + mh,
-                        px + w * 0.78f, my + mh * 0.5f };
-        gfx_polygon(s, tp, 3, mark);
+    case IC_THEME: {
+        /* a palette is one filled disc: no teeth, no notches, no lines, so
+         * it cannot be read as the gear a .conf gets */
+        float r = mh * 0.46f;
+        gfx_rrect(s, px + w * 0.5f - r, my + mh * 0.5f - r,
+                  r * 2.0f, r * 2.0f, r, mark);
         break;
     }
     case IC_IMAGE: {
-        float mt[6] = { px + w * 0.20f, my + mh,
-                        px + w * 0.50f, my + mh * 0.24f,
-                        px + w * 0.80f, my + mh };
+        float mt[6] = { mx, my + mh,
+                        mx + mw * 0.44f, my + mh * 0.18f,
+                        mx + mw, my + mh };
         gfx_polygon(s, mt, 3, mark);
-        float r = mh * 0.16f;
-        gfx_rrect(s, px + w * 0.60f, my + mh * 0.06f, r * 2.0f, r * 2.0f, r,
-                  color_alpha(th->accent, 0.70f));
+        float r = mh * 0.17f;
+        gfx_rrect(s, mx + mw * 0.62f, my + mh * 0.02f, r * 2.0f, r * 2.0f, r,
+                  color_alpha(th->accent, broken ? 0.40f : 0.70f));
         break;
     }
+    case IC_ARCHIVE:
+        mark_zip(s, mx, my, mw, mh, mark);
+        break;
+    case IC_TEXT:
+        mark_rules(s, mx, my, mw, mh, mark);
+        break;
+    case IC_EXEC: {
+        float tp[6] = { mx + mw * 0.14f, my,
+                        mx + mw * 0.14f, my + mh,
+                        mx + mw * 0.88f, my + mh * 0.5f };
+        gfx_polygon(s, tp, 3, mark);
+        break;
+    }
+    case IC_LINK:
+        mark_arrow(s, mx, my, mw, mh, mark);
+        break;
     default:
+        /* IC_FILE: a blank page is the honest icon for "I do not know" */
         break;
     }
 }
@@ -888,6 +989,17 @@ static void draw_entry_icon(Surface *s, const Entry *e, float x, float y, float 
 /* ------------------------------------------------------------
  *  Drawing
  * ------------------------------------------------------------ */
+/* One toolbar button: rounded rect, a real 1 px border, the icon, and the
+ * label when the layout found room for it. Three states are visible:
+ *   hover    - the last pointer position the desktop reported is inside
+ *   pressed  - the frame(s) drawn within PRESS_S of the click; the first
+ *              repaint after that window shows hover instead (the desktop
+ *              repaints from events, not from a timer, so an app cannot
+ *              hold a highlight for a while and then clear it - but the
+ *              pointer is still on the button, so it never looks stuck lit)
+ *   disabled - the action would do nothing (no history / already at /)
+ * The pressed button's contents shift down one pixel and the fill and
+ * border go to full accent, which is the whole vocabulary a button needs. */
 static void draw_toolbar(Files *f, Surface *s, int x, int y, int w,
                          const Layout *L, const Theme *th) {
     if (w <= 0 || L->toolbar_h <= 0) return;
@@ -895,42 +1007,54 @@ static void draw_toolbar(Files *f, Surface *s, int x, int y, int w,
     surf_blend(s, x, y, w, L->toolbar_h, th->panel);
     if (L->toolbar_h > 1) surf_blend(s, x, y + L->toolbar_h - 1, w, 1, th->panel_border);
 
-    int by = (L->toolbar_h - L->btn) / 2;
-    if (by < 0) by = 0;
+    double now = mono_now();
 
     for (int i = 0; i < TB_COUNT; i++) {
-        int bw = L->btn_w[i];
-        if (bw <= 0) continue;
-        int bx = L->btn_x[i];
-        int enabled = 1;
-        if (i == TB_BACK && f->hist_n <= 0) enabled = 0;
-        if (i == TB_UP && !strcmp(f->path, "/")) enabled = 0;
-        int hov = enabled && f->px >= bx && f->px < bx + bw &&
-                  f->py >= by && f->py < by + L->btn;
+        int bx, by, bw, bh;
+        if (!tb_rect(L, i, &bx, &by, &bw, &bh)) continue;
 
-        u32 fill = hov ? color_alpha(th->accent, 0.26f)
-                       : color_alpha(th->text, 0.07f);
-        if (!enabled) fill = color_alpha(th->text, 0.025f);
-        u32 border = hov ? color_alpha(th->accent, 0.55f)
-                         : color_alpha(th->panel_border, 0.85f);
-        gfx_rrect_aa(s, (float)(x + bx), (float)(y + by), (float)bw,
-                     (float)L->btn, (float)ui_px(5), fill, border, 1.0f);
+        int enabled = tb_enabled(f, i);
+        int hov = f->px >= bx && f->px < bx + bw &&
+                  f->py >= by && f->py < by + bh;
+        int down = hov && enabled && f->pressed == i &&
+                   (now - f->pressed_t) >= 0.0 && (now - f->pressed_t) < PRESS_S;
 
-        u32 fg = enabled ? (hov ? th->text : color_alpha(th->text, 0.85f))
-                         : color_alpha(th->text, 0.25f);
-        float iy = (float)(y + by) + (float)(L->btn - L->icw) * 0.5f;
+        u32 fill, border;
+        if (!enabled) {
+            fill   = color_alpha(th->text, 0.025f);
+            border = color_alpha(th->panel_border, 0.55f);
+        } else if (down) {
+            fill   = color_alpha(th->accent, 0.42f);
+            border = color_alpha(th->accent, 0.90f);
+        } else if (hov) {
+            fill   = color_alpha(th->accent, 0.24f);
+            border = color_alpha(th->accent, 0.60f);
+        } else {
+            fill   = color_alpha(th->text, 0.085f);
+            border = color_alpha(th->panel_border, 0.95f);
+        }
+
+        gfx_rrect_aa(s, (float)(x + bx), (float)(y + by), (float)bw, (float)bh,
+                     (float)ui_px(5), fill, border, 1.0f);
+
+        u32 fg = !enabled ? color_alpha(th->text, 0.25f)
+               : down    ? th->text
+               : hov     ? th->text
+                         : color_alpha(th->text, 0.85f);
+
+        /* pressed: the icon and the word sit one pixel lower, inside the
+         * same button - the pixel the finger would have pushed */
+        int dy = down ? 1 : 0;
         float ix = (float)(x + bx) + (float)L->pad;
+        float iy = (float)(y + by) + (float)(bh - L->icw) * 0.5f + (float)dy;
         tb_icon(s, i, ix, iy, (float)L->icw, fg);
 
         if (i == TB_SORT ? L->tb_sort_label : L->tb_labels) {
-            const char *lab = (i == TB_SORT) ? sort_label(f->sort) : NULL;
-            if (!lab) {
-                static const char *NAMES[TB_COUNT] = { "Back", "Up", "Home", "Refresh", "Name" };
-                lab = NAMES[i];
-            }
-            float ly = (float)(y + by) + ((float)L->btn - font_height(L->ft)) * 0.5f;
+            const char *lab = (i == TB_SORT) ? sort_label(f->sort) : TB_LABEL[i];
+            float ly = (float)(y + by) + ((float)bh - font_height(L->ft)) * 0.5f
+                     + (float)dy;
             float lx = ix + (float)L->icw + (float)L->pad;
-            float maxw = (float)(bx + bw) - (lx - (float)x) - (float)L->pad;
+            float maxw = (float)(x + bx + bw) - lx - (float)L->pad;
             draw_clipped(s, L->ft, lx, ly, maxw, lab, fg);
         }
     }
@@ -959,7 +1083,9 @@ static void draw_crumbs(Files *f, Surface *s, int x, int y, int w,
         lab[len] = 0;
         const char *text = len ? lab : "/";
 
-        int hov = f->py >= cy && f->py < cy + L->crumb_h &&
+        /* local pointer vs local span - see the coordinate-space note
+         * above layout_build(); the draw origin stays out of this */
+        int hov = f->py >= L->toolbar_h && f->py < L->toolbar_h + L->crumb_h &&
                   (float)f->px >= cr[i].x0 - 2.0f && (float)f->px < cr[i].x1 + 2.0f;
         int last = (i == n - 1);
 
@@ -991,16 +1117,15 @@ static void draw_crumbs(Files *f, Surface *s, int x, int y, int w,
 
 static void draw_list(Files *f, Surface *s, int x, int y, int w,
                       const Layout *L, const Theme *th) {
-    float top = (float)(y + L->list_y);
-    float availh = (float)(L->list_bot - L->list_y);
+    int top = y + L->list_y;
 
     if (f->error[0]) {
-        draw_clipped(s, L->fl, (float)(x + L->pad), top + (float)L->text_off,
+        draw_clipped(s, L->fl, (float)(x + L->pad), (float)(top + L->text_off),
                      (float)(w - 2 * L->pad), f->error, th->accent);
         return;
     }
     if (f->count == 0) {
-        draw_clipped(s, L->fl, (float)(x + L->pad), top + (float)L->text_off,
+        draw_clipped(s, L->fl, (float)(x + L->pad), (float)(top + L->text_off),
                      (float)(w - 2 * L->pad), "this folder is empty", th->text_dim);
         return;
     }
@@ -1018,26 +1143,41 @@ static void draw_list(Files *f, Surface *s, int x, int y, int w,
     if (f->scroll < 0) f->scroll = 0;
 
     for (int i = 0; i < L->rows; i++) {
+        int ryt, rh;
+        /* row_rect() is the same function files_click() hit-tests through:
+         * the row painted here is the row a click on it lands on */
+        if (!row_rect(L, i, &ryt, &rh)) break;
         int idx = f->scroll + i;
         if (idx >= f->count) break;
-        float ry = top + (float)i * (float)L->row_h;
-        if (ry + (float)L->row_h > top + availh + 0.5f) break;
+        float ry = (float)(y + ryt);
 
         Entry *e = &f->ent[idx];
         int sel = (idx == f->sel);
 
-        if (sel)
+        if (sel) {
             gfx_rrect_aa(s, (float)x + (float)(L->pad / 2), ry + 1.0f,
-                         (float)(w - L->pad), (float)(L->row_h - 2),
+                         (float)(w - L->pad), (float)(rh - 2),
                          (float)ui_px(4),
                          color_alpha(th->accent, 0.20f), 0, 0);
+        } else {
+            /* hover: the last pointer position the desktop reported sits on
+             * this row. A tint, never a selection - selecting is the click.
+             * f->px/f->py and row_rect() are both app-local. */
+            int hov = f->px >= 0 && f->px < w && f->py >= ryt && f->py < ryt + rh;
+            if (hov)
+                gfx_rrect_aa(s, (float)x + (float)(L->pad / 2), ry + 1.0f,
+                             (float)(w - L->pad), (float)(rh - 2),
+                             (float)ui_px(4),
+                             color_alpha(th->text, 0.05f), 0, 0);
+        }
 
         float ty = ry + (float)L->text_off;
         draw_entry_icon(s, e, (float)(x + L->pad),
-                        ry + (float)(L->row_h - L->icon_sz) * 0.5f,
+                        ry + (float)(rh - L->icon_sz) * 0.5f,
                         (float)L->icon_sz, sel, th);
 
-        /* name, with a trailing '/' on directories */
+        /* name, with a trailing '/' on directories (a symlink to a folder
+         * gets one too: it opens like a folder) */
         char name[NAME_LEN + 2];
         snprintf(name, sizeof(name), "%s%s", e->name, e->is_dir ? "/" : "");
         draw_clipped(s, L->fl, (float)(x + L->name_x), ty, (float)L->name_w, name,
@@ -1061,6 +1201,58 @@ static void draw_list(Files *f, Surface *s, int x, int y, int w,
                       color_alpha(th->text, sel ? 0.62f : 0.36f));
         }
     }
+
+    /* Scrollbar: the thumb's height and position are the real
+     * rows/scroll/count, so it is a map of the list, not decoration. It
+     * lives in the right padding so it can never cross a column. */
+    if (L->rows > 0 && f->count > L->rows) {
+        int bar_w = ui_px(3);
+        int band = L->list_bot - L->list_y;
+        int bx = x + w - bar_w - ui_px(2);
+        if (bx > x) {
+            int thumb = band * L->rows / f->count;
+            if (thumb < ui_px(10)) thumb = ui_px(10);
+            if (thumb > band) thumb = band;
+            int span = band - thumb;
+            int maxs = f->count - L->rows;
+            int off = maxs > 0 ? span * f->scroll / maxs : 0;
+            gfx_rrect(s, (float)bx, (float)(y + L->list_y), (float)bar_w,
+                      (float)band, (float)bar_w * 0.5f,
+                      color_alpha(th->text, 0.06f));
+            gfx_rrect(s, (float)bx, (float)(y + L->list_y + off), (float)bar_w,
+                      (float)thumb, (float)bar_w * 0.5f,
+                      color_alpha(th->accent, 0.55f));
+        }
+    }
+}
+
+/* One line about the selected entry: its name, the size stat() reported -
+ * for a directory too, because ext4 gives a directory a real st_size - and
+ * the kind word. A message from the last action owns the line when there is
+ * one. Split out of draw_footer() so the host harness can assert on the
+ * exact words the owner reads instead of a second copy of this snprintf. */
+static void footer_info(const Files *f, char *out, size_t n) {
+    out[0] = 0;
+    if (f->status[0]) { snprintf(out, n, "%s", f->status); return; }
+    if (f->sel < 0 || f->sel >= f->count) return;
+
+    const Entry *e = &f->ent[f->sel];
+    char sz[24];
+    human_size(e->size, sz, sizeof(sz));
+    const char *tgt = e->target[0] ? e->target : "?";
+
+    if (e->is_link && !e->link_ok)
+        /* nothing honest to report but the dead pointer itself: the link's
+         * own size is the length of the text inside it, not a file size */
+        snprintf(out, n, "%s -> %s (broken link)", e->name, tgt);
+    else if (e->is_link && e->is_dir)
+        snprintf(out, n, "%s/ -> %s  %s  folder", e->name, tgt, sz);
+    else if (e->is_link)
+        snprintf(out, n, "%s -> %s  %s", e->name, tgt, sz);
+    else if (e->is_dir)
+        snprintf(out, n, "%s/  %s  folder", e->name, sz);
+    else
+        snprintf(out, n, "%s  %s", e->name, sz);
 }
 
 static void draw_footer(Files *f, Surface *s, int x, int y, int w,
@@ -1093,30 +1285,8 @@ static void draw_footer(Files *f, Surface *s, int x, int y, int w,
     if (maxw < (float)ui_px(20)) return;
 
     char info[NAME_LEN + LINK_LEN + 64];
-    u32 col = color_alpha(th->text, 0.55f);
-    if (f->status[0]) {
-        snprintf(info, sizeof(info), "%s", f->status);
-        col = th->accent;
-    } else if (f->sel >= 0 && f->sel < f->count) {
-        Entry *e = &f->ent[f->sel];
-        char sz[24];
-        human_size(e->size, sz, sizeof(sz));
-        const char *tgt = e->target[0] ? e->target : "?";
-        if (e->is_link && !e->link_ok)
-            /* nothing to report but the dead pointer itself: the link's own
-             * size is the length of the text in it, not a file size */
-            snprintf(info, sizeof(info), "%s -> %s (broken link)", e->name, tgt);
-        else if (e->is_link && e->is_dir)
-            snprintf(info, sizeof(info), "%s/ -> %s  folder", e->name, tgt);
-        else if (e->is_link)
-            snprintf(info, sizeof(info), "%s -> %s  %s", e->name, tgt, sz);
-        else if (e->is_dir)
-            snprintf(info, sizeof(info), "%s/  folder", e->name);
-        else
-            snprintf(info, sizeof(info), "%s  %s", e->name, sz);
-    } else {
-        info[0] = 0;
-    }
+    footer_info(f, info, sizeof(info));
+    u32 col = f->status[0] ? th->accent : color_alpha(th->text, 0.55f);
     draw_clipped(s, L->ff, minfo, ty, maxw, info, col);
 }
 
@@ -1159,16 +1329,15 @@ static void files_click(App *a, int cx, int cy, int buttons) {
     Layout L;
     if (!layout_build(&L, f->w, f->h)) return;
 
-    /* toolbar */
-    int by = (L.toolbar_h - L.btn) / 2;
-    if (by < 0) by = 0;
-    if (cy >= by && cy < by + L.btn) {
-        for (int i = 0; i < TB_COUNT; i++) {
-            if (L.btn_w[i] <= 0) continue;
-            if (cx >= L.btn_x[i] && cx < L.btn_x[i] + L.btn_w[i]) {
-                toolbar_action(f, i);
-                return;
-            }
+    /* toolbar: tb_btn_at() walks the rectangles tb_rect() handed the
+     * painter, so a click can only land on a button that was drawn. */
+    {
+        int hit = tb_btn_at(&L, cx, cy);
+        if (hit >= 0) {
+            f->pressed = hit;
+            f->pressed_t = mono_now();
+            toolbar_action(f, hit);
+            return;
         }
     }
 
@@ -1193,30 +1362,31 @@ static void files_click(App *a, int cx, int cy, int buttons) {
         return;
     }
 
-    /* rows */
-    if (cy < L.list_y || cy >= L.list_bot) return;
-    if (L.row_h <= 0) return;
-    int row = (cy - L.list_y) / L.row_h;
-    if (row < 0 || row >= L.rows) return;
-    int idx = f->scroll + row;
-    if (idx < 0 || idx >= f->count) return;
+    /* rows: list_row_at() is the inverse of the row_rect() the painter
+     * used, so the row under the pointer is the row that was drawn there */
+    {
+        int row = list_row_at(&L, cy);
+        if (row < 0) return;
+        int idx = f->scroll + row;
+        if (idx < 0 || idx >= f->count) return;
 
-    double t = mono_now();
-    int twice = (idx == f->last_click_idx) &&
-                (t - f->last_click_t) <= 0.45 &&
-                (cx - f->last_click_x) > -8 && (cx - f->last_click_x) < 8 &&
-                (cy - f->last_click_y) > -8 && (cy - f->last_click_y) < 8;
+        double t = mono_now();
+        int twice = (idx == f->last_click_idx) &&
+                    (t - f->last_click_t) <= 0.45 &&
+                    (cx - f->last_click_x) > -8 && (cx - f->last_click_x) < 8 &&
+                    (cy - f->last_click_y) > -8 && (cy - f->last_click_y) < 8;
 
-    f->sel = idx;
-    f->status[0] = 0;
-    if (twice) {
-        f->last_click_idx = -1;
-        open_selected(f);
-    } else {
-        f->last_click_idx = idx;
-        f->last_click_t = t;
-        f->last_click_x = cx;
-        f->last_click_y = cy;
+        f->sel = idx;
+        f->status[0] = 0;
+        if (twice) {
+            f->last_click_idx = -1;
+            open_selected(f);
+        } else {
+            f->last_click_idx = idx;
+            f->last_click_t = t;
+            f->last_click_x = cx;
+            f->last_click_y = cy;
+        }
     }
 }
 
@@ -1294,6 +1464,7 @@ static void files_init(App *a, int w, int h) {
     f->w = w > 0 ? w : 0;
     f->h = h > 0 ? h : 0;
     f->px = f->py = -1;
+    f->pressed = -1;
     f->last_click_idx = -1;
     f->sort = SORT_NAME;
     snprintf(f->path, sizeof(f->path), "/");

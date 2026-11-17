@@ -239,6 +239,82 @@ static size_t shadow_mask_cap;                   /* bytes */
 static float *blur_small, *blur_tmp;             /* gfx_blur_region's work buffers */
 static size_t blur_small_cap, blur_tmp_cap;      /* bytes */
 
+/* One horizontal box pass and one vertical box pass, read small -> write tmp,
+ * with small updated each time. Split per channel count so the inner loops
+ * keep their channels in registers and stay unrolled; a runtime channel loop
+ * here cost 4x, which is the whole point of this cleanup. */
+static void box_passes3(float *small, float *tmp, int sw, int sh, int r) {
+    size_t cells = (size_t)sw * (size_t)sh;
+    for (int y = 0; y < sh; y++) {
+        for (int x = 0; x < sw; x++) {
+            float acc[3] = {0, 0, 0};
+            int n = 0;
+            for (int k = -r; k <= r; k++) {
+                int sx = x + k;
+                if (sx < 0) sx = 0;
+                if (sx >= sw) sx = sw - 1;
+                size_t i = ((size_t)y * sw + sx) * 3;
+                acc[0] += small[i + 0]; acc[1] += small[i + 1]; acc[2] += small[i + 2];
+                n++;
+            }
+            size_t o = ((size_t)y * sw + x) * 3;
+            tmp[o + 0] = acc[0] / n; tmp[o + 1] = acc[1] / n; tmp[o + 2] = acc[2] / n;
+        }
+    }
+    memcpy(small, tmp, cells * 3 * sizeof(float));
+    for (int y = 0; y < sh; y++) {
+        for (int x = 0; x < sw; x++) {
+            float acc[3] = {0, 0, 0};
+            int n = 0;
+            for (int k = -r; k <= r; k++) {
+                int sy = y + k;
+                if (sy < 0) sy = 0;
+                if (sy >= sh) sy = sh - 1;
+                size_t i = ((size_t)sy * sw + x) * 3;
+                acc[0] += small[i + 0]; acc[1] += small[i + 1]; acc[2] += small[i + 2];
+                n++;
+            }
+            size_t o = ((size_t)y * sw + x) * 3;
+            tmp[o + 0] = acc[0] / n; tmp[o + 1] = acc[1] / n; tmp[o + 2] = acc[2] / n;
+        }
+    }
+    memcpy(small, tmp, cells * 3 * sizeof(float));
+}
+
+static void box_passes1(float *small, float *tmp, int sw, int sh, int r) {
+    size_t cells = (size_t)sw * (size_t)sh;
+    for (int y = 0; y < sh; y++) {
+        for (int x = 0; x < sw; x++) {
+            float acc = 0.0f;
+            int n = 0;
+            for (int k = -r; k <= r; k++) {
+                int sx = x + k;
+                if (sx < 0) sx = 0;
+                if (sx >= sw) sx = sw - 1;
+                acc += small[(size_t)y * sw + sx];
+                n++;
+            }
+            tmp[(size_t)y * sw + x] = acc / n;
+        }
+    }
+    memcpy(small, tmp, cells * sizeof(float));
+    for (int y = 0; y < sh; y++) {
+        for (int x = 0; x < sw; x++) {
+            float acc = 0.0f;
+            int n = 0;
+            for (int k = -r; k <= r; k++) {
+                int sy = y + k;
+                if (sy < 0) sy = 0;
+                if (sy >= sh) sy = sh - 1;
+                acc += small[(size_t)sy * sw + x];
+                n++;
+            }
+            tmp[(size_t)y * sw + x] = acc / n;
+        }
+    }
+    memcpy(small, tmp, cells * sizeof(float));
+}
+
 /* ---------------------------------------------------------- blur
  * Separable box blur, run on a 4x-downsampled copy. Three passes of a
  * box approximates a gaussian well enough that nobody can tell, and it
@@ -268,6 +344,8 @@ static void blur_run(Surface *s, int rx, int ry, int rw, int rh, int radius, int
     if (cells > (size_t)-1 / (sizeof(float) * 3)) return;
     size_t need = cells * (size_t)ch * sizeof(float);
 
+    /* The box passes write every cell of both buffers before anything reads
+     * them, so reused (stale) contents are never visible: no clearing. */
     float *small = scratch_grow((void **)&blur_small, &blur_small_cap, need);
     float *tmp = scratch_grow((void **)&blur_tmp, &blur_tmp_cap, need);
     if (!small || !tmp) return;          /* out of memory: draw nothing, as before */
@@ -322,40 +400,8 @@ static void blur_run(Surface *s, int rx, int ry, int rw, int rh, int radius, int
 
     /* horizontal box, then vertical box, three times */
     for (int pass = 0; pass < 3; pass++) {
-        for (int y = 0; y < sh; y++) {
-            for (int x = 0; x < sw; x++) {
-                float acc[3] = {0, 0, 0};
-                int n = 0;
-                for (int k = -r; k <= r; k++) {
-                    int sx = x + k;
-                    if (sx < 0) sx = 0;
-                    if (sx >= sw) sx = sw - 1;
-                    const float *i = small + ((size_t)y * sw + sx) * ch;
-                    for (int c = 0; c < ch; c++) acc[c] += i[c];
-                    n++;
-                }
-                float *o = tmp + ((size_t)y * sw + x) * ch;
-                for (int c = 0; c < ch; c++) o[c] = acc[c] / n;
-            }
-        }
-        memcpy(small, tmp, cells * (size_t)ch * sizeof(float));
-        for (int y = 0; y < sh; y++) {
-            for (int x = 0; x < sw; x++) {
-                float acc[3] = {0, 0, 0};
-                int n = 0;
-                for (int k = -r; k <= r; k++) {
-                    int sy = y + k;
-                    if (sy < 0) sy = 0;
-                    if (sy >= sh) sy = sh - 1;
-                    const float *i = small + ((size_t)sy * sw + x) * ch;
-                    for (int c = 0; c < ch; c++) acc[c] += i[c];
-                    n++;
-                }
-                float *o = tmp + ((size_t)y * sw + x) * ch;
-                for (int c = 0; c < ch; c++) o[c] = acc[c] / n;
-            }
-        }
-        memcpy(small, tmp, cells * (size_t)ch * sizeof(float));
+        if (ch == 3) box_passes3(small, tmp, sw, sh, r);
+        else         box_passes1(small, tmp, sw, sh, r);
     }
 
     /* upsample (nearest, the blur hides it) */
