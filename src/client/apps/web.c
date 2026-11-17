@@ -131,7 +131,7 @@
 #define CGAP_D      4   /* gap between the header band and the page     */
 #define SBAR_D      8   /* gutter on the right holding the scroll bar   */
 #define MX_D       24   /* the one left/right margin of the whole window */
-#define BADGE_H_D  16   /* design height of the "http only" badge       */
+#define BADGE_H_D  16   /* design height of the scheme badge           */
 #define BADGE_PAD_D 7   /* its horizontal padding                       */
 
 /* The document's vertical rhythm, in design pixels. The parser stores
@@ -191,6 +191,7 @@ typedef struct {
 typedef struct {
     int  status;
     int  chunked;
+    int  short_body;                 /* Content-Length promised more    */
     long content_length;             /* -1 when the header is absent */
     char location[WEB_PATH_MAX];
     char charset[WEB_CHARSET_MAX];
@@ -704,8 +705,15 @@ static int http_parse(char *raw, long rawlen, HttpResponse *r, char **body, long
     if (bl < 0) bl = 0;
     if (r->chunked) {
         bl = dechunk(b, bl);
-    } else if (r->content_length >= 0 && bl > r->content_length) {
-        bl = r->content_length;      /* the server may keep the socket open */
+    } else if (r->content_length >= 0) {
+        if (bl > r->content_length) {
+            bl = r->content_length;  /* the server may keep the socket open */
+        } else if (bl < r->content_length) {
+            /* The peer closed before sending what it promised. The bytes
+             * that did arrive are real, but the document is not whole, so
+             * the caller must say so instead of passing it off as a page. */
+            r->short_body = 1;
+        }
     }
     *body = b;
     *blen = bl;
@@ -715,22 +723,31 @@ static int http_parse(char *raw, long rawlen, HttpResponse *r, char **body, long
 /* ============================================================
  *  The transport
  *
- *  Four syscall-shaped operations. The real implementation is a TCP
- *  socket below; a host test can supply its own and feed recorded
- *  bytes through the exact protocol code the OS runs.
+ *  Four socket-shaped operations plus one question ("is this
+ *  connection private?"). There is exactly one implementation, over
+ *  a TCP socket, and it picks plain HTTP or TLS 1.2 from the scheme
+ *  of the address it is handed: https goes through src/client/tls.c,
+ *  which refuses to complete the handshake unless the chain, the name
+ *  and the dates all check out. Everything above this struct - the
+ *  request, the header parser, Content-Length, chunked, redirects -
+ *  is therefore identical for http:// and https://.
  * ============================================================ */
 typedef struct WebStream WebStream;
 
 typedef struct {
-    WebStream *(*open)(const char *host, const char *port, char *err, size_t esz);
+    WebStream *(*open)(const char *host, const char *port, int https,
+                       char *err, size_t esz);
     int   (*send)(WebStream *s, const char *buf, long len, char *err, size_t esz);
     long  (*recv)(WebStream *s, char *buf, long cap, char *err, size_t esz);
     void  (*close)(WebStream *s);
+    /* Facts from the handshake, or NULL when the stream is plain HTTP. */
+    const TlsInfo *(*tls)(WebStream *s);
 } WebTransport;
 
 #if !defined(WEB_HOST_TEST) && !defined(WEB_DRAW_ONLY)
 struct WebStream {
     int fd;
+    TlsConn *tls;                /* NULL: the bytes are plain HTTP      */
 };
 
 /* An errno a person can read. */
@@ -753,7 +770,7 @@ static void put_net_error(char *err, size_t esz, const char *what, int e) {
     else     snprintf(err, esz, "%s: %s", what, strerror(e));
 }
 
-static WebStream *sock_open(const char *host, const char *port, char *err, size_t esz) {
+static WebStream *tcp_open(const char *host, const char *port, char *err, size_t esz) {
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -834,7 +851,66 @@ static WebStream *sock_open(const char *host, const char *port, char *err, size_
     return s;
 }
 
-static int sock_send(WebStream *s, const char *buf, long len, char *err, size_t esz) {
+/* ------------------------------------------------------------
+ * TLS
+ *
+ * tls.c never touches a socket: it asks these two functions for
+ * bytes and for room to put bytes. Both are one syscall, retried on
+ * EINTR, because the socket already carries SO_RCVTIMEO/SO_SNDTIMEO
+ * from tcp_open() - a server that stops talking cannot wedge the
+ * window forever.
+ * ------------------------------------------------------------ */
+static long tls_bio_read(void *ctx, void *buf, size_t len) {
+    WebStream *s = ctx;
+    for (;;) {
+        ssize_t n = recv(s->fd, buf, len, 0);
+        if (n >= 0) return (long)n;
+        if (errno == EINTR) continue;
+        return -1;
+    }
+}
+
+static long tls_bio_write(void *ctx, const void *buf, size_t len) {
+    WebStream *s = ctx;
+    for (;;) {
+        ssize_t n = send(s->fd, buf, len, MSG_NOSIGNAL);
+        if (n >= 0) return (long)n;
+        if (errno == EINTR) continue;
+        return -1;
+    }
+}
+
+/* Open the transport the address asks for. For https the handshake
+ * runs to completion here, so a bad certificate is reported before a
+ * single byte of the request is written. */
+static WebStream *net_open(const char *host, const char *port, int https,
+                           char *err, size_t esz) {
+    WebStream *s = tcp_open(host, port, err, esz);
+    if (!s) return NULL;
+    if (!https) return s;
+
+    char terr[WEB_ERR_MAX];
+    terr[0] = 0;
+    s->tls = tls_connect(s, tls_bio_read, tls_bio_write, host, terr, sizeof(terr));
+    if (!s->tls) {
+        snprintf(err, esz, "%s", terr[0] ? terr : "TLS handshake failed");
+        close(s->fd);
+        free(s);
+        return NULL;
+    }
+    return s;
+}
+
+static int net_send(WebStream *s, const char *buf, long len, char *err, size_t esz) {
+    if (s->tls) {
+        char terr[WEB_ERR_MAX];
+        terr[0] = 0;
+        if (tls_write(s->tls, buf, (size_t)len, terr, sizeof(terr)) != 0) {
+            snprintf(err, esz, "%s", terr[0] ? terr : "cannot send over TLS");
+            return -1;
+        }
+        return 0;
+    }
     long off = 0;
     while (off < len) {
         ssize_t n = send(s->fd, buf + off, (size_t)(len - off), MSG_NOSIGNAL);
@@ -848,7 +924,17 @@ static int sock_send(WebStream *s, const char *buf, long len, char *err, size_t 
     return 0;
 }
 
-static long sock_recv(WebStream *s, char *buf, long cap, char *err, size_t esz) {
+static long net_recv(WebStream *s, char *buf, long cap, char *err, size_t esz) {
+    if (s->tls) {
+        char terr[WEB_ERR_MAX];
+        terr[0] = 0;
+        long n = tls_read(s->tls, buf, (size_t)cap, terr, sizeof(terr));
+        if (n < 0) {
+            snprintf(err, esz, "%s", terr[0] ? terr : "cannot read over TLS");
+            return -1;
+        }
+        return n;                     /* 0 is the peer's close_notify */
+    }
     for (;;) {
         ssize_t n = recv(s->fd, buf, (size_t)cap, 0);
         if (n > 0) return (long)n;
@@ -859,14 +945,19 @@ static long sock_recv(WebStream *s, char *buf, long cap, char *err, size_t esz) 
     }
 }
 
-static void sock_close(WebStream *s) {
+static void net_close(WebStream *s) {
     if (!s) return;
+    if (s->tls) tls_close(s->tls);    /* sends close_notify, best effort */
     if (s->fd >= 0) close(s->fd);
     free(s);
 }
 
-static const WebTransport socket_transport = {
-    sock_open, sock_send, sock_recv, sock_close
+static const TlsInfo *net_tlsinfo(WebStream *s) {
+    return (s && s->tls) ? tls_info(s->tls) : NULL;
+}
+
+static const WebTransport net_transport = {
+    net_open, net_send, net_recv, net_close, net_tlsinfo
 };
 #endif /* sockets */
 
@@ -875,7 +966,10 @@ static const WebTransport socket_transport = {
  * ============================================================ */
 static int build_request(char *out, size_t cap, const Url *u) {
     char host_hdr[WEB_HOST_MAX + 16];
-    if (!strcmp(u->port, "80"))
+    /* The Host header carries a port only when it is not the scheme's
+     * default: 80 for http, 443 for https. Same rule for both. */
+    const char *defport = u->https ? "443" : "80";
+    if (!strcmp(u->port, defport))
         snprintf(host_hdr, sizeof(host_hdr), "%s", u->host);
     else
         snprintf(host_hdr, sizeof(host_hdr), "%s:%s", u->host, u->port);
@@ -906,6 +1000,13 @@ typedef struct {
     char  url[WEB_PATH_MAX];
     char *body;                 /* points inside the caller's raw buffer */
     long  body_len;
+    /* What TLS said, copied out of the session before it is closed.
+     * tls is 0 for plain http, where these strings stay empty. */
+    int   tls;
+    char  tls_version[16];
+    char  tls_cipher[48];
+    char  tls_cn[128];
+    char  tls_expiry[32];
 } Fetch;
 
 /* Fetch a page, following at most one redirect. `raw` holds the bytes
@@ -918,6 +1019,18 @@ static void web_fetch(Fetch *f, const WebTransport *tr, Url *u, char *raw) {
     if (!url_fetchable(u, f->error, sizeof(f->error))) return;
 
     for (int attempt = 0; attempt <= 1; attempt++) {
+        /* Every attempt opens a new connection, so nothing about the
+         * previous one survives it: an https -> http redirect must not be
+         * drawn with the padlock earned by the page that sent it. */
+        f->tls = 0;
+        f->tls_version[0] = 0;
+        f->tls_cipher[0] = 0;
+        f->tls_cn[0] = 0;
+        f->tls_expiry[0] = 0;
+        f->truncated = 0;
+        f->status = 0;
+        f->url[0] = 0;
+
         char req[1024];
         if (build_request(req, sizeof(req), u) < 0) {
             snprintf(f->error, sizeof(f->error), "the address is too long");
@@ -928,10 +1041,20 @@ static void web_fetch(Fetch *f, const WebTransport *tr, Url *u, char *raw) {
         err[0] = 0;
         long t0 = now_ms();
 
-        WebStream *st = tr->open(u->host, u->port, err, sizeof(err));
+        WebStream *st = tr->open(u->host, u->port, u->https, err, sizeof(err));
         if (!st) {
             snprintf(f->error, sizeof(f->error), "%s", err[0] ? err : "cannot connect");
             return;
+        }
+
+        /* Take the session facts now: the connection is closed below. */
+        const TlsInfo *ti = tr->tls ? tr->tls(st) : NULL;
+        if (ti) {
+            f->tls = 1;
+            snprintf(f->tls_version, sizeof(f->tls_version), "%s", ti->version);
+            snprintf(f->tls_cipher, sizeof(f->tls_cipher), "%s", ti->cipher);
+            snprintf(f->tls_cn, sizeof(f->tls_cn), "%s", ti->cn);
+            snprintf(f->tls_expiry, sizeof(f->tls_expiry), "%s", ti->not_after);
         }
         if (tr->send(st, req, (long)strlen(req), err, sizeof(err)) < 0) {
             tr->close(st);
@@ -978,6 +1101,7 @@ static void web_fetch(Fetch *f, const WebTransport *tr, Url *u, char *raw) {
         f->body = body;
         f->body_len = blen;
         f->body_bytes = blen;
+        if (hr.short_body) f->truncated = 1;
         snprintf(f->charset, sizeof(f->charset), "%s", hr.charset);
         f->latin1 = (hr.charset[0] &&
                      (!strcmp(hr.charset, "iso-8859-1") || !strcmp(hr.charset, "latin1") ||
@@ -997,12 +1121,7 @@ static void web_fetch(Fetch *f, const WebTransport *tr, Url *u, char *raw) {
                     snprintf(f->error, sizeof(f->error), "%s", rerr);
                     return;
                 }
-                if (!url_fetchable(&nu, f->error, sizeof(f->error))) {
-                    if (nu.https)
-                        snprintf(f->error, sizeof(f->error),
-                                 "the server redirects to https - this browser speaks http only");
-                    return;
-                }
+                if (!url_fetchable(&nu, f->error, sizeof(f->error))) return;
                 *u = nu;
                 f->status = 0;
                 continue;
@@ -1763,6 +1882,15 @@ typedef struct {
     int  state;
     char error[WEB_ERR_MAX];
 
+    /* Set from the handshake of the page on screen, so the header can
+     * show a lock and the status bar can name the session. All zero for
+     * a plain http page. */
+    int  tls_ok;
+    char tls_version[16];
+    char tls_cipher[48];
+    char tls_cn[128];
+    char tls_expiry[32];
+
     int  scroll, max_scroll;
     int  content_h;               /* how tall what is on screen really is */
     int  view_w, view_h, laid_w;
@@ -1805,7 +1933,17 @@ static int title_row_h(void) { return text_h(title_font(), 17); }
 static int field_h(void)     { return text_h(field_font(), 16) + 2 * ui_px(ADDR_PAD_D); }
 static int field_y(void)     { return ui_px(ROW_PAD_D) + title_row_h() + ui_px(ROW_PAD_D); }
 static int head_h(void)      { return field_y() + field_h() + ui_px(HEAD_GAP_D); }
-static int foot_h(void)      { return text_h(field_font(), 16) + 2 * ui_px(FOOT_PAD_D); }
+
+/* How many lines the status bar needs. A page that came over a verified TLS
+ * session gets a second line for the session facts; the page gives up
+ * exactly that much height, because page_rect() asks this same question. */
+static int foot_lines(const Web *w) {
+    return (w && w->state == ST_PAGE && w->tls_ok) ? 2 : 1;
+}
+
+static int foot_h(const Web *w) {
+    return foot_lines(w) * text_h(field_font(), 16) + 2 * ui_px(FOOT_PAD_D);
+}
 
 /* A surface with no pixels at all. font_draw() clips every glyph against
  * s->w / s->h, so drawing a screen into this measures its height with the
@@ -1813,7 +1951,7 @@ static int foot_h(void)      { return text_h(field_font(), 16) + 2 * ui_px(FOOT_
  * The width is set per measurement (word wrapping needs the real measure);
  * the height stays 0 so nothing can be written. Nothing here is const
  * because the draw functions take a Surface *. */
-static Surface SINK = { NULL, 0, 0, 0 };
+static Surface SINK = { NULL, 0, 0, 0, 0, 0, 0, 0 };
 
 typedef struct { int x, y, w, h; } PageRect;
 
@@ -1830,8 +1968,8 @@ static int header_fits(const Web *w) { return w->h >= head_h(); }
  * click can never land in a footer that is not there. */
 static int footer_px(const Web *w) {
     int body = w->h - (head_h() + ui_px(CGAP_D));
-    if (body < foot_h() + ui_px(12)) return 0;
-    return foot_h();
+    if (body < foot_h(w) + ui_px(12)) return 0;
+    return foot_h(w);
 }
 
 /* The rectangle the document lives in, between the header band and the
@@ -1986,6 +2124,27 @@ static void draw_page_lines(Surface *v, Web *w) {
     }
 }
 
+/* A padlock the height of a line of text, drawn from two rounded
+ * rectangles. The shackle is a ring, the body a filled block that covers
+ * the ring's lower half, so the two read as one lock. `secure` closes the
+ * shackle; without it the ring is lifted and pushed right, which is the
+ * open padlock every browser uses for a page that is not private. */
+static void draw_lock(Surface *s, float x, float y, float h, u32 col, int secure) {
+    if (h < 5.0f) return;
+    float w = h * 0.72f;
+    float bw = h * 0.15f;
+    if (bw < 1.0f) bw = 1.0f;
+    float bodyh = h * 0.52f;
+
+    float ringw = w - 2.0f * bw;
+    float ringh = h * 0.58f;
+    float ringx = x + bw + (secure ? 0.0f : w * 0.22f);
+    float ringy = y + bw + (secure ? 0.0f : -h * 0.10f);
+    gfx_rrect_aa(s, ringx, ringy, ringw, ringh, ringw * 0.5f, 0, col, bw);
+
+    gfx_rrect_aa(s, x, y + h - bodyh, w, bodyh, h * 0.15f, col, 0, 0);
+}
+
 static void draw_header(Surface *s, Web *w) {
     Font *ft = title_font();
     Font *fd = field_font();
@@ -1993,7 +2152,14 @@ static void draw_header(Surface *s, Web *w) {
 
     const int mx = page_mx();
     const char *title = w->title[0] ? w->title : (w->url[0] ? w->url : "Browser");
-    const char *badge = "http only";
+
+    /* The badge states the scheme of the page that is actually on screen,
+     * and only then: with no page there is nothing to make a claim about,
+     * and "https" is earned by the session, not by what the address says. */
+    int secure = (w->state == ST_PAGE) && w->tls_ok;
+    int badge_show = (w->state == ST_PAGE);
+    const char *badge = secure ? "https" : "http";
+    u32 badge_fg = secure ? C_ACCENT : C_DIM;
 
     /* The title row is one band of exactly title_row_h(): the title text
      * lives at its top, the badge is centred in it, and the address field
@@ -2003,7 +2169,7 @@ static void draw_header(Surface *s, Web *w) {
     float bh = (float)ui_px(BADGE_H_D);
     if (bh > (float)row_h) bh = (float)row_h;
     float bp = (float)ui_px(BADGE_PAD_D);
-    float badge_w = font_width(fd, badge) + 2.0f * bp;
+    float badge_w = badge_show ? font_width(fd, badge) + 2.0f * bp : 0.0f;
     float badge_x = (float)(w->w - mx) - badge_w;
     float badge_y = (float)row_y + ((float)row_h - bh) * 0.5f;
 
@@ -2012,11 +2178,11 @@ static void draw_header(Surface *s, Web *w) {
     float title_max = badge_x - (float)mx - (float)ui_px(12);
     if (title_max < (float)ui_px(24)) title_max = (float)(w->w - 2 * mx);
     draw_fit(s, ft, (float)mx, (float)row_y, title_max, title, C_TEXT);
-    if (badge_x > (float)mx + (float)ui_px(24)) {
+    if (badge_show && badge_x > (float)mx + (float)ui_px(24)) {
         gfx_rrect_aa(s, badge_x, badge_y, badge_w, bh, bh * 0.5f,
-                     WITH_A(C_ACCENT, 0x22), WITH_A(C_ACCENT, 0x55), 1.0f);
+                     WITH_A(badge_fg, 0x22), WITH_A(badge_fg, 0x55), 1.0f);
         font_draw(s, fd, badge_x + bp,
-                  badge_y + (bh - font_height(fd)) * 0.5f, badge, C_ACCENT);
+                  badge_y + (bh - font_height(fd)) * 0.5f, badge, badge_fg);
     }
 
     /* address bar */
@@ -2029,8 +2195,26 @@ static void draw_header(Surface *s, Web *w) {
     float ty = fy + (fh - font_height(fd)) * 0.5f;   /* centred in the field */
     const char *text = w->edit[0] ? w->edit : "";
     float inner = fw - 2.0f * pad;
+
+    /* The lock sits at the field's left edge and describes the page on
+     * screen - closed and accent for a verified TLS session, open and grey
+     * otherwise. The address text keeps the scheme ("https://...") itself,
+     * so the two together are the lock and the scheme in the bar. */
+    float lh = font_height(fd) * 0.86f;
+    float lw = lh * 0.72f;
+    float lgap = (float)ui_px(6);
+    float lockoff = 0.0f;
+    if (lh >= 6.0f && inner > lw + lgap + (float)ui_px(48)) {
+        draw_lock(s, fx + pad, fy + (fh - lh) * 0.5f, lh,
+                  secure ? C_ACCENT : C_DIM, secure);
+        lockoff = lw + lgap;
+        inner -= lockoff;
+    }
+    float base = fx + pad + lockoff;
+
     if (!text[0] && !w->edit_focus) {
-        font_draw(s, fd, fx + pad, ty, "Tab, then type an http address", C_FAINT);
+        draw_fit(s, fd, base, ty, inner,
+                 "Tab, then type an address - https:// is the default", C_FAINT);
     } else {
         /* While typing, the end of the address is what matters, so when
          * it is longer than the field we show its tail. Walking back from
@@ -2056,9 +2240,9 @@ static void draw_header(Surface *s, Web *w) {
                 i = j;
             }
             show = text + i;
-            font_draw(s, fd, fx + pad, ty, "<", C_FAINT);
+            font_draw(s, fd, base, ty, "<", C_FAINT);
         }
-        float tx0 = fx + (show != text ? pad + (float)ui_px(7) : pad);
+        float tx0 = base + (show != text ? (float)ui_px(7) : 0.0f);
         font_draw(s, fd, tx0, ty, show[0] ? show : "<",
                   show[0] ? C_TEXT : C_FAINT);
         if (w->edit_focus && w->caret_on) {
@@ -2087,7 +2271,7 @@ static void draw_footer(Surface *s, Web *w) {
     else if (w->state == ST_ERROR)
         snprintf(left, sizeof(left), "%s", w->error);
     else if (w->state == ST_START)
-        snprintf(left, sizeof(left), "ready - http only, no https, no scripts");
+        snprintf(left, sizeof(left), "ready - http and https, no scripts");
     else
         snprintf(left, sizeof(left), "HTTP %d  %ld bytes  %ld ms%s",
                  w->status, w->body_bytes, w->elapsed_ms,
@@ -2102,7 +2286,26 @@ static void draw_footer(Surface *s, Web *w) {
         snprintf(right, sizeof(right), "%ld bytes", w->raw_bytes);
     }
 
-    float fy = (float)(w->h - bar) + ((float)bar - font_height(fd)) * 0.5f;
+    /* Two lines only for a verified TLS page: the session facts sit above
+     * the HTTP facts, and both are read from the handshake of the page on
+     * screen - version, cipher, leaf CN and the real expiry date. */
+    const int lh = text_h(fd, 16);
+    const int padb = ui_px(FOOT_PAD_D);
+    const int bottom_top = w->h - padb - lh;
+    float fy = (float)bottom_top + ((float)lh - font_height(fd)) * 0.5f;
+
+    if (foot_lines(w) == 2) {
+        char tls[WEB_ERR_MAX + 96];
+        snprintf(tls, sizeof(tls), "%s  %s  CN=%s  expires %s",
+                 w->tls_version[0] ? w->tls_version : "TLS",
+                 w->tls_cipher[0] ? w->tls_cipher : "?",
+                 w->tls_cn[0] ? w->tls_cn : w->cur.host,
+                 w->tls_expiry[0] ? w->tls_expiry : "(unknown)");
+        int top = bottom_top - lh;
+        float ty = (float)top + ((float)lh - font_height(fd)) * 0.5f;
+        draw_fit(s, fd, (float)mx, ty, (float)(w->w - 2 * mx), tls, C_ACCENT);
+    }
+
     float rw = font_width(fd, right);
     u32 lc = C_ACCENT;
     if (w->state == ST_ERROR) lc = C_ERR;
@@ -2199,8 +2402,17 @@ static int draw_start(Surface *v, Web *w, int yoff) {
     y += ui_px(GAP_AFTER_HEAD_D);
     float tw = font_width(fd, "Try: ");
     font_draw(v, fd, x, (float)y, "Try:", C_DIM);
-    draw_fit(v, fm, x + tw, (float)y, (float)v->w - tw, "http://example.com/", C_LINK);
-    y += (int)font_height(fd);
+    draw_fit(v, fm, x + tw, (float)y, (float)v->w - tw, "https://example.com/", C_LINK);
+    y += (int)font_height(fd) + ui_px(GAP_BLOCK_D);
+
+    /* Say what https actually costs and checks, in the app itself, so the
+     * guarantee is not buried in a source comment. */
+    y += draw_wrapped(v, fd, x, (float)y, (float)v->w,
+                      "https:// is verified against the system CA bundle: the chain up "
+                      "to a trusted root, the host name in the certificate and its "
+                      "validity dates. A page that fails any of those checks is not "
+                      "rendered - the status bar names the check that failed.",
+                      C_DIM, 5);
     return y;
 }
 
@@ -2314,6 +2526,13 @@ static void web_clear_page(Web *w) {
     w->truncated = 0;
     w->scroll = 0;
     w->max_scroll = 0;
+    /* There is no page on screen any more, so there is no session to
+     * describe: the lock and the TLS line go with it. */
+    w->tls_ok = 0;
+    w->tls_version[0] = 0;
+    w->tls_cipher[0] = 0;
+    w->tls_cn[0] = 0;
+    w->tls_expiry[0] = 0;
 }
 
 static void hist_push(Web *w, const char *url) {
@@ -2382,7 +2601,7 @@ static void web_load(Web *w) {
     }
 
     Fetch f;
-    web_fetch(&f, &socket_transport, &u, w->raw);
+    web_fetch(&f, &net_transport, &u, w->raw);
 
     w->raw_bytes = f.raw_bytes;
     w->elapsed_ms = f.elapsed_ms;
@@ -2403,6 +2622,11 @@ static void web_load(Web *w) {
     w->cur = u;
     snprintf(w->url, sizeof(w->url), "%s", f.url);
     snprintf(w->edit, sizeof(w->edit), "%s", f.url);
+    w->tls_ok = f.tls;
+    snprintf(w->tls_version, sizeof(w->tls_version), "%s", f.tls_version);
+    snprintf(w->tls_cipher, sizeof(w->tls_cipher), "%s", f.tls_cipher);
+    snprintf(w->tls_cn, sizeof(w->tls_cn), "%s", f.tls_cn);
+    snprintf(w->tls_expiry, sizeof(w->tls_expiry), "%s", f.tls_expiry);
     w->status = f.status;
     w->body_bytes = f.body_bytes;
     w->truncated = f.truncated || (f.body_len >= WEB_RAW_MAX - 1);
@@ -2483,7 +2707,7 @@ static void edit_put(Web *w, const char *t) {
 static void submit_address(Web *w) {
     if (!w->edit[0]) {
         snprintf(w->error, sizeof(w->error),
-                 "the address bar is empty - type something like http://example.com/");
+                 "the address bar is empty - type something like https://example.com/");
         w->state = ST_ERROR;
         w->dirty = 1;
         return;
@@ -2638,7 +2862,7 @@ static void render_fatal(MClient *c, const char *what, const char *why) {
     if (!fr) return;
     draw_fit(&s, fr, (float)page_mx(), (float)page_mx(),
              (float)c->w - 2.0f * (float)page_mx(), what, C_ERR);
-    draw_fit(&s, fr, (float)page_mx(), (float)(page_mx() + foot_h()),
+    draw_fit(&s, fr, (float)page_mx(), (float)(page_mx() + foot_h(NULL)),
              (float)c->w - 2.0f * (float)page_mx(), why, C_TEXT);
     mc_present(c);
 }

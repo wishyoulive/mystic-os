@@ -327,8 +327,9 @@ static int win_banner;
 
 /* best score, read from and written to a real file */
 static long best;
-static char best_path[64];      /* "" when nothing was loadable/creatable */
-static char best_err[96];       /* why, when best_path is empty */
+static char best_path[80];      /* "" when nothing could be read or created */
+static char best_err[120];      /* the real strerror, whenever a write failed */
+static int  best_ok;            /* the last write to best_path succeeded */
 
 /* ------------------------------------------------------------ time */
 
@@ -388,13 +389,24 @@ static unsigned rng_next(void) {
 
 /* ------------------------------------------------------------ best score */
 
-/* The paths are tried in this order. /root is what the owner asked for and
- * works whenever the app can see it (run from a shell, or a jail that
- * binds it); the app's own /tmp is the fallback inside the sandbox, and is
- * a real file on the real disk too. */
+/* Where the best score can live, in the order it is tried.
+ *
+ *   /root/g2048.best    what the owner asked for. Reachable when the app runs
+ *                       outside the window server's jail, or when the jail
+ *                       binds a writable /root (it does not today).
+ *   /tmp/g2048.best     on disk, but the jail creates <jail>/tmp as a
+ *                       0755 root-owned directory, so uid 1000 gets EACCES.
+ *   /dev/shm/g2048.best the one path a jailed client can always write: the
+ *                       jail binds the host /dev/shm, which is a 1777 tmpfs.
+ *                       A real file, but RAM-backed: it survives an app
+ *                       restart, not a reboot.
+ *
+ * best_open() records which one answered; the footer prints it, so the owner
+ * can see where the score actually went instead of being told it was saved. */
 static const char *const BEST_CANDIDATES[] = {
     "/root/g2048.best",
     "/tmp/g2048.best",
+    "/dev/shm/g2048.best",
 };
 
 static int read_best(const char *path, long *out) {
@@ -426,21 +438,24 @@ static int write_best(const char *path, long v) {
 static void best_open(void) {
     best_path[0] = 0;
     best_err[0] = 0;
+    best_ok = 0;
     int last_errno = 0;
 
     for (unsigned i = 0; i < sizeof(BEST_CANDIDATES) / sizeof(BEST_CANDIDATES[0]); i++) {
         const char *p = BEST_CANDIDATES[i];
         if (read_best(p, &best)) {
             snprintf(best_path, sizeof(best_path), "%s", p);
+            best_ok = 1;
             return;
         }
-        /* not there yet: can we create it? A zero-byte probe is enough to
-         * learn whether this directory is writable, and it is removed if we
-         * did not find a score in it. */
+        /* Not there yet: can we create it? Opening for append is enough to
+         * learn whether the directory is writable; the empty file it leaves
+         * behind is then the score file itself. */
         FILE *f = fopen(p, "a");
         if (f) {
             fclose(f);
             snprintf(best_path, sizeof(best_path), "%s", p);
+            best_ok = 1;
             return;
         }
         last_errno = errno;
@@ -449,10 +464,29 @@ static void best_open(void) {
     snprintf(best_err, sizeof(best_err), "%s", strerror(last_errno));
 }
 
+/* The footer line, in one place so it cannot say two different things in two
+ * different states: path when the last write worked, the real errno when it
+ * did not, and why nothing is saved at all when no path could be opened. */
+static void best_status(char *out, size_t n) {
+    if (!best_path[0])
+        snprintf(out, n, "best %ld  not saved: %s", best, best_err);
+    else if (!best_ok)
+        snprintf(out, n, "best %ld  %s: %s", best, best_path, best_err);
+    else
+        snprintf(out, n, "best %ld  (%s)", best, best_path);
+}
+
+/* A write failure after a path was chosen keeps the path but clears best_ok,
+ * so the footer stops claiming the score is being saved. */
 static void best_save(long v) {
     if (!best_path[0]) return;
-    if (write_best(best_path, v) != 0)
+    if (write_best(best_path, v) != 0) {
         snprintf(best_err, sizeof(best_err), "%s", strerror(errno));
+        best_ok = 0;
+    } else {
+        best_ok = 1;
+        best_err[0] = 0;
+    }
 }
 
 /* ------------------------------------------------------------ game flow */
@@ -577,6 +611,9 @@ static u32 tile_color(int v) {
 
 /* ------------------------------------------------------------ layout */
 
+/* A plain rectangle, used by the dialog. */
+typedef struct { int x, y, w, h; } Box;
+
 typedef struct {
     int bx, by, bw, bh;   /* the board panel, in window pixels */
     int cell, gap;
@@ -637,16 +674,23 @@ static void layout_for(int vw, int vh, const Fonts *F, Layout *L) {
     int gap = side / 24;
     if (gap < 3) gap = 3;
     int cell = (side - (N + 1) * gap) / N;
-    if (cell < 4) cell = 4;
+    /* A floor on the cell size used to be able to make the board taller than
+     * the box it was given, which put its bottom edge into the footer on a
+     * window smaller than the window manager allows. If even the smallest
+     * usable cell does not fit, there is no board: the header and the footer
+     * still draw, and nothing can overlap. */
+    if (cell < 2) cell = 2;
+    if (N * cell + (N + 1) * gap > side) { cell = 0; gap = 0; }
 
     L->gap  = gap;
     L->cell = cell;
-    L->bw   = N * cell + (N + 1) * gap;
+    L->bw   = cell ? N * cell + (N + 1) * gap : 0;
     L->bh   = L->bw;
     L->bx   = (vw - L->bw) / 2;
     if (L->bx < 0) L->bx = 0;
     L->by   = m + head + (avail_h - L->bh) / 2;
     if (L->by < m + head) L->by = m + head;
+    if (L->by + L->bh > L->foot_y) { L->bw = 0; L->bh = 0; L->cell = 0; }
 }
 
 /* ------------------------------------------------------------ draw */
@@ -655,9 +699,14 @@ static void layout_for(int vw, int vh, const Fonts *F, Layout *L) {
  * 4-digit value is never clipped and a longer one shrinks instead of
  * vanishing. NULL when even the smallest still spills. */
 static Font *fit_font(int face, const char *txt, float max_w, float max_h) {
-    static const int sizes[8] = { 30, 26, 22, 18, 15, 12, 10, 8 };
+    /* The table reaches down to 6pt nominal on purpose. font_get() multiplies
+     * by the desktop scale, which is the ui.conf value times UI_BASE 1.4
+     * (src/ui.c:23-25), so 1.6 in Settings means every face is 2.24x its
+     * nominal size. A table that stopped at 8 left no face small enough for
+     * a 40px-tall dialog at that scale, and the dialog came out empty. */
+    static const int sizes[11] = { 30, 26, 22, 18, 15, 12, 10, 8, 7, 6, 5 };
     if (!txt || !*txt || max_w < 2.0f || max_h < 2.0f) return NULL;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 11; i++) {
         Font *f = font_get(face, (float)sizes[i]);
         if (!f) continue;
         if (font_width(f, txt) <= max_w && font_height(f) <= max_h) return f;
@@ -712,7 +761,10 @@ static void draw_tile(Surface *s, float x, float y, int cell, int v, float pop) 
     if (pop > 0.0f) fill = WITH_A(fill, 150 + (int)(105.0f * (1.0f - pop)));
     gfx_rrect_aa(s, tx, ty, ts, ts, ts * 0.16f, fill, 0, 0);
 
-    Font *f = fit_font(FONT_SEMIBOLD, buf, ts - 8.0f, ts - 6.0f);
+    /* The digit gets almost the whole tile: at text scale 1.6 the smallest
+     * face font.c will build is 15.4px tall, and a 19px tile (which is what
+     * a 320px-wide window has at that scale) has to be able to hold it. */
+    Font *f = fit_font(FONT_SEMIBOLD, buf, ts - 4.0f, ts - 2.0f);
     if (!f) return;
     float tw = font_width(f, buf), th = font_height(f);
     font_draw(s, f, tx + (ts - tw) * 0.5f, ty + (ts - th) * 0.5f,
@@ -726,40 +778,69 @@ static void cell_pos(const Layout *L, int idx, float *x, float *y) {
     *y = (float)(L->by + L->gap + r * (L->cell + L->gap));
 }
 
+/* One centred line inside a box, fitted, and "did it fit?" as the answer.
+ * The overlay uses the answer to give the space to the title first. */
+static int overlay_line(Surface *s, int face, Box box, const char *txt, u32 col) {
+    Font *f = fit_font(face, txt, (float)box.w, (float)box.h);
+    if (!f) return 0;
+    float w = font_width(f, txt);
+    float h = font_height(f);
+    float x = (float)box.x + ((float)box.w - w) * 0.5f;
+    float y = (float)box.y + ((float)box.h - h) * 0.5f;
+    font_draw(s, f, x, y, txt, col);
+    return 1;
+}
+
+/* The dialog that owns the board when the game is decided.
+ *
+ * It is sized from the *text*, not from a fraction of the board: the title
+ * takes 49% of the panel, the two hint lines 25% each, and the panel itself
+ * is the whole board inset by one gap. A percentage-of-the-board panel was
+ * what made the dialog empty at text scale 1.6 (board 212px -> panel 64px ->
+ * title band 24px, smaller than the smallest face at 2.24x). */
 static void draw_overlay(Surface *s, const Layout *L, const char *title,
-                         const char *sub, u32 edge, u32 text) {
+                         const char *short_title,
+                         const char *hint1, const char *hint2,
+                         u32 edge, u32 text) {
+    if (L->bw < 8 || L->bh < 8) return;
     surf_blend(s, L->bx, L->by, L->bw, L->bh, WITH_A(COL_BG_TOP, 200));
 
-    int pw = L->bw - 40, ph = (int)(L->bh * 0.30f);
-    if (pw > 280) pw = 280;
-    if (pw < 24) pw = 24;
-    if (pw > L->bw) pw = L->bw;
-    if (ph < 44) ph = 44;
-    if (ph > L->bh) ph = L->bh;
-    if (pw < 1 || ph < 1) return;
-    int px = L->bx + (L->bw - pw) / 2;
-    int py = L->by + (L->bh - ph) / 2;
-    if (px < L->bx) px = L->bx;
-    if (py < L->by) py = L->by;
-
+    int inset = L->gap;
+    int px = L->bx + inset, py = L->by + inset;
+    int pw = L->bw - 2 * inset, ph = L->bh - 2 * inset;
+    if (pw < 8 || ph < 8) { px = L->bx; py = L->by; pw = L->bw; ph = L->bh; }
     gfx_rrect_aa(s, (float)px, (float)py, (float)pw, (float)ph, 12.0f,
                  COL_PANEL, edge, 1.0f);
 
-    /* the title gets the top half, the hint the bottom half; each is fitted
-     * to its own half so the two lines cannot collide at any text scale */
-    int th = ph / 2;
-    Font *tf = fit_font(FONT_SEMIBOLD, title, (float)pw - 16.0f, (float)th - 8.0f);
-    if (tf) {
-        float tw = font_width(tf, title);
-        font_draw(s, tf, (float)px + ((float)pw - tw) * 0.5f, (float)py + 8.0f,
-                  title, text);
+    int pad = ph / 16;
+    if (pad < 3) pad = 3;
+    int iw = pw - 2 * pad;
+    int ih = ph - 2 * pad;
+    if (iw < 4 || ih < 4) return;
+
+    /* title first: it gets the largest share, and if only one line can be
+     * drawn it is this one */
+    int th = (ih * 49) / 100;
+    int hh = (ih - th) / 2;
+    Box tb = { px + pad, py + pad, iw, th };
+    Box h1 = { px + pad, py + pad + th, iw, hh };
+    Box h2 = { px + pad, py + pad + th + hh, iw, ih - th - hh };
+
+    if (!overlay_line(s, FONT_SEMIBOLD, tb, title, text)) {
+        /* The full title does not fit the band. On a small board at a large
+         * text scale even the shortest face is wide, so fall back to the
+         * short word and, failing that, to the whole panel with the hints
+         * dropped. A board that says "OVER" still tells the player what
+         * happened; an empty panel does not. */
+        Box all = { px + pad, py + pad, iw, ih };
+        if (!overlay_line(s, FONT_SEMIBOLD, tb, short_title, text) &&
+            !overlay_line(s, FONT_SEMIBOLD, all, short_title, text))
+            return;
     }
-    Font *sf = fit_font(FONT_REGULAR, sub, (float)pw - 16.0f, (float)ph - th - 8.0f);
-    if (sf) {
-        float sw = font_width(sf, sub);
-        font_draw(s, sf, (float)px + ((float)pw - sw) * 0.5f,
-                  (float)py + th + 2.0f, sub, COL_TEXT);
-    }
+    /* the action hint is the important one; the second line goes only if its
+     * band can hold it */
+    if (hint1 && *hint1) overlay_line(s, FONT_REGULAR, h1, hint1, COL_TEXT);
+    if (hint2 && *hint2) overlay_line(s, FONT_REGULAR, h2, hint2, COL_TEXT);
 }
 
 static void draw(MClient *c, int vw, int vh, const Layout *L,
@@ -803,73 +884,102 @@ static void draw(MClient *c, int vw, int vh, const Layout *L,
         }
     }
 
-    /* ---- the board: one rounded panel, sixteen rounded cells */
-    gfx_rrect_aa(&s, (float)L->bx, (float)L->by, (float)L->bw, (float)L->bh,
-                 12.0f, COL_BOARD, COL_BOARD_EDGE, 1.0f);
-
+    /* ---- the board: one rounded panel, sixteen rounded cells, the slide
+     * in flight and the dialog. A window too small to hold a usable board
+     * has no board at all (layout_for), so this whole block is skipped and
+     * the header and footer still draw. */
     float t = slide_t(now);
     int moving = slide_on && t < 1.0f;
 
-    for (int r = 0; r < N; r++) {
-        for (int col = 0; col < N; col++) {
-            int idx = r * N + col;
-            float x, y;
-            cell_pos(L, idx, &x, &y);
-            /* clip: never touch a pixel outside the window we were given */
-            if (x < 0 || y < 0 || x + L->cell > vw || y + L->cell > vh) continue;
-            gfx_rrect_aa(&s, x, y, (float)L->cell, (float)L->cell,
-                         (float)L->cell * 0.16f, COL_SLOT, 0, 0);
+    if (L->cell > 0) {
+        gfx_rrect_aa(&s, (float)L->bx, (float)L->by, (float)L->bw, (float)L->bh,
+                     12.0f, COL_BOARD, COL_BOARD_EDGE, 1.0f);
 
-            int v = G.board[idx];
-            if (!v) continue;
-            /* While a slide runs, the tiles are drawn from the trace at
-             * interpolated positions; anything without a trace (the tile
-             * that just spawned) waits for the landing. */
-            if (moving) continue;
-            draw_tile(&s, x, y, L->cell, v, pop_at(idx, now));
-        }
-    }
+        for (int r = 0; r < N; r++) {
+            for (int col = 0; col < N; col++) {
+                int idx = r * N + col;
+                float x, y;
+                cell_pos(L, idx, &x, &y);
+                /* clip: never touch a pixel outside the window we were given */
+                if (x < 0 || y < 0 || x + L->cell > vw || y + L->cell > vh) continue;
+                gfx_rrect_aa(&s, x, y, (float)L->cell, (float)L->cell,
+                             (float)L->cell * 0.16f, COL_SLOT, 0, 0);
 
-    if (moving) {
-        for (int d = 0; d < NN; d++) {
-            if (!trace[d].n) continue;
-            int v = G.board[d];
-            if (!v) continue;
-            int nsrc = trace[d].n;
-            int sv = nsrc == 2 ? v / 2 : v;
-            float dx, dy;
-            cell_pos(L, d, &dx, &dy);
-            for (int k = 0; k < nsrc; k++) {
-                int src = k == 0 ? trace[d].s0 : trace[d].s1;
-                if (src == NO_CELL || src >= NN) continue;
-                float sx0, sy0;
-                cell_pos(L, src, &sx0, &sy0);
-                float x = sx0 + (dx - sx0) * t;
-                float y = sy0 + (dy - sy0) * t;
-                if (x < -L->cell || y < -L->cell) continue;
-                draw_tile(&s, x, y, L->cell, sv, 0.0f);
+                int v = G.board[idx];
+                if (!v) continue;
+                /* While a slide runs, the tiles are drawn from the trace at
+                 * interpolated positions; anything without a trace (the tile
+                 * that just spawned) waits for the landing. */
+                if (moving) continue;
+                draw_tile(&s, x, y, L->cell, v, pop_at(idx, now));
             }
         }
+
+        if (moving) {
+            for (int d = 0; d < NN; d++) {
+                if (!trace[d].n) continue;
+                int v = G.board[d];
+                if (!v) continue;
+                int nsrc = trace[d].n;
+                int sv = nsrc == 2 ? v / 2 : v;
+                float dx, dy;
+                cell_pos(L, d, &dx, &dy);
+                for (int k = 0; k < nsrc; k++) {
+                    int src = k == 0 ? trace[d].s0 : trace[d].s1;
+                    if (src == NO_CELL || src >= NN) continue;
+                    float sx0, sy0;
+                    cell_pos(L, src, &sx0, &sy0);
+                    float x = sx0 + (dx - sx0) * t;
+                    float y = sy0 + (dy - sy0) * t;
+                    if (x < -L->cell || y < -L->cell) continue;
+                    draw_tile(&s, x, y, L->cell, sv, 0.0f);
+                }
+            }
+        }
+
+        /* the dialog that owns the board when the game is decided */
+        if (win_banner) {
+            draw_overlay(&s, L, "YOU WIN", "WIN", "space: keep playing",
+                         "r: new game", COL_WIN, COL_WIN);
+        } else if (G.over) {
+            draw_overlay(&s, L, "GAME OVER", "OVER", "r: new game", "u: undo",
+                         COL_HOT, COL_HOT_TEXT);
+        }
     }
 
-    /* ---- the overlay that owns the board when the game is decided */
-    if (win_banner) {
-        draw_overlay(&s, L, "YOU WIN", "space: keep playing   r: new game",
-                     COL_WIN, COL_WIN);
-    } else if (G.over) {
-        draw_overlay(&s, L, "GAME OVER",
-                     G.won ? "2048 reached   r: new   u: undo"
-                           : "r: new game   u: undo",
-                     COL_HOT, COL_HOT_TEXT);
-    }
-
-    /* ---- footer: the keys, then the numbers that are actually true */
+    /* ---- footer: the keys, then the numbers that are actually true.
+     * While the game is decided the first line becomes the keys for *that*
+     * state, so "space: keep playing" is reachable even if the dialog were
+     * too small to read. */
     float fy = (float)L->foot_y;
-    const char *keys = rand_err[0] ? rand_err
-                     : "arrows/WASD move   u undo   r new   q quit";
+    const char *keys;
+    u32 keycol = COL_DIM;
+    if (rand_err[0]) {
+        keys = rand_err;
+        keycol = COL_ERROR;
+    } else if (win_banner) {
+        keys = "space: keep playing   r: new game";
+        keycol = COL_WIN;
+    } else if (G.over) {
+        keys = "r: new game   u: undo the last move";
+        keycol = COL_HOT_TEXT;
+    } else {
+        keys = "arrows/WASD move   u undo   r new   q quit";
+    }
     Font *kf = fit_font(FONT_REGULAR, keys, (float)(vw - 2 * m), (float)L->line_h);
-    if (kf)
-        font_draw(&s, kf, (float)m, fy, keys, rand_err[0] ? COL_ERROR : COL_DIM);
+    if (kf) {
+        font_draw(&s, kf, (float)m, fy, keys, keycol);
+    } else {
+        /* A narrow window: say the same thing in fewer words rather than
+         * dropping the only place the keys are written down. */
+        const char *short_keys = win_banner ? "space: keep   r: new"
+                                : G.over    ? "r: new   u: undo"
+                                : rand_err[0] ? rand_err
+                                : "arrows/WASD  u  r  q";
+        kf = fit_font(FONT_REGULAR, short_keys, (float)(vw - 2 * m),
+                      (float)L->line_h);
+        if (kf) font_draw(&s, kf, (float)m, fy, short_keys, keycol);
+    }
 
     if (L->lines >= 2) {
         char info[80];
@@ -881,16 +991,14 @@ static void draw(MClient *c, int vw, int vh, const Layout *L,
     }
 
     if (L->lines >= 3) {
-        char src[128];
-        if (best_path[0])
-            snprintf(src, sizeof(src), "best %ld  (%s)", best, best_path);
-        else
-            snprintf(src, sizeof(src), "best %ld  not saved: %s", best, best_err);
+        char src[160];
+        best_status(src, sizeof(src));
         Font *sf = fit_font(FONT_REGULAR, src, (float)(vw - 2 * m),
                             (float)L->line_h);
+        /* red only when the score is not actually being written */
         if (sf)
             font_draw(&s, sf, (float)m, fy + 2.0f * (float)L->line_h, src,
-                      best_path[0] ? COL_FAINT : COL_ERROR);
+                      best_ok && best_path[0] ? COL_FAINT : COL_ERROR);
     }
 }
 

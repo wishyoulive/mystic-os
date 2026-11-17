@@ -14536,6 +14536,7 @@ struct TlsConn {
 
     TlsInfo info;
     int failed;
+    int eof;             /* the peer closed the TCP connection         */
 };
 
 /* ============================================================
@@ -15179,6 +15180,11 @@ br_prng_seeder br_prng_seeder_system(const char **name) {
 static int bio_read(void *ctx, unsigned char *buf, size_t len) {
     TlsConn *t = ctx;
     long n = t->rd(t->ioctx, buf, len);
+    /* The callback contract in tls.h tells an orderly EOF (0) apart from an
+     * error (-1). BearSSL needs -1 for both to stop, so the difference is
+     * remembered here and used by tls_read() to end the stream instead of
+     * calling a peer's plain TCP close a protocol error. */
+    if (n == 0) t->eof = 1;
     if (n <= 0) return -1;
     return (int)n;
 }
@@ -15240,6 +15246,12 @@ TlsConn *tls_connect(void *ioctx, TlsReadFn rd, TlsWriteFn wr,
     br_ssl_engine_set_rsavrfy(&t->sc.eng, &br_rsa_i32_pkcs1_vrfy);
     br_ssl_engine_set_aes_ctr(&t->sc.eng, &br_aes_ct64_ctr_vtable);
     br_ssl_engine_set_ghash(&t->sc.eng, &br_ghash_ctmul64);
+    /* The AES-GCM record engines. Without this the engine dereferences a
+     * NULL record class the moment a server picks an AES-GCM suite (the
+     * CHACHA20 suites do not use it, so the omission is invisible until a
+     * server that has no ChaCha20 answers). */
+    br_ssl_engine_set_gcm(&t->sc.eng, &br_sslrec_in_gcm_vtable,
+                          &br_sslrec_out_gcm_vtable);
     br_ssl_engine_set_chapol(&t->sc.eng, &br_sslrec_in_chapol_vtable,
                              &br_sslrec_out_chapol_vtable);
     br_ssl_engine_set_chacha20(&t->sc.eng, &br_chacha20_ct_run);
@@ -15366,6 +15378,11 @@ long tls_read(TlsConn *t, void *buf, size_t len, char *err, size_t esz) {
     if (n == 0) return 0;
     int e = br_ssl_engine_last_error(&t->sc.eng);
     if (e == 0) return 0;                     /* clean close_notify */
+    /* The peer closed the socket without sending close_notify. Every record
+     * BearSSL handed us was authenticated before delivery, so what arrived
+     * is genuine; the HTTP layer decides whether it is the whole response.
+     * A transport failure with the socket still open stays an error. */
+    if (e == BR_ERR_IO && t->eof) return 0;
     char b[192];
     snprintf(err, esz, "%s", br_error_text(e, t->sc.eng.server_name, b, sizeof(b)));
     t->failed = 1;
@@ -15392,7 +15409,31 @@ int tls_write(TlsConn *t, const void *buf, size_t len, char *err, size_t esz) {
 
 void tls_close(TlsConn *t) {
     if (!t) return;
-    if (!t->failed) (void)br_sslio_close(&t->ioc);   /* best-effort close_notify */
+    if (!t->failed) {
+        /* Ask the engine for a close_notify and write out whatever record
+         * bytes that produces - and nothing more.
+         *
+         * Neither br_sslio_close() nor br_sslio_flush() can be used here:
+         * both run the engine until the *peer* closes, reading and
+         * discarding records. A browser that stopped reading a page it
+         * already has (its buffer is full, or its Content-Length is
+         * satisfied) would then download and throw away the rest of that
+         * page, and against a server that keeps the connection open the
+         * loop never ends - the window would hang on the way out of a
+         * page. Writing the queued record bytes is bounded by the socket
+         * timeout and is all a polite goodbye needs. */
+        br_ssl_engine_close(&t->sc.eng);
+        for (int i = 0; i < 8; i++) {
+            size_t len = 0;
+            unsigned char *rec;
+            if (!(br_ssl_engine_current_state(&t->sc.eng) & BR_SSL_SENDREC)) break;
+            rec = br_ssl_engine_sendrec_buf(&t->sc.eng, &len);
+            if (!rec || len == 0) break;
+            long n = t->wr(t->ioctx, rec, len);
+            if (n <= 0) break;                /* peer gone: best effort   */
+            br_ssl_engine_sendrec_ack(&t->sc.eng, (size_t)n);
+        }
+    }
     memset(t->iobuf, 0, BR_SSL_BUFSIZE_BIDI);
     free(t->iobuf);
     memset(&t->info, 0, sizeof(t->info));

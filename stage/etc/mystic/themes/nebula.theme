@@ -1,0 +1,23 @@
+# Nebula - violet and indigo, the light of an emission nebula seen from far
+# out. Deep and dim, with the accent as the only saturated thing on screen.
+#
+# Contrast, WCAG 2.1 on the composited 8 bit sRGB values (docs/THEMES.md):
+#   text      16.27:1 on window_bg   16.67 / 16.44 on panel (bar / in window)
+#   text_dim   6.57:1 on window_bg    6.74 /  6.64 on panel
+#   accent     9.04:1 on window_bg    9.27 /  9.14 on panel
+# Targets are >= 7:1 for body text, >= 4.5:1 for dim text and accent.
+name          = Nebula
+dark          = 1
+bg_top        = #0A0618
+bg_bottom     = #170D33
+accent        = #B9A6FF
+glow          = #6B3FD4
+glow_strength = 0.65
+panel         = #A00F0A22
+panel_border  = #33B9A6FF
+text          = #F0EAFF
+text_dim      = #9E90C4
+window_bg     = #120B26
+window_border = #3A8F7AE0
+corner        = 16
+blur          = 1.0

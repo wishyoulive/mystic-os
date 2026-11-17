@@ -5,17 +5,23 @@
  *  drawn by the CPU from real measurements: resolution from fb0,
  *  memory and processes from /proc, input from evdev.
  *
- *  Keys:   1 2 3   switch theme
- *          Esc     close focused window
+ *  Keys:   every binding lives in src/shortcuts.c, and Super+/ (or F1
+ *          with nothing open) draws the list of them. The desktop-level
+ *          ones: Esc close, Alt+Tab switch, Super launcher, Ctrl+Alt+L
+ *          lock.
  *  Mouse:  drag a title bar to move a window, click a dock icon
  *          to launch an app, click a window's red dot to close it.
  * ============================================================ */
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include "mystic.h"
 #include "ipc.h"
 #include "wallpaper.h"
+#include "shortcuts.h"
+#include "notify.h"
 #include <unistd.h>
 
 #include <errno.h>
@@ -162,6 +168,23 @@ static char   pin[64];
 static int    pin_len = 0;
 static char   lock_msg[96] = "";
 static int    mouse_prev;
+
+/* Shortcut state that has to live across frames.
+ *
+ *   super_down  the Meta key is held. input.c reports it like any other
+ *               key, so the desktop tracks it itself - without that,
+ *               Super+Left could only ever open the launcher.
+ *   super_lone  Super was pressed and nothing else was: that tap is the
+ *               launcher, and a tap is only known on the release.
+ *   help_open   the keyboard-shortcut panel is up.
+ *   dnd_on      do-not-disturb, also mirrored to /etc/mystic/dnd.
+ *   dirty       the frame needs recomposing. It is at file scope so the
+ *               shortcut actions, which live outside main(), can ask for
+ *               a repaint the same way every other piece of code does.
+ */
+static int super_down, super_lone;
+static int help_open, dnd_on;
+static int dirty = 1;
 
 /* ------------------------------------------------------------ helpers */
 static long mem_field(const char *key) {
@@ -476,7 +499,24 @@ static Window *win_open(int kind, const char *app_id) {
             snprintf(w->title, sizeof(w->title), "Terminal");
             if (!w->term) { win_reset(w); return NULL; }
         } else {
-            w->w = ui_px(520); w->h = ui_px(360);
+            /* The calculator is portrait: the owner asked for it to grow
+             * downwards rather than sideways, so it opens tall and narrow.
+             * Every other app keeps the wide default. The height is clamped to
+             * the screen because ui_px(520) is 832 px at the largest text
+             * scale, which would push the title bar above the top edge. */
+            if (app_id && !strcmp(app_id, "calc")) {
+                w->w = ui_px(300);
+                w->h = ui_px(520);
+            } else {
+                w->w = ui_px(520);
+                w->h = ui_px(360);
+            }
+            {
+                int maxh = disp.h - topbar_h() - ui_px(90);
+                if (w->h > maxh) w->h = maxh;
+                if (w->h < ui_px(240)) w->h = ui_px(240);
+                if (w->w > disp.w - ui_px(40)) w->w = disp.w - ui_px(40);
+            }
             w->x = 140 + (i % 3) * 40;
             w->y = 110 + (i % 3) * 40;
             w->app = app_new(app_id, w->w - 2, w->h - 40 - 2);
@@ -733,7 +773,8 @@ static void draw_desktop(Surface *s, const Theme *th) {
     long avail = mem_field("MemAvailable:");
     long used = mem - avail;
     if (used < 0) used = 0;
-    snprintf(right, sizeof(right), "%s      %ld MB used of %ld MB", clock, used / 1024, mem / 1024);
+    snprintf(right, sizeof(right), "%s%s      %ld MB used of %ld MB",
+             dnd_on ? "DND  \xC2\xB7  " : "", clock, used / 1024, mem / 1024);
     float rw = font_width(f11, right);
     font_draw(s, f11, (float)W - rw - 16, y11, right, th->text_dim);
 
@@ -945,6 +986,9 @@ static void draw_desktop(Surface *s, const Theme *th) {
         if (launcher_sel < 0) launcher_sel = 0;
         draw_launcher(s, th);
     }
+    /* the shortcut panel is above every window, and the lock screen is
+     * above everything - it is a security boundary, not a decoration */
+    if (help_open) shortcuts_draw_panel(s, th, topbar_h());
     if (locked) draw_lock_screen(s, th);
 }
 
@@ -1245,8 +1289,383 @@ static void win_toggle_max(Window *w) {
     window_resized(w);
 }
 
+/* ============================================================
+ *  Shortcut actions
+ *
+ *  src/shortcuts.c owns WHICH keys are bound; this owns what they do,
+ *  because the windows, the theme, the wallpaper and the framebuffer all
+ *  live in this file. Every case is a real operation: no action writes a
+ *  placeholder, and a value that is not read back from the system is not
+ *  invented here.
+ * ============================================================ */
+
+/* The area a maximised or snapped window may use: everything under the top
+ * bar and above the dock. Same reserve as win_toggle_max(), so a snapped
+ * window and a maximised one cannot disagree about where the bottom is. */
+static void desk_area(int *x, int *y, int *w, int *h) {
+    int bdx, bdy, bdw, bdh;
+    int reserved = dock_rect(&bdx, &bdy, &bdw, &bdh)
+                 ? (disp.h - bdy + ui_px(12)) : ui_px(16);
+    int top = topbar_h();
+    *x = 0; *y = top; *w = disp.w; *h = disp.h - top - reserved;
+    if (*h < ui_px(160)) *h = disp.h - top;
+}
+
+static void win_fullscreen(Window *w) {
+    if (!w) return;
+    if (w->maxed == 2) {            /* already full screen: give the size back */
+        win_toggle_max(w);
+        return;
+    }
+    if (!w->maxed) {                /* keep the windowed rect to return to */
+        w->restore_x = w->x; w->restore_y = w->y;
+        w->restore_w = w->w; w->restore_h = w->h;
+    }
+    w->x = 0; w->y = 0; w->w = disp.w; w->h = disp.h;
+    w->maxed = 2;
+    window_resized(w);
+    dirty = 1;
+}
+
+static void win_restore_action(Window *w) {
+    if (w && w->maxed) { win_toggle_max(w); return; }
+    /* nothing maximised: bring back the most recently focused window that
+     * was put away, which is what "restore" means when one is minimised */
+    Window *back = NULL;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window *o = &wins[i];
+        if (!o->used || !o->hidden) continue;
+        if (!back || o->z > back->z) back = o;
+    }
+    if (back) { back->hidden = 0; win_focus(back); dirty = 1; }
+}
+
+static void win_snap(Window *w, int dir) {
+    if (!w) return;
+    if (dir == 0) {                 /* Super+Up: maximise, or give the size back */
+        if (w->maxed == 3) w->maxed = 0;
+        win_toggle_max(w);
+        dirty = 1;
+        return;
+    }
+    if (!w->maxed) {                /* remember the windowed rect */
+        w->restore_x = w->x; w->restore_y = w->y;
+        w->restore_w = w->w; w->restore_h = w->h;
+    }
+    int x, y, ww, hh;
+    desk_area(&x, &y, &ww, &hh);
+    w->maxed = 3;                   /* snapped: win_toggle_max restores it */
+    w->y = y; w->h = hh;
+    if (dir < 0)      { w->x = x; w->w = ww / 2; }
+    else              { w->w = ww / 2; w->x = x + ww - w->w; }
+    window_resized(w);
+    dirty = 1;
+}
+
+static void win_move_by(Window *w, int key) {
+    if (!w) return;
+    int step = ui_px(20);
+    if (key == SC_KEY_LEFT)  w->x -= step;
+    if (key == SC_KEY_RIGHT) w->x += step;
+    if (key == SC_KEY_UP)    w->y -= step;
+    if (key == SC_KEY_DOWN)  w->y += step;
+    /* never push the title bar where it cannot be grabbed again */
+    if (w->y < topbar_h()) w->y = topbar_h();
+    if (w->y > disp.h - ui_px(40)) w->y = disp.h - ui_px(40);
+    if (w->x + w->w < ui_px(80)) w->x = ui_px(80) - w->w;
+    if (w->x > disp.w - ui_px(80)) w->x = disp.w - ui_px(80);
+    dirty = 1;
+}
+
+static void win_resize_by(Window *w, int key) {
+    if (!w) return;
+    int step = ui_px(20);
+    if (key == SC_KEY_LEFT)  w->w -= step;
+    if (key == SC_KEY_RIGHT) w->w += step;
+    if (key == SC_KEY_UP)    w->h -= step;
+    if (key == SC_KEY_DOWN)  w->h += step;
+    if (w->w < ui_px(220)) w->w = ui_px(220);
+    if (w->h < ui_px(150)) w->h = ui_px(150);
+    if (w->x + w->w > disp.w) w->w = disp.w - w->x;
+    if (w->y + w->h > disp.h) w->h = disp.h - w->y;
+    w->maxed = 0;                   /* a resized window is a window again */
+    window_resized(w);
+    dirty = 1;
+}
+
+/* Alt+Tab walks the z order: "next" is the window that was focused before
+ * this one (what Alt+Tab always did here), "previous" starts from the other
+ * end, so the two directions are not the same key. */
+static void focus_cycle(int dir) {
+    Window *cur = win_top(), *pick = NULL;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window *w = &wins[i];
+        if (!w->used || w->hidden || w == cur) continue;
+        if (!pick) { pick = w; continue; }
+        if (dir > 0) { if (w->z > pick->z) pick = w; }
+        else         { if (w->z < pick->z) pick = w; }
+    }
+    if (pick) { win_focus(pick); dirty = 1; }
+}
+
+/* A window's identity, for "cycle this app's windows": the bundle id for an
+ * external app, the app id for a built-in one, "terminal" for a shell. */
+static const char *win_identity(const Window *w) {
+    if (w->kind == WIN_TERM) return "terminal";
+    if (w->kind == WIN_CLIENT && w->client >= 0 && w->client < WM_MAX_CLIENTS &&
+        clients[w->client].used)
+        return clients[w->client].id;
+    if (w->app && w->app->vt && w->app->vt->id) return w->app->vt->id;
+    return "";
+}
+
+static void focus_same_app(void) {
+    Window *cur = win_top();
+    if (!cur) return;
+    const char *id = win_identity(cur);
+    if (!id[0]) return;
+    Window *below = NULL, *top = NULL;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window *w = &wins[i];
+        if (!w->used || w->hidden || w == cur) continue;
+        if (strcmp(win_identity(w), id) != 0) continue;
+        if (!top || w->z > top->z) top = w;
+        if (w->z < cur->z && (!below || w->z > below->z)) below = w;
+    }
+    Window *pick = below ? below : top;      /* wrap round to the newest */
+    if (pick) { win_focus(pick); dirty = 1; }
+}
+
+static void launch_bundle(const char *id) {
+    for (int b = 0; b < bundle_count; b++) {
+        if (strcmp(bundles[b].id, id) != 0) continue;
+        int pid = wms_launch(&bundles[b], clients, b);
+        fprintf(stderr, "wms: shortcut launch %s pid %d\n", id, pid);
+        return;
+    }
+    fprintf(stderr, "shortcuts: no installed bundle '%s'\n", id);
+}
+
+/* Theme and wallpaper writes use the same files and the same format the
+ * Settings app uses, so the desktop's once-a-second re-read and the app
+ * cannot disagree about what is on screen. */
+static void theme_apply(int idx) {
+    if (idx < 0 || idx >= theme_count) return;
+    theme_index = idx;
+    FILE *f = fopen("/etc/mystic/current-theme", "w");
+    if (f) { fprintf(f, "%s\n", themes[idx].name); fclose(f); }
+    persist_settings();
+    dirty = 1;
+}
+
+static void wallpaper_apply(int idx) {
+    if (idx < 0 || idx >= WALLPAPER_COUNT) return;
+    wall_index = idx;
+    const char *name = wallpaper_name(idx);
+    if (name) {
+        FILE *f = fopen("/etc/mystic/wallpaper", "w");
+        if (f) { fprintf(f, "%s\n", name); fclose(f); }
+        persist_settings();
+    }
+    wall_t0 = now_sec();
+    dirty = 1;
+}
+
+/* ui.conf stores the scale RELATIVE to ui.c's baseline, and the same file
+ * carries that baseline as its first line. Reading it back is what keeps
+ * this file from hardcoding a third copy of the constant. */
+static float ui_conf_baseline(void) {
+    float base = 1.4f;              /* UI_BASE in src/ui.c: the shipped size */
+    FILE *f = fopen("/etc/mystic/ui.conf", "r");
+    if (!f) return base;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "baseline", 8)) continue;
+        char *eq = strchr(line, '=');
+        if (eq) {
+            float v = (float)atof(eq + 1);
+            if (v > 0.1f && v < 8.0f) base = v;
+        }
+        break;
+    }
+    fclose(f);
+    return base;
+}
+
+/* The five shipped sizes are 0.8 .. 1.6 in steps of 0.2 relative to the
+ * baseline, which is the same set the Settings app offers. Stepping through
+ * them (instead of inventing a fine-grained number) keeps the file readable
+ * and the Settings list in sync with what a chord just did. */
+static void text_size_step(int dir) {
+    float base = ui_conf_baseline();
+    float cur = ui_scale_get() / base;
+    int k = (int)((cur - 0.8f) / 0.2f + 0.5f);
+    if (k < 0) k = 0;
+    if (k > 4) k = 4;
+    if (dir == 0) k = 1;                      /* Ctrl+0: back to 1.0x */
+    else k += dir > 0 ? 1 : -1;
+    if (k < 0) k = 0;
+    if (k > 4) k = 4;
+    float rel = 0.8f + 0.2f * (float)k;
+
+    char text[96];
+    snprintf(text, sizeof(text), "baseline = %.1f\nscale = %.1f\n",
+             (double)base, (double)rel);
+    FILE *f = fopen("/etc/mystic/ui.conf", "w");
+    if (!f) {
+        fprintf(stderr, "shortcuts: ui.conf: %s\n", strerror(errno));
+        return;
+    }
+    int ok = fputs(text, f) != EOF;
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) { fprintf(stderr, "shortcuts: ui.conf not written\n"); return; }
+    ui_scale_load("/etc/mystic/ui.conf");
+    persist_settings();
+    fprintf(stderr, "shortcuts: text scale %.1fx\n", (double)rel);
+    dirty = 1;
+}
+
+/* Do not disturb. The notification service (src/notify.c) takes the same
+ * one-line command over its documented socket, and the file is what a
+ * service started after this press reads. With no service running the file
+ * is still the honest record of the setting. */
+static void dnd_toggle(void) {
+    dnd_on = !dnd_on;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd >= 0) {
+        struct sockaddr_un sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sun_family = AF_UNIX;
+        snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", NOTIFY_SOCKET);
+        if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+            FILE *sf = fdopen(fd, "w");
+            if (sf) {
+                fd = -1;                 /* fclose owns it from here */
+                fprintf(sf, "DND %d\n", dnd_on);
+                fclose(sf);
+            }
+        }
+        if (fd >= 0) close(fd);
+    }
+    FILE *f = fopen("/etc/mystic/dnd", "w");
+    if (f) { fprintf(f, "%d\n", dnd_on); fclose(f); }
+    fprintf(stderr, "shortcuts: do not disturb %s\n", dnd_on ? "on" : "off");
+}
+
+/* A screenshot of the desktop as it is on screen: `scene` is the composed
+ * frame the framebuffer was last given, without the pointer. P6/PPM needs
+ * no encoder and no dependency, and the pixels are the surface's own. */
+static int shot_next;
+static void take_screenshot(void) {
+    if (mkdir("/root/screenshots", 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "shortcuts: screenshot dir: %s\n", strerror(errno));
+        return;
+    }
+    char path[96];
+    int slot = -1;
+    for (int n = shot_next; n < 10000; n++) {
+        struct stat st;
+        snprintf(path, sizeof(path), "/root/screenshots/shot-%04d.ppm", n);
+        if (stat(path, &st) != 0) { slot = n; break; }   /* never overwrite */
+    }
+    if (slot < 0) { fprintf(stderr, "shortcuts: screenshot: no free name\n"); return; }
+    shot_next = slot + 1;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "shortcuts: screenshot: %s\n", strerror(errno)); return; }
+    unsigned char *row = malloc((size_t)scene.w * 3u);
+    if (!row) { fclose(f); remove(path); return; }
+    int ok = fprintf(f, "P6\n%d %d\n255\n", scene.w, scene.h) > 0;
+    for (int y = 0; y < scene.h && ok; y++) {
+        const u32 *src = scene.px + (size_t)y * (size_t)scene.stride;
+        for (int x = 0; x < scene.w; x++) {
+            row[x * 3 + 0] = (unsigned char)((src[x] >> 16) & 0xFF);
+            row[x * 3 + 1] = (unsigned char)((src[x] >> 8) & 0xFF);
+            row[x * 3 + 2] = (unsigned char)(src[x] & 0xFF);
+        }
+        if (fwrite(row, 3, (size_t)scene.w, f) != (size_t)scene.w) ok = 0;
+    }
+    free(row);
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) {
+        fprintf(stderr, "shortcuts: screenshot failed\n");
+        remove(path);
+        return;
+    }
+    fprintf(stderr, "shortcuts: screenshot %s (%dx%d)\n", path, scene.w, scene.h);
+}
+
+static void shortcut_action(void *ctx, int id, int key, unsigned mods) {
+    (void)ctx;
+    (void)mods;
+    Window *w = win_top();
+
+    switch (id) {
+    case SC_ACT_WIN_CLOSE:   if (w) win_close(w); break;
+    case SC_ACT_WIN_MIN:
+        if (w) { w->hidden = 1; Window *nx = win_top(); if (nx) win_focus(nx); }
+        break;
+    case SC_ACT_WIN_MAX:
+        if (w) { if (w->maxed == 3) w->maxed = 0; win_toggle_max(w); }
+        break;
+    case SC_ACT_WIN_FULL:    win_fullscreen(w); break;
+    case SC_ACT_WIN_RESTORE: win_restore_action(w); break;
+    case SC_ACT_WIN_NEXT:    focus_cycle(1); break;
+    case SC_ACT_WIN_PREV:    focus_cycle(-1); break;
+    case SC_ACT_WIN_SAME_APP: focus_same_app(); break;
+    case SC_ACT_WIN_MOVE:    win_move_by(w, key); break;
+    case SC_ACT_WIN_RESIZE:  win_resize_by(w, key); break;
+    case SC_ACT_WIN_SNAP:
+        if (key == SC_KEY_LEFT)       win_snap(w, -1);
+        else if (key == SC_KEY_RIGHT) win_snap(w, 1);
+        else                          win_snap(w, 0);
+        break;
+    case SC_ACT_LAUNCHER:
+        /* a bare Super press is half of a tap: the launcher is toggled when
+         * the key comes back up, so Super+E can still open Files */
+        if (key != SC_KEY_META) launcher_open = !launcher_open;
+        break;
+    case SC_ACT_LOCK:
+        locked = 1;
+        pin_len = 0;
+        pin[0] = 0;
+        lock_msg[0] = 0;
+        break;
+    case SC_ACT_THEME_NEXT:
+        if (theme_count > 0) theme_apply((theme_index + 1) % theme_count);
+        break;
+    case SC_ACT_THEME_SET:   theme_apply(key - SC_KEY_1); break;
+    case SC_ACT_WALLPAPER:   wallpaper_apply((wall_index + 1) % WALLPAPER_COUNT); break;
+    case SC_ACT_TEXT_UP:     text_size_step(1); break;
+    case SC_ACT_TEXT_DOWN:   text_size_step(-1); break;
+    case SC_ACT_TEXT_RESET:  text_size_step(0); break;
+    case SC_ACT_DND:         dnd_toggle(); break;
+    case SC_ACT_SHOT:        take_screenshot(); break;
+    case SC_ACT_TERMINAL:    win_open(WIN_TERM, NULL); break;
+    case SC_ACT_FILES:       win_open(WIN_APP, "files"); break;
+    case SC_ACT_SETTINGS:    win_open(WIN_APP, "settings"); break;
+    case SC_ACT_MONITOR:     win_open(WIN_APP, "monitor"); break;
+    case SC_ACT_NOTES:       win_open(WIN_APP, "notes"); break;
+    case SC_ACT_BROWSER:     launch_bundle("web"); break;
+    case SC_ACT_HELP:        help_open = !help_open; break;
+    case SC_ACT_NONE:
+    case SC_ACT_COUNT:
+    default:
+        /* a row without a case is a compiler warning above and a real
+         * message here - never a key that silently does nothing */
+        fprintf(stderr, "shortcuts: no action for id %d\n", id);
+        break;
+    }
+}
+
+static const ShortcutActions SHORTCUTS = { shortcut_action, NULL };
+
         static int handle_click(void) {
     int mx = input.mouse_x, my = input.mouse_y;
+
+    /* the shortcut panel is modal: a click dismisses it and does nothing
+     * else, so a half-seen key cannot be clicked "through" by accident */
+    if (help_open) { help_open = 0; dirty = 1; return 1; }
 
     /* The taskbar is drawn above the windows, so it must be hit first:
      * otherwise a window dragged over the bar swallows its clicks. */
@@ -1370,6 +1789,16 @@ int main(void) {
         }
         wall_t0 = now_sec();
     }
+    /* do-not-disturb survives a restart: it is the same file Super+N writes,
+     * and the top bar shows it when it is on */
+    {
+        FILE *df = fopen("/etc/mystic/dnd", "r");
+        if (df) {
+            int v = 0;
+            if (fscanf(df, "%d", &v) == 1) dnd_on = v ? 1 : 0;
+            fclose(df);
+        }
+    }
     font_init(FONT_DIR);
     fprintf(stderr, "ui: scale %.2f", ui_scale_get());
     fputc(10, stderr);
@@ -1394,7 +1823,7 @@ int main(void) {
     bundle_count = wms_scan_apps(bundles, WM_MAX_APPS);
     fprintf(stderr, "wms: %d installed app bundle(s)\n", bundle_count);
 
-    int quit = 0, dirty = 1;
+    int quit = 0;
     int cur_x = -1, cur_y = -1;      /* where the cursor is painted right now */
     long last_tick = 0;
 
@@ -1485,6 +1914,26 @@ int main(void) {
         for (int ki = 0; ki < input.nkeys; ki++) {
             int k = input.keys[ki];
 
+            /* Super is a modifier as well as the launcher key, and input.c
+             * reports the Meta keys like any other key, so the desktop tracks
+             * it: held across frames, and a tap (pressed with nothing else in
+             * between) is the launcher on the RELEASE. Toggling on the press
+             * instead would open the launcher and swallow Super+Left. */
+            if (k == SC_KEY_META) { super_down = 1; super_lone = 1; }
+            else if (super_down) super_lone = 0;
+
+            /* the shortcut panel is modal: Esc, F1 or the chord that opened it
+             * closes it, and nothing behind it sees a key while it is up */
+            if (help_open) {
+                if (k == SC_KEY_ESC || k == SC_KEY_F1 ||
+                    (super_down && k == SC_KEY_SLASH)) {
+                    help_open = 0;
+                    dirty = 1;
+                    input.text_len = 0;
+                }
+                continue;
+            }
+
             if (input.ctrl && input.alt && k == 38) {        /* Ctrl+Alt+L */
                 locked = 1;
                 pin_len = 0;
@@ -1495,11 +1944,13 @@ int main(void) {
                 continue;
             }
 
-            if (k == 125) {                  /* Super toggles the launcher */
-                launcher_open = !launcher_open;
-                dirty = 1;
-                continue;
-            }
+            /* What the dispatcher below will be asked with. Computed once so
+             * a binding means the same thing wherever it is reached from. */
+            const unsigned sc_mods = (input.shift ? SC_MOD_SHIFT : 0u) |
+                                     (input.ctrl  ? SC_MOD_CTRL  : 0u) |
+                                     (input.alt   ? SC_MOD_ALT   : 0u) |
+                                     (super_down  ? SC_MOD_SUPER : 0u);
+            const unsigned sc_cond = win_top() ? SC_WHEN_WINDOW : SC_WHEN_NO_WINDOW;
 
             if (launcher_open) {
                 if (k == 1) { launcher_open = 0; dirty = 1; continue; }
@@ -1542,40 +1993,31 @@ int main(void) {
                     dirty = 1;
                     continue;
                 }
-            }
 
-            if (input.alt && k == 15 && z_top > 0) {           /* Alt+Tab */
-                Window *cur = win_top(), *next = NULL;
-                if (cur) {
-                    int best = -1;
-                    for (int i = 0; i < MAX_WINDOWS; i++) {
-                        if (!wins[i].used || wins[i].hidden || &wins[i] == cur) continue;
-                        if (wins[i].z > best) { best = wins[i].z; next = &wins[i]; }
-                    }
-                }
-                if (next) { win_focus(next); dirty = 1; }
-                continue;
-            }
-
-            if (launcher_open) {
-                /* modal overlay: nothing may leak to the window behind it */
+                /* modal overlay: nothing may leak to the window behind it,
+                 * except the bindings the table marks SC_ALWAYS - Alt+Tab
+                 * switched windows through the launcher long before this
+                 * table existed, and it still does */
+                const Shortcut *always = shortcuts_find(k, sc_mods, sc_cond);
+                if (always && (always->flags & SC_ALWAYS))
+                    shortcuts_dispatch(&SHORTCUTS, k, sc_mods, sc_cond);
                 dirty = 1;
                 continue;
             }
 
-            switch (k) {                     /* F1..F5 launch */
-                case 59: win_open(WIN_TERM, NULL); dirty = 1; continue;
-                case 60: win_open(WIN_APP, "files"); dirty = 1; continue;
-                case 61: win_open(WIN_APP, "settings"); dirty = 1; continue;
-                case 62: win_open(WIN_APP, "monitor"); dirty = 1; continue;
-                case 63: win_open(WIN_APP, "notes"); dirty = 1; continue;
-                default: break;
-            }
-
-            if (k == 1) {                    /* Esc closes the top window */
-                Window *t = win_top();
-                if (t) { win_close(t); dirty = 1; }
-                continue;
+            /* One table decides every desktop binding (src/shortcuts.c). It
+             * runs before the focused window gets the key, so a chord always
+             * means the same thing; a key it does not know falls through to
+             * the window exactly as it did before there was a table. */
+            {
+                if (shortcuts_dispatch(&SHORTCUTS, k, sc_mods, sc_cond)) {
+                    /* a chord that also types a character (Ctrl+W is 0x17)
+                     * must not type it into the window behind the action */
+                    if (sc_mods & (SC_MOD_CTRL | SC_MOD_ALT | SC_MOD_SUPER))
+                        input.text_len = 0;
+                    dirty = 1;
+                    continue;
+                }
             }
 
             /* the focused window gets the key */
@@ -1603,6 +2045,19 @@ int main(void) {
             }
         }
 
+        /* Super released: a tap that touched nothing else is the launcher.
+         * Done here rather than on the press, which is what lets Super+Left,
+         * Super+E and the rest keep their own meaning. */
+        for (int i = 0; i < input.nkeys_up; i++) {
+            if (input.keys_up[i] != SC_KEY_META) continue;
+            if (super_down && super_lone) {
+                launcher_open = !launcher_open;
+                dirty = 1;
+            }
+            super_down = 0;
+            super_lone = 0;
+        }
+
         /* releases: the protocol carries a press flag that was always 1, so a
          * client could never tell when a key went back up */
         {
@@ -1617,7 +2072,10 @@ int main(void) {
 
         /* text is delivered once per frame, not per key */
         {
-            Window *top = launcher_open ? NULL : win_top();
+            /* a modal overlay owns the keyboard: nothing typed while the
+             * launcher or the shortcut panel is up may reach the window
+             * behind it */
+            Window *top = (launcher_open || help_open) ? NULL : win_top();
             if (top && input.text_len) {
                 if (top->term) {
                     term_scroll(top->term, -(term_scroll_offset(top->term)));

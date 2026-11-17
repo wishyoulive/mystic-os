@@ -27,20 +27,28 @@
  *                  file is visible on the next repaint.  The "now"
  *                  row is the Theme the desktop passes to this draw
  *                  call, so even the Ctrl+1..9 shortcut (which never
- *                  writes the file, src/main.c:1459-1462) is shown
+ *                  writes the file, src/main.c:1901-1911) is shown
  *                  truthfully.  Enter writes the file's "name ="
  *                  value to /etc/mystic/current-theme, which main.c
- *                  matches against Theme::name (src/main.c:1858-1866).
+ *                  matches against Theme::name (src/main.c:2332-2343).
+ *                  The desktop loads its array once at boot
+ *                  (src/main.c:1812), so a theme file ADDED to the
+ *                  directory while it runs is listed here but could
+ *                  not be applied until a restart; an EDITED file's
+ *                  colours do show up on the next frame.
  *
- *      Wallpaper   the four wallpapers wallpaper_name() implements
- *                  (Dusk, Mesh, Waves, Orbits).  Enter writes the
- *                  name to /etc/mystic/wallpaper, re-read by main.c
- *                  once a second (src/main.c:1810-1819).
+ *      Wallpaper   every wallpaper wallpaper_name() implements, by the
+ *                  name that function returns (Dusk, Mesh, Waves,
+ *                  Orbits, Black Hole, Nebula), so a wallpaper added
+ *                  to src/wallpaper.c gets a row here without this
+ *                  file changing.  Enter writes the name to
+ *                  /etc/mystic/wallpaper, re-read by main.c once a
+ *                  second (src/main.c:2284-2291).
  *
  *      Users       changes the lock-screen password.  It asks for the
  *                  current one and then twice for the new one, checks
  *                  the current one with mystic_check_password() -
- *                  the same call try_unlock() makes (src/main.c:1132)
+ *                  the same call try_unlock() makes (src/main.c:1192)
  *                  - generates a 16-byte salt from /dev/urandom,
  *                  hashes with mystic_make_password_line() at the
  *                  20000 rounds the shipped file uses
@@ -49,6 +57,19 @@
  *                  then reads the file back and verifies the new
  *                  password against it.  Nothing typed is echoed:
  *                  the field draws one '*' per byte, never the byte.
+ *                  The last result stays on the page once the prompt
+ *                  closes, so a change, a refusal and a cancel are all
+ *                  visible after the fact.
+ *
+ *                  /etc/mystic lives in the RAM rootfs, so the new
+ *                  line survives until reboot only if something
+ *                  mirrors it to the disk: stage/init:restore_settings
+ *                  copies /root/mystic-<name> back for the three names
+ *                  it lists (ui.conf, wallpaper, current-theme).
+ *                  Adding "passwd" to that list, and to
+ *                  persist_settings() in src/main.c, is what makes a
+ *                  password change permanent; this file writes the
+ *                  real file the lock screen reads (src/main.c:1177).
  *
  *      Network     the interface of the default route from
  *                  /proc/net/route, its real IPv4 address from
@@ -73,13 +94,17 @@
  *  real ink box (ascent..descent) inside its band.  The tab strip is
  *  measured from the heading font the same way.  There is no bare
  *  pixel height in this file, so the text scale cannot make rows
- *  overlap: they grow with the fonts that fill them.
+ *  overlap: they grow with the fonts that fill them.  A note that
+ *  names several files wraps onto whole extra line_h bands instead of
+ *  being shortened with "..", so the source of every value stays
+ *  readable at every scale.
  *
  *  Input:
  *      Up/Down, j/k        move the selection on a page with controls
  *      Left/Right, Tab     change page
  *      Enter               apply the selected row (or submit a password)
  *      digits 1..9         apply that row of Text size / Theme / Wallpaper
+ *      wheel               move the selection (a page of facts scrolls)
  *      Ctrl+C              cancel a password prompt (Esc is consumed by
  *                          main.c before an app sees it)
  *      click a tab         change page
@@ -124,21 +149,32 @@
 #ifndef MYSTIC_RESOLV
 #define MYSTIC_RESOLV "/etc/resolv.conf"
 #endif
+/* The kernel's own two sources are guarded the same way, so a host probe can
+ * drive the real parsers with a captured /proc/net/route and a scratch sysfs
+ * tree. The desktop build has no definition of these and so reads the real
+ * kernel, exactly like the MYSTIC_* paths above. */
+#ifndef MYSTIC_ROUTE
+#define MYSTIC_ROUTE "/proc/net/route"
+#endif
+#ifndef MYSTIC_SYS_NET
+#define MYSTIC_SYS_NET "/sys/class/net"
+#endif
 
-/* src/main.c loads at most this many theme files
- * (theme_load_all(themes, 8, THEME_DIR), src/main.c:1367). Listing more than
- * the desktop can load would offer rows that cannot be applied. */
-#define MAX_THEMES 16   /* matches the desktop's array; ten themes ship */
+/* src/main.c loads at most this many theme files: `static Theme themes[16]`
+ * filled by theme_load_all(themes, 16, THEME_DIR) (src/main.c:105,1812).
+ * Listing more than the desktop can load would offer rows that cannot be
+ * applied, so these two numbers are the same number. Twelve themes ship. */
+#define MAX_THEMES 16
 
-/* The five values ui_scale_load() accepts after its clamp (src/ui.c:75-77).
- * 1.0 is relative to the shipped readable size, UI_BASE = 1.4 (src/ui.c:24),
+/* The five values ui_scale_load() accepts after its clamp (src/ui.c:58-59).
+ * 1.0 is relative to the shipped readable size, UI_BASE = 1.4 (src/ui.c:23),
  * which is the marker value written below. */
 #define SIZE_COUNT 5
 static const char  *SIZE_LABEL[SIZE_COUNT] = { "Small", "Normal", "Large", "Larger", "Huge" };
 static const float  SIZE_VALUE[SIZE_COUNT] = { 0.8f, 1.0f, 1.2f, 1.4f, 1.6f };
 #define SETTINGS_BASELINE 1.4f
 
-/* The lock screen's pin[64] (src/main.c:161) holds at most 63 bytes, and
+/* The lock screen's pin[64] (src/main.c:167) holds at most 63 bytes, and
  * mystic_hash_password() also truncates at 64, so accepting more here would
  * create a password the lock screen could never match. */
 #define PW_MAX     63
@@ -167,6 +203,7 @@ typedef struct {
     char        value[224];
     int         current;        /* this row is what is in effect on disk */
     const Theme *swatch;        /* non-NULL: draw this theme's colours here */
+    int         lines;          /* K_NOTE only: bands it needs, from rows_measure */
 } PRow;
 
 typedef struct {
@@ -198,7 +235,7 @@ typedef struct {
 /* ---- one grid, every metric from the fonts and ui_px() ------------------ */
 
 /* font_draw() takes y as the ascender line and puts the baseline
- * font_ascent() below it (src/font.c:229). stbtt_ScaleForPixelHeight() makes
+ * font_ascent() below it (src/font.c:1316). stbtt_ScaleForPixelHeight() makes
  * ascent + descent exactly the nominal size while font_height() is
  * size * 1.4, so the glyphs reach font_height/1.4 below y. Centring THAT box
  * is what puts a label in the middle of its row at every text scale. */
@@ -356,15 +393,75 @@ static void head_draw(Surface *s, Font *fh, Font *fr, const Grid *g,
                   th->text_dim);
 }
 
-/* A small explanatory line, in its own font-derived band. */
-static void note_draw(Surface *s, Font *fd, const Grid *g, float ry,
-                      const char *text, const Theme *th) {
+/* A small explanatory line, wrapped onto as many font-derived lines as it
+ * needs. A note that names four files does not fit one row of a 518 px window,
+ * and shortening it with ".." throws away exactly the part that says where
+ * the value came from, so the note is split at spaces instead and its band
+ * grows by whole line_h rows. The grid is still the grid: line_h comes from
+ * the font, nothing here is a bare pixel count. */
+
+/* Split `text` into at most four lines, each of which fits maxw, and return
+ * how many lines were produced. The last line is shortened with ".." only
+ * when a single word is wider than the whole column. */
+static int note_split(const char *text, Font *fd, float maxw,
+                      char out[4][384]) {
     char b[384];
     snprintf(b, sizeof(b), "%s", text ? text : "");
-    fit_text(fd, b, b, sizeof(b), g->val_r - g->lab_x);
-    if (b[0])
-        font_draw(s, fd, g->lab_x, top_y(fd, base_y(fd, ry, g->line_h)), b,
+    int nl = 0;
+    char *p = b;
+    while (*p && nl < 4) {
+        char line[384] = {0};
+        while (*p == ' ') p++;
+        while (*p) {
+            char *e = p;
+            while (*e && *e != ' ') e++;
+            int wl = (int)(e - p);
+            char word[192];
+            if (wl > (int)sizeof(word) - 1) wl = (int)sizeof(word) - 1;
+            memcpy(word, p, (size_t)wl);
+            word[wl] = 0;
+            char trial[384];
+            if (line[0]) snprintf(trial, sizeof(trial), "%s %s", line, word);
+            else         snprintf(trial, sizeof(trial), "%s", word);
+            /* a word that does not fit starts the next line, unless it is the
+             * first word of this one - then it is shortened, never dropped */
+            if (font_width(fd, trial) > maxw && line[0]) break;
+            snprintf(line, sizeof(line), "%s", trial);
+            p = e;
+            while (*p == ' ') p++;
+        }
+        if (!line[0]) break;
+        fit_text(fd, line, out[nl], 384, maxw);
+        nl++;
+    }
+    if (nl == 0) { out[0][0] = 0; nl = 1; }
+    return nl;
+}
+
+/* The number of bands each note needs, filled in once per frame before the
+ * page's offsets are summed. */
+static void rows_measure(PRow *rows, int nr, Font *fd, const Grid *g) {
+    float maxw = g->val_r - g->lab_x;
+    for (int i = 0; i < nr; i++) {
+        rows[i].lines = 0;
+        if (rows[i].kind != K_NOTE) continue;
+        char tmp[4][384];
+        int n = note_split(rows[i].label, fd, maxw, tmp);
+        rows[i].lines = n < 1 ? 1 : n;
+    }
+}
+
+static void note_draw(Surface *s, Font *fd, const Grid *g, float ry,
+                      const char *text, int lines, const Theme *th) {
+    char out[4][384];
+    int nl = note_split(text, fd, g->val_r - g->lab_x, out);
+    if (lines > 0 && nl > lines) nl = lines;
+    for (int i = 0; i < nl; i++) {
+        if (!out[i][0]) continue;
+        float y = ry + (float)i * g->line_h;
+        font_draw(s, fd, g->lab_x, top_y(fd, base_y(fd, y, g->line_h)), out[i],
                   color_alpha(th->text, 0.52f));
+    }
 }
 
 /* ---- reading the facts back off the disk --------------------------------- */
@@ -422,7 +519,7 @@ static long mem_kb(const char *key) {
 }
 
 /* The scale the desktop is really using. This is ui_scale_load()'s own
- * algorithm (src/ui.c:49-84): the clamp, and the legacy conversion when the
+ * algorithm (src/ui.c:44-68): the clamp, and the legacy conversion when the
  * "baseline" marker is absent. Returns 0 when there is no usable setting. */
 static int read_scale(float *out) {
     *out = 1.0f;
@@ -537,7 +634,7 @@ static int cmp_names(const void *a, const void *b) {
 }
 
 /* Read every *.theme the desktop can load, in the same order: filename order
- * (theme_load_all sorts first, src/theme.c:141). theme_load() supplies the
+ * (theme_load_all sorts first, src/theme.c:363). theme_load() supplies the
  * real colours and the "name =" field, so the swatch and the applied name can
  * never disagree. Rescanned on every draw: the list is the disk. */
 static void scan_themes(Settings *s) {
@@ -579,7 +676,7 @@ static void scan_themes(Settings *s) {
 /* The theme the window is being drawn with is the Theme* the desktop hands
  * to settings_draw(); that is the live value, so it is used for the "now"
  * row instead of the current-theme file. That matters because Ctrl+1..9
- * changes theme_index without writing the file (src/main.c:1459-1462). */
+ * changes theme_index without writing the file (src/main.c:1901-1911). */
 
 /* ---- the password -------------------------------------------------------- */
 
@@ -691,7 +788,7 @@ static void pw_start(Settings *s) {
     }
     if (r <= 0) {
         /* No file or an empty one: try_unlock() fails open in that state
-         * (src/main.c:1125-1130), so there is no old password to ask for. */
+         * (src/main.c:1183-1188), so there is no old password to ask for. */
         s->pw_stage = 2;
         pw_set_msg(s, 0, "No password is set yet; choose one and type it twice.");
     } else {
@@ -840,7 +937,7 @@ static int route_default(char *ifname, size_t ifn, char *gw, size_t gwn, int *er
     ifname[0] = 0;
     gw[0] = 0;
 
-    FILE *f = fopen("/proc/net/route", "r");
+    FILE *f = fopen(MYSTIC_ROUTE, "r");
     if (!f) { *err = errno ? errno : EIO; return 0; }
 
     char line[512];
@@ -870,7 +967,7 @@ static int route_default(char *ifname, size_t ifn, char *gw, size_t gwn, int *er
 /* A real interface when there is no default route: the first one in sysfs
  * that is not loopback, or loopback if that is all there is. */
 static int first_iface(char *out, size_t n) {
-    DIR *d = opendir("/sys/class/net");
+    DIR *d = opendir(MYSTIC_SYS_NET);
     if (!d) return 0;
     struct dirent *e;
     char lo[32] = {0};
@@ -894,7 +991,7 @@ static int first_iface(char *out, size_t n) {
 
 static void iface_state(const char *ifname, char *out, size_t n) {
     char path[160];
-    snprintf(path, sizeof(path), "/sys/class/net/%s/operstate", ifname);
+    snprintf(path, sizeof(path), "%s/%s/operstate", MYSTIC_SYS_NET, ifname);
     if (!first_line(path, out, n)) snprintf(out, n, "%s", "unknown");
 }
 
@@ -1040,6 +1137,7 @@ static int page_add(PRow *r, int n, int max, int kind, int id,
     p->id = id;
     p->current = current;
     p->swatch = swatch;
+    p->lines = 0;
     snprintf(p->label, sizeof(p->label), "%s", label ? label : "");
     snprintf(p->value, sizeof(p->value), "%s", value ? value : "");
     return n + 1;
@@ -1049,7 +1147,7 @@ static float band_h(const PRow *r, const Grid *g) {
     switch (r->kind) {
         case K_HEAD: return g->head_h;
         case K_ROW:  return g->row_h;
-        case K_NOTE: return g->line_h;
+        case K_NOTE: return g->line_h * (float)(r->lines > 0 ? r->lines : 1);
         default:     return g->gap;
     }
 }
@@ -1108,9 +1206,8 @@ static int build_page(Settings *st, const Theme *live, PRow *rows, int max) {
         }
         n = page_add(rows, n, max, K_HEAD, -1, "Theme", v, 0, NULL);
         n = page_add(rows, n, max, K_NOTE, -1,
-                     "Each swatch is drawn from that file's own bg_top, "
-                     "bg_bottom, accent and text colours, read now.",
-                     "", 0, NULL);
+                     "Swatch = that file's bg_top, bg_bottom, accent and text, "
+                     "read now.", "", 0, NULL);
         if (st->theme_count == 0) {
             if (st->theme_errno)
                 snprintf(v, sizeof(v), "Cannot read %s: %s", MYSTIC_THEME_DIR,
@@ -1144,8 +1241,8 @@ static int build_page(Settings *st, const Theme *live, PRow *rows, int max) {
             snprintf(v, sizeof(v), "%s", "now: unknown name");
         n = page_add(rows, n, max, K_HEAD, -1, "Wallpaper", v, 0, NULL);
         n = page_add(rows, n, max, K_NOTE, -1,
-                     "The four wallpapers wallpaper.c actually paints.", "",
-                     0, NULL);
+                     "Every wallpaper wallpaper.c paints, by the name it "
+                     "answers to. Enter applies one.", "", 0, NULL);
         for (int i = 0; i < WALLPAPER_COUNT; i++) {
             const char *nm = wallpaper_name(i);
             int is_cur = (i == cur);
@@ -1170,6 +1267,12 @@ static int build_page(Settings *st, const Theme *live, PRow *rows, int max) {
             n = page_add(rows, n, max, K_NOTE, -1,
                          "Enter starts; the current password is checked "
                          "before a new one is accepted.", "", 0, NULL);
+            /* The prompt is gone but its result is not: a change, a refusal
+             * and a cancel each leave a line here, so the outcome of the
+             * action is readable after the fact instead of only in the
+             * status band. */
+            if (st->pw_msg[0])
+                n = page_add(rows, n, max, K_NOTE, -1, st->pw_msg, "", 0, NULL);
         } else {
             char mask[64];
             pw_mask(st->pw_buf, st->pw_len, mask, sizeof(mask));
@@ -1283,8 +1386,10 @@ static const char *tab_hint(const Settings *s) {
         case TAB_WALL:
             return "Enter applies; the desktop re-reads wallpaper within a second.";
         case TAB_USERS:
-            return s->pw_stage ? "Ctrl+C cancels. Nothing you type is shown."
-                               : "Enter starts. The current password is checked first.";
+            return s->pw_stage
+                 ? "Ctrl+C cancels. Nothing you type is shown."
+                 : "Enter starts. The current password is checked first "
+                   "when one is set.";
         case TAB_NET:
             return "Read now from /proc/net/route, the interface and resolv.conf.";
         case TAB_STORAGE:
@@ -1429,6 +1534,7 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h,
     PRow rows[MAX_PAGE_ROWS];
     float off[MAX_PAGE_ROWS];
     int nr = build_page(st, th, rows, MAX_PAGE_ROWS);
+    rows_measure(rows, nr, fd, &g);          /* how many lines each note takes */
     float cy = 0.0f;
     for (int i = 0; i < nr; i++) {
         off[i] = cy;
@@ -1513,30 +1619,38 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h,
                 break;
             }
             case K_NOTE:
-                note_draw(&bs, fd, &g, ry, rows[i].label, th);
+                note_draw(&bs, fd, &g, ry, rows[i].label, rows[i].lines, th);
                 break;
             default:
                 break;
         }
     }
 
-    /* Scroll indicators, in the page margin to the right of the value
-     * column, only when the page really continues past an edge. */
-    {
-        float t = font_height(fd) * 0.4f;
-        if (body_h > g.line_h * 1.5f && t > 1.0f && body_h > t * 2.0f) {
-            float mx = (float)(x + w) - t - (float)ui_px(2);
-            if (st->scroll + body_h < content_h - 0.5f) {
-                float my = body_bottom - t - (float)ui_px(4);
-                float dn[6] = { mx, my, mx + t, my, mx + t * 0.5f, my + t * 0.8f };
-                gfx_polygon(s, dn, 3, color_alpha(th->text, 0.45f));
-            }
-            if (st->scroll > 0.5f) {
-                float my = body_top + (float)ui_px(3);
-                float up[6] = { mx, my + t * 0.8f, mx + t, my + t * 0.8f,
-                                mx + t * 0.5f, my };
-                gfx_polygon(s, up, 3, color_alpha(th->text, 0.45f));
-            }
+    /* A scroll bar in the page's right margin, clear of the value column, and
+     * only when the page really continues past an edge. The old pair of
+     * triangles sat on the first and last row's value text; a thumb in the
+     * margin cannot collide with a label and also says how far down the page
+     * you are. Track and thumb are sized from ui_px(), so they scale with the
+     * text like every other margin here. */
+    if (content_h > body_h + 0.5f && body_h > g.line_h * 0.5f) {
+        float tw = (float)ui_px(4);
+        if (tw < 1.0f) tw = 1.0f;
+        float tx = (float)(x + w) - g.m * 0.5f - tw * 0.5f;
+        float ty = body_top + (float)ui_px(2);
+        float track_h = body_h - (float)ui_px(4);
+        if (track_h > tw) {
+            gfx_rrect_aa(s, tx, ty, tw, track_h, tw * 0.5f,
+                         color_alpha(th->text, 0.16f), 0, 0);
+            float frac = body_h / content_h;
+            float thumb = track_h * frac;
+            if (thumb < tw * 2.0f) thumb = tw * 2.0f;
+            if (thumb > track_h) thumb = track_h;
+            float t = st->scroll / (content_h - body_h);
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+            float thumb_y = ty + (track_h - thumb) * t;
+            gfx_rrect_aa(s, tx, thumb_y, tw, thumb, tw * 0.5f,
+                         color_alpha(th->text, 0.50f), 0, 0);
         }
     }
 
@@ -1620,7 +1734,7 @@ static void activate(Settings *s) {
 }
 
 /* A digit picks the nth row of the page's own short list - 1..5 for the text
- * sizes, 1..8 for the themes, 1..4 for the wallpapers. */
+ * sizes, 1..12 for the themes, 1..6 for the wallpapers. */
 static void pick_digit(Settings *s, int idx) {
     switch (s->tab) {
         case TAB_TEXT:
