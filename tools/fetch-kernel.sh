@@ -31,6 +31,8 @@ kernel/drivers/i2c
 kernel/drivers/input
 kernel/drivers/block
 kernel/fs/fat
+kernel/fs/ext4
+kernel/fs/jbd2
 kernel/fs/nls
 "
 
@@ -61,6 +63,15 @@ for tree in $MODULE_TREES; do
         mkdir -p "$(dirname "$out")"
         gzip -dc "$KDIR/lib/modules/$KV/$rel" > "$out"
     done
+done
+
+# a couple of modules live directly under kernel/fs/ rather than in a subdir
+for rel in kernel/fs/mbcache.ko; do
+    src="$KDIR/lib/modules/$KV/$rel.gz"
+    [ -f "$src" ] || continue
+    out="$DEST/$rel"
+    mkdir -p "$(dirname "$out")"
+    gzip -dc "$src" > "$out"
 done
 
 count=$(find "$DEST" -name '*.ko' | wc -l)

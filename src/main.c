@@ -49,6 +49,14 @@ typedef struct {
 static Window wins[MAX_WINDOWS];
 static int    z_top;
 static int    drag_win = -1, drag_dx, drag_dy;
+static int    resize_win = -1;
+static int    launcher_open = 0;
+
+/* lock screen state */
+static int    locked = 0;
+static char   pin[64];
+static int    pin_len = 0;
+static char   lock_msg[96] = "";
 static int    mouse_prev;
 
 /* ------------------------------------------------------------ helpers */
@@ -192,6 +200,9 @@ static void dock_rect(int *dx, int *dy, int *dw, int *dh) {
     *dy = disp.h - h - 22;
 }
 
+static void draw_launcher(Surface *s, const Theme *th);
+static void draw_lock_screen(Surface *s, const Theme *th);
+
 /* ------------------------------------------------------------ compose */
 static void draw_desktop(Surface *s, const Theme *th) {
     int W = s->w, H = s->h;
@@ -259,6 +270,13 @@ static void draw_desktop(Surface *s, const Theme *th) {
 
         font_draw(s, f13, (float)cur->x + 72, (float)cur->y + 13, cur->title, th->text);
 
+        /* resize grip */
+        for (int g = 0; g < 3; g++) {
+            float gx = (float)(cur->x + cur->w - 6 - g * 5);
+            float gy = (float)(cur->y + cur->h - 6);
+            gfx_line(s, gx - 4, gy, gx, gy - 4, 1.4f, color_alpha(th->text, 0.30f));
+        }
+
         int cx0 = cur->x + 1, cy0 = cur->y + tb + 1;
         int cw0 = cur->w - 2, ch0 = cur->h - tb - 3;
 
@@ -288,7 +306,170 @@ static void draw_desktop(Surface *s, const Theme *th) {
         u32 bg = hovered ? color_alpha(th->accent, 0.22f) : color_alpha(th->text, 0.07f);
         gfx_rrect_aa(s, ix, iy, (float)isz, (float)isz, 11.0f, bg, 0, 0);
         DOCK[i].icon(s, ix, iy, (float)isz, hovered ? th->accent : th->text);
+
+        /* a dot under the icon when that app is open */
+        int open = 0;
+        for (int wi = 0; wi < MAX_WINDOWS; wi++) {
+            if (!wins[wi].used) continue;
+            if (DOCK[i].app_id) {
+                if (wins[wi].app && wins[wi].app->vt && !strcmp(wins[wi].app->vt->id, DOCK[i].app_id))
+                    open = 1;
+            } else if (wins[wi].term) {
+                open = 1;
+            }
+        }
+        if (open)
+            gfx_rrect_aa(s, ix + (float)isz / 2 - 2, iy + (float)isz + 3, 4, 4, 2, th->accent, 0, 0);
     }
+
+    if (launcher_open) draw_launcher(s, th);
+    if (locked) draw_lock_screen(s, th);
+}
+
+/* ------------------------------------------------------------ launcher
+ * Super opens a grid of every app that exists. Tiles are the same icons
+ * as the dock, so there is one place that defines what an app looks like.
+ */
+typedef struct {
+    const char *app_id;      /* NULL = terminal */
+    const char *label;
+    void (*icon)(Surface *, float, float, float, u32);
+} LauncherItem;
+
+static const LauncherItem LAUNCHER[] = {
+    { NULL,       "Terminal", icon_terminal },
+    { "files",    "Files",    icon_folder },
+    { "settings", "Settings", icon_gear },
+    { "monitor",  "Monitor",  icon_bars },
+    { "notes",    "Notes",    icon_pencil },
+    { "sysinfo",  "System",   icon_gear },
+};
+#define LAUNCHER_N ((int)(sizeof(LAUNCHER) / sizeof(LAUNCHER[0])))
+
+static void launcher_geom(int idx, int *tx, int *ty, int *tw, int *th) {
+    const int cols = 3, tile = 128, gap = 18, grid_h = 118;
+    int rows = (LAUNCHER_N + cols - 1) / cols;
+    int gw = cols * tile + (cols - 1) * gap;
+    int gh = rows * grid_h + (rows - 1) * gap;
+    int gx = (disp.w - gw) / 2;
+    int gy = (disp.h - gh) / 2;
+    int r = idx / cols, c = idx % cols;
+    *tx = gx + c * (tile + gap);
+    *ty = gy + r * (grid_h + gap);
+    *tw = tile;
+    *th = grid_h;
+}
+
+static void draw_launcher(Surface *s, const Theme *th) {
+    /* dim everything behind */
+    surf_blend(s, 0, 0, s->w, s->h, 0xAA000000u);
+
+    const int cols = 3, tile = 128, gap = 18, grid_h = 118;
+    int rows = (LAUNCHER_N + cols - 1) / cols;
+    int gw = cols * tile + (cols - 1) * gap;
+    int gh = rows * grid_h + (rows - 1) * gap;
+    int px = (s->w - gw) / 2 - 24;
+    int py = (s->h - gh) / 2 - 24;
+    int pw = gw + 48, ph = gh + 48;
+
+    gfx_shadow(s, (float)px, (float)py, (float)pw, (float)ph, 22, 30, 0.55f);
+    if (th->blur > 0) gfx_blur_region(s, px, py, pw, ph, (int)(22 * th->blur));
+    gfx_rrect_aa(s, (float)px, (float)py, (float)pw, (float)ph, 22,
+                 color_alpha(th->window_bg, 0.97f), th->window_border, 1.0f);
+
+    Font *f12 = font_get(FONT_MEDIUM, 12);
+    Font *fd = font_get(FONT_REGULAR, 10);
+
+    for (int i = 0; i < LAUNCHER_N; i++) {
+        int tx, ty, tw, th2;
+        launcher_geom(i, &tx, &ty, &tw, &th2);
+        int hovered = (input.mouse_x >= tx && input.mouse_x < tx + tw &&
+                       input.mouse_y >= ty && input.mouse_y < ty + th2);
+        u32 bg = hovered ? color_alpha(th->accent, 0.22f) : color_alpha(th->text, 0.06f);
+        gfx_rrect_aa(s, (float)tx, (float)ty, (float)tw, (float)th2, 14.0f, bg, 0, 0);
+
+        float isz = 52;
+        LAUNCHER[i].icon(s, (float)tx + (tw - isz) / 2, (float)ty + 18, isz,
+                         hovered ? th->accent : th->text);
+
+        float lw = font_width(f12, LAUNCHER[i].label);
+        font_draw(s, f12, (float)tx + (tw - lw) / 2, (float)ty + th2 - 30,
+                  LAUNCHER[i].label, hovered ? th->text : th->text_dim);
+    }
+
+    float hw = font_width(fd, "Super or Esc closes");
+    font_draw(s, fd, (float)(s->w - hw) / 2, (float)(py + ph + 10),
+              "Super or Esc closes", color_alpha(th->text, 0.55f));
+}
+
+/* ------------------------------------------------------------ lock screen
+ * Ctrl+Alt+L locks. The password is checked against /etc/mystic/passwd,
+ * which holds SHA-256 iterated over salt||password, 20000 rounds.
+ */
+static void draw_lock_screen(Surface *s, const Theme *th) {
+    if (th->blur > 0) gfx_blur_region(s, 0, 0, s->w, s->h, 40);
+    surf_blend(s, 0, 0, s->w, s->h, 0xB0000000u);
+
+    int pw = 380, ph = 210;
+    int px = (s->w - pw) / 2, py = (s->h - ph) / 2;
+
+    gfx_shadow(s, (float)px, (float)py, (float)pw, (float)ph, 20, 26, 0.6f);
+    gfx_rrect_aa(s, (float)px, (float)py, (float)pw, (float)ph, 20,
+                 th->window_bg, th->window_border, 1.0f);
+
+    Font *fh = font_get(FONT_MEDIUM, 16);
+    Font *fr = font_get(FONT_REGULAR, 12);
+    Font *fd = font_get(FONT_REGULAR, 10);
+
+    char clock[16] = {0};
+    time_t t = time(NULL);
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+    snprintf(clock, sizeof(clock), "%02d:%02d", tmv.tm_hour, tmv.tm_min);
+
+    float hw = font_width(fh, clock);
+    font_draw(s, fh, (float)px + (pw - hw) / 2, (float)py + 26, clock, th->text);
+
+    float lw = font_width(fr, "Mystic OS is locked");
+    font_draw(s, fr, (float)px + (pw - lw) / 2, (float)py + 58, "Mystic OS is locked",
+              th->text_dim);
+
+    /* password field, one dot per character */
+    int fw = pw - 80, fh2 = 38;
+    int fx = px + 40, fy = py + 92;
+    gfx_rrect_aa(s, (float)fx, (float)fy, (float)fw, (float)fh2, 9,
+                 color_alpha(th->text, 0.08f), th->window_border, 1.0f);
+    float dx = (float)fx + 14;
+    for (int i = 0; i < pin_len && i < 24; i++) {
+        gfx_rrect_aa(s, dx, (float)fy + 15, 8, 8, 4, th->text, 0, 0);
+        dx += 14;
+    }
+
+    if (lock_msg[0]) {
+        float mw = font_width(fd, lock_msg);
+        font_draw(s, fd, (float)px + (pw - mw) / 2, (float)py + 142, lock_msg, th->accent);
+    }
+    font_draw(s, fd, (float)px + 40, (float)py + 170, "Enter to unlock", color_alpha(th->text, 0.45f));
+}
+
+static void try_unlock(void) {
+    char line[256] = {0};
+    FILE *f = fopen("/etc/mystic/passwd", "r");
+    if (f) {
+        if (!fgets(line, sizeof(line), f)) line[0] = 0;
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        fclose(f);
+    }
+    pin[pin_len < (int)sizeof(pin) ? pin_len : (int)sizeof(pin) - 1] = 0;
+    if (line[0] && mystic_check_password(line, pin)) {
+        locked = 0;
+        snprintf(lock_msg, sizeof(lock_msg), "%s", "");
+    } else {
+        snprintf(lock_msg, sizeof(lock_msg), "wrong password");
+    }
+    pin_len = 0;
+    pin[0] = 0;
 }
 
 /* ------------------------------------------------------------ cursor */
@@ -328,6 +509,20 @@ static void key_bytes(char *out, int *n) {
 static int handle_click(void) {
     int mx = input.mouse_x, my = input.mouse_y;
 
+    if (launcher_open) {
+        for (int i = 0; i < LAUNCHER_N; i++) {
+            int tx, ty, tw, th2;
+            launcher_geom(i, &tx, &ty, &tw, &th2);
+            if (mx < tx || mx >= tx + tw || my < ty || my >= ty + th2) continue;
+            if (LAUNCHER[i].app_id) win_open(WIN_APP, LAUNCHER[i].app_id);
+            else                    win_open(WIN_TERM, NULL);
+            launcher_open = 0;
+            return 1;
+        }
+        launcher_open = 0;                  /* click outside closes */
+        return 1;
+    }
+
     /* topmost window under the pointer */
     Window *hit = NULL;
     for (int i = 0; i < MAX_WINDOWS; i++) {
@@ -342,6 +537,11 @@ static int handle_click(void) {
         int lx = mx - hit->x, ly = my - hit->y;
         /* close dot */
         if (ly < tb && lx >= 14 && lx < 24) { win_close(hit); return 1; }
+        /* bottom-right corner resizes */
+        if (lx >= hit->w - 18 && ly >= hit->h - 18) {
+            resize_win = (int)(hit - wins);
+            return 1;
+        }
         /* title bar = drag */
         if (ly < tb) {
             drag_win = (int)(hit - wins);
@@ -404,6 +604,41 @@ int main(void) {
         if (input.mouse_x >= disp.w) input.mouse_x = disp.w - 1;
         if (input.mouse_y >= disp.h) input.mouse_y = disp.h - 1;
 
+        if (input.ctrl && input.alt && input.key == 38) {   /* Ctrl+Alt+L */
+            locked = 1;
+            pin_len = 0;
+            pin[0] = 0;
+            lock_msg[0] = 0;
+            dirty = 1;
+            /* the 'l' of the shortcut itself arrives as a control character in
+             * this same frame - drop it or it becomes the first password byte */
+            input.text_len = 0;
+            input.key = 0;
+        }
+
+        if (locked) {
+            for (int i = 0; i < input.text_len; i++) {
+                unsigned char c = (unsigned char)input.text[i];
+                if (c < 32) continue;      /* Enter/Backspace arrive here too - ignore */
+                if (pin_len < (int)sizeof(pin) - 1) pin[pin_len++] = (char)c;
+            }
+            if (input.key == 14 && pin_len > 0) pin[--pin_len] = 0;   /* Backspace */
+            if (input.key == 28) try_unlock();                        /* Enter */
+            dirty = 1;
+            if (locked) {
+                if (dirty) {
+                    draw_desktop(&scene, &themes[theme_index]);
+                    surf_copy(&screen, &scene);
+                    draw_cursor_at(&screen, input.mouse_x, input.mouse_y);
+                    disp_present(&disp, &screen);
+                    dirty = 0;
+                }
+                struct pollfd lp = { 0, 0, 0 };
+                poll(&lp, 1, 16);
+                continue;
+            }
+        }
+
         /* global keys */
         for (int i = 0; i < input.text_len; i++) {
             char c = input.text[i];
@@ -412,6 +647,31 @@ int main(void) {
                 if (idx < theme_count) { theme_index = idx; dirty = 1; }
             }
         }
+        if (input.key == 125) {                 /* Super toggles the launcher */
+            launcher_open = !launcher_open;
+            dirty = 1;
+        } else if (launcher_open && input.key == 1) {   /* Esc closes it */
+            launcher_open = 0;
+            dirty = 1;
+        }
+
+        /* Alt+Tab cycles the window stack */
+        if (input.alt && input.key == 15 && z_top > 0) {          /* KEY_TAB */
+            Window *cur = win_top();
+            Window *next = NULL;
+            if (cur) {
+                int best = -1;
+                for (int i = 0; i < MAX_WINDOWS; i++) {
+                    if (!wins[i].used || &wins[i] == cur) continue;
+                    if (wins[i].z > best) { best = wins[i].z; next = &wins[i]; }
+                }
+                if (!next) {                      /* only one window: nothing to cycle */
+                    next = NULL;
+                }
+            }
+            if (next) { win_focus(next); dirty = 1; }
+        }
+
         /* F1..F5 launch, so apps are reachable without a mouse */
         switch (input.key) {
             case 59: win_open(WIN_TERM, NULL); dirty = 1; break;   /* F1 terminal */
@@ -433,9 +693,17 @@ int main(void) {
             if (top->term) {
                 char buf[64];
                 int n = 0;
-                key_bytes(buf, &n);
-                if (n) term_key(top->term, buf, n);
-                if (input.text_len) term_key(top->term, input.text, input.text_len);
+                if (input.shift && (input.key == 104 || input.key == 109)) {
+                    term_scroll(top->term, input.key == 104 ? 8 : -8);
+                    dirty = 1;
+                } else {
+                    key_bytes(buf, &n);
+                    if (n) term_key(top->term, buf, n);
+                }
+                if (input.text_len) {
+                    term_scroll(top->term, -(term_scroll_offset(top->term)));
+                    term_key(top->term, input.text, input.text_len);
+                }
             } else if (top->app) {
                 if (input.text_len) app_key(top->app, input.text, input.text_len);
                 if (input.key == 14) app_key(top->app, "\b", 1);   /* Backspace */
@@ -444,8 +712,53 @@ int main(void) {
         }
 
         /* mouse */
+        if (input.wheel) {
+            Window *under = NULL;
+            for (int i = 0; i < MAX_WINDOWS; i++) {
+                Window *w = &wins[i];
+                if (!w->used || !w->term) continue;
+                if (input.mouse_x < w->x || input.mouse_x >= w->x + w->w) continue;
+                if (input.mouse_y < w->y || input.mouse_y >= w->y + w->h) continue;
+                if (!under || w->z > under->z) under = w;
+            }
+            if (under) { term_scroll(under->term, input.wheel * 3); dirty = 1; }
+        }
         if (input.clicked & 1) { if (handle_click()) dirty = 1; }
-        if (input.released & 1) drag_win = -1;
+        if (input.released & 1) {
+            if (drag_win >= 0 && wins[drag_win].used) {
+                Window *w = &wins[drag_win];
+                const int bar = 34;
+                if (w->y <= bar + 6) {                       /* top edge: full width */
+                    w->x = 0; w->y = bar; w->w = disp.w; w->h = disp.h - bar - 90;
+                } else if (w->x <= 8) {                      /* left edge: left half */
+                    w->x = 0; w->y = bar; w->w = disp.w / 2; w->h = disp.h - bar - 90;
+                } else if (w->x + w->w >= disp.w - 8) {      /* right edge: right half */
+                    w->w = disp.w / 2; w->x = disp.w - w->w;
+                    w->y = bar; w->h = disp.h - bar - 90;
+                }
+                if (w->app && w->app->vt && w->app->vt->resize)
+                    w->app->vt->resize(w->app, w->w - 2, w->h - 42);
+                dirty = 1;
+            }
+            drag_win = -1;
+            resize_win = -1;
+        }
+        if ((input.buttons & 1) && resize_win >= 0) {
+            Window *w = &wins[resize_win];
+            if (w->used) {
+                int nw = input.mouse_x - w->x + 1;
+                int nh = input.mouse_y - w->y + 1;
+                if (nw < 280) nw = 280;
+                if (nh < 160) nh = 160;
+                if (nw != w->w || nh != w->h) {
+                    w->w = nw;
+                    w->h = nh;
+                    if (w->app && w->app->vt && w->app->vt->resize)
+                        w->app->vt->resize(w->app, w->w - 2, w->h - 42);
+                    dirty = 1;
+                }
+            }
+        }
         if ((input.buttons & 1) && drag_win >= 0) {
             Window *w = &wins[drag_win];
             if (w->used) {

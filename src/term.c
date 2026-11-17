@@ -28,12 +28,18 @@ typedef struct {
     u8  fg, bg, bold;
 } Cell;
 
+#define HIST_ROWS 600      /* lines of scrollback per terminal */
+
 struct Term {
     int   fd;
     pid_t pid;
     int   cols, rows;
 
     Cell *grid;          /* rows * cols */
+    Cell *hist;          /* ring buffer of lines that scrolled off the top */
+    int   hist_head;     /* next slot to write in hist */
+    int   hist_count;    /* valid lines in hist */
+    int   scroll;        /* lines scrolled back from the live screen */
     int   cx, cy;        /* cursor */
     u8    fg, bg, bold;
 
@@ -78,7 +84,15 @@ static void clear_cells(Term *t, int x0, int y0, int x1, int y1) {
         }
 }
 
+static void hist_push(Term *t, const Cell *row) {
+    if (!t->hist) return;
+    memcpy(t->hist + (size_t)t->hist_head * t->cols, row, (size_t)t->cols * sizeof(Cell));
+    t->hist_head = (t->hist_head + 1) % HIST_ROWS;
+    if (t->hist_count < HIST_ROWS) t->hist_count++;
+}
+
 static void scroll_up(Term *t) {
+    hist_push(t, t->grid);
     memmove(t->grid, t->grid + t->cols, (size_t)(t->rows - 1) * t->cols * sizeof(Cell));
     Cell *last = t->grid + (size_t)(t->rows - 1) * t->cols;
     for (int x = 0; x < t->cols; x++) {
@@ -254,7 +268,8 @@ Term *term_create(int cols, int rows, const char *shell) {
     t->alive = 1;
     t->dirty = 1;
     t->grid = calloc((size_t)cols * rows, sizeof(Cell));
-    if (!t->grid) { free(t); return NULL; }
+    t->hist = calloc((size_t)cols * HIST_ROWS, sizeof(Cell));
+    if (!t->grid || !t->hist) { free(t->grid); free(t->hist); free(t); return NULL; }
     clear_cells(t, 0, 0, cols - 1, rows - 1);
 
     struct winsize ws = { 0 };
@@ -311,6 +326,16 @@ void term_key(Term *t, const char *bytes, int n) {
     (void)r;
 }
 
+void term_scroll(Term *t, int lines) {
+    if (!t) return;
+    t->scroll += lines;
+    if (t->scroll > t->hist_count) t->scroll = t->hist_count;
+    if (t->scroll < 0) t->scroll = 0;
+    t->dirty = 1;
+}
+
+int term_scroll_offset(Term *t) { return t ? t->scroll : 0; }
+
 void term_clear_screen(Term *t) {
     if (!t) return;
     clear_cells(t, 0, 0, t->cols - 1, t->rows - 1);
@@ -329,9 +354,20 @@ void term_draw(Term *t, Surface *s, int x, int y, int w, int h,
 
     surf_fill(s, x, y, w, h, PALETTE[0]);
 
+    int first_line = t->hist_count - t->scroll;   /* line index shown at the top */
+
     for (int ry = 0; ry < rows; ry++) {
         for (int rx = 0; rx < cols; rx++) {
-            Cell *c = cell_at(t, rx, ry);
+            int line = first_line + ry;
+            Cell *c = NULL;
+            if (line < 0) continue;
+            if (line < t->hist_count) {
+                int idx = (t->hist_head - t->hist_count + line + HIST_ROWS * 2) % HIST_ROWS;
+                c = &t->hist[(size_t)idx * t->cols + rx];
+            } else {
+                int gy = line - t->hist_count;
+                if (gy < t->rows) c = cell_at(t, rx, gy);
+            }
             if (!c) continue;
             float px = x + rx * cw;
             float py = y + ry * ch;
@@ -356,8 +392,17 @@ void term_draw(Term *t, Surface *s, int x, int y, int w, int h,
         }
     }
 
+    if (t->scroll > 0) {
+        char ind[48];
+        snprintf(ind, sizeof(ind), "  scrolled back %d lines  ", t->scroll);
+        float iw = font_width(fr, ind);
+        gfx_rrect_aa(s, (float)x + (w - iw) / 2 - 8, (float)(y + h) - 20, iw + 16, 16, 8,
+                     0xCC000000u, 0, 0);
+        font_draw(s, fr, (float)x + (w - iw) / 2, (float)(y + h) - 17, ind, 0xFFCCCCCCu);
+    }
+
     /* cursor */
-    if (t->alive && t->cx < cols && t->cy < rows) {
+    if (t->scroll == 0 && t->alive && t->cx < cols && t->cy < rows) {
         float px = x + t->cx * cw;
         float py = y + t->cy * ch;
         surf_blend(s, (int)px, (int)py + (int)ch - 2, (int)cw, 2, 0xFFBBBBBBu);
