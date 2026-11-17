@@ -250,7 +250,15 @@ void wms_notify_key(WmClient *c, int key, int mods, int press) {
     sendf(c, "KEY %d %d %d\n", key, mods, press);
 }
 void wms_notify_text(WmClient *c, const char *utf8) {
-    sendf(c, "TEXT %s\n", utf8 ? utf8 : "");
+    /* The event stream is line oriented, so a newline inside the text would end
+     * the message early: Enter reached every sandboxed app as an EMPTY text
+     * event and so never did anything. Line breakers travel as 0x01. */
+    char buf[512];
+    size_t o = 0;
+    for (const char *p = utf8 ? utf8 : ""; *p && o + 1 < sizeof(buf); p++)
+        buf[o++] = (*p == 10 || *p == 13) ? 1 : *p;
+    buf[o] = 0;
+    sendf(c, "TEXT %s\n", buf);
 }
 void wms_notify_mouse(WmClient *c, int x, int y, int buttons) {
     sendf(c, "MOUSE %d %d %d\n", x, y, buttons);
@@ -307,6 +315,7 @@ int wms_scan_apps(WmApp *out, int max) {
             if (!strcmp(k, "name")) snprintf(a->name, sizeof(a->name), "%s", v);
             else if (!strcmp(k, "desc")) snprintf(a->desc, sizeof(a->desc), "%s", v);
             else if (!strcmp(k, "exec")) snprintf(a->exe, sizeof(a->exe), "%s", v);
+            else if (!strcmp(k, "network") && !strcmp(v, "host")) a->net = 1;
         }
         fclose(f);
         if (!a->name[0]) snprintf(a->name, sizeof(a->name), "%s", a->id);
@@ -344,7 +353,7 @@ static void mkdirp_for(const char *jail, const char *sub) {
     mkdir(buf, 0755);
 }
 
-static void sandbox_child(const char *exe, const char *id) {
+static void sandbox_child(const char *exe, const char *id, int net) {
     char jail[192], path[256];
     snprintf(jail, sizeof(jail), "/run/mystic/jail/%s", id);
 
@@ -355,7 +364,11 @@ static void sandbox_child(const char *exe, const char *id) {
      * paths; they do not take away file descriptors. */
     for (int fd = 3; fd < 1024; fd++) close(fd);
 
-    if (unshare(CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS) == 0) {
+    /* An app that declares 'network = host' keeps the real namespace: a
+     * browser in an empty netns can only reach loopback, which is exactly the
+     * 'name lookup timed out' it used to report. Everything else stays blind. */
+    int ns = CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | (net ? 0 : CLONE_NEWNET);
+    if (unshare(ns) == 0) {
         mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
 
         /* mkdir(2) does not create parents: /run/mystic/jail must exist
@@ -386,6 +399,19 @@ static void sandbox_child(const char *exe, const char *id) {
         fd = open(path, O_CREAT | O_RDWR, 0666);
         if (fd >= 0) close(fd);
         mount(WM_SOCKET, path, NULL, MS_BIND, NULL);
+
+        if (net) {
+            /* getaddrinfo needs these two; ro, and only when asked for */
+            snprintf(path, sizeof(path), "%s/etc", jail);   mkdir(path, 0755);
+            const char *cf[] = { "/etc/resolv.conf", "/etc/hosts" };
+            for (int ci = 0; ci < 2; ci++) {
+                snprintf(path, sizeof(path), "%s%s", jail, cf[ci]);
+                fd = open(path, O_CREAT | O_RDWR, 0644);
+                if (fd >= 0) close(fd);
+                if (mount(cf[ci], path, NULL, MS_BIND | MS_RDONLY, NULL) < 0)
+                    fprintf(stderr, "wms: sandbox bind %s failed: %s\n", cf[ci], strerror(errno));
+            }
+        }
 
         snprintf(path, sizeof(path), "%s/dev/null", jail);
         fd = open(path, O_CREAT | O_RDWR, 0666);
@@ -460,7 +486,7 @@ int wms_launch(const WmApp *app, WmClient *cl, int slot) {
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
-        sandbox_child(exe, app->id);
+        sandbox_child(exe, app->id, app->net);
         execl("/bin/app", "app", (char *)NULL);   /* inside the jail, or not at all */
         fprintf(stderr, "wms: cannot exec the jailed %s\n", app->id);
         _exit(127);
