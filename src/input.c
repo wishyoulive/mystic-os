@@ -105,6 +105,41 @@ static int key_to_char(int code, int shift) {
     return 0;
 }
 
+/* The character a key produces, after the Ctrl+letter -> control-code rule
+ * (Ctrl+S is 0x13). Used for both the release edge and autorepeat. */
+static int key_char(int code, int shift, int ctrl) {
+    int ch = key_to_char(code, shift);
+    if (ch && ctrl && ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')))
+        ch = (ch >= 'a' ? ch - 'a' : ch - 'A') + 1;
+    return ch;
+}
+
+/* Per-frame event queues are deliberately small; app code walks them every
+ * frame. A burst larger than the buffer is therefore possible (a key held
+ * down, a chord of arrows, a pasted-on-the-keyboard run of digits), and when
+ * it happens we drop the OLDEST entry and append the new one. The queue is
+ * consumed once per frame, so the events at the front are already stale by
+ * the time the frame is drawn while the newest one is what the user is
+ * reacting to - keeping the newest is the behaviour a person can feel. */
+static void push_key(int *arr, int *n, int cap, int code) {
+    if (*n >= cap) {
+        memmove(arr, arr + 1, sizeof(*arr) * (size_t)(cap - 1));
+        *n = cap - 1;
+    }
+    arr[(*n)++] = code;
+}
+
+/* Same choice for the character queue: keep the newest bytes. One byte is
+ * reserved for the NUL that input_poll() writes. */
+static void push_char(Input *in, char ch) {
+    int cap = (int)sizeof(in->text) - 1;
+    if (in->text_len >= cap) {
+        memmove(in->text, in->text + 1, (size_t)(cap - 1));
+        in->text_len = cap - 1;
+    }
+    in->text[in->text_len++] = ch;
+}
+
 static void handle_event(Input *in, struct input_event *ev, int *shift, int *ctrl) {
     switch (ev->type) {
         case EV_REL:
@@ -150,26 +185,32 @@ static void handle_event(Input *in, struct input_event *ev, int *shift, int *ctr
             } else if (ev->code == KEY_LEFTALT || ev->code == KEY_RIGHTALT) {
                 in->alt = ev->value;
             } else {
-                if (ev->value == 1) {
+                /* evdev values: 1 press, 2 kernel autorepeat (already
+                 * rate-limited by the input device), 0 release. */
+                if (ev->value == 1 || ev->value == 2) {
                     in->key = ev->code;
-                    if (in->nkeys < (int)(sizeof(in->keys) / sizeof(in->keys[0])))
-                        in->keys[in->nkeys++] = ev->code;
+                    push_key(in->keys, &in->nkeys,
+                             (int)(sizeof(in->keys) / sizeof(in->keys[0])), ev->code);
+                    /* A repeat is a press as far as keys[] is concerned, so
+                     * holding an arrow keeps walking. This layer hands the
+                     * printable character over on the release edge, so a
+                     * repeat must carry it too or holding Backspace would
+                     * still delete exactly one character. */
+                    if (ev->value == 2) {
+                        int ch = key_char(ev->code, *shift, *ctrl);
+                        if (ch) push_char(in, (char)ch);
+                        in->key_pressed = 1;
+                    }
                 } else if (ev->value == 0) {
                     /* releases matter: a client that never sees KEY ... 0
                      * thinks the key is still held */
-                    if (in->nkeys_up < (int)(sizeof(in->keys_up) / sizeof(in->keys_up[0])))
-                        in->keys_up[in->nkeys_up++] = ev->code;
+                    push_key(in->keys_up, &in->nkeys_up,
+                             (int)(sizeof(in->keys_up) / sizeof(in->keys_up[0])), ev->code);
                     in->shift = *shift;
                     in->ctrl = *ctrl;
                     in->key_pressed = 1;
-                    int ch = key_to_char(ev->code, *shift);
-                    /* Ctrl+letter is a control code: Ctrl+S is 0x13 */
-                    if (ch && *ctrl && ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'))) {
-                        int base = (ch >= 'a') ? ch - 'a' : ch - 'A';
-                        ch = base + 1;
-                    }
-                    if (ch && in->text_len < (int)sizeof(in->text) - 1)
-                        in->text[in->text_len++] = (char)ch;
+                    int ch = key_char(ev->code, *shift, *ctrl);
+                    if (ch) push_char(in, (char)ch);
                 }
             }
             break;

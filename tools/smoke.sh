@@ -16,8 +16,9 @@
 #  ships (src/, stage/, assets/) and assert the things that have gone
 #  silently wrong in this project before: a text scale that font_get()
 #  never applied, a terminal drawn in a proportional face, a taskbar
-#  that drew itself with nothing open, and a stale binary sitting inside
-#  a freshly packed image.
+#  that drew itself with nothing open, a stale binary sitting inside
+#  a freshly packed image, a CRLF in /init, and an app bundle linked
+#  without the objects it calls into.
 #
 #  Every check prints PASS or FAIL, and the script exits non-zero
 #  if any check failed.
@@ -307,7 +308,10 @@ if [ ! -f "$UI_CONF" ]; then
 else
     check "text scale: $UI_CONF present" 1
     # Same reading the C does: first line whose first five characters are
-    # "scale" (strncmp in ui_scale_load), value after '=' eaten by atof().
+    # "scale" (strncmp in ui_scale_load), then atof() on what follows '='.
+    # atof() takes a leading number and stops at junk, so "1.2x" is 1.2 to
+    # the C and has to be 1.2 here too - a stricter rule would fail a config
+    # that actually works.
     ui_val=$(awk '
         /^scale/ {
             i = index($0, "=")
@@ -318,17 +322,34 @@ else
                 exit
             }
         }' "$UI_CONF")
+    # The number atof() would read: optional sign, digits, optional fraction,
+    # optional exponent. Anything atof() cannot start a number with is 0.
+    ui_num=$(printf '%s\n' "$ui_val" | awk '
+        { if (match($0, /^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?/))
+              print substr($0, RSTART, RLENGTH) }')
     if [ -z "$ui_val" ]; then
         check "text scale: $UI_CONF has a 'scale = <number>' line" 0
-        note "no line starts with 'scale' and holds '=' - ui_scale_load() ignores the file"
-    elif ! printf '%s\n' "$ui_val" | grep -qE '^[0-9]+([.][0-9]+)?$'; then
+        note "no line starts with 'scale' and holds '=' - ui_scale_load() keeps 1.0"
+    elif [ -z "$ui_num" ]; then
         check "text scale: $UI_CONF has a 'scale = <number>' line" 0
-        note "'$ui_val' is not a decimal number - atof() gives 0, which clamps to 0.8"
-    elif printf '%s\n' "$ui_val" | awk -v v="$ui_val" 'BEGIN { exit !(v + 0 >= 0.8 && v + 0 <= 1.6) }'; then
-        check "text scale: scale = $ui_val (inside 0.8..1.6)" 1
+        note "atof('$ui_val') is 0, which ui_scale_load() clamps to 0.8 - the file is ignored"
     else
-        check "text scale: scale = $ui_val (inside 0.8..1.6)" 0
-        note "ui_scale_load() silently clamps to 0.8..1.6 - file and clamp disagree"
+        # The three outcomes the C has: accepted, clamped to the bounds, or
+        # (an overflowing literal) rejected by isfinite() and left at 1.0.
+        ui_verdict=$(awk -v v="$ui_num" 'BEGIN {
+            x = v + 0
+            if (x > 1e308) print "inf"
+            else if (x < 0.8 || x > 1.6) print "clamp"
+            else print "ok"
+        }')
+        case "$ui_verdict" in
+            ok)    check "text scale: scale = $ui_num (inside 0.8..1.6)" 1
+                   [ "$ui_num" != "$ui_val" ] && note "atof() reads '$ui_num' out of '$ui_val' - the rest of the line is ignored" ;;
+            inf)   check "text scale: scale = $ui_num (inside 0.8..1.6)" 0
+                   note "atof('$ui_val') overflows to infinity; isfinite() rejects the line, so the scale stays 1.0" ;;
+            *)     check "text scale: scale = $ui_num (inside 0.8..1.6)" 0
+                   note "ui_scale_load() clamps to 0.8..1.6 - '$ui_num' in the file is not the scale that ships" ;;
+        esac
     fi
 fi
 
@@ -399,14 +420,32 @@ else
     note "FONT_FILES[FONT_MONO] must match the file that ships"
 fi
 # FONT_MONO must be the face handed to the terminal's draw call, not just
-# present somewhere in the file.
-mono_draw=$(awk '/font_get\(FONT_MONO/ { last = NR }
-                  /term_draw\(/ { if (last > 0 && NR - last <= 20) { print NR; exit } }' src/main.c)
-if [ -n "$mono_draw" ]; then
-    check "monospace: term_draw() uses FONT_MONO (src/main.c:$mono_draw)" 1
+# present somewhere in the file: loading it into a variable nobody passes
+# on draws the terminal in whatever font happens to be in scope.
+mono_get=""
+term_call=$(grep -n 'term_draw(' src/main.c 2>/dev/null | head -1 | cut -d: -f1)
+# The load that matters is the last one before the draw call: main.c also
+# loads FONT_MONO to size a terminal window, which proves nothing about
+# what term_draw() itself is handed.
+[ -n "$term_call" ] && mono_get=$(grep -n 'font_get(FONT_MONO' src/main.c 2>/dev/null \
+    | awk -F: -v t="$term_call" '$1 + 0 < t + 0 { l = $1 } END { print l }')
+mono_var=""
+[ -n "$mono_get" ] && mono_var=$(sed -n "${mono_get}p" src/main.c \
+    | sed -n 's/^.*[*][[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*=[[:space:]]*font_get(FONT_MONO.*/\1/p')
+if [ -z "$mono_get" ] || [ -z "$term_call" ]; then
+    check "monospace: term_draw() uses FONT_MONO" 0
+    note "src/main.c has no font_get(FONT_MONO ...) before a term_draw( call"
+elif [ "$term_call" -le "$mono_get" ] || [ $((term_call - mono_get)) -gt 20 ]; then
+    check "monospace: term_draw() uses FONT_MONO" 0
+    note "the mono face is loaded at src/main.c:$mono_get but term_draw( is at :$term_call"
+elif [ -n "$mono_var" ] \
+     && sed -n "${term_call},$((term_call + 5))p" src/main.c | grep -qw -- "$mono_var"; then
+    check "monospace: term_draw() is passed the FONT_MONO face '$mono_var' (src/main.c:$term_call)" 1
+elif sed -n "${term_call}p" src/main.c | grep -q 'font_get(FONT_MONO'; then
+    check "monospace: term_draw() is passed the FONT_MONO face (src/main.c:$term_call)" 1
 else
     check "monospace: term_draw() uses FONT_MONO" 0
-    note "no font_get(FONT_MONO, ...) within 20 lines of the term_draw() call"
+    note "src/main.c:$mono_get loads FONT_MONO into '${mono_var:-?}' but the term_draw( call at :$term_call does not receive it"
 fi
 
 # ---- taskbar: the bar is a list of open windows, and nothing else
@@ -513,16 +552,45 @@ else
             frontier="$nxt"
         done
 
+        # main.c is the one file a desktop cannot be built without. If the
+        # source list were emptied or rewritten past this script's reader,
+        # every comparison below would silently be against the wrong set.
+        case " $built_c " in
+            *" src/main.c "*) check "build: $DESKTOP_SH compiles src/main.c" 1 ;;
+            *) check "build: $DESKTOP_SH compiles src/main.c" 0
+               note "the source list was not read back from $DESKTOP_SH: '$built_c'" ;;
+        esac
+
+        # A header a compiled unit #includes must have its module linked too,
+        # or the feature is declared and never built (wallpaper.h is the
+        # case that prompted this). No list is duplicated here: the walk
+        # above already found what the desktop actually includes.
+        missing_c=""
+        for inc in $reach; do
+            [ -f "src/$inc" ] || continue
+            sib="src/${inc%.h}.c"
+            [ -f "$sib" ] || continue
+            case " $built_c " in *" $sib "*) ;; *) missing_c="$missing_c $sib" ;; esac
+        done
+        if [ -z "$missing_c" ]; then
+            check "build: every included header's module is linked" 1
+        else
+            check "build: every included header's module is linked" 0
+            note "a compiled unit includes the header, but $DESKTOP_SH never links:$missing_c"
+        fi
+
         newest_src=""
         newer_count=0
         ignored_src=""
+        unlinked_c=""
 
         # Sources the desktop does not link cannot make its binary stale: an
-        # app built by tools/mkapp.sh, or a module not wired in yet. Name
-        # them so the decision to ignore them is visible, not silent.
+        # app built by tools/mkapp.sh, or a module not wired in yet. Say so
+        # out loud rather than deciding it silently.
         for f in src/*.c src/apps/*.c; do
             [ -f "$f" ] || continue
             case " $built_c " in *" $f "*) continue ;; esac
+            unlinked_c="$unlinked_c $f"
             [ "$f" -nt "$BIN" ] && ignored_src="$ignored_src $f"
         done
 
@@ -551,7 +619,91 @@ else
             note "the packed image would run the old desktop - run ./tools/build-desktop.sh"
         fi
         [ -n "$ignored_src" ] && note "not part of the desktop build, ignored:$ignored_src"
+        [ -n "$unlinked_c" ] && note "not linked into the desktop at all (cannot ship until $DESKTOP_SH names it):$unlinked_c"
     fi
+
+    # The app bundles are packed exactly as they sit on disk: image.sh
+    # rebuilds the desktop but never re-runs tools/mkapp.sh. A bundle older
+    # than the SDK sources it links ships stale code. Reported, not failed:
+    # rebuilding is a separate step and this script does not touch the tree.
+    stale_apps=""
+    newest_app_src=""
+    for bundle in stage/usr/share/mystic/apps/*/bin; do
+        [ -f "$bundle" ] || continue
+        id=${bundle%/bin}; id=${id##*/}
+        [ -f "src/client/apps/$id.c" ] || continue
+        newest="src/client/apps/$id.c"
+        for f in src/client/mystic_client.c src/gfx.c src/font.c src/ui.c \
+                 src/mystic.h src/ipc.h src/client/mystic_client.h; do
+            [ -f "$f" ] && [ "$f" -nt "$newest" ] && newest=$f
+        done
+        if [ "$newest" -nt "$bundle" ]; then
+            stale_apps="$stale_apps $id"
+            if [ -z "$newest_app_src" ] || [ "$newest" -nt "$newest_app_src" ]; then
+                newest_app_src=$newest
+            fi
+        fi
+    done
+    if [ -n "$stale_apps" ]; then
+        note "stale app bundles (newer source than binary):$stale_apps"
+        note "rebuild with ./tools/mkapp.sh <id> - newest source is $(mtime "$newest_app_src") $newest_app_src"
+    fi
+fi
+
+# ---- regressions this project has actually shipped and had to hunt down
+# 1) A CRLF in stage/init: the kernel execs /init and the shebang is
+#    "#!/bin/sh\r", so PID 1 dies with ENOENT and the box panics with no
+#    useful message. Zero information for the person looking at the screen.
+INIT=stage/init
+# grep cannot answer this: the git-bash build of grep strips CR from its
+# input, so a CRLF file matches /\r/ zero times. Count the bytes instead.
+crlf_count() { tr -cd '\r' < "$1" 2>/dev/null | wc -c | tr -d ' '; }
+if [ ! -f "$INIT" ]; then
+    check "history: $INIT present" 0
+    note "the kernel has nothing to exec as PID 1"
+elif [ "$(crlf_count "$INIT")" = "0" ]; then
+    check "history: $INIT has no CRLF line endings" 1
+else
+    check "history: $INIT has no CRLF line endings" 0
+    note "$(crlf_count "$INIT") CR byte(s): exec sees '#!/bin/sh\\r' and fails"
+fi
+
+# 2) An external app linked without the SDK objects or without -lm produced
+#    a bundle that built "successfully" and died at load with undefined
+#    symbols; the error had scrolled past because only the tail was shown.
+MKAPP=tools/mkapp.sh
+if [ -f "$MKAPP" ]; then
+    mk_missing=""
+    for need in 'src/client/mystic_client.c' 'src/gfx.c' 'src/font.c' 'src/ui.c' '-lm'; do
+        grep -qF -- "$need" "$MKAPP" || mk_missing="$mk_missing $need"
+    done
+    if [ -z "$mk_missing" ]; then
+        check "history: $MKAPP links the SDK objects + -lm" 1
+    else
+        check "history: $MKAPP links the SDK objects + -lm" 0
+        note "missing from $MKAPP:$mk_missing - the bundle links and fails at load"
+    fi
+else
+    check "history: $MKAPP links the SDK objects + -lm" 0
+    note "no way to build an external app"
+fi
+
+# 3) The same class on the desktop side: wmsrv.c needs -lutil for the
+#    socketpair helpers and the maths needs -lm. The link error only shows
+#    at the very end of a long build, which is how it was missed before.
+if [ -f "$DESKTOP_SH" ]; then
+    dk_missing=""
+    for need in '-lm' '-lutil' '-static'; do
+        grep -qF -- "$need" "$DESKTOP_SH" || dk_missing="$dk_missing $need"
+    done
+    if [ -z "$dk_missing" ]; then
+        check "history: $DESKTOP_SH links -static -lm -lutil" 1
+    else
+        check "history: $DESKTOP_SH links -static -lm -lutil" 0
+        note "missing from $DESKTOP_SH:$dk_missing"
+    fi
+else
+    skipped "history: $DESKTOP_SH linker flags (script missing)"
 fi
 
 # ------------------------------------------------------------ compile checks

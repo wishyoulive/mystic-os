@@ -133,6 +133,12 @@ typedef struct {
 } Files;
 
 static int iround(float v) { return (int)(v < 0.0f ? v - 0.5f : v + 0.5f); }
+/* A box that must *contain* a string rounds up: rounding a text width down by
+ * half a pixel is enough for draw_clipped() to cut the last letter. */
+static int iceil(float v) {
+    int i = (int)v;
+    return (v > (float)i) ? i + 1 : i;
+}
 
 static double mono_now(void) {
     struct timespec ts;
@@ -281,13 +287,13 @@ static int layout_build(Layout *L, int w, int h) {
          * the box is measured against the widest of the three */
         int sort_w = 0;
         for (int m = 0; m < SORT_MODES; m++) {
-            int sw = iround(font_width(L->ft, sort_label(m)));
+            int sw = iceil(font_width(L->ft, sort_label(m)));
             if (sw > sort_w) sort_w = sw;
         }
         long total = L->pad;
         for (int i = 0; i < TB_COUNT; i++) {
             const char *lab = (i == TB_SORT) ? "Refresh" : LABEL[i];  /* widest */
-            nat[i] = L->pad + L->icw + L->pad + iround(font_width(L->ft, lab)) + L->pad;
+            nat[i] = L->pad + L->icw + L->pad + iceil(font_width(L->ft, lab)) + L->pad;
             total += nat[i] + L->gap;
         }
         L->tb_labels = (total <= (long)w);
@@ -326,8 +332,8 @@ static int layout_build(Layout *L, int w, int h) {
      * never overflow into each other as the contents change. */
     {
         int right = w - L->pad;
-        L->size_col = iround(font_width(L->fl, "0000.0 MB"));
-        L->time_col = iround(font_width(L->fl, "0000-00-00 00:00"));
+        L->size_col = iceil(font_width(L->fl, "0000.0 MB"));
+        L->time_col = iceil(font_width(L->fl, "0000-00-00 00:00"));
         L->name_x = L->pad + L->icon_sz + L->pad;
         L->size_x = right - L->size_col;
         L->time_x = right - L->time_col;
@@ -390,13 +396,17 @@ static int crumb_build(const Files *f, const Layout *L, int w, Crumb *out, int *
     float avail = (float)(w - 2 * L->pad);
     int first = 0;
     float dots_w = font_width(L->fc, "...") + (float)L->gap;
-    while (total > avail && first < n - 1) {
+    /* Drop whole leading segments until the line fits *with* the ellipsis
+     * that says so. The ellipsis is never dropped on its own: a breadcrumb
+     * that starts part way down without a mark would claim the path starts
+     * where it does not. The last segment (the folder we are in) always
+     * survives, and is clipped only if it alone is wider than the line. */
+    while (total + dots_w > avail && first < n - 1) {
         total -= wid[first];
         if (first + 1 < n) total -= chev;
         first++;
         *dots = 1;
     }
-    if (total + (*dots ? dots_w : 0.0f) > avail) { *dots = 0; }
 
     float x = (float)L->pad + (*dots ? dots_w : 0.0f);
     int m = 0;
