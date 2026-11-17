@@ -16,10 +16,22 @@
  *    - a footer that reports the real st_size of the file next to the
  *      buffer length and says "unsaved" when the two disagree.
  *
- *  Ctrl+S saves and fsyncs.
+ *  Ctrl+S writes the whole 64 KB buffer into /root/notes.txt.tmp,
+ *  fsyncs that file, closes it and rename()s it over /root/notes.txt.
+ *  Until the rename succeeds the file that is already on the disk is
+ *  untouched, so a full disk, a read-only /root or a short write can
+ *  never eat the notes that were there. Every call is checked; when
+ *  one fails the buffer stays dirty and the footer shows the kernel's
+ *  own strerror() text instead of claiming a save.
+ *
+ *  A file larger than the buffer is only ever overwritten on purpose:
+ *  the first Ctrl+S warns with the real byte counts and a second one,
+ *  with no edit in between, goes ahead.
  * ============================================================ */
 #include "mystic.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +45,7 @@
 #define FOOT_H      26     /* footer band, rule plus one 10 px line */
 #define TEXT_GAP    8      /* gap between gutter rule and glyphs    */
 #define GUTTER_PAD  6      /* gutter's own left inset               */
+#define ERR_COLOR   0xFFFF7B72u  /* footer text when a save failed   */
 
 typedef struct {
     char  *buf;
@@ -48,6 +61,12 @@ typedef struct {
     int    top_row;    /* first visible wrapped row inside that line */
     int    fitted_w, fitted_h;  /* size top/top_row were last fitted for */
     int    pcol;       /* preferred byte column, for up/down         */
+    /* What the last save or load actually did. err[] empty == no
+     * failure; otherwise it holds the real strerror() text and the
+     * footer shows it instead of "saved". */
+    char   err[128];
+    int    partial;    /* the buffer is only part of the file on disk */
+    int    confirm;    /* warned once; the next Ctrl+S may overwrite  */
     /* Escape-sequence reader. An escape can be split over two key
      * events, so the state lives in the app, not on the stack. */
     int    esc;        /* 0 idle, 1 after ESC, 2 in CSI, 3 after ESC O */
@@ -137,6 +156,24 @@ static float gutter_width_px(const Notes *n, Font *fd) {
 static float text_avail_px(const Notes *n, Font *fd) {
     float avail = (float)n->w - gutter_width_px(n, fd) - (float)TEXT_GAP;
     return avail < 24.0f ? 24.0f : avail;
+}
+
+/* Shorten s in place, with a trailing "..", until it fits maxw. A
+ * strerror() message can be long and the window can be narrow: text
+ * must never spill out of the app's rect. */
+static void fit_footer(char *s, size_t cap, Font *fd, float maxw) {
+    if (font_width(fd, s) <= maxw) return;
+    size_t len = strlen(s);
+    char cut[192];
+    while (len > 0) {
+        len--;
+        snprintf(cut, sizeof(cut), "%.*s..", (int)len, s);
+        if (font_width(fd, cut) <= maxw) {
+            snprintf(s, cap, "%s", cut);
+            return;
+        }
+    }
+    s[0] = 0;
 }
 
 /* Rows of text that fit between the top padding and the footer. */
@@ -304,6 +341,7 @@ static void insert(Notes *n, char c) {
     n->cur++;
     n->len++;
     n->dirty = 1;
+    n->confirm = 0;      /* the buffer moved: ask again before clobbering */
     note_pcol(n);
 }
 
@@ -313,6 +351,7 @@ static void erase_one(Notes *n) {
     n->cur--;
     n->len--;
     n->dirty = 1;
+    n->confirm = 0;
     note_pcol(n);
 }
 
@@ -321,23 +360,119 @@ static void erase_forward(Notes *n) {
     memmove(n->buf + n->cur, n->buf + n->cur + 1, (size_t)(n->len - n->cur - 1));
     n->len--;
     n->dirty = 1;
+    n->confirm = 0;
     note_pcol(n);
 }
 
+/* Record a failed operation. errno must still be the failing call's. */
+static void save_error(Notes *n, const char *op) {
+    int e = errno;
+    snprintf(n->err, sizeof(n->err), "%s: %s", op, strerror(e));
+}
+
+/* Replace NOTES_PATH atomically: write the whole buffer to a sibling
+ * temp file, flush it all the way to the device, close it, and only
+ * then rename() it over the real path. rename() inside one directory
+ * is atomic, so every failure below leaves the old notes.txt intact
+ * and there is never a moment when the file is half written. On any
+ * failure the buffer stays dirty and err[] carries the real errno. */
 static void save(Notes *n) {
-    FILE *f = fopen(NOTES_PATH, "w");
-    if (!f) return;
-    fwrite(n->buf, 1, (size_t)n->len, f);
-    fflush(f);
-    /* Without this the bytes sit in the kernel's page cache. Pull the
-     * plug and they are gone - which is exactly what happened the first
-     * time this was tested. */
-    fsync(fileno(f));
-    fclose(f);
+    char   tmp[128];
+    int    fd = -1;
+    size_t off = 0;
+
+    n->err[0] = 0;
+
+    /* The buffer holds only the first NOTES_MAX-1 bytes of a bigger
+     * file: writing it back would delete the rest. Say so with the
+     * real sizes first, and only overwrite on an explicit second
+     * Ctrl+S (any edit clears the confirmation). */
+    if (n->partial) {
+        struct stat st;
+        if (stat(NOTES_PATH, &st) == 0 && (long)st.st_size > (long)n->len) {
+            if (!n->confirm) {
+                n->confirm = 1;
+                snprintf(n->err, sizeof(n->err),
+                         "disk has %ld bytes, loaded %d - Ctrl+S again to overwrite",
+                         (long)st.st_size, n->len);
+                n->dirty = 1;
+                return;
+            }
+        } else {
+            n->partial = 0;     /* the file shrank: the buffer is whole */
+        }
+    }
+
+    /* The temp sits in the same directory as the target, which is what
+     * makes the rename atomic (a different filesystem would not be). */
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp", NOTES_PATH) >= (int)sizeof(tmp)) {
+        snprintf(n->err, sizeof(n->err), "save: temp path too long");
+        n->dirty = 1;
+        return;
+    }
+
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        save_error(n, "open .tmp");
+        n->dirty = 1;
+        return;
+    }
+
+    while (off < (size_t)n->len) {
+        ssize_t w = write(fd, n->buf + off, (size_t)n->len - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            save_error(n, "write .tmp");
+            close(fd);
+            unlink(tmp);
+            n->dirty = 1;
+            return;
+        }
+        if (w == 0) {           /* no progress, no errno: a real failure */
+            snprintf(n->err, sizeof(n->err),
+                     "write .tmp: stopped after %ld of %d bytes",
+                     (long)off, n->len);
+            close(fd);
+            unlink(tmp);
+            n->dirty = 1;
+            return;
+        }
+        off += (size_t)w;
+    }
+
+    /* Without this the bytes sit in the page cache. Pull the plug and
+     * they are gone - which is exactly what happened the first time
+     * this was tested. */
+    if (fsync(fd) != 0) {
+        save_error(n, "fsync .tmp");
+        close(fd);
+        unlink(tmp);
+        n->dirty = 1;
+        return;
+    }
+    if (close(fd) != 0) {       /* close reports deferred write errors */
+        save_error(n, "close .tmp");
+        unlink(tmp);
+        n->dirty = 1;
+        return;
+    }
+
+    if (rename(tmp, NOTES_PATH) != 0) {
+        save_error(n, "rename");
+        unlink(tmp);
+        n->dirty = 1;
+        return;
+    }
+
+    /* Only now, after the successful rename, is the save a fact. */
     n->dirty = 0;
+    n->partial = 0;
+    n->confirm = 0;
     n->saved_here = 1;
     n->saved_at = time(NULL);
 
+    /* A stat failure here cannot undo the rename; draw() re-reads the
+     * real size every frame, so the footer corrects itself. */
     struct stat st;
     n->disk_len = (stat(NOTES_PATH, &st) == 0) ? (long)st.st_size : -1;
     if (n->disk_len >= 0) n->disk_mtime = st.st_mtime;
@@ -422,12 +557,32 @@ static void notes_init(App *a, int w, int h) {
     n->h = h;
     n->disk_len = -1;
 
+    /* The size on disk is needed before the read: it is the only way
+     * to tell a complete load from one that hit the 64 KB cap. */
+    struct stat st;
+    int have_st = (stat(NOTES_PATH, &st) == 0) ? 1 : 0;
+
     FILE *f = fopen(NOTES_PATH, "r");
     if (f) {
         size_t got = fread(n->buf, 1, NOTES_MAX - 1, f);
+        int    bad = ferror(f) ? 1 : 0;
+        int    rerr = errno;
+        fclose(f);
         n->len = (int)got;
         n->cur = 0;
-        fclose(f);
+        if (bad) {
+            /* A partial read is not the file. Never let a later Ctrl+S
+             * turn a half-read buffer into the whole file. */
+            snprintf(n->err, sizeof(n->err), "read: %s", strerror(rerr));
+            n->partial = 1;
+            n->dirty = 1;
+        } else if (have_st && (long)st.st_size > (long)got) {
+            snprintf(n->err, sizeof(n->err),
+                     "disk has %ld bytes, loaded %d - Ctrl+S overwrites",
+                     (long)st.st_size, (int)got);
+            n->partial = 1;
+            n->dirty = (got == 0) ? 1 : 0;
+        }
     } else {
         const char *welcome =
             "Notes.\n\n"
@@ -440,6 +595,13 @@ static void notes_init(App *a, int w, int h) {
         memcpy(n->buf, welcome, (size_t)n->len);
         n->cur = n->len;
         n->dirty = 1;
+        /* ENOENT is simply "no notes yet". Anything else means a file
+         * is there and we could not read it, so say so and treat the
+         * buffer as partial: Ctrl+S will ask before replacing it. */
+        if (errno != ENOENT) {
+            save_error(n, NOTES_PATH);
+            n->partial = 1;
+        }
     }
     n->top = 0;
     n->top_row = 0;
@@ -447,8 +609,7 @@ static void notes_init(App *a, int w, int h) {
     n->esc = 0;
     n->saved_here = 0;
 
-    struct stat st;
-    if (stat(NOTES_PATH, &st) == 0) {
+    if (have_st) {
         n->disk_len = (long)st.st_size;
         n->disk_mtime = st.st_mtime;
     } else {
@@ -572,7 +733,10 @@ static void notes_draw(App *a, Surface *s, int x, int y, int w, int h, const The
 
     char foot[192];
     int unsaved = n->dirty || (n->disk_len >= 0 && n->disk_len != (long)n->len);
-    if (n->disk_len < 0) {
+    if (n->err[0]) {
+        /* A real failure with a real errno: say that, never "saved". */
+        snprintf(foot, sizeof(foot), "not saved - %s", n->err);
+    } else if (n->disk_len < 0) {
         snprintf(foot, sizeof(foot), "%d bytes buf  -  no file on disk  -  Ctrl+S saves", n->len);
     } else if (unsaved) {
         snprintf(foot, sizeof(foot), "%d bytes buf  -  %ld bytes on disk  -  unsaved",
@@ -591,14 +755,16 @@ static void notes_draw(App *a, Surface *s, int x, int y, int w, int h, const The
                      n->len, n->disk_len, ago < 0 ? 0L : ago);
         }
     }
-    if (font_width(fd, foot) > (float)(w - 16)) {   /* narrow window: shorten */
+    if (!n->err[0] && font_width(fd, foot) > (float)(w - 16)) {   /* narrow window: shorten */
         if (n->disk_len < 0)
             snprintf(foot, sizeof(foot), "%d b buf  -  no disk file", n->len);
         else
             snprintf(foot, sizeof(foot), "%d b buf  -  %ld b disk%s",
                      n->len, n->disk_len, unsaved ? "  -  unsaved" : "");
     }
-    font_draw(s, fd, (float)x + 8, (float)(y + h) - 16, foot, color_alpha(th->text, 0.55f));
+    fit_footer(foot, sizeof(foot), fd, (float)(w - 16));
+    font_draw(s, fd, (float)x + 8, (float)(y + h) - 16, foot,
+              n->err[0] ? ERR_COLOR : color_alpha(th->text, 0.55f));
 }
 
 static void notes_key(App *a, const char *bytes, int count) {

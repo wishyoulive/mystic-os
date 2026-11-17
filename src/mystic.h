@@ -84,6 +84,7 @@ typedef struct {
     int   mouse_dx, mouse_dy;
     int   buttons;          /* bit0 left, bit1 right, bit2 middle */
     int   clicked, released;
+    int   clicked2;         /* a second press within 350ms and 6px */
     int   wheel;
     int   key;              /* last key code, 0 if none */
     int   keys[16];         /* every key pressed this frame, in order */

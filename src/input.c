@@ -13,9 +13,13 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_FDS 8
+
+static double last_t = -1.0;
+static int    last_x, last_y;
 
 static int  mouse_fd = -1;
 static int  key_fd = -1;
@@ -118,7 +122,24 @@ static void handle_event(Input *in, struct input_event *ev, int *shift, int *ctr
                 if (ev->code == BTN_LEFT) bit = 1;
                 if (ev->code == BTN_RIGHT) bit = 2;
                 if (ev->code == BTN_MIDDLE) bit = 4;
-                if (ev->value == 1) { in->buttons |= bit; in->clicked |= bit; }
+                if (ev->value == 1) {
+                    in->buttons |= bit;
+                    in->clicked |= bit;
+                    if (bit == 1) {
+                        /* double click: two presses close together in time and
+                         * place, measured, not assumed */
+                        struct timespec ts;
+                        clock_gettime(CLOCK_MONOTONIC, &ts);
+                        double t = ts.tv_sec + ts.tv_nsec / 1e9;
+                        int dx = in->mouse_x - last_x, dy = in->mouse_y - last_y;
+                        if (dx < 0) dx = -dx;
+                        if (dy < 0) dy = -dy;
+                        if (t - last_t < 0.35 && dx < 6 && dy < 6) in->clicked2 = 1;
+                        last_t = t;
+                        last_x = in->mouse_x;
+                        last_y = in->mouse_y;
+                    }
+                }
                 else                { in->buttons &= ~bit; in->released |= bit; }
             } else if (ev->code == KEY_LEFTSHIFT || ev->code == KEY_RIGHTSHIFT) {
                 *shift = ev->value;
@@ -176,6 +197,7 @@ int input_poll(Input *in) {
 void input_frame(Input *in) {
     in->clicked = 0;
     in->released = 0;
+    in->clicked2 = 0;
     in->wheel = 0;
     in->key = 0;
     in->key_pressed = 0;
