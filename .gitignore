@@ -10,3 +10,10 @@ build/
 
 # needs the workflow OAuth scope to push: gh auth refresh -s workflow
 .github/workflows/
+# build outputs: never commit binaries or downloaded modules
+stage/usr/bin/mystic-desktop
+stage/usr/share/mystic/apps/*/bin
+stage/lib/modules/
+stage/usr/share/fonts/*.ttf
+stage/sbin/
+stage/usr/lib/

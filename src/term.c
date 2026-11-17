@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -42,6 +43,8 @@ typedef struct {
 struct Term {
     int   fd;
     pid_t pid;
+    int   pidfd;        /* pidfd_open() handle for pid: names the process
+                         * instance, not a number (-1 when unavailable) */
     int   cols, rows;
 
     Cell *grid;          /* rows * cols */
@@ -169,8 +172,8 @@ static void put_char(Term *t, u32 ch) {
     t->dirty = 1;
 }
 
-/* RIS (ESC c) and the public term_clear_screen(): blank the screen, home the
- * cursor, drop attributes and any half-received UTF-8 character. */
+/* Blank the screen, home the cursor, drop attributes and any half-received
+ * UTF-8 character. Shared by the public term_clear_screen() and RIS (ESC c). */
 static void screen_reset(Term *t) {
     t->fg = 7;
     t->bg = 0;
@@ -184,6 +187,14 @@ static void screen_reset(Term *t) {
     t->scroll = 0;
     clear_cells(t, 0, 0, t->cols - 1, t->rows - 1);
     t->dirty = 1;
+}
+
+/* Public API (mystic.h): a full reset of the visible screen. Defined here so
+ * that RIS below can call it - this function is now reached from the wire
+ * (ESC c), which is what makes it live code rather than dead code. */
+void term_clear_screen(Term *t) {
+    if (!t) return;
+    screen_reset(t);
 }
 
 /* ---------------------------------------------------------- parser */
@@ -422,9 +433,9 @@ static void feed_byte(Term *t, unsigned char b) {
             } else if (b == ']') {
                 t->state = 3;
                 t->osc_len = 0;
-            } else if (b == 'c') {  /* RIS: full reset, so term_clear_screen
-                                     * is reachable from the wire */
-                screen_reset(t);
+            } else if (b == 'c') {  /* RIS: a full reset, through the public
+                                     * term_clear_screen() entry point */
+                term_clear_screen(t);
                 t->state = 0;
             } else if (b == '(' || b == ')') {
                 t->state = 5;       /* charset select: swallow one byte */
@@ -480,6 +491,8 @@ Term *term_create(int cols, int rows, const char *shell) {
 
     Term *t = calloc(1, sizeof(Term));
     if (!t) return NULL;
+    t->fd = -1;
+    t->pidfd = -1;
     t->cols = cols;
     t->rows = rows;
     t->fg = 7;
@@ -511,6 +524,11 @@ Term *term_create(int cols, int rows, const char *shell) {
     fcntl(master, F_SETFL, fcntl(master, F_GETFL, 0) | O_NONBLOCK);
     t->fd = master;
     t->pid = pid;
+    /* A pidfd names this process instance rather than a number, so hanging the
+     * shell up can never reach a process that later reused the pid. Optional:
+     * kernels before 5.3 have no pidfd_open, and term_destroy then falls back
+     * to the waitpid probe + kill(2). */
+    t->pidfd = (int)syscall(SYS_pidfd_open, (long)pid, 0L);
     return t;
 }
 
@@ -542,11 +560,14 @@ int term_pump(Term *t) {
         break;
     }
     if (!t->alive) {
-        /* Reap once, and forget the pid so term_destroy never signals a pid
-         * that has been recycled by an unrelated process. */
+        /* Reap once. A pid that has been reaped here (or by main()'s
+         * waitpid(-1) loop) must be forgotten, so term_destroy never signals
+         * a pid that has since been recycled: ECHILD means it is already
+         * somebody else's problem. */
         int status;
-        if (t->pid > 0 && waitpid(t->pid, &status, WNOHANG) == t->pid)
-            t->pid = -1;
+        pid_t r;
+        do { r = waitpid(t->pid, &status, WNOHANG); } while (r < 0 && errno == EINTR);
+        if (r == t->pid || r < 0) t->pid = -1;
     }
     t->dirty = t->dirty || total > 0;
     return total;
@@ -568,27 +589,55 @@ void term_scroll(Term *t, int lines) {
 
 int term_scroll_offset(Term *t) { return t ? t->scroll : 0; }
 
-void term_clear_screen(Term *t) {
-    if (!t) return;
-    screen_reset(t);
-}
-
 /* Close the pty, hang up the shell, reap it, and free the grid, the
  * scrollback and the struct. The only correct way to throw a terminal away:
  * close(2) alone leaks 426 KiB (88x20 grid + 88x600 scrollback) and leaves the
  * shell running (or its zombie behind when a background job holds the slave).
- * The reaping is bounded: a shell that ignores SIGHUP is SIGKILLed after
- * 100 ms and waited on for at most another 100 ms, so closing a window can
- * never wedge the desktop. */
+ *
+ * Before signalling anything we ask the kernel whether the pid is still ours.
+ * main() runs waitpid(-1, ..., WNOHANG) every frame (main.c:1148), and
+ * term_pump reaps too, so by the time a window is closed an exited shell has
+ * usually been reaped already and t->pid may name a recycled process - a blind
+ * kill() would then HUP an unrelated one. close(master) has already delivered
+ * SIGHUP to the terminal's foreground group, so nothing is lost by skipping
+ * the kill when the probe says the pid is not ours any more.
+ * Reaping is bounded: a shell that ignores SIGHUP is SIGKILLed after ~100 ms
+ * and waited on for at most another ~100 ms, so closing a window can never
+ * wedge the desktop. */
+/* Hang the shell up / kill it. When a pidfd is open the signal is delivered
+ * through the handle, which is bound to *this* process instance: even if the
+ * pid has been recycled (main() reaps with waitpid(-1) every frame, so a dead
+ * shell's number is free again immediately) the signal goes to nobody rather
+ * than to the new owner of the number. Without a pidfd we fall back to kill(2)
+ * on a number we have just probed. */
+static void term_signal(Term *t, int sig) {
+    if (t->pidfd >= 0)
+        syscall(SYS_pidfd_send_signal, (long)t->pidfd, (long)sig, (void *)0, 0L);
+    else
+        kill(t->pid, sig);
+}
+
 void term_destroy(Term *t) {
     if (!t) return;
 
     if (t->fd >= 0) { close(t->fd); t->fd = -1; }
 
     if (t->pid > 0) {
+        /* Is the pid still ours? ECHILD means somebody already reaped it (and
+         * the number may now name any child of ours), the pid itself means it
+         * was a zombie and is reaped now, 0 means it is still running. Only a
+         * 0 leaves the kill(2) fallback enabled - the pidfd path is safe either
+         * way because it never looks the process up by number. */
+        int status;
+        pid_t probe;
+        do { probe = waitpid(t->pid, &status, WNOHANG); } while (probe < 0 && errno == EINTR);
+        if (probe < 0 || probe == t->pid) t->pid = -1;
+    }
+
+    if (t->pid > 0) {
         int status;
         int reaped = 0;
-        kill(t->pid, SIGHUP);
+        term_signal(t, SIGHUP);
         for (int i = 0; i < 20 && !reaped; i++) {
             pid_t r = waitpid(t->pid, &status, WNOHANG);
             if (r == t->pid || r < 0) { reaped = 1; break; }  /* r < 0: ECHILD */
@@ -596,7 +645,7 @@ void term_destroy(Term *t) {
             nanosleep(&ts, NULL);
         }
         if (!reaped) {
-            kill(t->pid, SIGKILL);
+            term_signal(t, SIGKILL);
             for (int i = 0; i < 20; i++) {
                 pid_t r = waitpid(t->pid, &status, WNOHANG);
                 if (r == t->pid || r < 0) break;
@@ -606,6 +655,8 @@ void term_destroy(Term *t) {
         }
         t->pid = -1;
     }
+
+    if (t->pidfd >= 0) { close(t->pidfd); t->pidfd = -1; }
 
     t->alive = 0;
     free(t->grid);
