@@ -10,6 +10,8 @@
  *  Mouse:  drag a title bar to move a window, click a dock icon
  *          to launch an app, click a window's red dot to close it.
  * ============================================================ */
+#include <signal.h>
+
 #include "mystic.h"
 #include "ipc.h"
 #include "wallpaper.h"
@@ -41,8 +43,14 @@ static int topbar_h(void) { return ui_px(34); }     /* screen top bar   */
 /* F12: the dots, the title text and the click targets all hang off this one
  * vertical centre, so nothing drifts when the text scale changes the bar. */
 static int traffic_y(int bar_h) { return (bar_h - DOT_SZ) / 2; }
-static int dock_isz(void) { return ui_px(40); }     /* taskbar icon     */
-static int dock_gap(void) { return ui_px(16); }
+/* The dock is as wide as the windows in it. Ten windows at Huge text were
+ * wider than an 800px screen, and the icons painted off the left edge could
+ * not be clicked at all. dock_rect() lowers this percentage until the bar
+ * fits; draw and hit-test both read it, so they cannot disagree. */
+static int dock_pct = 100;
+
+static int dock_isz(void) { return ui_px(40) * dock_pct / 100; }  /* taskbar icon */
+static int dock_gap(void) { return ui_px(16) * dock_pct / 100; }
 static int dock_pad(void) { return ui_px(12); }
 
 static Display disp;
@@ -76,6 +84,29 @@ static int    drag_win = -1, drag_dx, drag_dy;
 static unsigned drag_gen;         /* generation of the window being dragged   */
 static int    resize_win = -1;
 static unsigned resize_gen;       /* generation of the window being resized   */
+/* A compositor that dies silently leaves a frozen picture that looks like a
+ * hang. Say which signal and where, so the serial console records it. */
+static void on_fatal(int sig, siginfo_t *si, void *ctx) {
+    (void)ctx;
+    char msg[160];
+    int n = snprintf(msg, sizeof(msg),
+                     "mystic: FATAL signal %d at %p - the desktop is gone\n",
+                     sig, si ? si->si_addr : (void *)0);
+    if (n > 0) { ssize_t w = write(2, msg, (size_t)n); (void)w; }
+    _exit(1);
+}
+
+static void install_fatal_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = on_fatal;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+}
+
 static int    launcher_open = 0;
 static int    wall_index = 0;
 static double wall_t0 = 0.0;
@@ -414,12 +445,20 @@ static Window *taskbar_at(int n) {
  * eye in the top bar is the launcher. With nothing open there is no bar. */
 static int dock_rect(int *dx, int *dy, int *dw, int *dh) {
     int n = taskbar_count();
-    if (n <= 0) { *dx = *dy = *dw = *dh = 0; return 0; }
-    const int isz = dock_isz(), gap = dock_gap(), pad = dock_pad();
+    if (n <= 0) { *dx = *dy = *dw = *dh = 0; dock_pct = 100; return 0; }
+    const int pad = dock_pad();
+    dock_pct = 100;
+    int isz = dock_isz(), gap = dock_gap();
     int w = n * isz + (n - 1) * gap + pad * 2;
+    while (w > disp.w - 8 && dock_pct > 40) {      /* shrink until it fits */
+        dock_pct -= 5;
+        isz = dock_isz(); gap = dock_gap();
+        w = n * isz + (n - 1) * gap + pad * 2;
+    }
     int h = isz + pad * 2;
     *dw = w; *dh = h;
     *dx = (disp.w - w) / 2;
+    if (*dx < 4) *dx = 4;
     *dy = disp.h - h - 22;
     return 1;
 }
@@ -1187,6 +1226,7 @@ static int handle_click(void) {
 
 /* ------------------------------------------------------------ main */
 int main(void) {
+    install_fatal_handlers();
     if (disp_open(&disp, "/dev/fb0") < 0) return 1;
     /* the text scale must be known before the first font is requested */
     ui_scale_load("/etc/mystic/ui.conf");
@@ -1617,7 +1657,12 @@ int main(void) {
             {
                 float before = ui_scale_get();
                 ui_scale_load("/etc/mystic/ui.conf");
-                if (ui_scale_get() != before) { dirty = 1; persist_settings(); }
+                if (ui_scale_get() != before) {
+                    fprintf(stderr, "ui: scale %.2f -> %.2f", before, ui_scale_get());
+                    fputc(10, stderr);
+                    dirty = 1;
+                    persist_settings();
+                }
 
                 FILE *wf = fopen("/etc/mystic/wallpaper", "r");
                 if (wf) {
