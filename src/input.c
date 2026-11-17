@@ -217,7 +217,11 @@ static void handle_event(Input *in, struct input_event *ev, int *shift, int *ctr
                      * printable character over on the release edge, so a
                      * repeat must carry it too or holding Backspace would
                      * still delete exactly one character. */
-                    if (ev->value == 2) {
+                    {
+                        /* the character belongs to the PRESS edge: emitting it
+                         * on release meant nothing echoed until the key came
+                         * up, and the modifier was sampled at release time so
+                         * Shift down, A down, Shift up, A up gave 'a' not 'A' */
                         int ch = key_char(ev->code, *shift, *ctrl);
                         if (ch) push_char(in, (char)ch);
                         in->key_pressed = 1;
@@ -230,8 +234,6 @@ static void handle_event(Input *in, struct input_event *ev, int *shift, int *ctr
                     in->shift = *shift;
                     in->ctrl = *ctrl;
                     in->key_pressed = 1;
-                    int ch = key_char(ev->code, *shift, *ctrl);
-                    if (ch) push_char(in, (char)ch);
                 }
             }
             break;

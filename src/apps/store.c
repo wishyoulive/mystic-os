@@ -1,21 +1,43 @@
 /* ============================================================
  *  Mystic OS - apps/store.c
- *  "Apps": a browser for the bundles in /usr/share/mystic/apps.
+ *  "Apps": one window, two sections.
  *
- *  Every row is a real directory read by readdir() that holds a
- *  readable 'manifest'. The manifest is parsed exactly the way
- *  src/wmsrv.c parses it (name/desc/exec keys, one '=' per line),
- *  and the size shown for each bundle is the st_size of its real
- *  payload file, WM_APP_DIR/<id>/<exec>.
+ *  Installed - the bundles that are already on the disk, read with
+ *  readdir() from /usr/share/mystic/apps and /root/apps (that is
+ *  where `pkg install` unpacks them).  A directory counts as a
+ *  bundle when it holds a readable 'manifest'; the manifest is
+ *  parsed the way src/wmsrv.c parses it (name/desc/exec, one '='
+ *  per line) and the size shown is the real st_size of
+ *  <dir>/<id>/<exec>.
  *
- *  This window never forks anything. Marking an app and pressing
- *  Enter (or clicking its row) writes the app id, one line, to
- *  /run/mystic/launch.request - the desktop watches that file and
- *  does the fork/exec. That keeps process creation in one place.
+ *  Available - the packages the repository advertises, read from
+ *  /run/mystic/repo.index.  The index is the same TSV the installer
+ *  caches (stage/usr/bin/pkg):
  *
- *  Keys:  j/k or Up/Down  move      Enter   write the launch request
- *         Home/End         first/last         PageUp/PageDown  page
- *         g/G, Ctrl+A/E    first/last  r      rescan the directory
+ *      name<TAB>version<TAB>size<TAB>sha256<TAB>file<TAB>description
+ *
+ *  A package whose name is also an installed bundle (a directory in
+ *  either bundle root) is painted as 'installed' and Enter will not
+ *  offer it again.
+ *
+ *  This window never forks and never installs by itself.  It asks
+ *  the desktop, which owns the privileged work:
+ *
+ *    Enter on an Installed row -> /run/mystic/launch.request   (one id)
+ *    Enter on an Available row -> /run/mystic/install.request   (one name)
+ *    'r' or the Refresh button -> /run/mystic/repo.refresh      ("refresh")
+ *
+ *  The desktop validates the install name against [a-z0-9-]{1,32}
+ *  before running `pkg install <name>`.  This file applies the same
+ *  rule twice: a row whose name would fail it is never listed, so
+ *  the single line written to install.request can only ever be a
+ *  name the desktop accepts.
+ *
+ *  Keys:  j/k or Up/Down  move        Enter  launch / install
+ *         Home/End/g/G    first/last  PgUp/PgDn  by a screen
+ *         r               refresh the repo index
+ *  Mouse: click the Refresh button, click a row to select it, click
+ *         the selected row again to activate it.
  * ============================================================ */
 #include "mystic.h"
 #include "ipc.h"
@@ -27,35 +49,106 @@
 #include <string.h>
 #include <sys/stat.h>
 
+/* Every path this window touches. The -D overrides exist so the host
+ * harness can point the app at a scratch tree instead of the real /run. */
+#ifndef STORE_APP_DIR
+#define STORE_APP_DIR WM_APP_DIR
+#endif
+#ifndef STORE_ROOT_APPS
+#define STORE_ROOT_APPS "/root/apps"
+#endif
+#ifndef STORE_REPO_INDEX
+#define STORE_REPO_INDEX "/run/mystic/repo.index"
+#endif
+#ifndef STORE_REPO_REFRESH
+#define STORE_REPO_REFRESH "/run/mystic/repo.refresh"
+#endif
+#ifndef STORE_INSTALL_REQUEST
+#define STORE_INSTALL_REQUEST "/run/mystic/install.request"
+#endif
+#ifndef STORE_LAUNCH_REQUEST
+#define STORE_LAUNCH_REQUEST "/run/mystic/launch.request"
+#endif
+
 #define DESC_LINE 256
 #define DESC_MAXLINES 3
-#define DESC_WORDS 128   /* a 255-char line cannot hold more words than this */
-#define LAUNCH_REQUEST "/run/mystic/launch.request"
+#define DESC_WORDS 128          /* a 255-char line cannot hold more words */
+#define PKG_MAX 64              /* repo rows we hold; the index is small */
+#define INST_MAX (2 * WM_MAX_APPS)   /* both bundle roots together */
+#define DISP_MAX (INST_MAX + PKG_MAX + 6)
 
 typedef struct {
     char id[32];
     char name[64];
     char desc[DESC_LINE];
     char exe[128];
-    long size;        /* st_size of WM_APP_DIR/<id>/<exe>, 0 if unreadable */
+    long size;          /* st_size of <dir>/<id>/<exe>, 0 if unreadable */
     int  have_size;
+    int  from_root;     /* came from /root/apps, where pkg installs */
 } StoreApp;
 
 typedef struct {
-    StoreApp *app;            /* WM_MAX_APPS entries, calloc'd once */
-    int       count;
-    int       sel;
-    int       scroll;
-    int       w, h;
+    char name[32];
+    char version[24];
+    char desc[DESC_LINE];
+    long size;          /* bytes, the index's size column */
+    int  have_size;
+} Pkg;
 
-    char      error[128];     /* why the directory could not be read */
-    char      status[128];    /* result of the last launch request */
+/* one painted line of the window: a section title, a real row, or a note */
+enum { D_SECT = 1, D_APP, D_PKG, D_MSG };
 
-    char      dlines[DESC_MAXLINES][DESC_LINE];   /* wrapped description */
-    int       dn;
-    int       wrap_w;         /* width the wrap was computed for */
-    char      wrap_id[32];    /* which app's desc the wrap holds; "" if none */
+typedef struct {
+    int         kind;
+    int         idx;    /* D_APP: inst[] index, D_PKG: avail[] index,
+                           D_SECT: how many rows the section holds */
+    const char *msg;    /* D_SECT label / D_MSG text (static or Store-owned) */
+} Disp;
+
+typedef struct {
+    StoreApp inst[INST_MAX];
+    int      ninst;
+
+    Pkg      avail[PKG_MAX];
+    int      navail;
+
+    /* the index as it was when we last read it; a change on disk makes
+     * draw() read it again, which is how a refresh becomes visible */
+    int       index_state;   /* 0 = no file, 1 = read, -1 = could not read */
+    char      index_err[160];
+    long long index_mtime;
+    long long index_size;
+
+    Disp     disp[DISP_MAX];
+    int      ndisp;
+    int      sel;            /* index into disp[], always a selectable row */
+    int      scroll;
+    int      w, h;
+
+    char     error[128];     /* why the bundle directory could not be read */
+    char     status[128];    /* result of the last request we wrote */
+    char     pending[32];    /* name asked for, until its directory appears */
+
+    /* the Refresh button, recorded by the painter and used by the click */
+    int      btn_x, btn_y, btn_w, btn_h;
+
+    char     dlines[DESC_MAXLINES][DESC_LINE];  /* wrapped description */
+    int      dn;
+    int      wrap_w;         /* width the wrap was computed for */
+    char     wrap_id[64];    /* which row the wrap holds; "" if none */
 } Store;
+
+/* ------------------------------------------------------------
+ * The desktop's rule, copied so this window can never hand it a
+ * name it would refuse: lowercase letters, digits and '-', 1..32.
+ * ------------------------------------------------------------ */
+static int pkg_name_ok(const char *n) {
+    if (!n || !n[0] || strlen(n) > 32) return 0;
+    for (const char *c = n; *c; c++)
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '-'))
+            return 0;
+    return 1;
+}
 
 /* ------------------------------------------------------------
  * Manifest parsing - identical rules to wms_scan_apps() in
@@ -65,6 +158,11 @@ typedef struct {
 static int read_manifest(const char *dir, StoreApp *a) {
     char path[512];
     snprintf(path, sizeof(path), "%s/%s/manifest", dir, a->id);
+
+    /* defaults first, so a bundle with no manifest (a pkg-installed
+     * directory) still has a name and a payload to show */
+    snprintf(a->name, sizeof(a->name), "%s", a->id);
+    snprintf(a->exe, sizeof(a->exe), "bin");
 
     FILE *f = fopen(path, "r");
     if (!f) return 0;
@@ -93,9 +191,9 @@ static int read_manifest(const char *dir, StoreApp *a) {
 }
 
 /* The payload is a real file on disk; its size is what we show. */
-static void probe_payload(StoreApp *a) {
+static void probe_payload(const char *dir, StoreApp *a) {
     char path[512];
-    snprintf(path, sizeof(path), "%s/%s/%s", WM_APP_DIR, a->id, a->exe);
+    snprintf(path, sizeof(path), "%s/%s/%s", dir, a->id, a->exe);
 
     struct stat st;
     if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
@@ -120,77 +218,291 @@ static void sort_apps(StoreApp *e, int n) {
     }
 }
 
-static int index_of(const Store *s, const char *id) {
-    for (int i = 0; i < s->count; i++)
-        if (!strcmp(s->app[i].id, id)) return i;
-    return -1;
+static int pkg_before(const Pkg *a, const Pkg *b) {
+    return strcmp(a->name, b->name) < 0;
 }
 
-/* Re-read the bundle directory. Selection follows the same app id. */
-static void scan(Store *s) {
-    char keep[32];
-    keep[0] = 0;
-    if (s->sel >= 0 && s->sel < s->count)
-        snprintf(keep, sizeof(keep), "%s", s->app[s->sel].id);
+static void sort_pkgs(Pkg *e, int n) {
+    for (int i = 1; i < n; i++) {
+        Pkg key = e[i];
+        int j = i - 1;
+        while (j >= 0 && pkg_before(&key, &e[j])) { e[j + 1] = e[j]; j--; }
+        e[j + 1] = key;
+    }
+}
 
-    s->count = 0;
-    s->error[0] = 0;
-    /* Whatever was wrapped describes the list as it was before this scan
-     * (a bundle may have appeared, vanished, or had its desc = edited).
-     * Throw the cache away so the band cannot show another app's text. */
+/* ------------------------------------------------------------
+ * The display list. Section titles and notes take a row slot but
+ * are not selectable, so one flat selection can walk from an
+ * installed row to an available one with no special cases.
+ * ------------------------------------------------------------ */
+static int disp_selectable(const Disp *d) {
+    return d->kind == D_APP || d->kind == D_PKG;
+}
+
+static void disp_push(Store *s, int kind, int idx, const char *msg) {
+    if (s->ndisp >= DISP_MAX) return;
+    Disp *d = &s->disp[s->ndisp++];
+    d->kind = kind;
+    d->idx = idx;
+    d->msg = msg;
+}
+
+static void build_disp(Store *s) {
+    int old = s->sel;
+    char keep[64];
+    keep[0] = 0;
+
+    if (old >= 0 && old < s->ndisp && disp_selectable(&s->disp[old])) {
+        Disp *d = &s->disp[old];
+        if (d->kind == D_APP)
+            snprintf(keep, sizeof(keep), "a:%s", s->inst[d->idx].id);
+        else
+            snprintf(keep, sizeof(keep), "p:%s", s->avail[d->idx].name);
+    }
+
+    s->ndisp = 0;
+    s->sel = -1;
+
+    disp_push(s, D_SECT, s->ninst, "Installed");
+    if (s->ninst == 0)
+        disp_push(s, D_MSG, 0, "no app bundles installed");
+    else
+        for (int i = 0; i < s->ninst; i++)
+            disp_push(s, D_APP, i, NULL);
+
+    disp_push(s, D_SECT, s->navail, "Available");
+    if (s->index_state == 0)
+        disp_push(s, D_MSG, 0, "no index - press r to fetch it");
+    else if (s->index_state < 0)
+        disp_push(s, D_MSG, 0, s->index_err);
+    else if (s->navail == 0)
+        disp_push(s, D_MSG, 0, "the index lists no packages");
+    else
+        for (int i = 0; i < s->navail; i++)
+            disp_push(s, D_PKG, i, NULL);
+
+    /* same row as before, when it still exists */
+    if (keep[0]) {
+        for (int i = 0; i < s->ndisp && s->sel < 0; i++) {
+            Disp *d = &s->disp[i];
+            if (d->kind == D_APP && !strncmp(keep, "a:", 2) &&
+                !strcmp(keep + 2, s->inst[d->idx].id))
+                s->sel = i;
+            else if (d->kind == D_PKG && !strncmp(keep, "p:", 2) &&
+                     !strcmp(keep + 2, s->avail[d->idx].name))
+                s->sel = i;
+        }
+    }
+    if (s->sel < 0) {
+        /* nearest selectable at or after where we were, else the last one */
+        int start = old < 0 ? 0 : old;
+        if (start > s->ndisp) start = s->ndisp;
+        for (int i = start; i < s->ndisp && s->sel < 0; i++)
+            if (disp_selectable(&s->disp[i])) s->sel = i;
+        for (int i = s->ndisp - 1; i >= 0 && s->sel < 0; i--)
+            if (disp_selectable(&s->disp[i])) s->sel = i;
+    }
+    if (s->sel >= 0 && s->scroll > s->sel) s->scroll = s->sel;
+    if (s->sel < 0) s->scroll = 0;
+
+    /* the band text follows the list, so its wrap is stale now */
     s->wrap_id[0] = 0;
     s->wrap_w = -1;
     s->dn = 0;
+}
 
-    DIR *d = opendir(WM_APP_DIR);
+/* ------------------------------------------------------------
+ * Reading the two things this window knows about: the bundles on
+ * disk, and the index the desktop downloaded.
+ * ------------------------------------------------------------ */
+static void add_bundle(Store *s, const char *dir, const char *id, int from_root) {
+    if (s->ninst >= INST_MAX) return;
+    if (!id[0] || strlen(id) >= sizeof(s->inst[0].id)) return;
+    if (strchr(id, '/')) return;
+    for (int i = 0; i < s->ninst; i++)
+        if (!strcmp(s->inst[i].id, id)) return;      /* already listed */
+
+    StoreApp *a = &s->inst[s->ninst];
+    memset(a, 0, sizeof(*a));
+    snprintf(a->id, sizeof(a->id), "%s", id);
+    /* a directory in the shared bundle root without a manifest is not an
+     * app; /root/apps is pkg's own root, so list whatever it put there */
+    if (!read_manifest(dir, a) && !from_root) return;
+    if (!a->desc[0] && from_root)
+        snprintf(a->desc, sizeof(a->desc), "installed by pkg");
+    a->from_root = from_root;
+    probe_payload(dir, a);
+    s->ninst++;
+}
+
+static void scan_installed(Store *s) {
+    s->ninst = 0;
+    s->error[0] = 0;
+
+    DIR *d = opendir(STORE_APP_DIR);
     if (!d) {
-        snprintf(s->error, sizeof(s->error), "%s: %s", WM_APP_DIR, strerror(errno));
-        s->sel = 0;
-        s->scroll = 0;
+        snprintf(s->error, sizeof(s->error), "%s: %s", STORE_APP_DIR, strerror(errno));
+    } else {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            add_bundle(s, STORE_APP_DIR, de->d_name, 0);
+        }
+        closedir(d);
+    }
+
+    d = opendir(STORE_ROOT_APPS);
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            add_bundle(s, STORE_ROOT_APPS, de->d_name, 1);
+        }
+        closedir(d);
+    }
+
+    sort_apps(s->inst, s->ninst);
+    build_disp(s);
+}
+
+/* an index row that is already on disk: /usr/share bundles and pkg's own
+ * /root/apps bundles both land in inst[], so one lookup covers both */
+static int is_installed(const Store *s, const char *name) {
+    for (int i = 0; i < s->ninst; i++)
+        if (!strcmp(s->inst[i].id, name)) return 1;
+    return 0;
+}
+
+static void load_index(Store *s) {
+    s->navail = 0;
+    s->index_err[0] = 0;
+    s->index_state = 0;
+    s->index_mtime = 0;
+    s->index_size = -1;
+
+    struct stat st;
+    if (stat(STORE_REPO_INDEX, &st) != 0) {
+        if (errno != ENOENT) {
+            s->index_state = -1;
+            snprintf(s->index_err, sizeof(s->index_err), "%s: %s",
+                     STORE_REPO_INDEX, strerror(errno));
+        }
+        return;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        s->index_state = -1;
+        snprintf(s->index_err, sizeof(s->index_err), "%s: not a file", STORE_REPO_INDEX);
         return;
     }
 
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL && s->count < WM_MAX_APPS) {
-        if (de->d_name[0] == '.') continue;
-
-        StoreApp *a = &s->app[s->count];
-        memset(a, 0, sizeof(*a));
-        snprintf(a->id, sizeof(a->id), "%s", de->d_name);
-        if (!read_manifest(WM_APP_DIR, a)) continue;    /* no manifest: not an app */
-        probe_payload(a);
-        s->count++;
+    FILE *f = fopen(STORE_REPO_INDEX, "r");
+    if (!f) {
+        s->index_state = -1;
+        snprintf(s->index_err, sizeof(s->index_err), "%s: %s",
+                 STORE_REPO_INDEX, strerror(errno));
+        return;
     }
-    closedir(d);
 
-    sort_apps(s->app, s->count);
+    char line[512];
+    while (s->navail < PKG_MAX && fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        char *cr = strchr(line, '\r');
+        if (cr) *cr = 0;
+        if (!line[0]) continue;
 
-    if (keep[0]) {
-        int i = index_of(s, keep);
-        if (i >= 0) { s->sel = i; return; }
+        char *field[6];
+        int nf = 0;
+        char *p = line;
+        while (nf < 6) {
+            field[nf++] = p;
+            char *tab = strchr(p, '\t');
+            if (!tab) break;
+            *tab = 0;
+            p = tab + 1;
+        }
+
+        /* the desktop would refuse this name, so it is not offered at all */
+        if (!pkg_name_ok(field[0])) continue;
+
+        Pkg *k = &s->avail[s->navail];
+        memset(k, 0, sizeof(*k));
+        snprintf(k->name, sizeof(k->name), "%s", field[0]);
+        if (nf > 1) snprintf(k->version, sizeof(k->version), "%s", field[1]);
+        if (nf > 2) {
+            char *end = NULL;
+            long v = strtol(field[2], &end, 10);
+            if (end && end != field[2] && v > 0) {
+                k->size = v;
+                k->have_size = 1;
+            }
+        }
+        if (nf > 5) snprintf(k->desc, sizeof(k->desc), "%s", field[5]);
+        s->navail++;
     }
-    if (s->sel >= s->count) s->sel = s->count > 0 ? s->count - 1 : 0;
-    if (s->sel < 0) s->sel = 0;
+
+    int ioerr = ferror(f);
+    fclose(f);
+
+    if (ioerr) {
+        s->navail = 0;
+        s->index_state = -1;
+        snprintf(s->index_err, sizeof(s->index_err), "%s: %s",
+                 STORE_REPO_INDEX, strerror(EIO));
+        return;
+    }
+
+    sort_pkgs(s->avail, s->navail);
+    s->index_state = 1;
+    s->index_mtime = (long long)st.st_mtime;
+    s->index_size  = (long long)st.st_size;
 }
 
-static void store_init(App *a, int w, int h) {
-    Store *s = calloc(1, sizeof(Store));
-    if (!s) return;
-    s->app = calloc(WM_MAX_APPS, sizeof(StoreApp));
-    if (!s->app) { free(s); return; }
-    s->w = w;
-    s->h = h;
-    s->wrap_w = -1;
-    scan(s);
-    a->state = s;
+/* The desktop downloads the index with wget -O, so the file can exist and
+ * still be half written. Watching (mtime, size) instead of a one-shot flag
+ * means the finished file is read on the next draw, and a refresh the user
+ * asked for needs no timer: it appears as soon as the file changes. */
+static void sync_index(Store *s) {
+    struct stat st;
+    if (stat(STORE_REPO_INDEX, &st) != 0) {
+        if (s->index_state != 0) {          /* it was here and is gone */
+            load_index(s);
+            build_disp(s);
+        }
+        return;
+    }
+    if (s->index_state == 1 &&
+        (long long)st.st_mtime == s->index_mtime &&
+        (long long)st.st_size  == s->index_size)
+        return;
+
+    int had = s->index_state;
+    int before = s->navail;
+    load_index(s);
+    build_disp(s);
+
+    if (s->index_state == 1 && (had != 1 || s->navail != before))
+        snprintf(s->status, sizeof(s->status), "index: %d package%s",
+                 s->navail, s->navail == 1 ? "" : "s");
 }
 
-static void store_free(App *a) {
-    Store *s = a->state;
-    if (!s) return;
-    free(s->app);
-    free(s);
-    a->state = NULL;
+/* `pkg install` unpacks into /root/apps. Until that directory shows up the
+ * row stays available; once it does, the bundle list and the marks follow. */
+static void poll_install(Store *s) {
+    if (!s->pending[0]) return;
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", STORE_ROOT_APPS, s->pending);
+
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) return;
+
+    char done[32];
+    snprintf(done, sizeof(done), "%s", s->pending);
+    s->pending[0] = 0;
+    scan_installed(s);
+    snprintf(s->status, sizeof(s->status), "installed %s", done);
 }
 
 /* ------------------------------------------------------------
@@ -198,9 +510,9 @@ static void store_free(App *a) {
  * are, so they all derive the vertical metrics from the fonts and
  * share one layout function.
  *
- * There is no ROW_H/HEAD_H/FOOT_H/LINE_H constant any more. Every
- * vertical size is the height of the font that draws in it plus a
- * fixed amount of leading, which is what "leading" means: the space
+ * There is no ROW_H/HEAD_H/FOOT_H/LINE_H constant. Every vertical
+ * size is the height of the font that draws in it plus a fixed
+ * amount of leading, which is what "leading" means: the space
  * between baselines. font_get() is where the global text scale is
  * applied (src/font.c:125), so a scale change moves every one of
  * these numbers together with the glyphs: rows cannot overlap, the
@@ -209,7 +521,7 @@ static void store_free(App *a) {
  * painted. Horizontal paddings stay fixed on purpose.
  * ------------------------------------------------------------ */
 typedef struct {
-    int row_h;      /* one app row            (font of the row + 4) */
+    int row_h;      /* one row                (font of the row + 4) */
     int head_h;     /* title band + its rule  (font of the title + 12) */
     int foot_h;     /* status line at the bottom (font of the line + 6) */
     int line_h;     /* one wrapped description line (font + 2) */
@@ -238,7 +550,7 @@ static int geo_now(Geo *g) {
 
 /* The nl thresholds only decide how many description lines are shown at
  * all (3 on a tall window, 1 or none on a short one); they are not text
- * positions. The band and the rows below are computed from the metrics. */
+ * positions. The band and the rows above it are computed from the metrics. */
 static void layout_of(int h, const Geo *g, int *rows, int *band, int *nlines) {
     int nl = h >= 210 ? DESC_MAXLINES : h >= 172 ? 2 : h >= 134 ? 1 : 0;
     for (;;) {
@@ -253,6 +565,19 @@ static void layout_of(int h, const Geo *g, int *rows, int *band, int *nlines) {
         }
         nl--;
     }
+}
+
+/* When the bundle directory cannot be read, its error line gets the first
+ * row slot instead of replacing the list - the Available section stays
+ * usable. The painter, the pager and the click hit-test shift by the same
+ * derived amount, so a click still lands on the row that was painted. */
+static int list_offset(const Store *s, const Geo *g) {
+    return s->error[0] ? g->row_h : 0;
+}
+
+static int list_rows(const Store *s, int rows) {
+    if (s->error[0] && rows > 0) rows--;
+    return rows > 0 ? rows : 0;
 }
 
 /* ------------------------------------------------------------
@@ -368,56 +693,238 @@ static int wrap_desc(Font *fr, const char *text, float maxw,
     return nlines;
 }
 
-/* The cache is keyed on the selected app's id, not on its row number, and
- * scan() clears it - so a rescan can never leave another app's text in the
- * band, whether the list grew, shrank, or a desc = line was edited. */
+/* The cache is keyed on the selected row's name, not on its row number, and
+ * every list rebuild clears it - so a rescan can never leave another
+ * package's text in the band, whether rows appeared, vanished, or a desc
+ * column was edited. */
 static void refresh_wrap(Store *s, Font *fr, int w) {
-    const char *id = (s->sel >= 0 && s->sel < s->count) ? s->app[s->sel].id : "";
+    char key[64];
+    key[0] = 0;
+    const char *text = "";
 
-    if (s->wrap_w == w && !strcmp(s->wrap_id, id)) return;
-    snprintf(s->wrap_id, sizeof(s->wrap_id), "%s", id);
+    if (s->sel >= 0 && s->sel < s->ndisp) {
+        Disp *d = &s->disp[s->sel];
+        if (d->kind == D_APP) {
+            snprintf(key, sizeof(key), "a:%s", s->inst[d->idx].id);
+            text = s->inst[d->idx].desc;
+        } else if (d->kind == D_PKG) {
+            snprintf(key, sizeof(key), "p:%s", s->avail[d->idx].name);
+            text = s->avail[d->idx].desc;
+        }
+    }
+
+    if (s->wrap_w == w && !strcmp(s->wrap_id, key)) return;
+    snprintf(s->wrap_id, sizeof(s->wrap_id), "%s", key);
     s->wrap_w = w;
     s->dn = 0;
-    if (!s->wrap_id[0]) return;
-    s->dn = wrap_desc(fr, s->app[s->sel].desc, (float)w - 12.0f,
-                      s->dlines, DESC_MAXLINES);
+    if (!key[0]) return;
+    s->dn = wrap_desc(fr, text, (float)w - 12.0f, s->dlines, DESC_MAXLINES);
 }
 
 /* ------------------------------------------------------------
- * The launch request. The desktop owns the fork/exec; we only
- * hand it the id, one line, in the file it watches.
+ * Requests. The desktop owns the fork/exec and the package
+ * manager; this window only writes the one-line request file it
+ * watches. Nothing else is ever written to those paths.
  * ------------------------------------------------------------ */
-static void request_launch(Store *s) {
-    if (s->sel < 0 || s->sel >= s->count) {
+static int write_line(const char *path, const char *value, char *err, size_t errsz) {
+    /* "wb": the bytes handed to the desktop must be exactly value + '\n',
+     * on any host, not whatever the C library's text mode does to them */
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        snprintf(err, errsz, "%s: %s", path, strerror(errno));
+        return 0;
+    }
+
+    int e = 0;
+    if (fprintf(f, "%s\n", value) < 0) e = errno;
+    if (fflush(f) != 0 && !e) e = errno;
+    if (ferror(f) && !e) e = EIO;
+    if (fclose(f) != 0 && !e) e = errno;
+    if (e) {
+        /* never leave half a request behind for the desktop to read */
+        remove(path);
+        snprintf(err, errsz, "%s: %s", path, strerror(e));
+        return 0;
+    }
+    return 1;
+}
+
+static void request_refresh(Store *s) {
+    char err[128];
+    int ok = write_line(STORE_REPO_REFRESH, "refresh", err, sizeof(err));
+
+    /* a refresh is also the moment to look at the disk again: pkg writes
+     * into a bundle root, so a finished install shows up here too */
+    scan_installed(s);
+
+    if (!ok) {
+        snprintf(s->status, sizeof(s->status), "%s", err);
+        return;
+    }
+    snprintf(s->status, sizeof(s->status),
+             "refresh requested - the desktop fetches the index");
+}
+
+static void activate(Store *s) {
+    if (s->sel < 0 || s->sel >= s->ndisp) {
         snprintf(s->status, sizeof(s->status), "nothing selected");
         return;
     }
-    StoreApp *a = &s->app[s->sel];
+    Disp *d = &s->disp[s->sel];
 
-    FILE *f = fopen(LAUNCH_REQUEST, "w");
-    if (!f) {
-        snprintf(s->status, sizeof(s->status), "%s: %s",
-                 LAUNCH_REQUEST, strerror(errno));
+    if (d->kind == D_APP) {
+        StoreApp *a = &s->inst[d->idx];
+        char err[128];
+        if (!write_line(STORE_LAUNCH_REQUEST, a->id, err, sizeof(err))) {
+            snprintf(s->status, sizeof(s->status), "%s", err);
+            return;
+        }
+        snprintf(s->status, sizeof(s->status),
+                 "asked the desktop to launch %s", a->id);
         return;
     }
 
-    int wrote = fprintf(f, "%s\n", a->id);
-    int err = 0;
-    if (wrote < 0) err = errno;
-    if (fflush(f) != 0 && !err) err = errno;
-    if (ferror(f) && !err) err = EIO;
-    if (fclose(f) != 0 && !err) err = errno;
+    if (d->kind == D_PKG) {
+        Pkg *k = &s->avail[d->idx];
+        if (is_installed(s, k->name)) {
+            snprintf(s->status, sizeof(s->status), "already installed: %s", k->name);
+            return;
+        }
+        if (!pkg_name_ok(k->name)) {      /* belt and braces: load_index filtered */
+            snprintf(s->status, sizeof(s->status), "refusing package name");
+            return;
+        }
+        char err[128];
+        if (!write_line(STORE_INSTALL_REQUEST, k->name, err, sizeof(err))) {
+            snprintf(s->status, sizeof(s->status), "%s", err);
+            return;
+        }
+        snprintf(s->status, sizeof(s->status), "installing %s...", k->name);
+        snprintf(s->pending, sizeof(s->pending), "%s", k->name);
+        return;
+    }
 
-    if (err)
-        snprintf(s->status, sizeof(s->status), "%s: %s",
-                 LAUNCH_REQUEST, strerror(err));
-    else
-        snprintf(s->status, sizeof(s->status), "asked the desktop to launch %s", a->id);
+    /* section titles and notes are not rows you can act on */
 }
 
 /* ------------------------------------------------------------
  * Drawing
  * ------------------------------------------------------------ */
+static void paint_row(Surface *s, Font *fr, Font *fd, const Theme *th,
+                      int x, int ry, int w, int row_h, Store *st, int idx) {
+    Disp *d = &st->disp[idx];
+    int selected = (idx == st->sel);
+    float fx = (float)x;
+    float fy = (float)ry;
+
+    if (selected && disp_selectable(d))
+        gfx_rrect_aa(s, fx + 3.0f, fy - 1.0f, (float)w - 6.0f, (float)row_h,
+                     4.0f, color_alpha(th->accent, 0.20f), 0, 0);
+
+    if (d->kind == D_SECT) {
+        char label[64];
+        snprintf(label, sizeof(label), "%s (%d)", d->msg, d->idx);
+        float lw = font_width(fd, label);
+        font_draw(s, fd, fx + 8.0f, fy + 2.0f, label, color_alpha(th->accent, 0.75f));
+        float rx = fx + 8.0f + lw + 8.0f;
+        float re = fx + (float)w - 8.0f;
+        if (re > rx)
+            surf_blend(s, (int)rx, ry + row_h / 2, (int)(re - rx), 1, th->panel_border);
+        return;
+    }
+
+    if (d->kind == D_MSG) {
+        draw_clipped(s, fd, fx + 14.0f, fy + 2.0f, (float)w - 22.0f, d->msg,
+                     color_alpha(th->text, 0.45f));
+        return;
+    }
+
+    float right = fx + (float)w - 6.0f;
+
+    if (d->kind == D_APP) {
+        StoreApp *e = &st->inst[d->idx];
+
+        char sz[32];
+        if (e->have_size)
+            snprintf(sz, sizeof(sz), "%.1f KB", (double)e->size / 1024.0);
+        else
+            snprintf(sz, sizeof(sz), "no payload");
+        float sw = font_width(fr, sz);
+        if (sw + 90.0f < (float)w) {
+            font_draw(s, fr, right - sw, fy, sz,
+                      color_alpha(th->text, e->have_size ? 0.55f : 0.35f));
+            right -= sw + 10.0f;
+        }
+
+        if (w >= 320) {
+            float ew = font_width(fd, e->exe);
+            if (right - ew > fx + 140.0f) {
+                font_draw(s, fd, right - ew, fy + 1.0f, e->exe,
+                          color_alpha(th->text, 0.35f));
+                right -= ew + 10.0f;
+            }
+        }
+
+        if (e->from_root) {     /* came from the repo, not the image */
+            float mw = font_width(fd, "pkg");
+            if (right - mw > fx + 140.0f) {
+                font_draw(s, fd, right - mw, fy + 1.0f, "pkg",
+                          color_alpha(th->accent, 0.55f));
+                right -= mw + 10.0f;
+            }
+        }
+
+        float name_x = fx + 8.0f;
+        draw_clipped(s, fr, name_x, fy, right - name_x, e->name,
+                     selected ? th->text : th->text_dim);
+        return;
+    }
+
+    /* D_PKG: name, the index's size, and its description */
+    Pkg *k = &st->avail[d->idx];
+    int ins = is_installed(st, k->name);
+
+    char sz[32];
+    if (!k->have_size)
+        snprintf(sz, sizeof(sz), "?");
+    else if (k->size >= 1048576)
+        snprintf(sz, sizeof(sz), "%.1f MB", (double)k->size / 1048576.0);
+    else
+        snprintf(sz, sizeof(sz), "%ld KB", (k->size + 1023) / 1024);
+    {
+        float sw = font_width(fd, sz);
+        if (sw + 70.0f < (float)w) {
+            font_draw(s, fd, right - sw, fy + 1.0f, sz,
+                      color_alpha(th->text, k->have_size ? 0.55f : 0.35f));
+            right -= sw + 10.0f;
+        }
+    }
+
+    if (ins) {
+        float iw = font_width(fd, "installed");
+        if (right - iw > fx + 150.0f) {
+            font_draw(s, fd, right - iw, fy + 1.0f, "installed",
+                      color_alpha(th->accent, 0.70f));
+            right -= iw + 10.0f;
+        }
+    }
+
+    float name_x = fx + 8.0f;
+    float name_w = (float)w * 0.34f;
+    if (name_w > 170.0f) name_w = 170.0f;
+    if (name_w < 64.0f) name_w = 64.0f;
+
+    float desc_x = name_x + name_w + 6.0f;
+    float desc_w = right - 8.0f - desc_x;
+    if (desc_w > 20.0f)
+        draw_clipped(s, fd, desc_x, fy + 1.0f, desc_w, k->desc,
+                     color_alpha(th->text, ins ? 0.30f : 0.50f));
+
+    draw_clipped(s, fr, name_x, fy, name_w, k->name,
+                 ins ? color_alpha(th->text, 0.55f)
+                     : (selected ? th->text : th->text_dim));
+}
+
 static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const Theme *th) {
     Store *st = a->state;
     if (!st) return;
@@ -430,135 +937,138 @@ static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const The
     Font *fd = font_get(FONT_REGULAR, 10);
     if (!fp || !fr || !fd) return;
 
+    /* bring the two sources up to date before painting them */
+    poll_install(st);
+    sync_index(st);
+
     Geo g = geo_of(fp, fr);
 
-    /* header: what this window is, and how many bundles it found */
+    /* header: what this window is, and the Refresh action */
     font_draw(s, fp, (float)x + 6.0f, (float)y + 5.0f, "Apps", th->text);
     {
-        char head[64];
-        snprintf(head, sizeof(head), "%d bundle%s", st->count,
-                 st->count == 1 ? "" : "s");
-        float hw = font_width(fr, head);
-        if (hw + 60.0f < (float)w)
-            font_draw(s, fr, (float)(x + w) - hw - 6.0f, (float)y + 7.0f, head,
-                      color_alpha(th->text, 0.45f));
+        const char *label = "Refresh";
+        float lw = font_width(fd, label);
+        int bw = (int)(lw + 18.0f);
+        int bh = g.head_h - 10;
+        if (bh < 12) bh = 12;
+        int bx = x + w - bw - 6;
+        int by = y + 5;
+
+        /* recorded, so store_click() hit-tests exactly what was painted */
+        st->btn_x = bx;
+        st->btn_y = by;
+        st->btn_w = bw;
+        st->btn_h = bh;
+
+        gfx_rrect_aa(s, (float)bx, (float)by, (float)bw, (float)bh, 4.0f,
+                     color_alpha(th->accent, 0.18f),
+                     color_alpha(th->accent, 0.55f), 1.0f);
+        float ty = (float)by + ((float)bh - font_height(fd)) * 0.5f;
+        if (ty < (float)by) ty = (float)by;
+        font_draw(s, fd, (float)bx + 9.0f, ty, label, th->text);
     }
     surf_blend(s, x + 4, y + g.head_h - 6, w - 8, 1, th->panel_border);
 
     int rows = 0, band = 0, nlines = 0;
     layout_of(h, &g, &rows, &band, &nlines);
 
-    if (st->error[0]) {
+    if (st->error[0])
         draw_clipped(s, fr, (float)x + 6.0f, (float)y + (float)g.head_h,
                      (float)w - 12.0f, st->error, th->accent);
-    } else if (st->count == 0) {
-        draw_clipped(s, fr, (float)x + 6.0f, (float)y + (float)g.head_h,
-                     (float)w - 12.0f, "no app bundles with a manifest here",
-                     th->text_dim);
-    } else {
-        /* keep the highlighted row inside the scroll window */
-        if (rows > 0) {
+
+    int nrows = list_rows(st, rows);
+    int top = y + g.head_h + list_offset(st, &g);
+
+    if (nrows > 0) {
+        /* keep the selected row inside the scroll window */
+        if (st->sel >= 0) {
             if (st->sel < st->scroll) st->scroll = st->sel;
-            if (st->sel >= st->scroll + rows) st->scroll = st->sel - rows + 1;
-            int max_scroll = st->count - rows;
-            if (max_scroll < 0) max_scroll = 0;
-            if (st->scroll > max_scroll) st->scroll = max_scroll;
-            if (st->scroll < 0) st->scroll = 0;
+            if (st->sel >= st->scroll + nrows) st->scroll = st->sel - nrows + 1;
         }
+        int max_scroll = st->ndisp - nrows;
+        if (max_scroll < 0) max_scroll = 0;
+        if (st->scroll > max_scroll) st->scroll = max_scroll;
+        if (st->scroll < 0) st->scroll = 0;
 
-        for (int i = 0; i < rows; i++) {
+        for (int i = 0; i < nrows; i++) {
             int idx = st->scroll + i;
-            if (idx >= st->count) break;
-            StoreApp *e = &st->app[idx];
-            int selected = (idx == st->sel);
-            float ry = (float)y + (float)g.head_h + (float)i * (float)g.row_h;
-
-            if (selected)
-                gfx_rrect_aa(s, (float)x + 3.0f, ry - 1.0f, (float)w - 6.0f, (float)g.row_h,
-                             4.0f, color_alpha(th->accent, 0.20f), 0, 0);
-
-            /* payload size, right aligned, from the real st_size */
-            float right = (float)(x + w) - 6.0f;
-            char sz[32];
-            if (e->have_size)
-                snprintf(sz, sizeof(sz), "%.1f KB", (double)e->size / 1024.0);
-            else
-                snprintf(sz, sizeof(sz), "no payload");
-            float sw = font_width(fr, sz);
-            if (sw + 90.0f < (float)w) {
-                font_draw(s, fr, right - sw, ry, sz,
-                          color_alpha(th->text, e->have_size ? 0.55f : 0.35f));
-                right -= sw + 10.0f;
-            }
-
-            /* the exec name, when there is room for it */
-            if (w >= 300) {
-                float ew = font_width(fd, e->exe);
-                if (right - ew > (float)x + 120.0f) {
-                    font_draw(s, fd, right - ew, ry + 1.0f, e->exe,
-                              color_alpha(th->text, 0.35f));
-                    right -= ew + 10.0f;
-                }
-            }
-
-            float name_x = (float)x + 8.0f;
-            draw_clipped(s, fr, name_x, ry, right - name_x, e->name,
-                         selected ? th->text : th->text_dim);
+            if (idx >= st->ndisp) break;
+            int ry = top + i * g.row_h;
+            paint_row(s, fr, fd, th, x, ry, w, g.row_h, st, idx);
         }
     }
 
-    /* description band: the selected manifest's 'desc =' line, wrapped */
+    /* description band: the selected row's own text, wrapped */
     if (band > 0) {
         float by = (float)(y + h) - (float)g.foot_h - (float)band;
         surf_blend(s, x + 4, (int)by, w - 8, 1, th->panel_border);
         refresh_wrap(st, fr, w);
 
-        if (st->count > 0 && st->sel >= 0 && st->sel < st->count) {
+        int sel = st->sel;
+        if (sel >= 0 && sel < st->ndisp && disp_selectable(&st->disp[sel])) {
             int shown = st->dn;
             if (shown > nlines) shown = nlines;
-            if (st->dn == 0 && nlines > 0)
+            if (shown == 0 && nlines > 0)
                 draw_clipped(s, fr, (float)x + 6.0f, by + 5.0f, (float)w - 12.0f,
-                             "this manifest has no desc = line", th->text_dim);
+                             st->disp[sel].kind == D_PKG
+                                 ? "no description in the index"
+                                 : "this manifest has no desc = line",
+                             th->text_dim);
             for (int i = 0; i < shown; i++)
-                draw_clipped(s, fr, (float)x + 6.0f, by + 5.0f + (float)i * (float)g.line_h,
+                draw_clipped(s, fr, (float)x + 6.0f,
+                             by + 5.0f + (float)i * (float)g.line_h,
                              (float)w - 12.0f, st->dlines[i],
                              color_alpha(th->text, 0.85f));
 
-            /* the hint: this window asks, the desktop launches */
+            /* the hint: what Enter will ask for, and nothing else */
+            char hint[128];
             float hy = (float)(y + h) - (float)g.foot_h - (float)g.line_h - 3.0f;
-            char hint[96];
-            snprintf(hint, sizeof(hint), "Enter or click: write %s", LAUNCH_REQUEST);
+            if (st->disp[sel].kind == D_PKG) {
+                Pkg *k = &st->avail[st->disp[sel].idx];
+                if (is_installed(st, k->name))
+                    snprintf(hint, sizeof(hint), "%s is installed - Enter does nothing",
+                             k->name);
+                else if (k->version[0])
+                    snprintf(hint, sizeof(hint), "Enter: pkg install %s (v%s)",
+                             k->name, k->version);
+                else
+                    snprintf(hint, sizeof(hint), "Enter: pkg install %s", k->name);
+            } else {
+                StoreApp *e = &st->inst[st->disp[sel].idx];
+                if (e->from_root)
+                    snprintf(hint, sizeof(hint),
+                             "Enter: launch %s (pkg unpacked it into %s)",
+                             e->id, STORE_ROOT_APPS);
+                else
+                    snprintf(hint, sizeof(hint),
+                             "Enter: ask the desktop to launch %s", e->id);
+            }
             draw_clipped(s, fd, (float)x + 6.0f, hy, (float)w - 12.0f, hint,
                          color_alpha(th->text, 0.40f));
         } else {
             float hy = (float)(y + h) - (float)g.foot_h - (float)g.line_h - 3.0f;
-            char hint[96];
-            snprintf(hint, sizeof(hint), "the desktop launches %s", LAUNCH_REQUEST);
-            draw_clipped(s, fd, (float)x + 6.0f, hy, (float)w - 12.0f, hint,
-                         color_alpha(th->text, 0.40f));
+            draw_clipped(s, fd, (float)x + 6.0f, hy, (float)w - 12.0f,
+                         "r: fetch the package index", color_alpha(th->text, 0.40f));
         }
     }
 
-    /* footer: how many bundles, and the outcome of the last request */
+    /* footer: how much is installed and offered, plus the last outcome */
     {
-        /* one line inside the derived footer band, 3 px off its bottom */
         float fy = (float)(y + h) - font_height(fr) - 3.0f;
-        const char *tail = st->status[0]
-                         ? st->status
-                         : "the desktop launches what /run/mystic/launch.request names";
-        float tw = font_width(fr, tail);
-        if (tw + 70.0f < (float)w) {
+        const char *tail = st->status;
+        float tw = tail[0] ? font_width(fr, tail) : 0.0f;
+        if (tw > 0.0f && tw + 90.0f < (float)w) {
             font_draw(s, fr, (float)(x + w) - tw - 6.0f, fy, tail,
-                      color_alpha(st->status[0] ? th->accent : th->text, 0.45f));
+                      color_alpha(th->accent, 0.55f));
             tw += 12.0f;
         } else {
             tw = 0.0f;
         }
 
-        char foot[64];
-        snprintf(foot, sizeof(foot), "%d app%s%s", st->count,
-                 st->count == 1 ? "" : "s",
-                 st->count >= WM_MAX_APPS ? " (max)" : "");
+        char foot[96];
+        snprintf(foot, sizeof(foot), "%d installed - %d available%s",
+                 st->ninst, st->navail,
+                 st->index_state == 0 ? " - no index" : "");
         draw_clipped(s, fr, (float)x + 6.0f, fy, (float)w - tw - 12.0f, foot,
                      color_alpha(th->text, 0.45f));
     }
@@ -568,11 +1078,30 @@ static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const The
  * Input
  * ------------------------------------------------------------ */
 static void move_sel(Store *s, int delta) {
-    if (s->count == 0) return;
-    int v = s->sel + delta;
-    if (v < 0) v = 0;
-    if (v >= s->count) v = s->count - 1;
-    s->sel = v;
+    if (s->ndisp <= 0 || delta == 0) return;
+    int dir = delta > 0 ? 1 : -1;
+    int steps = delta > 0 ? delta : -delta;
+    int i = s->sel;
+    if (i < 0) i = dir > 0 ? -1 : s->ndisp;
+
+    while (steps > 0) {
+        int j = i + dir;
+        while (j >= 0 && j < s->ndisp && !disp_selectable(&s->disp[j])) j += dir;
+        if (j < 0 || j >= s->ndisp) break;
+        i = j;
+        steps--;
+    }
+    if (i >= 0 && i < s->ndisp) s->sel = i;
+}
+
+static void sel_first(Store *s) {
+    for (int i = 0; i < s->ndisp; i++)
+        if (disp_selectable(&s->disp[i])) { s->sel = i; return; }
+}
+
+static void sel_last(Store *s) {
+    for (int i = s->ndisp - 1; i >= 0; i--)
+        if (disp_selectable(&s->disp[i])) { s->sel = i; return; }
 }
 
 static void store_key(App *a, const char *bytes, int n) {
@@ -582,6 +1111,7 @@ static void store_key(App *a, const char *bytes, int n) {
     Geo g;
     int rows = 1, band = 0, nlines = 0;
     if (geo_now(&g)) layout_of(s->h, &g, &rows, &band, &nlines);
+    rows = list_rows(s, rows);
     if (rows < 1) rows = 1;
 
     for (int i = 0; i < n; i++) {
@@ -592,8 +1122,8 @@ static void store_key(App *a, const char *bytes, int n) {
                 switch (bytes[i + 2]) {
                     case 'A': move_sel(s, -1); break;
                     case 'B': move_sel(s, +1); break;
-                    case 'H': s->sel = 0; break;
-                    case 'F': s->sel = s->count > 0 ? s->count - 1 : 0; break;
+                    case 'H': sel_first(s); break;
+                    case 'F': sel_last(s); break;
                     case '5':                            /* \x1b[5~ PageUp */
                         move_sel(s, -rows);
                         if (i + 3 < n) i++;
@@ -612,13 +1142,13 @@ static void store_key(App *a, const char *bytes, int n) {
         switch (c) {
             case 'j': move_sel(s, +1); break;
             case 'k': move_sel(s, -1); break;
-            case 'g': s->sel = 0; break;
-            case 'G': s->sel = s->count > 0 ? s->count - 1 : 0; break;
-            case 0x01: s->sel = 0; break;                       /* Ctrl+A */
-            case 0x05: s->sel = s->count > 0 ? s->count - 1 : 0; break;  /* Ctrl+E */
-            case 'r': scan(s); break;
+            case 'g': sel_first(s); break;
+            case 'G': sel_last(s); break;
+            case 0x01: sel_first(s); break;                         /* Ctrl+A */
+            case 0x05: sel_last(s); break;                          /* Ctrl+E */
+            case 'r': request_refresh(s); break;
             case '\n':
-            case '\r': request_launch(s); break;
+            case '\r': activate(s); break;
             default: break;
         }
     }
@@ -626,38 +1156,43 @@ static void store_key(App *a, const char *bytes, int n) {
 
 static void store_click(App *a, int x, int y, int buttons) {
     Store *s = a->state;
-    (void)x;
     if (!s) return;
     if (buttons && !(buttons & 1)) return;      /* left button only */
+
+    /* the Refresh button: exactly the rect store_draw() recorded */
+    if (s->btn_w > 0 && x >= s->btn_x && x < s->btn_x + s->btn_w &&
+        y >= s->btn_y && y < s->btn_y + s->btn_h) {
+        request_refresh(s);
+        return;
+    }
 
     Geo g;
     int rows = 0, band = 0, nlines = 0;
     if (!geo_now(&g)) return;
     layout_of(s->h, &g, &rows, &band, &nlines);
+    rows = list_rows(s, rows);
+    int top = g.head_h + list_offset(s, &g);
     if (rows < 1) return;
 
     /* Only the row band owns rows. A click above the first row - the
-     * "Apps" title, the "N bundles" count, or the rule under them - and a
-     * click in the footer or the desc band below the list belong to no row
-     * and must do nothing. This used to be `(int)(((float)y - HEAD_H) /
-     * ROW_H)` - the fixed row height this file used before the metrics
-     * became font-derived: C truncates a negative float toward zero, so y in
-     * [HEAD_H - ROW_H + 1, HEAD_H - 1] (here 11..25) became row 0 and the
-     * `row < 0` guard could never fire - one click on the word "Apps"
-     * selected the top bundle and wrote /run/mystic/launch.request, which
-     * the desktop then fork/exec'd. Reject the bands first, then divide a
-     * value that is known to be >= 0, so truncation and floor agree and no
-     * negative or out-of-range index can be produced. */
-    if (y < g.head_h) return;                   /* header band */
+     * "Apps" title, the Refresh button, the rule under them, or the error
+     * line when the bundle directory is unreadable - and a click in the
+     * description band or the footer belong to no row and must do nothing.
+     * Reject the bands first, then divide a value that is known to be >= 0,
+     * so truncation and floor agree and no negative or out-of-range index
+     * can be produced. */
+    if (y < top) return;                        /* header band */
     if (y >= s->h - g.foot_h) return;           /* footer band */
 
-    int row = (y - g.head_h) / g.row_h;         /* y >= head_h: exact */
-    if (row < 0 || row >= rows) return;         /* past the list / desc band */
+    int row = (y - top) / g.row_h;              /* y >= top: exact */
+    if (row < 0 || row >= rows) return;         /* past the list */
     int idx = s->scroll + row;
-    if (idx < 0 || idx >= s->count) return;
+    if (idx < 0 || idx >= s->ndisp) return;
+    if (!disp_selectable(&s->disp[idx])) return;  /* titles and notes */
 
+    int again = (idx == s->sel);
     s->sel = idx;
-    request_launch(s);
+    if (again) activate(s);                     /* click twice to act */
 }
 
 static void store_resize(App *a, int w, int h) {
@@ -666,6 +1201,26 @@ static void store_resize(App *a, int w, int h) {
     s->w = w;
     s->h = h;
     s->wrap_w = -1;              /* force a re-wrap for the new width */
+}
+
+static void store_init(App *a, int w, int h) {
+    Store *s = calloc(1, sizeof(Store));
+    if (!s) return;
+    s->w = w;
+    s->h = h;
+    s->sel = -1;
+    s->wrap_w = -1;
+    s->index_size = -1;
+    load_index(s);
+    scan_installed(s);           /* ends with build_disp() */
+    a->state = s;
+}
+
+static void store_free(App *a) {
+    Store *s = a->state;
+    if (!s) return;
+    free(s);
+    a->state = NULL;
 }
 
 const AppVT app_vt_store = {

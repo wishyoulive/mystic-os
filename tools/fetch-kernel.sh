@@ -34,6 +34,7 @@ kernel/drivers/net
 kernel/net/core
 kernel/net/packet
 kernel/fs/fat
+kernel/lib
 kernel/fs/ext4
 kernel/fs/jbd2
 kernel/fs/nls

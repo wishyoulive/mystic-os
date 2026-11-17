@@ -227,3 +227,43 @@ refreshes, Enter writes the install request). Check `progress` for it.
 At the measured rate (~2,800 verified lines per 30-minute swarm with a critic on every file),
 500k is ~85 more swarm cycles. The owner forbids padding, so the honest progress metric is
 capability; the line count is a by-product.
+
+---
+
+## 11. Latest hunter round — 20 findings (just landed, mostly unfixed)
+
+Fixed immediately because they were live: **#1** characters were emitted on the
+key-UP edge (nothing echoed until release, and `Shift↓ A↓ Shift↑ A↑` produced
+`a` not `A`) — now emitted on press; **#6** `setup_disk` force-formatted on any
+mount failure (data loss) — reverted to the known-good path with the risk
+documented in `stage/init`, after a safer superblock-magic version failed to
+mount; **root cause of the disk trouble**: `crc16.ko` lives in `kernel/lib`,
+which `fetch-kernel.sh` did not fetch (I had hand-copied it, and the script
+wipes the tree), so `ext4` could not load — added `kernel/lib` to MODULE_TREES.
+
+Still open, highest value first:
+
+| # | Sev | Where | What |
+|---|---|---|---|
+| 2 | HIGH | `term.c:744` + `main.c:1375` | one frame can block the compositor for 1.6 s: `term_key` waits 100 ms per queued key (16 per frame) |
+| 3 | HIGH | `font.c:80-152` | every (face,size) keeps its own full TTF copy — **40 MB** after clicking the five text sizes once |
+| 4 | HIGH | `files.c:281` | truncation is O(len²) per row per frame — 7530 `font_width` calls, 8.9 ms/frame |
+| 5 | HIGH | `fetch-browser.py:152` | a partial `.apk` is trusted (size never checked), then silently dropped, script exits 0 |
+| 7 | MED | `term.c:659` | every column change rebuilds the 600-line scrollback (50–846 µs) + SIGWINCH per mouse-move |
+| 9 | MED | `input.c:243` | evdev drain unbounded while queues hold 16/31 → 21 chars silently lost after a long frame |
+| 10 | MED | `main.c:375` | dock wider than the screen is not clamped (10 windows at 1.6×) |
+| 11 | MED | `settings.c:400` | five file reads per frame, 300 opens/s while Settings is visible |
+| 12 | MED | `settings.c:221` | truncate-then-write can leave an empty `ui.conf` that never heals across reboots |
+| 13 | MED | `main.c:735` | a magnified icon is up to 1.45× its hit box |
+| 19 | LOW | `gfx.c:509` | `gfx_shadow` alpha not clamped (alpha > 1 inverts it) |
+
+Their own corrections: `files.c` insertion sort over a 376-byte Entry is 1.1–2.5 ms
+once per navigation (downgraded), as were the symlink-host-resolution and
+`udhcpc` empties.
+
+## 12. If I had one more session
+
+1. The 20 findings above (2, 3, 4 are the ones the owner would feel).
+2. Browser fetch (Enter), then publish the repo to a public URL and set `/etc/mystic/repo.conf`.
+3. Sandbox H1/H2/H5 (per-app uid, private `/dev/shm` with `size=`, `CLONE_NEWPID`).
+4. Encryption (dm-crypt modules are in the package), index signing (Ed25519), setup screen.
