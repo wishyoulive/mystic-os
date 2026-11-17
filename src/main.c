@@ -96,7 +96,7 @@ static Display disp;
 static Surface screen;
 static Surface scene;
 static Input   input;
-static Theme   themes[8];
+static Theme   themes[16];   /* ten are shipped; the array used to hold 8 */
 static int     theme_count, theme_index;
 
 /* ------------------------------------------------------------ windows */
@@ -1380,7 +1380,7 @@ int main(void) {
     scene.px = calloc((size_t)screen.w * screen.h, 4);
     if (!screen.px || !scene.px) { fprintf(stderr, "out of memory\n"); return 1; }
 
-    theme_count = theme_load_all(themes, 8, THEME_DIR);
+    theme_count = theme_load_all(themes, 16, THEME_DIR);
     if (theme_count == 0) {
         Theme t;
         theme_load(&t, "/nonexistent");

@@ -14,10 +14,17 @@
 #      pkg repo                  which repository is in use
 #
 #  Repository layout - identical for a static host, a directory
-#  listing and GitHub release assets:
-#      <base>/index.tsv
+#  listing and GitHub release assets. The index is signed; an index
+#  whose signature does not verify is never read:
+#      <base>/index.tsv       the rows
+#      <base>/index.tsv.sig   64 raw bytes, Ed25519 over the exact bytes
+#      <base>/index.pub       32 raw bytes, the publisher's public key
 #      <base>/<file>
 #      name<TAB>version<TAB>size<TAB>sha256<TAB>file<TAB>description
+#
+#  The trusted key is NOT downloaded. It ships in the image at
+#  /etc/mystic/repo.pub, because a key fetched from the same server as
+#  the signature would authenticate nothing. See docs/SIGNING.md.
 #
 #  The base URL, highest priority first:
 #      $MYSTIC_REPO            a one-command override
@@ -44,6 +51,15 @@ CACHE="${MYSTIC_CACHE:-/tmp/pkg}"
 INDEX="$CACHE/index.tsv"
 DL_LOG="$CACHE/download.log"
 RUN_INDEX=/run/mystic/repo.index
+
+# The trust anchor. The public key is part of the OS image and is never
+# fetched: a key that arrives from the same server as the signature proves
+# nothing. MYSTIC_REPO_PUB and MYSTIC_VERIFY let this script be exercised
+# outside the image; they are a test hook, not a security boundary - anyone
+# who can set them can edit this script too.
+PUBKEY="${MYSTIC_REPO_PUB:-/etc/mystic/repo.pub}"
+VERIFY="${MYSTIC_VERIFY:-/usr/bin/ed25519-verify}"
+INDEX_SIG="$INDEX.sig"
 
 say()  { echo "$*"; }
 warn() { echo "pkg: $*" >&2; }
@@ -155,6 +171,93 @@ download() {
     return 1
 }
 
+# The cached index and the tarballs live in $CACHE. If an unprivileged
+# user pre-created that directory they could swap the index between the
+# signature check and the read, so the cache must be ours and not writable
+# by anyone else. The mode stays 0755: the Store app stats .part files in
+# here to show real download progress.
+prepare_cache() {
+    mkdir -p "$CACHE" 2>/dev/null || die "cannot create $CACHE"
+    _owner=$(stat -c %u "$CACHE" 2>/dev/null)
+    _me=$(id -u 2>/dev/null)
+    if [ -n "$_owner" ] && [ -n "$_me" ] && [ "$_owner" != "$_me" ]; then
+        die "$CACHE belongs to uid $_owner, not $_me - refusing to use a cache someone else can write"
+    fi
+    chmod go-w "$CACHE" 2>/dev/null
+    return 0
+}
+
+# The verifier is a tiny static binary built from src/tools/ed25519.c.
+verifier_path() {
+    for _v in "$VERIFY" /usr/bin/ed25519-verify /bin/ed25519-verify; do
+        [ -n "$_v" ] && [ -x "$_v" ] && { printf '%s\n' "$_v"; return 0; }
+    done
+    return 1
+}
+
+# sha256 of the raw key file: the fingerprint tools/sign-index.py prints.
+key_fingerprint() {
+    [ -f "$1" ] || return 0
+    sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+}
+
+# verify_index MESSAGE SIGNATURE - 0 only if SIGNATURE is a valid Ed25519
+# signature of MESSAGE under the key shipped in the image. Everything pkg
+# does with an index goes through this first.
+verify_index() {
+    [ -f "$1" ] || { warn "cannot verify: $1 is missing"; return 1; }
+    if [ ! -f "$PUBKEY" ]; then
+        warn "no repository public key at $PUBKEY"
+        warn "without it an index cannot be authenticated, so it is not used"
+        warn "the key ships with the OS image; see docs/SIGNING.md"
+        return 1
+    fi
+    if [ ! -f "$2" ]; then
+        warn "the repository publishes no signature ($2 is missing)"
+        warn "an unsigned index is refused: the publisher must sign index.tsv"
+        return 1
+    fi
+    _ver=$(verifier_path) || {
+        warn "no Ed25519 verifier found (looked for $VERIFY and /usr/bin/ed25519-verify)"
+        warn "this image was built without it; unsigned indexes are refused by design"
+        return 1
+    }
+    if "$_ver" "$PUBKEY" "$1" "$2" >/dev/null 2>&1; then
+        return 0
+    fi
+    warn "SIGNATURE VERIFICATION FAILED for $1"
+    warn "  key       : $PUBKEY"
+    warn "  fingerprint: sha256 $(key_fingerprint "$PUBKEY")"
+    warn "  signature : $2"
+    warn "the index was altered in transit, or it was signed with a key this"
+    warn "image does not trust. Either way it is not used."
+    return 1
+}
+
+# A package is unpacked as root. tar would happily write "../../etc/shadow"
+# or an absolute path out of the install directory, so every member is
+# checked before a single byte is extracted.
+tar_members_ok() {
+    _list="$CACHE/.members.$$"
+    if ! tar -tzf "$1" >"$_list" 2>/dev/null; then
+        rm -f "$_list"
+        warn "$2 is not a readable gzip tar archive"
+        return 1
+    fi
+    _bad=$(grep -E '(^/|(^|/)\.\.($|/))' "$_list" | head -n 1)
+    _n=$(wc -l < "$_list" | tr -d ' ')
+    rm -f "$_list"
+    if [ -n "$_bad" ]; then
+        warn "$2 contains a path that would escape the install directory: $_bad"
+        return 1
+    fi
+    if [ "$_n" -eq 0 ]; then
+        warn "$2 is an empty archive"
+        return 1
+    fi
+    return 0
+}
+
 # A cached index must be a TSV. An empty repository is legal; an HTML error
 # page or a plain-text 404 is not, and must never be promoted to $INDEX.
 index_ok() {
@@ -173,7 +276,7 @@ index_ok() {
 }
 
 fetch_index() {
-    mkdir -p "$CACHE" || die "cannot create $CACHE"
+    prepare_cache
     say "fetching index from $REPO/index.tsv"
     if ! download "$REPO/index.tsv" "$INDEX.part" 20 "index download"; then
         rm -f "$INDEX.part"
@@ -186,9 +289,30 @@ fetch_index() {
         warn "$REPO/index.tsv is not a package index (HTML error page, or a wrong path)"
         return 1
     fi
-    mv "$INDEX.part" "$INDEX" || { rm -f "$INDEX.part"; die "cannot write $INDEX"; }
+    # The signature file travels separately, but proves nothing on its own:
+    # it is checked here against the key that already lives in this image.
+    say "fetching signature from $REPO/index.tsv.sig"
+    if ! download "$REPO/index.tsv.sig" "$INDEX_SIG.part" 20 "signature download"; then
+        rm -f "$INDEX.part" "$INDEX_SIG.part"
+        warn "$REPO/index.tsv.sig could not be fetched - refusing the unsigned index"
+        return 1
+    fi
+    if ! verify_index "$INDEX.part" "$INDEX_SIG.part"; then
+        rm -f "$INDEX.part" "$INDEX_SIG.part"
+        warn "the index from $REPO was NOT installed; any previously verified"
+        warn "index in $INDEX is left untouched"
+        return 1
+    fi
+    # Publish the signature first: a reader that sees a new index always has
+    # the matching signature beside it, and re-checks the pair anyway.
+    mv "$INDEX_SIG.part" "$INDEX_SIG" || { rm -f "$INDEX.part" "$INDEX_SIG.part"; die "cannot write $INDEX_SIG"; }
+    mv "$INDEX.part" "$INDEX" || { rm -f "$INDEX.part" "$INDEX_SIG"; die "cannot write $INDEX"; }
+    if ! verify_index "$INDEX" "$INDEX_SIG"; then
+        rm -f "$INDEX" "$INDEX_SIG"
+        die "the index changed while it was being installed - removed"
+    fi
     _n=$(awk -F'\t' 'NF >= 2 && $1 != "" { n++ } END { print n + 0 }' "$INDEX")
-    say "$_n packages"
+    say "$_n packages (signature ok, key sha256 $(key_fingerprint "$PUBKEY"))"
     # The Store app lists "Available" from this file, so keep its copy in step
     # whenever pkg refreshes the index.
     if [ -d /run/mystic ]; then
@@ -198,7 +322,14 @@ fetch_index() {
 }
 
 ensure_index() {
-    [ -f "$INDEX" ] && return 0
+    [ -f "$INDEX" ] || { fetch_index; return $?; }
+    # The cache lives in /tmp. Every read re-checks the signature, so a file
+    # that cannot be authenticated is treated as absent, not as an index.
+    if verify_index "$INDEX" "$INDEX_SIG" 2>/dev/null; then
+        return 0
+    fi
+    warn "the cached index at $INDEX cannot be authenticated - fetching it again"
+    rm -f "$INDEX" "$INDEX_SIG"
     fetch_index
 }
 
@@ -302,12 +433,13 @@ cmd_install() {
     [ -n "$size" ] || size=0
     say "installing $name ($file, $(human "$size")) from $REPO"
 
-    mkdir -p "$CACHE" "$APPS" || die "cannot create $CACHE or $APPS"
+    prepare_cache
+    mkdir -p "$APPS" || die "cannot create $APPS"
     tar_path="$CACHE/$file"
     if [ -f "$tar_path" ]; then
         got=$(sha256sum "$tar_path" | cut -d' ' -f1)
         if [ "$got" != "$want" ]; then
-            warn "cached $file does not match the index - downloading it again"
+            warn "cached $file does not match the signed index - downloading it again"
             rm -f "$tar_path"
         fi
     fi
@@ -323,10 +455,14 @@ cmd_install() {
         got=$(sha256sum "$tar_path" | cut -d' ' -f1)
         if [ "$got" != "$want" ]; then
             rm -f "$tar_path"
-            die "checksum mismatch for $file (expected $want, got $got)"
+            die "checksum mismatch for $file (signed index says $want, download is $got) - refusing to unpack"
         fi
     fi
-    say "checksum ok"
+    say "checksum ok ($want)"
+    if ! tar_members_ok "$tar_path" "$file"; then
+        rm -f "$tar_path"
+        die "$file is not safe to unpack - nothing was installed"
+    fi
 
     stage="$APPS/.$name.new.$$"
     rm -rf "$stage"
@@ -387,12 +523,38 @@ cmd_repo() {
     else
         say "  from:  built-in default"
     fi
+    _ver=$(verifier_path 2>/dev/null)
+    if [ -f "$PUBKEY" ]; then
+        say "  key:   $PUBKEY"
+        say "         sha256 $(key_fingerprint "$PUBKEY")"
+    else
+        say "  key:   MISSING ($PUBKEY) - nothing can be installed"
+    fi
+    say "  verifier: ${_ver:-MISSING (ed25519-verify)} - indexes are unsigned, so refused"
     if [ -f "$INDEX" ]; then
         _n=$(awk -F'\t' 'NF >= 2 && $1 != "" { n++ } END { print n + 0 }' "$INDEX")
-        say "  index: $_n packages cached in $INDEX"
+        if verify_index "$INDEX" "$INDEX_SIG" 2>/dev/null; then
+            say "  index: $_n packages cached in $INDEX (signature ok)"
+        else
+            say "  index: $_n packages cached in $INDEX (SIGNATURE BAD - will be refetched)"
+        fi
     else
         say "  index: not fetched yet (run: pkg update)"
     fi
+}
+
+cmd_key() {
+    if [ ! -f "$PUBKEY" ]; then
+        say "no repository key at $PUBKEY"
+        say "this image cannot authenticate a package index"
+        return 1
+    fi
+    say "repository key: $PUBKEY"
+    say "  sha256   : $(key_fingerprint "$PUBKEY")"
+    say "  raw bytes: $(od -An -tx1 "$PUBKEY" | tr -d ' \n')"
+    say "compare that sha256 with the fingerprint the publisher quotes;"
+    say "if they differ, packages from that publisher will be refused."
+    return 0
 }
 
 case "${1:-list}" in
@@ -402,8 +564,9 @@ case "${1:-list}" in
     remove)    cmd_remove "$2" ;;
     update)    fetch_index ;;
     repo)      cmd_repo ;;
+    key)       cmd_key ;;
     *)
-        echo "usage: pkg [list|installed|install <name>|remove <name>|update|repo]" >&2
+        echo "usage: pkg [list|installed|install <name>|remove <name>|update|repo|key]" >&2
         exit 1
         ;;
 esac
