@@ -58,7 +58,7 @@ typedef struct {
     char      dlines[DESC_MAXLINES][DESC_LINE];   /* wrapped description */
     int       dn;
     int       wrap_w;         /* width the wrap was computed for */
-    int       wrap_sel;       /* selection the wrap was computed for */
+    char      wrap_id[32];    /* which app's desc the wrap holds; "" if none */
 } Store;
 
 /* ------------------------------------------------------------
@@ -139,6 +139,12 @@ static void scan(Store *s) {
 
     s->count = 0;
     s->error[0] = 0;
+    /* Whatever was wrapped describes the list as it was before this scan
+     * (a bundle may have appeared, vanished, or had its desc = edited).
+     * Throw the cache away so the band cannot show another app's text. */
+    s->wrap_id[0] = 0;
+    s->wrap_w = -1;
+    s->dn = 0;
 
     DIR *d = opendir(WM_APP_DIR);
     if (!d) {
@@ -178,7 +184,7 @@ static void store_init(App *a, int w, int h) {
     if (!s->app) { free(s); return; }
     s->w = w;
     s->h = h;
-    s->wrap_sel = -1;
+    s->wrap_w = -1;
     scan(s);
     a->state = s;
 }
@@ -323,12 +329,17 @@ static int wrap_desc(Font *fr, const char *text, float maxw,
     return nlines;
 }
 
+/* The cache is keyed on the selected app's id, not on its row number, and
+ * scan() clears it - so a rescan can never leave another app's text in the
+ * band, whether the list grew, shrank, or a desc = line was edited. */
 static void refresh_wrap(Store *s, Font *fr, int w) {
-    if (s->wrap_sel == s->sel && s->wrap_w == w) return;
-    s->wrap_sel = s->sel;
+    const char *id = (s->sel >= 0 && s->sel < s->count) ? s->app[s->sel].id : "";
+
+    if (s->wrap_w == w && !strcmp(s->wrap_id, id)) return;
+    snprintf(s->wrap_id, sizeof(s->wrap_id), "%s", id);
     s->wrap_w = w;
     s->dn = 0;
-    if (s->sel < 0 || s->sel >= s->count) return;
+    if (!s->wrap_id[0]) return;
     s->dn = wrap_desc(fr, s->app[s->sel].desc, (float)w - 12.0f,
                       s->dlines, DESC_MAXLINES);
 }
@@ -428,14 +439,10 @@ static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const The
             /* payload size, right aligned, from the real st_size */
             float right = (float)(x + w) - 6.0f;
             char sz[32];
-            if (e->have_size) {
-                if (e->size < 1024)
-                    snprintf(sz, sizeof(sz), "%ld B", e->size);
-                else
-                    snprintf(sz, sizeof(sz), "%.1f KB", (double)e->size / 1024.0);
-            } else {
+            if (e->have_size)
+                snprintf(sz, sizeof(sz), "%.1f KB", (double)e->size / 1024.0);
+            else
                 snprintf(sz, sizeof(sz), "no payload");
-            }
             float sw = font_width(fr, sz);
             if (sw + 90.0f < (float)w) {
                 font_draw(s, fr, right - sw, ry, sz,

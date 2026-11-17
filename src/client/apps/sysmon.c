@@ -487,7 +487,8 @@ int main(void) {
 
         /* sit out the rest of the second, but react to input at once */
         MEvent ev;
-        for (int i = 0; i < 20; i++) {
+        int resized = 0;
+        for (int i = 0; i < 20 && !resized; i++) {
             while (mc_poll(&c, &ev)) {
                 if (ev.type == MC_CLOSE) { mc_close(&c); return 0; }
                 if (ev.type == MC_KEY && ev.press && ev.key == 16) {  /* q */
@@ -501,11 +502,16 @@ int main(void) {
                 if (ev.type == MC_RESIZE) {
                     /* the mapping we were given cannot grow, so only a
                      * shrink is honoured; anything larger is ignored */
-                    if (ev.w > 0 && ev.w <= s.w) m.w = ev.w;
-                    if (ev.h > 0 && ev.h <= s.h) m.h = ev.h;
+                    int nw = ev.w > 0 && ev.w <= s.w ? ev.w : m.w;
+                    int nh = ev.h > 0 && ev.h <= s.h ? ev.h : m.h;
+                    if (nw != m.w || nh != m.h) {
+                        m.w = nw;
+                        m.h = nh;
+                        resized = 1;   /* repaint now, not a second late */
+                    }
                 }
             }
-            usleep(50 * 1000);
+            if (!resized) usleep(50 * 1000);
         }
     }
 }
