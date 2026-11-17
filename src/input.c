@@ -68,32 +68,36 @@ int input_open(Input *in) {
     return (mouse_fd >= 0 || key_fd >= 0) ? 0 : -1;
 }
 
-/* US keyboard, keycode -> character (lower case + shift) */
+/* US keyboard: keycode -> character, explicit so it can be read and
+ * checked. (An offset table computed from row strings was off by one and
+ * turned "ls" into "ka" - a real bug, caught by a real test.) */
+static const struct { int code; char lo, hi; } KEYMAP[] = {
+    {KEY_1,'1','!'},{KEY_2,'2','@'},{KEY_3,'3','#'},{KEY_4,'4','$'},
+    {KEY_5,'5','%'},{KEY_6,'6','^'},{KEY_7,'7','&'},{KEY_8,'8','*'},
+    {KEY_9,'9','('},{KEY_0,'0',')'},{KEY_MINUS,'-','_'},{KEY_EQUAL,'=','+'},
+    {KEY_Q,'q','Q'},{KEY_W,'w','W'},{KEY_E,'e','E'},{KEY_R,'r','R'},
+    {KEY_T,'t','T'},{KEY_Y,'y','Y'},{KEY_U,'u','U'},{KEY_I,'i','I'},
+    {KEY_O,'o','O'},{KEY_P,'p','P'},{KEY_LEFTBRACE,'[','{'},{KEY_RIGHTBRACE,']','}'},
+    {KEY_A,'a','A'},{KEY_S,'s','S'},{KEY_D,'d','D'},{KEY_F,'f','F'},
+    {KEY_G,'g','G'},{KEY_H,'h','H'},{KEY_J,'j','J'},{KEY_K,'k','K'},
+    {KEY_L,'l','L'},{KEY_SEMICOLON,';',':'},{KEY_APOSTROPHE,'\'','"'},
+    {KEY_GRAVE,'`','~'},{KEY_BACKSLASH,'\\','|'},
+    {KEY_Z,'z','Z'},{KEY_X,'x','X'},{KEY_C,'c','C'},
+    {KEY_V,'v','V'},{KEY_B,'b','B'},{KEY_N,'n','N'},{KEY_M,'m','M'},
+    {KEY_COMMA,',','<'},{KEY_DOT,'.','>'},{KEY_SLASH,'/','?'},
+};
+
 static int key_to_char(int code, int shift) {
-    static const char plain[] = "1234567890-=  qwertyuiop[]  asdfghjkl;'`  zxcvbnm,./";
-    static const char upper[] = "!@#$%^&*()_+  QWERTYUIOP{}  ASDFGHJKL:\"~  ZXCVBNM<>?";
     switch (code) {
-        case KEY_SPACE: return ' ';
-        case KEY_ENTER: return '\n';
+        case KEY_SPACE:     return ' ';
+        case KEY_ENTER:     return '\n';
         case KEY_BACKSPACE: return '\b';
-        case KEY_TAB: return '\t';
+        case KEY_TAB:       return '\t';
         default: break;
     }
-    const int map[][2] = {
-        {KEY_1,0},{KEY_2,1},{KEY_3,2},{KEY_4,3},{KEY_5,4},{KEY_6,5},{KEY_7,6},{KEY_8,7},
-        {KEY_9,8},{KEY_0,9},{KEY_MINUS,10},{KEY_EQUAL,11},{KEY_Q,13},{KEY_W,14},{KEY_E,15},
-        {KEY_R,16},{KEY_T,17},{KEY_Y,18},{KEY_U,19},{KEY_I,20},{KEY_O,21},{KEY_P,22},
-        {KEY_LEFTBRACE,23},{KEY_RIGHTBRACE,24},{KEY_A,27},{KEY_S,28},{KEY_D,29},{KEY_F,30},
-        {KEY_G,31},{KEY_H,32},{KEY_J,33},{KEY_K,34},{KEY_L,35},{KEY_SEMICOLON,36},
-        {KEY_APOSTROPHE,37},{KEY_GRAVE,38},{KEY_BACKSLASH,39},{KEY_Z,41},{KEY_X,42},
-        {KEY_C,43},{KEY_V,44},{KEY_B,45},{KEY_N,46},{KEY_M,47},{KEY_COMMA,48},
-        {KEY_DOT,49},{KEY_SLASH,50},
-    };
-    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++)
-        if (map[i][0] == code) {
-            int idx = map[i][1];
-            return (unsigned char)(shift ? upper[idx] : plain[idx]);
-        }
+    for (size_t i = 0; i < sizeof(KEYMAP) / sizeof(KEYMAP[0]); i++)
+        if (KEYMAP[i].code == code)
+            return (unsigned char)(shift ? KEYMAP[i].hi : KEYMAP[i].lo);
     return 0;
 }
 

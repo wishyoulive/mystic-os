@@ -13,8 +13,12 @@
 /bin/mount -t proc     none /proc
 /bin/mount -t sysfs    none /sys
 /bin/mount -t devtmpfs none /dev
+# pty support: without devpts forkpty() cannot open the slave side
+mkdir -p /dev/pts
+/bin/mount -t devpts none /dev/pts 2>/dev/null
 /bin/hostname mystic
 export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+mkdir -p /root /run /tmp /var/log 2>/dev/null
 
 KV=$(uname -r)
 
