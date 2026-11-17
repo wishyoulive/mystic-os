@@ -85,5 +85,8 @@ void wms_shutdown_client(WmClient *c);
 
 int  wms_scan_apps(WmApp *out, int max);            /* read WM_APP_DIR */
 int  wms_launch(const WmApp *app, WmClient *c, int slot); /* fork/exec */
+/* Same, but the app receives `path` as argv[1]: this is how Files opens
+ * a document in the app the type registry chose for it. */
+int  wms_launch_path(const WmApp *app, WmClient *c, int slot, const char *path);
 
 #endif /* MYSTIC_IPC_H */

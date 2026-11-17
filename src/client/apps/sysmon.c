@@ -1,36 +1,51 @@
 /* ============================================================
  *  Mystic OS - apps (external) / sysmon
  *
- *  A system monitor that runs as its own process. Everything it
- *  draws was read from the kernel moments earlier:
+ *  A system dashboard that runs as its own process. It is the same
+ *  feature as Monitor (src/apps/monitor.c), seen from outside the
+ *  desktop: the process table uses the same columns, the same sort
+ *  keys, the same filter keys and the same card geometry, so moving
+ *  between the two windows does not mean learning a second table.
  *
- *    /proc/cpuinfo        "processor" lines           -> cpu count
- *    /proc/loadavg        the three load averages     -> numbers + sparkline
- *    /proc/meminfo        MemTotal / MemAvailable     -> memory % + sparkline
- *    /proc/uptime         first field                 -> uptime
- *    /proc/<pid>/stat     fields 3, 14, 15            -> state, utime+stime
- *    /proc/<pid>/statm    fields 1, 2                 -> virtual / resident
- *    /proc/<pid>/comm     the process name
- *    /proc/net/dev        per-interface rx/tx bytes   -> totals and rates
+ *  Everything it draws was read from the kernel moments earlier:
  *
- *  CPU% is a DELTA, and the screen says so: for every pid we keep the
- *  utime+stime jiffies from the previous sample, subtract, and divide
- *  by the measured wall time between the two samples. A lifetime
- *  average would be a different (and much less useful) number. A
- *  process can legitimately show more than 100% on a multi-core box.
+ *    /proc/cpuinfo        "processor" lines                 -> cpu count
+ *    /proc/loadavg        the three load averages           -> numbers + graph
+ *    /proc/meminfo        MemTotal / MemAvailable           -> numbers + graph
+ *    /proc/uptime         first field                       -> uptime
+ *    /proc/<pid>/stat     fields 2, 3, 14, 15               -> comm, state,
+ *                                                              utime+stime
+ *    /proc/<pid>/statm    fields 1, 2                       -> resident set
+ *    /proc/net/dev        per-interface rx/tx byte counters -> totals + rates
  *
- *  Memory is statm field 2 (resident pages) times the real page size,
- *  not a guess.
+ *  Every value that is a DELTA says so on screen:
  *
- *  Kill sends SIGTERM; if the pid is still there two seconds later it
- *  sends SIGKILL. It refuses pid 1, pid 0 and this monitor's own pid.
- *  kill(2) errors are shown with strerror.
+ *    CPU%    the jiffies between two samples divided by the measured wall
+ *            time between those samples (CLOCK_MONOTONIC), as a percentage
+ *            of one core, so a threaded process can read above 100%. The
+ *            process card's title says "cpu% = delta over 0.98 s" with the
+ *            interval that was actually measured.
+ *    NET     the byte counters are cumulative; the rates beside them are
+ *            (now - previous) / measured seconds, and the network card's
+ *            title says "rates since last sample".
  *
- *  The two graphs are ring buffers inside this process: one sample per
- *  second, RING_N slots, so the window is the last three minutes.
+ *  Memory is statm field 2 (resident pages) times the real page size.
  *
- *  Mouse: click a column heading to sort, click a row to select it,
- *  click the filter box (or press /) and type to filter. Wheel scrolls.
+ *  Kill sends SIGTERM to the selected pid; if it is still alive after the
+ *  grace period it sends SIGKILL. It refuses pid 1 and this process, and
+ *  reports kill(2) errors with strerror.
+ *
+ *  The graphs are ring buffers inside this process: one point per one
+ *  second sample, RING_N slots (three minutes). A ring is only advanced
+ *  when its source file could be read, so a missing /proc/loadavg holds
+ *  the old history instead of drawing invented zeros.
+ *
+ *  Mouse: click a column heading to sort, the filter line to type, a row
+ *  to select. Wheel scrolls. Keys are listed on the window's bottom line.
+ *
+ *  Colours are the Obsidian theme's (stage/etc/mystic/themes/
+ *  1-obsidian.theme), the theme a fresh image boots with, so this window
+ *  and the two in-desktop system windows read as one family.
  * ============================================================ */
 #include "../mystic_client.h"
 #include "../../mystic.h"
@@ -53,64 +68,60 @@
 #define MAX_PROC 384
 #define RING_N   180          /* three minutes at one sample per second */
 #define MAX_IF   6
-#define MAX_ROWS 60
 
 #define KILL_GRACE_MS 2000.0  /* SIGTERM -> SIGKILL */
 
 /* ------------------------------------------------------------ colours */
 
-static const u32 C_BG_TOP = RGB(0x0D, 0x14, 0x22);
-static const u32 C_BG_BOT = RGB(0x18, 0x24, 0x3A);
-static const u32 C_TEXT   = RGB(0xE8, 0xEC, 0xF6);
-static const u32 C_DIM    = RGB(0x8A, 0x93, 0xA6);
-static const u32 C_ACCENT = RGB(0x4F, 0xD1, 0xC5);
-static const u32 C_MEM    = RGB(0x7A, 0xA2, 0xF7);
+static const u32 C_BG_TOP = RGB(0x0B, 0x0F, 0x1A);   /* Obsidian bg_top    */
+static const u32 C_BG_BOT = RGB(0x16, 0x1C, 0x2E);   /* Obsidian bg_bottom */
+static const u32 C_TEXT   = RGB(0xE8, 0xEC, 0xF6);   /* Obsidian text      */
+static const u32 C_DIM    = WITH_A(RGB(0xE8, 0xEC, 0xF6), 0x99);
+static const u32 C_ACCENT = RGB(0x7A, 0xA2, 0xF7);   /* Obsidian accent    */
 static const u32 C_WARN   = RGB(0xE0, 0x6C, 0x5C);
-static const u32 C_NET    = RGB(0x7B, 0xD8, 0x8F);
-static const u32 C_PANEL  = RGB(0x12, 0x1B, 0x2B);
-
-/* The OS build reads the real /proc. The host harness points the same
- * parsers at a fixture tree it wrote itself, so nothing in the shipped
- * object changes. */
-#ifdef SYSMON_HOST_TEST
-#  define PROC_ROOT ".work/paintmon/fake/proc"
-#else
-#  define PROC_ROOT "/proc"
-#endif
+static const u32 C_PANEL  = WITH_A(RGB(0x16, 0x1C, 0x2B), 0x8C);
+static const u32 C_BORDER = WITH_A(RGB(0xFF, 0xFF, 0xFF), 0x1A);
 
 #ifndef SIGKILL
 #  define SIGKILL 9
 #endif
 
+/* The OS build reads the real /proc. The host harness points the same
+ * parsers at a fixture tree it wrote itself, so nothing in the shipped
+ * object changes. */
+#ifdef SYSMON_HOST_TEST
+#  define PROC_ROOT ".work/systemui/fake/proc"
+#else
+#  define PROC_ROOT "/proc"
+#endif
+
 /* ------------------------------------------------------------ data */
 
 typedef struct {
-    int  pid;
-    char comm[24];
-    char state;
-    unsigned long long utime, stime;   /* jiffies from /proc/<pid>/stat */
-    long size_pages;                   /* statm field 1 */
-    long rss_pages;                    /* statm field 2 */
-    long mem_kb;                       /* rss_pages * the real page size */
-    int  cpu10;                        /* tenths of a percent, -1 if unknown */
+    int    pid;
+    char   comm[32];
+    char   state;                      /* /proc/<pid>/stat field 3 */
+    unsigned long long utime, stime;   /* jiffies from the stat    */
+    long   mem_kb;                     /* statm field 2 x page     */
+    double cpu;                        /* % of one core, delta; <0 unknown */
 } Proc;
 
 typedef struct {
     char name[16];
-    unsigned long long rx, tx;         /* byte counters, cumulative */
-    double rx_rate, tx_rate;           /* bytes per second, from the delta */
+    unsigned long long rx, tx;         /* cumulative byte counters  */
+    double rx_rate, tx_rate;           /* bytes/second, real delta  */
 } Iface;
 
 typedef struct {
-    /* one snapshot */
     int    ncpu;
     int    nproc;
     int    truncated;                  /* MAX_PROC rows and more pids existed */
     int    hz;                         /* sysconf(_SC_CLK_TCK) */
     long   page_kb;
+    int    load_ok, mem_ok, net_ok;
     double load[3];
     long   total_kb, avail_kb;
-    double uptime;
+    double uptime;                     /* <0 when /proc/uptime is unreadable */
     double dt_ms;                      /* measured gap between samples */
     int    samples;
 
@@ -118,40 +129,43 @@ typedef struct {
     Iface  ifs[MAX_IF];
     int    nif;
 
-    /* ring buffers: hist_head is the slot the next sample overwrites */
+    /* one ring per graph: a sample is only appended when its file was read */
     float  hist_load[RING_N];
+    int    load_head, load_len;
     float  hist_mem[RING_N];
-    int    hist_head, hist_len;
+    int    mem_head, mem_len;
 
-    /* interaction */
-    int    sort_key, sort_dir;         /* S_* and +1 ascending / -1 descending */
+    /* table */
+    int    view[MAX_PROC];
+    int    nview;
+    int    sort_key, sort_dir;
     char   filter[32];
     int    filter_edit;
     int    sel_pid;
-    int    scroll;
-    int    hover;                      /* row index under the pointer, -1 */
-    int    dlg;                        /* kill confirmation is up */
+    int    scroll, rows;
+
+    /* actions */
+    int    dlg;
     int    kill_pid;
-    char   kill_comm[24];
+    char   kill_comm[32];
     int    pending_pid;
-    double pending_at;                 /* when SIGKILL is due */
+    double pending_at;
     char   msg[160];
     double msg_at;
 } SysMon;
 
 enum { S_PID, S_NAME, S_STATE, S_CPU, S_MEM, S_N };
+enum { K_SYS, K_MEM, K_NET };
 
-static const char *SORT_NAME[S_N] = { "pid", "name", "state", "cpu", "memory" };
-
-/* ------------------------------------------------------------ clock */
+/* ------------------------------------------------------------ clock and kill */
 
 #ifdef SYSMON_HOST_TEST
 static double g_host_ms;
 static double mono_ms(void) { return g_host_ms; }
 static void host_advance(double ms) { g_host_ms += ms; }
 /* kill(2) does not exist on the Windows host; this records the signal and
- * pretends the call succeeded, so the SIGTERM -> SIGKILL state machine is
- * still exercised end to end. pid 999999 reports ESRCH. */
+ * reports success, so the SIGTERM -> SIGKILL state machine is exercised end
+ * to end. pid 999999 reports ESRCH, like a process that is already gone. */
 static int g_kill_n;
 static int g_kill_pid[16];
 static int g_kill_sig[16];
@@ -186,46 +200,56 @@ static int read_ncpu(void) {
     return n;
 }
 
-static void read_loadavg(SysMon *m) {
+/* Returns 1 when the three averages were read, 0 otherwise. */
+static int read_loadavg(SysMon *m) {
     m->load[0] = m->load[1] = m->load[2] = 0.0;
     FILE *f = fopen(PROC_ROOT "/loadavg", "r");
-    if (!f) return;
+    if (!f) return 0;
     double a = 0.0, b = 0.0, c = 0.0;
-    if (fscanf(f, "%lf %lf %lf", &a, &b, &c) == 3) {
-        m->load[0] = a;
-        m->load[1] = b;
-        m->load[2] = c;
-    }
+    int got = fscanf(f, "%lf %lf %lf", &a, &b, &c);
     fclose(f);
+    if (got != 3) return 0;
+    m->load[0] = a;
+    m->load[1] = b;
+    m->load[2] = c;
+    return 1;
 }
 
-static void read_meminfo(SysMon *m) {
+/* MemAvailable arrived in 3.14; older kernels only have MemFree. Returns 1
+ * only when a used/total pair can actually be computed. */
+static int read_meminfo(SysMon *m) {
     m->total_kb = 0;
     m->avail_kb = 0;
     long free_kb = 0;
+    int have_avail = 0, have_free = 0;
     FILE *f = fopen(PROC_ROOT "/meminfo", "r");
-    if (!f) return;
+    if (!f) return 0;
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         if (!strncmp(line, "MemTotal:", 9))
             m->total_kb = strtol(line + 9, NULL, 10);
-        else if (!strncmp(line, "MemAvailable:", 13))
+        else if (!strncmp(line, "MemAvailable:", 13)) {
             m->avail_kb = strtol(line + 13, NULL, 10);
-        else if (!strncmp(line, "MemFree:", 8))
+            have_avail = 1;
+        } else if (!strncmp(line, "MemFree:", 8)) {
             free_kb = strtol(line + 8, NULL, 10);
+            have_free = 1;
+        }
     }
     fclose(f);
-    /* MemAvailable arrived in 3.14; older kernels only have MemFree */
-    if (m->avail_kb == 0 && free_kb > 0) m->avail_kb = free_kb;
+    if (!have_avail && have_free) m->avail_kb = free_kb;
+    return m->total_kb > 0 && (have_avail || have_free);
 }
 
+/* <0 when the file cannot be read: a zero here would be a claim. */
 static double read_uptime(void) {
     FILE *f = fopen(PROC_ROOT "/uptime", "r");
-    if (!f) return 0.0;
+    if (!f) return -1.0;
     double up = 0.0;
-    if (fscanf(f, "%lf", &up) != 1) up = 0.0;
+    int got = fscanf(f, "%lf", &up);
     fclose(f);
-    return up > 0.0 ? up : 0.0;
+    if (got != 1 || up < 0.0) return -1.0;
+    return up;
 }
 
 static char *next_field(char **sp) {
@@ -238,9 +262,9 @@ static char *next_field(char **sp) {
     return t;
 }
 
-/* /proc/<pid>/stat: the command may contain spaces and ')' so the last
- * ')' on the line is the one that closes it; every field after it is a
- * number or a state letter. */
+/* /proc/<pid>/stat: the command may contain spaces and ')' so the last ')'
+ * on the line is the one that closes it; every field after it is a number or
+ * a state letter. Fills comm, state, utime, stime. */
 static int read_stat(int pid, Proc *p) {
     char path[64], buf[1024];
     snprintf(path, sizeof(path), PROC_ROOT "/%d/stat", pid);
@@ -268,24 +292,25 @@ static int read_stat(int pid, Proc *p) {
     return 0;
 }
 
-/* statm is "size resident shared text lib data dt" in pages */
-static int read_statm(int pid, long *size_pages, long *rss_pages) {
+/* statm is "size resident shared text lib data dt" in pages. A pid whose
+ * statm cannot be read keeps mem_kb = -1, which draws as "-": a live process
+ * is not dropped from the table just because one file is missing. */
+static int read_statm(int pid, long *rss_pages) {
     char path[64];
     snprintf(path, sizeof(path), PROC_ROOT "/%d/statm", pid);
     FILE *f = fopen(path, "r");
     if (!f) return -1;
-    long a = 0, b = 0;
-    int got = fscanf(f, "%ld %ld", &a, &b);
+    long size_pages = 0, rss = 0;
+    int got = fscanf(f, "%ld %ld", &size_pages, &rss);
     fclose(f);
     if (got != 2) return -1;
-    *size_pages = a;
-    *rss_pages = b;
+    *rss_pages = rss > 0 ? rss : 0;
     return 0;
 }
 
-static const Proc *find_pid(const SysMon *m, int pid) {
-    for (int i = 0; i < m->nproc; i++)
-        if (m->procs[i].pid == pid) return &m->procs[i];
+static const Proc *find_pid(const Proc *list, int n, int pid) {
+    for (int i = 0; i < n; i++)
+        if (list[i].pid == pid) return &list[i];
     return NULL;
 }
 
@@ -303,6 +328,7 @@ static void read_net(SysMon *m, double dt_ms) {
     memset(next, 0, sizeof(next));
 
     FILE *f = fopen(PROC_ROOT "/net/dev", "r");
+    m->net_ok = f != NULL;
     if (!f) { m->nif = 0; return; }
 
     char line[512];
@@ -356,18 +382,17 @@ static void read_net(SysMon *m, double dt_ms) {
 /* Read every pid and compute its CPU delta against the previous table.
  * dt_ms is the measured wall time since the previous sample. */
 static void sample(SysMon *m, double dt_ms) {
-    double dt = dt_ms;
-    m->dt_ms = dt;
-
-    m->ncpu = read_ncpu();
-    read_loadavg(m);
-    read_meminfo(m);
+    m->dt_ms = dt_ms;
+    m->load_ok = read_loadavg(m);
+    m->mem_ok = read_meminfo(m);
     m->uptime = read_uptime();
-    read_net(m, dt);
+    m->ncpu = read_ncpu();
+    read_net(m, dt_ms);
 
     static Proc next[MAX_PROC];
     int n = 0;
     m->truncated = 0;
+    double dt_s = dt_ms / 1000.0;
     DIR *d = opendir(PROC_ROOT);
     if (d) {
         struct dirent *e;
@@ -380,24 +405,22 @@ static void sample(SysMon *m, double dt_ms) {
             Proc tmp;
             memset(&tmp, 0, sizeof(tmp));
             tmp.pid = pid;
-            tmp.cpu10 = -1;
+            tmp.cpu = -1.0;                       /* unknown until a delta */
             if (read_stat(pid, &tmp) != 0) continue;      /* it died mid-scan */
-            if (read_statm(pid, &tmp.size_pages, &tmp.rss_pages) != 0) continue;
-            tmp.mem_kb = tmp.rss_pages * m->page_kb;
-            if (tmp.mem_kb < 0) tmp.mem_kb = 0;
+            long rss = 0;
+            tmp.mem_kb = read_statm(pid, &rss) == 0 ? rss * m->page_kb : -1;
 
-            const Proc *old = m->samples > 0 ? find_pid(m, pid) : NULL;
-            if (old && dt > 0.5) {
+            const Proc *old = find_pid(m->procs, m->nproc, pid);
+            if (old && dt_s > 0.0005) {
                 unsigned long long a = old->utime + old->stime;
                 unsigned long long b = tmp.utime + tmp.stime;
-                if (b > a) {
-                    double pct10 = (double)(b - a) * 1000000.0 /
-                                   ((double)m->hz * dt);
-                    double ceiling = 1000.0 * (double)(m->ncpu > 0 ? m->ncpu : 1);
-                    if (pct10 > ceiling) pct10 = ceiling;
-                    tmp.cpu10 = (int)(pct10 + 0.5);
+                if (b >= a) {
+                    double pct = (double)(b - a) * 100.0 /
+                                 ((double)m->hz * dt_s);
+                    if (pct > 999.0) pct = 999.0;
+                    tmp.cpu = pct;
                 } else {
-                    tmp.cpu10 = 0;
+                    tmp.cpu = 0.0;                /* counters went backwards */
                 }
             }
             next[n++] = tmp;
@@ -407,218 +430,143 @@ static void sample(SysMon *m, double dt_ms) {
     memcpy(m->procs, next, sizeof(Proc) * (size_t)n);
     m->nproc = n;
 
-    /* one point per graph, per second */
-    m->hist_load[m->hist_head] = (float)m->load[0];
-    long used = m->total_kb - m->avail_kb;
-    if (used < 0) used = 0;
-    m->hist_mem[m->hist_head] = m->total_kb > 0
-        ? (float)((double)used / (double)m->total_kb) : 0.0f;
-    m->hist_head = (m->hist_head + 1) % RING_N;
-    if (m->hist_len < RING_N) m->hist_len++;
-
+    /* One point per graph, and only when that graph's source was read. */
+    if (m->load_ok) {
+        m->hist_load[m->load_head] = (float)m->load[0];
+        m->load_head = (m->load_head + 1) % RING_N;
+        if (m->load_len < RING_N) m->load_len++;
+    }
+    if (m->mem_ok) {
+        long used = m->total_kb - m->avail_kb;
+        if (used < 0) used = 0;
+        m->hist_mem[m->mem_head] = m->total_kb > 0
+            ? (float)((double)used / (double)m->total_kb) : 0.0f;
+        m->mem_head = (m->mem_head + 1) % RING_N;
+        if (m->mem_len < RING_N) m->mem_len++;
+    }
     m->samples++;
 }
 
-/* ------------------------------------------------------------ view */
-
-static const SysMon *g_m;
-static int g_key;
-static int g_dir;
-
-static int ci_cmp(const char *a, const char *b) {
-    while (*a && *b) {
-        int ca = tolower((unsigned char)*a);
-        int cb = tolower((unsigned char)*b);
-        if (ca != cb) return ca - cb;
-        a++;
-        b++;
-    }
-    return (int)(unsigned char)*a - (int)(unsigned char)*b;
-}
-
-static int cmp_proc(const void *pa, const void *pb) {
-    int ia = *(const int *)pa, ib = *(const int *)pb;
-    const Proc *a = &g_m->procs[ia];
-    const Proc *b = &g_m->procs[ib];
-    int r = 0;
-    switch (g_key) {
-    case S_PID:
-        r = a->pid - b->pid;
-        break;
-    case S_NAME:
-        r = ci_cmp(a->comm, b->comm);
-        break;
-    case S_STATE:
-        r = (int)a->state - (int)b->state;
-        break;
-    case S_CPU:
-        r = a->cpu10 - b->cpu10;
-        break;
-    case S_MEM:
-        r = a->mem_kb > b->mem_kb ? 1 : (a->mem_kb < b->mem_kb ? -1 : 0);
-        break;
-    default:
-        break;
-    }
-    if (r == 0) r = a->pid - b->pid;
-    return g_dir > 0 ? r : -r;
-}
-
-static int view_match(const Proc *p, const char *f) {
-    if (!f[0]) return 1;
-    char pid[16];
-    snprintf(pid, sizeof(pid), "%d", p->pid);
-    if (strstr(pid, f)) return 1;
-    size_t fl = strlen(f);
-    for (const char *q = p->comm; *q; q++) {
-        size_t i = 0;
-        while (i < fl && q[i] &&
-               tolower((unsigned char)q[i]) == tolower((unsigned char)f[i]))
-            i++;
-        if (i == fl) return 1;
-        if (!q[1]) break;
-    }
-    return 0;
-}
-
-/* Rebuild the visible order: filter first, then sort. */
-static int build_view(SysMon *m, int *view) {
-    int n = 0;
-    for (int i = 0; i < m->nproc && n < MAX_PROC; i++)
-        if (view_match(&m->procs[i], m->filter)) view[n++] = i;
-    g_m = m;
-    g_key = m->sort_key;
-    g_dir = m->sort_dir;
-    if (n > 1) qsort(view, (size_t)n, sizeof(int), cmp_proc);
-    return n;
-}
-
-static int view_index_of(const SysMon *m, const int *view, int n, int pid) {
-    for (int i = 0; i < n; i++)
-        if (m->procs[view[i]].pid == pid) return i;
-    return -1;
-}
-
-/* ------------------------------------------------------------ text */
-
-static void text_right(Surface *s, Font *f, int xr, float y, const char *t, u32 col) {
-    font_draw(s, f, (float)xr - font_width(f, t), y, t, col);
-}
-
-static void fit(char *t, Font *f, float maxw) {
-    size_t n = strlen(t);
-    while (n > 1 && font_width(f, t) > maxw) {
-        t[--n] = 0;
-        while (n > 1 && ((u8)t[n] & 0xC0) == 0x80) t[--n] = 0;
-    }
-}
-
-static void fmt_bytes(double v, char *out, size_t n) {
-    if (v < 1024.0) snprintf(out, n, "%.0f B", v);
-    else if (v < 1024.0 * 1024.0) snprintf(out, n, "%.1f kB", v / 1024.0);
-    else if (v < 1024.0 * 1024.0 * 1024.0) snprintf(out, n, "%.1f MB", v / (1024.0 * 1024.0));
-    else snprintf(out, n, "%.2f GB", v / (1024.0 * 1024.0 * 1024.0));
-}
-
-static void fmt_uptime(double secs, char *out, size_t n) {
-    unsigned long s = (unsigned long)(secs > 0.0 ? secs : 0.0);
-    unsigned long d = s / 86400UL;
-    unsigned long hh = (s % 86400UL) / 3600UL;
-    unsigned long mm = (s % 3600UL) / 60UL;
-    unsigned long ss = s % 60UL;
-    if (d) snprintf(out, n, "%lud %02lu:%02lu:%02lu", d, hh, mm, ss);
-    else snprintf(out, n, "%02lu:%02lu:%02lu", hh, mm, ss);
-}
-
-/* ------------------------------------------------------------ layout */
-
-typedef struct { int x, y, w, h; } Rect;
+/* ------------------------------------------------------------
+ *  CARDS - one visual language for sysinfo, monitor and sysmon.
+ *  The frame, title, row and margin code is identical in
+ *  src/apps/sysinfo.c and src/apps/monitor.c; this file also carries the
+ *  sparkline painter, because only this window has history to draw.
+ * ------------------------------------------------------------ */
+typedef struct { float x, y, w, h; } CrdRect;
 
 typedef struct {
-    int  vw, vh;
-    Rect head;
-    Rect spark_load, spark_mem;
-    Rect net;
-    Rect filter, kill_btn;
-    Rect thead, rows;
-    Rect dlg, dlg_ok, dlg_no;
-    int  col[6];          /* column boundaries: 0..5 */
-    int  row_h, rows_visible, rows_top, rows_bottom;
-    int  y_foot[3];
-} Layout;
+    u32 panel, border, text, dim, accent, warn;
+    float corner;
+} CrdStyle;
 
 typedef struct {
-    Font *head, *body, *small, *mono;
-} Fonts;
+    float pad;
+    float gap;
+    float title_h;
+    float row_h;
+    float line_h;
+    float spark_h;
+} CrdMetrics;
 
-static void layout_build(int vw, int vh, const Fonts *F, Layout *L) {
-    memset(L, 0, sizeof(*L));
-    L->vw = vw;
-    L->vh = vh;
+static float crd_ink(Font *f) { return font_height(f) / 1.4f; }
+static float crd_base(Font *f, float top, float band) {
+    return top + (band - crd_ink(f)) * 0.5f + font_ascent(f);
+}
+static float crd_top(Font *f, float base) { return base - font_ascent(f); }
 
-    int gh = (int)font_height(F->head);
-    int sh = (int)font_height(F->small);
-    int bh = (int)font_height(F->body);
-    if (gh < 1) gh = 1;
-    if (sh < 1) sh = 1;
-    if (bh < 1) bh = 1;
-
-    L->head = (Rect){ 12, 8, vw - 24, gh };
-
-    int y = 8 + gh + 4;
-    int gap = 12;
-    int pw = (vw - 24 - gap) / 2;
-    L->spark_load = (Rect){ 12, y, pw, 74 };
-    L->spark_mem  = (Rect){ 12 + pw + gap, y, pw, 74 };
-    y += 74 + 8;
-
-    L->net = (Rect){ 12, y, vw - 24, 3 * sh };
-    y += 3 * sh + 4;
-
-    L->filter = (Rect){ 12, y, vw - 24 - 96, sh + 4 };
-    L->kill_btn = (Rect){ vw - 12 - 88, y, 88, sh + 4 };
-    y += sh + 4 + 6;
-
-    L->thead = (Rect){ 12, y, vw - 24, sh + 2 };
-    y += sh + 2;
-
-    int foot_top = vh - 3 * (sh + 1) - 6;
-    L->rows_top = y;
-    L->rows_bottom = foot_top - 4;
-    L->rows = (Rect){ 12, L->rows_top, vw - 24, L->rows_bottom - L->rows_top };
-    L->row_h = sh + 3;
-    L->rows_visible = (L->rows_bottom - L->rows_top) / L->row_h;
-    if (L->rows_visible < 1) L->rows_visible = 1;
-    if (L->rows_visible > MAX_ROWS) L->rows_visible = MAX_ROWS;
-
-    for (int i = 0; i < 3; i++) L->y_foot[i] = foot_top + i * (sh + 1);
-
-    L->col[0] = 12;
-    L->col[1] = 74;
-    L->col[2] = vw - 300;
-    L->col[3] = vw - 190;
-    L->col[4] = vw - 100;
-    L->col[5] = vw - 12;
-    if (L->col[2] < L->col[1] + 40) L->col[2] = L->col[1] + 40;
-
-    int dw = 420;
-    if (dw > vw - 20) dw = vw - 20;
-    int dh = 14 + gh + 6 + 2 * sh + 14 + 26 + 14;
-    L->dlg = (Rect){ (vw - dw) / 2, (vh - dh) / 2, dw, dh };
-    L->dlg_ok = (Rect){ L->dlg.x + 16, L->dlg.y + dh - 40, 180, 26 };
-    L->dlg_no = (Rect){ L->dlg.x + dw - 136, L->dlg.y + dh - 40, 120, 26 };
+static CrdMetrics crd_metrics(Font *ft, Font *fr, Font *fs) {
+    CrdMetrics m;
+    m.pad     = (float)ui_px(10);
+    m.gap     = (float)ui_px(6);
+    m.title_h = font_height(ft) + (float)ui_px(6);
+    m.row_h   = font_height(fr) + (float)ui_px(6);
+    m.line_h  = font_height(fs) + (float)ui_px(4);
+    m.spark_h = font_height(fs) + (float)ui_px(4) + font_height(fs) * 1.6f;
+    return m;
 }
 
-static int rect_hit(const Rect *r, int x, int y) {
-    return x >= r->x && y >= r->y && x < r->x + r->w && y < r->y + r->h;
+static float crd_height(const CrdMetrics *m, int rows, int spark) {
+    float h = m->pad * 2.0f + m->title_h + m->gap + (float)rows * m->row_h;
+    if (spark) h += m->gap + m->spark_h;
+    return h;
 }
 
-/* ------------------------------------------------------------ drawing */
+static int crd_hit(const CrdRect *r, int px, int py) {
+    return (float)px >= r->x && (float)py >= r->y &&
+           (float)px < r->x + r->w && (float)py < r->y + r->h;
+}
 
-/* A crisp 2 px polyline straight into the surface: gfx_line is
- * antialiased and a flat graph at 63% coverage reads as a smudge, while a
- * sparkline wants to be a hard line. */
-static void spark_line(Surface *s, int x0, int y0, int x1, int y1, u32 col) {
+static void crd_fit(Font *f, const char *text, char *out, size_t cap, float maxw) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s", text ? text : "");
+    snprintf(out, cap, "%s", tmp);
+    if (maxw <= 0.0f) { out[0] = 0; return; }
+    if (font_width(f, out) <= maxw) return;
+    size_t n = strlen(tmp);
+    while (n > 0) {
+        n--;
+        snprintf(out, cap, "%.*s..", (int)n, tmp);
+        if (font_width(f, out) <= maxw) return;
+    }
+    out[0] = 0;
+}
+
+static void crd_row_text(Font *fr, float inner_w, float gap,
+                         const char *label, const char *value,
+                         char *lb, size_t lcap, char *vb, size_t vcap) {
+    float maxv = inner_w * 0.58f;
+    if (maxv < 0.0f) maxv = 0.0f;
+    crd_fit(fr, value, vb, vcap, maxv);
+    float vw = vb[0] ? font_width(fr, vb) + gap : 0.0f;
+    crd_fit(fr, label, lb, lcap, inner_w - vw);
+}
+
+static float crd_row_y(const CrdRect *c, const CrdMetrics *m, int i) {
+    return c->y + m->pad + m->title_h + m->gap + (float)i * m->row_h;
+}
+
+static void crd_begin(Surface *s, const CrdRect *c, const CrdMetrics *m,
+                      const CrdStyle *st, Font *ft,
+                      const char *title, const char *meta, int meta_warn) {
+    float r = st->corner;
+    float lim = (c->w < c->h ? c->w : c->h) * 0.5f;
+    if (r > lim) r = lim;
+    if (r < 0.0f) r = 0.0f;
+    gfx_rrect_aa(s, c->x, c->y, c->w, c->h, r, st->panel, st->border, 1.0f);
+    float base = crd_base(ft, c->y + m->pad, m->title_h);
+    font_draw(s, ft, c->x + m->pad, crd_top(ft, base), title,
+              color_alpha(st->accent, 0.92f));
+    if (meta && meta[0]) {
+        float mw = font_width(ft, meta);
+        if (mw + m->pad * 2.0f + font_width(ft, title) <= c->w)
+            font_draw(s, ft, c->x + c->w - m->pad - mw, crd_top(ft, base), meta,
+                      meta_warn ? color_alpha(st->warn, 0.95f)
+                                : color_alpha(st->text, 0.45f));
+    }
+    float ry = c->y + m->pad + m->title_h;
+    surf_blend(s, (int)(c->x + m->pad), (int)ry,
+               (int)(c->w - 2.0f * m->pad), 1, color_alpha(st->text, 0.10f));
+}
+
+static void crd_row(Surface *s, const CrdRect *c, const CrdMetrics *m,
+                    const CrdStyle *st, Font *fr, int i,
+                    const char *label, const char *value) {
+    float ys = crd_row_y(c, m, i);
+    float inner = c->w - 2.0f * m->pad;
+    char lb[128], vb[192];
+    crd_row_text(fr, inner, m->gap, label, value, lb, sizeof(lb), vb, sizeof(vb));
+    float base = crd_base(fr, ys, m->row_h);
+    font_draw(s, fr, c->x + m->pad, crd_top(fr, base), lb,
+              color_alpha(st->text, 0.62f));
+    if (vb[0])
+        font_draw(s, fr, c->x + c->w - m->pad - font_width(fr, vb),
+                  crd_top(fr, base), vb, st->text);
+}
+
+/* A crisp 2 px polyline: gfx_line is antialiased, and a flat graph at 63%
+ * coverage reads as a smudge, while a sparkline wants to be a hard line. */
+static void crd_spark_line(Surface *s, int x0, int y0, int x1, int y1, u32 col) {
     int dx = x1 > x0 ? x1 - x0 : x0 - x1;
     int dy = y1 > y0 ? y0 - y1 : y1 - y0;
     int sx = x0 < x1 ? 1 : -1;
@@ -634,322 +582,703 @@ static void spark_line(Surface *s, int x0, int y0, int x1, int y1, u32 col) {
     }
 }
 
-static void draw_spark(Surface *s, Font *f_small, const Rect *r,
-                       const float *hist, int head, int len,
-                       float vmax_fixed, const char *title, const char *now,
-                       u32 col) {
-    gfx_rrect_aa(s, (float)r->x, (float)r->y, (float)r->w, (float)r->h, 6.0f,
-                 C_PANEL, color_alpha(C_TEXT, 0.10f), 1.0f);
-    font_draw(s, f_small, (float)r->x + 9.0f, (float)r->y + 3.0f, title,
-              color_alpha(C_TEXT, 0.55f));
-    if (now && font_width(f_small, title) + font_width(f_small, now) + 26.0f < (float)r->w)
-        text_right(s, f_small, r->x + r->w - 9, (float)r->y + 3.0f, now, col);
-
-    int px0 = r->x + 9, px1 = r->x + r->w - 9;
-    int py0 = r->y + (int)font_height(f_small) + 6;
-    int py1 = r->y + r->h - 8;
-    if (px1 - px0 < 20 || py1 - py0 < 10) return;
+/* The history strip at the foot of a card: a caption, a floor line, a faint
+ * top line and the line itself. No fill: a filled area behind a sparkline
+ * reads as a bar repeating the number above it. */
+static void crd_spark(Surface *s, const CrdRect *c, const CrdMetrics *m,
+                      Font *fs, const char *legend, u32 legend_col,
+                      const float *hist, int head, int len, int cap,
+                      float vmax_fixed, u32 col) {
+    float top = c->y + c->h - m->pad - m->spark_h;
+    float x0 = c->x + m->pad;
+    float x1 = c->x + c->w - m->pad;
+    float gy0 = top + font_height(fs) + (float)ui_px(2);
+    float gy1 = c->y + c->h - m->pad;
+    if (legend && legend[0]) font_draw(s, fs, x0, top, legend, legend_col);
+    if (x1 - x0 < 8.0f || gy1 - gy0 < 4.0f) return;
+    surf_blend(s, (int)x0, (int)gy1, (int)(x1 - x0), 1, color_alpha(col, 0.38f));
+    surf_blend(s, (int)x0, (int)gy0, (int)(x1 - x0), 1, color_alpha(col, 0.12f));
+    if (len <= 0 || cap <= 1) return;
 
     float vmax = vmax_fixed;
     if (vmax <= 0.0f) {
         vmax = 0.0f;
         for (int i = 0; i < len; i++) {
-            int idx = (head - len + i + RING_N) % RING_N;
-            if (hist[idx] > vmax) vmax = hist[idx];
+            float v = hist[(head - len + i + cap) % cap];
+            if (v > vmax) vmax = v;
         }
-        if (vmax < 1.0f) vmax = 1.0f;   /* idle is not thrashing */
     }
+    if (vmax < 0.0001f) vmax = 1.0f;
 
-    /* two hairlines: the floor, and the top of the scale */
-    surf_blend(s, px0, py1, px1 - px0, 1, color_alpha(C_TEXT, 0.16f));
-    surf_blend(s, px0, py0, px1 - px0, 1, color_alpha(C_TEXT, 0.06f));
-
-    float plotw = (float)(px1 - px0);
-    float ph = (float)(py1 - py0);
-    float step = plotw / (float)(RING_N - 1);
+    float plotw = x1 - x0;
+    float step = plotw / (float)(cap - 1);
     float prevx = 0.0f, prevy = 0.0f;
     int have = 0;
-    float lastx = (float)px1, lasty = (float)py1;
-
     for (int i = 0; i < len; i++) {
-        int idx = (head - len + i + RING_N) % RING_N;
+        int idx = (head - len + i + cap) % cap;
         float v = hist[idx];
         if (v < 0.0f) v = 0.0f;
         if (v > vmax) v = vmax;
-        /* newest sample on the right edge, history grows leftwards */
-        float x = (float)px1 - (float)(len - 1 - i) * step;
-        float y = (float)py1 - (v / vmax) * ph;
-        if (y < (float)py0) y = (float)py0;
-        if (y > (float)(py1 - 1)) y = (float)(py1 - 1);
+        /* newest sample on the right edge, history growing leftwards */
+        float px = x1 - (float)(len - 1 - i) * step;
+        float py = gy1 - (v / vmax) * (gy1 - gy0);
+        if (py < gy0) py = gy0;
+        if (py > gy1 - 1.0f) py = gy1 - 1.0f;
         if (have)
-            spark_line(s, (int)(prevx + 0.5f), (int)(prevy + 0.5f),
-                       (int)(x + 0.5f), (int)(y + 0.5f), col);
-        prevx = x;
-        prevy = y;
-        lastx = x;
-        lasty = y;
+            crd_spark_line(s, (int)(prevx + 0.5f), (int)(prevy + 0.5f),
+                           (int)(px + 0.5f), (int)(py + 0.5f), col);
+        prevx = px;
+        prevy = py;
         have = 1;
+        if (i == len - 1)
+            surf_fill(s, (int)px - 1, (int)py - 1, 3, 3, col);
     }
-    if (have)
-        surf_fill(s, (int)lastx - 1, (int)lasty - 1, 3, 3, col);
 }
 
-static void draw_sort_mark(Surface *s, int x, int y, int dir, u32 col) {
+static CrdStyle crd_style(void) {
+    CrdStyle st;
+    st.panel  = C_PANEL;
+    st.border = C_BORDER;
+    st.text   = C_TEXT;
+    st.dim    = C_DIM;
+    st.accent = C_ACCENT;
+    st.warn   = C_WARN;
+    st.corner = 7.0f;
+    return st;
+}
+
+/* ------------------------------------------------------------
+ *  Process table - the same struct, columns, sort and filter as
+ *  src/apps/monitor.c.
+ * ------------------------------------------------------------ */
+typedef struct {
+    CrdRect card;
+    int   show_filter, show_head;
+    CrdRect filter, head;
+    float body_y, row_h;
+    int   rows;
+    int   have_state, have_cpu, have_mem;
+    float pid_r, name_x, name_end;
+    float state_l, state_r, cpu_l, cpu_r, mem_l, mem_r;
+    float name_max;
+} ProcCard;
+
+static ProcCard proc_card_layout(const CrdRect *card, const CrdMetrics *m,
+                                 Font *fr, Font *fs) {
+    ProcCard p;
+    memset(&p, 0, sizeof(p));
+    p.card = *card;
+    p.row_h = m->row_h;
+
+    float inner_l = card->x + m->pad;
+    float inner_r = card->x + card->w - m->pad;
+    float gap = m->gap;
+    float min_name = (float)ui_px(24);
+
+    float mem_w = font_width(fr, "9999.9 MB") + gap;
+    float cpu_w = font_width(fr, "999.9%") + gap;
+    float st_w  = font_width(fs, "STATE") + gap;
+    float pid_w = font_width(fr, "999999");
+
+    p.pid_r = inner_l + pid_w;
+    p.name_x = p.pid_r + gap;
+    p.mem_r = inner_r;
+    p.cpu_r = p.mem_r - mem_w;
+    p.state_r = p.cpu_r - cpu_w;
+
+    p.have_mem = (p.cpu_r - p.name_x) >= min_name;
+    if (!p.have_mem) { p.mem_r = inner_r; p.cpu_r = inner_r; p.state_r = inner_r; }
+    p.have_cpu = p.have_mem && (p.state_r - p.name_x) >= min_name;
+    if (!p.have_cpu) { p.state_r = p.cpu_r; }
+    p.have_state = p.have_cpu && (p.state_r - st_w - p.name_x) >= min_name;
+    if (!p.have_state) { p.state_r = p.cpu_r; }
+
+    p.mem_l = p.mem_r - font_width(fs, "MEM");
+    p.cpu_l = p.cpu_r - font_width(fs, "CPU%");
+    p.state_l = p.state_r - font_width(fs, "STATE");
+    p.name_end = p.have_state ? p.state_l
+               : p.have_cpu   ? p.cpu_l
+               : p.have_mem   ? p.mem_l
+                              : inner_r;
+    p.name_max = p.name_end - p.name_x;
+
+    float y = card->y + m->pad + m->title_h + m->gap;
+    float bottom = card->y + card->h - m->pad;
+    int fit_filter = (bottom - y - m->line_h - m->line_h) >= m->row_h;
+    int fit_head = (bottom - y - m->line_h) >= m->row_h;
+    p.show_filter = fit_filter;
+    if (p.show_filter) {
+        p.filter = (CrdRect){ inner_l, y, inner_r - inner_l, m->line_h };
+        y += m->line_h;
+    }
+    p.show_head = fit_head;
+    if (p.show_head) {
+        p.head = (CrdRect){ inner_l, y, inner_r - inner_l, m->line_h };
+        y += m->line_h;
+    }
+    p.body_y = y;
+    float rf = (bottom - y) / m->row_h;
+    p.rows = (int)rf;
+    if (p.rows < 0) p.rows = 0;
+    return p;
+}
+
+static int proc_col_at(const ProcCard *p, int x) {
+    float centers[S_N];
+    float best = 1e30f;
+    int col = S_NAME;
+    centers[S_PID]   = (p->name_x - (float)ui_px(6) + p->pid_r) * 0.5f;
+    centers[S_NAME]  = (p->name_x + p->name_end) * 0.5f;
+    centers[S_STATE] = (p->state_l + p->state_r) * 0.5f;
+    centers[S_CPU]   = (p->cpu_l + p->cpu_r) * 0.5f;
+    centers[S_MEM]   = (p->mem_l + p->mem_r) * 0.5f;
+    for (int i = 0; i < S_N; i++) {
+        if (i == S_STATE && !p->have_state) continue;
+        if (i == S_CPU && !p->have_cpu) continue;
+        if (i == S_MEM && !p->have_mem) continue;
+        float d = (float)x - centers[i];
+        if (d < 0.0f) d = -d;
+        if (d < best) { best = d; col = i; }
+    }
+    return col;
+}
+
+static const Proc *g_sort_procs;
+static int g_sort_key;
+static int g_sort_dir;
+
+static int ci_cmp(const char *a, const char *b) {
+    while (*a && *b) {
+        int ca = (int)(unsigned char)*a;
+        int cb = (int)(unsigned char)*b;
+        if (ca >= 'A' && ca <= 'Z') ca += 'a' - 'A';
+        if (cb >= 'A' && cb <= 'Z') cb += 'a' - 'A';
+        if (ca != cb) return ca - cb;
+        a++; b++;
+    }
+    return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
+static int proc_cmp(const void *pa, const void *pb) {
+    int ia = *(const int *)pa, ib = *(const int *)pb;
+    const Proc *a = &g_sort_procs[ia];
+    const Proc *b = &g_sort_procs[ib];
+    int r = 0;
+    switch (g_sort_key) {
+    case S_PID:   r = a->pid - b->pid; break;
+    case S_NAME:  r = ci_cmp(a->comm, b->comm); break;
+    case S_STATE: r = (int)(unsigned char)a->state - (int)(unsigned char)b->state; break;
+    case S_CPU:   r = a->cpu > b->cpu ? 1 : (a->cpu < b->cpu ? -1 : 0); break;
+    case S_MEM:   r = a->mem_kb > b->mem_kb ? 1 : (a->mem_kb < b->mem_kb ? -1 : 0); break;
+    default: break;
+    }
+    if (r == 0) r = a->pid - b->pid;
+    return g_sort_dir > 0 ? r : -r;
+}
+
+static int ci_contains(const char *hay, const char *needle) {
+    size_t fl = strlen(needle);
+    if (!fl) return 1;
+    for (const char *q = hay; *q; q++) {
+        size_t i = 0;
+        while (i < fl && q[i]) {
+            int a = (int)(unsigned char)q[i];
+            int b = (int)(unsigned char)needle[i];
+            if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+            if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+            if (a != b) break;
+            i++;
+        }
+        if (i == fl) return 1;
+    }
+    return 0;
+}
+
+static int proc_match(const Proc *p, const char *f) {
+    if (!f[0]) return 1;
+    char pid[16];
+    snprintf(pid, sizeof(pid), "%d", p->pid);
+    if (strstr(pid, f)) return 1;
+    return ci_contains(p->comm, f);
+}
+
+static int proc_view_build(const Proc *procs, int n, int key, int dir,
+                           const char *filter, int *view) {
+    int vn = 0;
+    for (int i = 0; i < n && vn < MAX_PROC; i++)
+        if (proc_match(&procs[i], filter)) view[vn++] = i;
+    g_sort_procs = procs;
+    g_sort_key = key;
+    g_sort_dir = dir;
+    if (vn > 1) qsort(view, (size_t)vn, sizeof(int), proc_cmp);
+    return vn;
+}
+
+static int proc_view_index(const Proc *procs, const int *view, int vn, int pid) {
+    for (int i = 0; i < vn; i++) if (procs[view[i]].pid == pid) return i;
+    return -1;
+}
+
+typedef struct {
+    const Proc *procs;
+    const int  *view;
+    int         nview;
+    int         ntotal;
+    int         scroll;
+    int         sel_pid;
+    int         sort_key, sort_dir;
+    char        filter[32];
+    int         filter_edit;
+    const char *note;
+    int         note_warn;
+} ProcView;
+
+static void proc_sort_mark(Surface *s, float x, float y, int dir, u32 col) {
     float pts[6];
-    if (dir > 0) {                        /* ascending: triangle pointing up */
-        pts[0] = (float)x;      pts[1] = (float)y + 7.0f;
-        pts[2] = (float)x + 8.0f; pts[3] = (float)y + 7.0f;
-        pts[4] = (float)x + 4.0f; pts[5] = (float)y;
+    float w = 7.0f, h = 6.0f;
+    if (dir > 0) {
+        pts[0] = x;         pts[1] = y + h;
+        pts[2] = x + w;     pts[3] = y + h;
+        pts[4] = x + w / 2; pts[5] = y;
     } else {
-        pts[0] = (float)x;      pts[1] = (float)y;
-        pts[2] = (float)x + 8.0f; pts[3] = (float)y;
-        pts[4] = (float)x + 4.0f; pts[5] = (float)y + 7.0f;
+        pts[0] = x;         pts[1] = y;
+        pts[2] = x + w;     pts[3] = y;
+        pts[4] = x + w / 2; pts[5] = y + h;
     }
     gfx_polygon(s, pts, 3, col);
 }
 
-static void draw_frame(SysMon *m, Surface *s, const Layout *L, const Fonts *F,
-                       const int *view, int view_n) {
-    int vw = L->vw, vh = L->vh;
-    if (vw < 200 || vh < 200) return;
+static void proc_draw(Surface *s, const ProcCard *p, const CrdMetrics *m,
+                      const CrdStyle *st, Font *ft, Font *fr, Font *fs,
+                      const ProcView *v, const char *title, const char *meta) {
+    crd_begin(s, &p->card, m, st, ft, title, meta, 0);
 
-    gfx_gradient(s, 0, 0, vw, vh, C_BG_TOP, C_BG_BOT);
-    const u32 rule = color_alpha(C_TEXT, 0.10f);
-    const u32 label = color_alpha(C_TEXT, 0.50f);
-    const u32 faint = color_alpha(C_TEXT, 0.35f);
-    char buf[160];
+    u32 label = color_alpha(st->text, 0.45f);
+    u32 dim = color_alpha(st->text, 0.62f);
 
-    /* ---- header ---- */
-    font_draw(s, F->head, 12.0f, 8.0f, "SYSTEM MONITOR", C_TEXT);
-    {
-        char up[32];
-        fmt_uptime(m->uptime, up, sizeof(up));
-        snprintf(buf, sizeof(buf), "pid %d    up %s    %d cpu    %d proc",
-                 (int)getpid(), up, m->ncpu, m->nproc);
-        text_right(s, F->small, vw - 12, 10.0f, buf, C_DIM);
-    }
-    surf_blend(s, 12, 8 + (int)font_height(F->head) + 1, vw - 24, 1, rule);
-
-    /* ---- load ---- */
-    {
-        long used = m->total_kb - m->avail_kb;
-        if (used < 0) used = 0;
-        char now[80];
-        snprintf(now, sizeof(now), "1m %.2f   5m %.2f   15m %.2f",
-                 (double)m->load[0], (double)m->load[1], (double)m->load[2]);
-        draw_spark(s, F->small, &L->spark_load, m->hist_load, m->hist_head,
-                   m->hist_len, 0.0f, "LOAD AVERAGE (1 min)", now, C_ACCENT);
-
-        char now2[96];
-        double frac = m->total_kb > 0 ? (double)used / (double)m->total_kb : 0.0;
-        snprintf(now2, sizeof(now2), "%.0f%%   %ld of %ld MB",
-                 frac * 100.0, used / 1024, m->total_kb / 1024);
-        draw_spark(s, F->small, &L->spark_mem, m->hist_mem, m->hist_head,
-                   m->hist_len, 1.0f, "MEMORY USED", now2, C_MEM);
-    }
-
-    /* ---- network ---- */
-    {
-        int y = L->net.y;
-        int shown = 0;
-        for (int i = 0; i < m->nif && shown < 3; i++) {
-            const Iface *f = &m->ifs[i];
-            if (f->rx == 0 && f->tx == 0) continue;
-            char rx[24], tx[24], rr[24], tr[24];
-            fmt_bytes((double)f->rx, rx, sizeof(rx));
-            fmt_bytes((double)f->tx, tx, sizeof(tx));
-            fmt_bytes(f->rx_rate, rr, sizeof(rr));
-            fmt_bytes(f->tx_rate, tr, sizeof(tr));
-            font_draw(s, F->mono, 12.0f, (float)y, f->name, C_NET);
-            snprintf(buf, sizeof(buf), "rx %s   tx %s", rx, tx);
-            font_draw(s, F->small, 110.0f, (float)y, buf, C_TEXT);
-            snprintf(buf, sizeof(buf), "down %s/s   up %s/s", rr, tr);
-            text_right(s, F->small, vw - 12, (float)y, buf, C_DIM);
-            y += (int)font_height(F->small);
-            shown++;
+    if (p->show_filter) {
+        float base = crd_base(fs, p->filter.y, p->filter.h);
+        char line[96], out[128];
+        if (v->filter[0]) snprintf(line, sizeof(line), "/ %s", v->filter);
+        else              snprintf(line, sizeof(line), "/ filter   (f)");
+        char rtxt[128];
+        rtxt[0] = 0;
+        if (v->note && v->note[0]) snprintf(rtxt, sizeof(rtxt), "%s", v->note);
+        else snprintf(rtxt, sizeof(rtxt), "%d of %d", v->nview, v->ntotal);
+        float rightw = font_width(fs, rtxt);
+        crd_fit(fs, line, out, sizeof(out), p->filter.w - rightw - m->gap);
+        font_draw(s, fs, p->filter.x, crd_top(fs, base), out,
+                  v->filter_edit ? color_alpha(st->accent, 0.95f)
+                                 : color_alpha(st->text, 0.55f));
+        if (v->filter_edit) {
+            float cx = p->filter.x + font_width(fs, out) + 2.0f;
+            surf_fill(s, (int)cx, (int)(p->filter.y + 2.0f), 1,
+                      (int)(p->filter.h - 4.0f), color_alpha(st->accent, 0.95f));
         }
-        if (!shown) {
-            font_draw(s, F->small, 12.0f, (float)y,
-                      "network: no counters in /proc/net/dev", faint);
-        }
+        if (rightw > 0.0f)
+            font_draw(s, fs, p->filter.x + p->filter.w - rightw, crd_top(fs, base),
+                      rtxt, v->note && v->note[0]
+                                ? (v->note_warn ? color_alpha(st->warn, 0.95f)
+                                                : color_alpha(st->accent, 0.85f))
+                                : dim);
     }
 
-    /* ---- filter row ---- */
-    {
-        int editing = m->filter_edit;
-        gfx_rrect_aa(s, (float)L->filter.x, (float)L->filter.y,
-                     (float)L->filter.w, (float)L->filter.h, 4.0f,
-                     C_PANEL, editing ? C_ACCENT : color_alpha(C_TEXT, 0.14f), 1.0f);
-        char line[96];
-        if (m->filter[0])
-            snprintf(line, sizeof(line), "/ %s", m->filter);
-        else
-            snprintf(line, sizeof(line), "/ filter by name or pid%s",
-                     editing ? "" : "   (press / to type)");
-        font_draw(s, F->small, (float)L->filter.x + 8.0f,
-                  (float)L->filter.y + 2.0f, line, m->filter[0] ? C_TEXT : faint);
-        if (editing) {
-            float cx = (float)L->filter.x + 8.0f + font_width(F->small, line);
-            surf_fill(s, (int)cx + 1, L->filter.y + 3, 2,
-                      L->filter.h - 6, C_ACCENT);
+    if (p->show_head) {
+        float base = crd_base(fs, p->head.y, p->head.h);
+        float ty = crd_top(fs, base);
+        const char *nm = "NAME";
+        font_draw(s, fs, p->name_x, ty, nm, label);
+        if (p->have_state) {
+            const char *t = "STATE";
+            font_draw(s, fs, p->state_r - font_width(fs, t), ty, t, label);
         }
-        snprintf(buf, sizeof(buf), "%d shown of %d%s", view_n, m->nproc,
-                 m->truncated ? " (list full)" : "");
-        text_right(s, F->small, L->filter.x + L->filter.w - 8,
-                   (float)L->filter.y + 2.0f, buf, label);
-
-        int can = m->sel_pid > 0;
-        gfx_rrect_aa(s, (float)L->kill_btn.x, (float)L->kill_btn.y,
-                     (float)L->kill_btn.w, (float)L->kill_btn.h, 4.0f,
-                     can ? color_alpha(C_WARN, 0.20f) : C_PANEL,
-                     can ? C_WARN : color_alpha(C_TEXT, 0.14f), 1.0f);
-        font_draw(s, F->small, (float)L->kill_btn.x + 10.0f,
-                  (float)L->kill_btn.y + 2.0f, "kill  (k)",
-                  can ? C_WARN : faint);
+        if (p->have_cpu) {
+            const char *t = "CPU%";
+            font_draw(s, fs, p->cpu_r - font_width(fs, t), ty, t, label);
+        }
+        if (p->have_mem) {
+            const char *t = "MEM";
+            font_draw(s, fs, p->mem_r - font_width(fs, t), ty, t, label);
+        }
+        {
+            const char *t = "PID";
+            font_draw(s, fs, p->pid_r - font_width(fs, t), ty, t, label);
+        }
+        for (int i = 0; i < S_N; i++) {
+            if (i == S_STATE && !p->have_state) continue;
+            if (i == S_CPU && !p->have_cpu) continue;
+            if (i == S_MEM && !p->have_mem) continue;
+            if (i != v->sort_key) continue;
+            float mx = (i == S_PID)   ? p->pid_r - font_width(fs, "PID") - 10.0f
+                     : (i == S_NAME)  ? p->name_x + font_width(fs, "NAME") + 4.0f
+                     : (i == S_STATE) ? p->state_r - font_width(fs, "STATE") - 10.0f
+                     : (i == S_CPU)   ? p->cpu_r - font_width(fs, "CPU%") - 10.0f
+                                      : p->mem_r - font_width(fs, "MEM") - 10.0f;
+            proc_sort_mark(s, mx, p->head.y + 3.0f, v->sort_dir, st->accent);
+        }
+        surf_blend(s, (int)p->head.x, (int)(p->head.y + p->head.h),
+                   (int)p->head.w, 1, color_alpha(st->text, 0.08f));
     }
 
-    /* ---- table header ---- */
-    {
-        const char *nm[5] = { "PID", "NAME", "STATE", "CPU%", "MEM" };
-        int align_r[5] = { 0, 0, 0, 1, 1 };
-        int y = L->thead.y;
-        for (int i = 0; i < 5; i++) {
-            int x = L->col[i];
-            int limit = L->col[i + 1] - 6;
-            if (align_r[i]) {
-                text_right(s, F->small, limit, (float)y, nm[i],
-                           m->sort_key == i ? C_ACCENT : label);
-            } else {
-                font_draw(s, F->small, (float)x, (float)y, nm[i],
-                          m->sort_key == i ? C_ACCENT : label);
+    if (v->nview == 0) {
+        if (p->rows > 0) {
+            float base = crd_base(fr, p->body_y, p->row_h);
+            font_draw(s, fr, p->card.x + m->pad, crd_top(fr, base),
+                      v->filter[0] ? "no process matches the filter"
+                                   : "no process in /proc",
+                      color_alpha(st->text, 0.40f));
+        }
+    } else {
+        int sel = proc_view_index(v->procs, v->view, v->nview, v->sel_pid);
+        for (int i = 0; i < p->rows; i++) {
+            int vi = v->scroll + i;
+            if (vi >= v->nview) break;
+            const Proc *pr = &v->procs[v->view[vi]];
+            float ry = p->body_y + (float)i * p->row_h;
+            if (vi == sel) {
+                surf_blend(s, (int)(p->card.x + 1.0f), (int)ry,
+                           (int)(p->card.w - 2.0f), (int)p->row_h,
+                           color_alpha(st->accent, 0.16f));
+                surf_blend(s, (int)(p->card.x + 1.0f), (int)ry,
+                           2, (int)p->row_h, color_alpha(st->accent, 0.85f));
             }
-            if (m->sort_key == i) {
-                int mx = align_r[i] ? limit - (int)font_width(F->small, nm[i]) - 11
-                                    : x + (int)font_width(F->small, nm[i]) + 5;
-                draw_sort_mark(s, mx, y + 4, m->sort_dir, C_ACCENT);
+            float base = crd_base(fr, ry, p->row_h);
+            float ty = crd_top(fr, base);
+            char buf[64], nm[64];
+
+            snprintf(buf, sizeof(buf), "%d", pr->pid);
+            font_draw(s, fr, p->pid_r - font_width(fr, buf), ty, buf,
+                      color_alpha(st->text, 0.55f));
+
+            crd_fit(fr, pr->comm, nm, sizeof(nm), p->name_max);
+            font_draw(s, fr, p->name_x, ty, nm, st->text);
+
+            if (p->have_state) {
+                char sb[2] = { pr->state ? pr->state : '?', 0 };
+                font_draw(s, fr, p->state_r - font_width(fr, sb), ty, sb,
+                          pr->state == 'R' ? color_alpha(st->accent, 0.95f)
+                                           : color_alpha(st->text, 0.55f));
             }
-        }
-        /* a line under the heading */
-        surf_blend(s, 12, L->thead.y + L->thead.h, vw - 24, 1, rule);
-    }
-
-    /* ---- rows ---- */
-    {
-        int sel = view_index_of(m, view, view_n, m->sel_pid);
-        surf_clip(s, L->rows.x, L->rows.y, L->rows.w, L->rows.h);
-        int budget = L->rows_visible;
-        for (int r = 0; r < budget; r++) {
-            int vi = m->scroll + r;
-            if (vi >= view_n) break;
-            const Proc *p = &m->procs[view[vi]];
-            int y = L->rows_top + r * L->row_h;
-            if (y + L->row_h > L->rows_bottom) break;
-
-            int rowid = vi;
-            if (rowid == sel)
-                surf_blend(s, L->rows.x, y, L->rows.w, L->row_h - 1,
-                           color_alpha(C_ACCENT, 0.16f));
-            else if (rowid == m->hover)
-                surf_blend(s, L->rows.x, y, L->rows.w, L->row_h - 1,
-                           color_alpha(C_TEXT, 0.05f));
-            else if (r & 1)
-                surf_blend(s, L->rows.x, y, L->rows.w, L->row_h - 1,
-                           color_alpha(C_TEXT, 0.025f));
-
-            float ty = (float)y + 1.0f;
-            snprintf(buf, sizeof(buf), "%d", p->pid);
-            font_draw(s, F->mono, (float)L->col[0], ty, buf, C_DIM);
-
-            char name[28];
-            snprintf(name, sizeof(name), "%s", p->comm);
-            fit(name, F->small, (float)(L->col[2] - L->col[1] - 10));
-            font_draw(s, F->small, (float)L->col[1], ty, name,
-                      rowid == sel ? C_TEXT : color_alpha(C_TEXT, 0.85f));
-
-            char st[2] = { p->state ? p->state : '?', 0 };
-            font_draw(s, F->mono, (float)L->col[2], ty, st,
-                      p->state == 'R' ? C_ACCENT :
-                      (p->state == 'Z' ? C_WARN : C_DIM));
-
-            if (p->cpu10 < 0)
-                text_right(s, F->mono, L->col[4] - 6, ty, "-", faint);
-            else {
-                snprintf(buf, sizeof(buf), "%d.%d", p->cpu10 / 10, p->cpu10 % 10);
-                text_right(s, F->mono, L->col[4] - 6, ty, buf,
-                           p->cpu10 >= 500 ? C_WARN : C_TEXT);
+            if (p->have_cpu) {
+                if (pr->cpu < 0.0) {
+                    font_draw(s, fr, p->cpu_r - font_width(fr, "-"), ty, "-",
+                              color_alpha(st->text, 0.40f));
+                } else {
+                    snprintf(buf, sizeof(buf), "%.1f%%", pr->cpu);
+                    font_draw(s, fr, p->cpu_r - font_width(fr, buf), ty, buf,
+                              pr->cpu >= 50.0 ? color_alpha(st->warn, 0.95f)
+                                              : color_alpha(st->text, 0.85f));
+                }
             }
-
-            if (p->mem_kb >= 1024)
-                snprintf(buf, sizeof(buf), "%ld.%ld MB", p->mem_kb / 1024,
-                         (p->mem_kb % 1024) * 10 / 1024);
-            else
-                snprintf(buf, sizeof(buf), "%ld kB", p->mem_kb);
-            text_right(s, F->small, L->col[5] - 6, ty, buf, C_TEXT);
-        }
-        surf_unclip(s);
-    }
-
-    /* ---- footer ---- */
-    {
-        double dt = m->dt_ms > 0.0 ? m->dt_ms : 0.0;
-        snprintf(buf, sizeof(buf),
-                 "CPU%% is a DELTA since the previous sample (%.2f s), not a lifetime average; over 100%% means more than one core.",
-                 dt / 1000.0);
-        fit(buf, F->small, (float)(vw - 24));
-        font_draw(s, F->small, 12.0f, (float)L->y_foot[0], buf, color_alpha(C_TEXT, 0.55f));
-
-        snprintf(buf, sizeof(buf),
-                 "MEM = statm field 2 x %ld kB pages   -   load /proc/loadavg   -   net /proc/net/dev   -   %d samples",
-                 m->page_kb, m->samples);
-        fit(buf, F->small, (float)(vw - 24));
-        font_draw(s, F->small, 12.0f, (float)L->y_foot[1], buf, faint);
-
-        snprintf(buf, sizeof(buf),
-                 "arrows move   k kill   / filter   %s %s   q quit",
-                 SORT_NAME[m->sort_key], m->sort_dir > 0 ? "asc" : "desc");
-        font_draw(s, F->small, 12.0f, (float)L->y_foot[2], buf, faint);
-        if (m->msg[0]) {
-            /* keep the message clear of the key legend on its left */
-            int room = vw - 24 - (int)font_width(F->small, buf) - 12;
-            if (room > 40) {
-                char m2[160];
-                snprintf(m2, sizeof(m2), "%s", m->msg);
-                fit(m2, F->small, (float)room);
-                text_right(s, F->small, vw - 12, (float)L->y_foot[2], m2, C_ACCENT);
+            if (p->have_mem) {
+                if (pr->mem_kb < 0) {
+                    font_draw(s, fr, p->mem_r - font_width(fr, "-"), ty, "-",
+                              color_alpha(st->text, 0.40f));
+                } else {
+                    snprintf(buf, sizeof(buf), "%.1f MB", (double)pr->mem_kb / 1024.0);
+                    font_draw(s, fr, p->mem_r - font_width(fr, buf), ty, buf,
+                              color_alpha(st->text, 0.85f));
+                }
             }
         }
     }
+}
 
-    /* ---- the kill confirmation ---- */
+/* ------------------------------------------------------------ formatting */
+
+static void fmt_bytes(double v, char *out, size_t n) {
+    if (v < 1024.0) snprintf(out, n, "%.0f B", v);
+    else if (v < 1024.0 * 1024.0) snprintf(out, n, "%.1f kB", v / 1024.0);
+    else if (v < 1024.0 * 1024.0 * 1024.0) snprintf(out, n, "%.1f MB", v / (1024.0 * 1024.0));
+    else snprintf(out, n, "%.2f GB", v / (1024.0 * 1024.0 * 1024.0));
+}
+
+static void fmt_uptime(double secs, char *out, size_t n) {
+    if (secs < 0.0) { snprintf(out, n, "unreadable"); return; }
+    unsigned long s = (unsigned long)secs;
+    unsigned long d  = s / 86400UL;
+    unsigned long hh = (s % 86400UL) / 3600UL;
+    unsigned long mm = (s % 3600UL) / 60UL;
+    unsigned long ss = s % 60UL;
+    if (d) snprintf(out, n, "%lud %02lu:%02lu", d, hh, mm);
+    else   snprintf(out, n, "%02lu:%02lu:%02lu", hh, mm, ss);
+}
+
+/* ------------------------------------------------------------ layout */
+
+typedef struct {
+    Font *head, *body, *small, *mono;
+} Fonts;
+
+typedef struct {
+    int   nsum;
+    int   kind[3];
+    CrdRect sum[3];
+    ProcCard pc;
+    float margin, gap, legend_h;
+    int   legend;
+    int   split;
+    CrdRect dlg, dlg_ok, dlg_no;
+} SysLayout;
+
+/* Cards down the left column, the table on the right. The split only happens
+ * when the window is wide enough in LOGICAL pixels (ui_px(560)) and a card
+ * can still hold its longest label and value without truncating both; at the
+ * largest text scale 760 device pixels is a narrow window, so the table gets
+ * the whole width instead. Summary cards are offered by priority and dropped
+ * from the end (network, then memory, then system) until they fit - the table
+ * keeps its full height either way. */
+static SysLayout sysmon_layout(int w, int h, const SysMon *m,
+                               const CrdMetrics *cm, Font *fr, Font *fs,
+                               const int *want_kind, const int *want_rows,
+                               const int *want_spark, int nwant) {
+    SysLayout L;
+    memset(&L, 0, sizeof(L));
+    L.margin = (float)ui_px(10);
+    L.gap = (float)ui_px(8);
+    L.legend_h = font_height(fs) + (float)ui_px(4);
+
+    float avail = (float)h - 2.0f * L.margin;
+    float min_card = cm->pad * 2.0f + cm->title_h + cm->gap + cm->line_h + cm->row_h;
+    L.legend = (avail - L.legend_h) >= min_card;
+    if (L.legend) avail -= L.legend_h;
+    if (avail < 1.0f) avail = 1.0f;
+
+    float left_w = 0.0f;
+    L.split = 0;
+    if (w >= ui_px(560)) {
+        left_w = (float)ui_px(320);
+        float cap = ((float)w - 2.0f * L.margin) * 0.42f;
+        if (left_w > cap) left_w = cap;
+        if (left_w >= (float)ui_px(220)) {
+            float inner = left_w - 2.0f * cm->pad;
+            float need = font_width(fr, "0000.0 MB") + font_width(fr, "Load 1/5/15");
+            if (inner >= need) L.split = 1;
+        }
+    }
+
+    if (L.split) {
+        float stack = 0.0f;
+        int n = 0;
+        for (int i = 0; i < nwant && i < 3; i++) {
+            float ch = crd_height(cm, want_rows[i], want_spark[i]);
+            if (stack + ch + (n ? L.gap : 0.0f) > avail) break;
+            stack += ch + (n ? L.gap : 0.0f);
+            L.kind[n] = want_kind[i];
+            L.sum[n] = (CrdRect){ L.margin, L.margin + (stack - ch), left_w, ch };
+            n++;
+        }
+        L.nsum = n;
+    }
+
+    CrdRect card;
+    if (L.nsum > 0) {
+        card.x = L.margin + left_w + L.gap;
+        card.w = (float)w - L.margin - card.x;
+    } else {
+        card.x = L.margin;
+        card.w = (float)w - 2.0f * L.margin;
+    }
+    card.y = L.margin;
+    card.h = avail;
+    if (card.w < 1.0f) card.w = 1.0f;
+    if (card.h < 1.0f) card.h = 1.0f;
+    L.pc = proc_card_layout(&card, cm, fr, fs);
+
     if (m->dlg) {
-        surf_blend(s, 0, 0, vw, vh, color_alpha(RGB(0, 0, 0), 0.55f));
-        gfx_rrect_aa(s, (float)L->dlg.x, (float)L->dlg.y,
-                     (float)L->dlg.w, (float)L->dlg.h, 8.0f,
+        float dw = (float)ui_px(420);
+        float maxw = (float)w - 2.0f * (float)ui_px(20);
+        if (dw > maxw) dw = maxw;
+        if (dw < 1.0f) dw = 1.0f;
+        float btn_h = font_height(fr) + (float)ui_px(10);
+        float dh = cm->pad * 2.0f + cm->title_h + cm->row_h * 2.0f +
+                   cm->gap + btn_h;
+        if (dh > (float)h - 2.0f * (float)ui_px(10))
+            dh = (float)h - 2.0f * (float)ui_px(10);
+        if (dh < 1.0f) dh = 1.0f;
+        L.dlg = (CrdRect){ ((float)w - dw) * 0.5f, ((float)h - dh) * 0.5f, dw, dh };
+        float ok_w = font_width(fr, "Send SIGTERM") + (float)ui_px(24);
+        float no_w = font_width(fr, "Cancel") + (float)ui_px(24);
+        float by = L.dlg.y + L.dlg.h - cm->pad - btn_h;
+        L.dlg_no = (CrdRect){ L.dlg.x + L.dlg.w - cm->pad - no_w, by, no_w, btn_h };
+        L.dlg_ok = (CrdRect){ L.dlg_no.x - cm->gap - ok_w, by, ok_w, btn_h };
+    }
+    return L;
+}
+
+/* Number of rows the network card needs for the interfaces it will show. */
+static int net_card_rows(const SysMon *m) {
+    int shown = m->nif < 2 ? m->nif : 2;
+    if (shown < 0) shown = 0;
+    return shown * 2 + (m->nif > shown ? 1 : 0);
+}
+
+/* The one place the dashboard's card set is chosen. The harness calls this
+ * too, so the sizes it proves are the sizes the window draws. */
+static SysLayout sysmon_layout_for(const SysMon *m, int w, int h,
+                                   const Fonts *F, const CrdMetrics *cm) {
+    int want_kind[3], want_rows[3], want_spark[3];
+    int nwant = 0;
+    want_kind[nwant] = K_SYS; want_rows[nwant] = 3; want_spark[nwant] = 1; nwant++;
+    want_kind[nwant] = K_MEM; want_rows[nwant] = 2; want_spark[nwant] = 1; nwant++;
+    if (m->nif > 0) {
+        want_kind[nwant] = K_NET;
+        want_rows[nwant] = net_card_rows(m);
+        want_spark[nwant] = 0;
+        nwant++;
+    }
+    return sysmon_layout(w, h, m, cm, F->body, F->small,
+                         want_kind, want_rows, want_spark, nwant);
+}
+
+/* ------------------------------------------------------------ summary cards */
+
+static void draw_sys_card(Surface *s, const CrdRect *c, const CrdMetrics *cm,
+                          const CrdStyle *st, Font *ft, Font *fr, Font *fs,
+                          const SysMon *m) {
+    crd_begin(s, c, cm, st, ft, "SYSTEM", NULL, 0);
+    char v[96];
+    if (m->load_ok)
+        snprintf(v, sizeof(v), "%.2f %.2f %.2f", m->load[0], m->load[1], m->load[2]);
+    else
+        snprintf(v, sizeof(v), "unreadable");
+    crd_row(s, c, cm, st, fr, 0, "Load 1/5/15", v);
+    fmt_uptime(m->uptime, v, sizeof(v));
+    crd_row(s, c, cm, st, fr, 1, "Uptime", v);
+    if (m->ncpu > 0) snprintf(v, sizeof(v), "%d", m->ncpu);
+    else             snprintf(v, sizeof(v), "unreadable");
+    crd_row(s, c, cm, st, fr, 2, "CPUs", v);
+    char legend[64];
+    if (m->load_ok)
+        snprintf(legend, sizeof(legend), "load 1m, last %d samples", m->load_len);
+    else
+        snprintf(legend, sizeof(legend), "load: no history");
+    crd_spark(s, c, cm, fs, legend, color_alpha(st->text, 0.40f),
+              m->hist_load, m->load_head, m->load_len, RING_N, 0.0f, st->accent);
+}
+
+static void draw_mem_card(Surface *s, const CrdRect *c, const CrdMetrics *cm,
+                          const CrdStyle *st, Font *ft, Font *fr, Font *fs,
+                          const SysMon *m) {
+    crd_begin(s, c, cm, st, ft, "MEMORY", NULL, 0);
+    char used[32], total[32], v[96];
+    if (m->mem_ok) {
+        long u = m->total_kb - m->avail_kb;
+        if (u < 0) u = 0;
+        fmt_bytes((double)u * 1024.0, used, sizeof(used));
+        fmt_bytes((double)m->total_kb * 1024.0, total, sizeof(total));
+        snprintf(v, sizeof(v), "%s of %s", used, total);
+        crd_row(s, c, cm, st, fr, 0, "In use", v);
+        fmt_bytes((double)m->avail_kb * 1024.0, v, sizeof(v));
+        crd_row(s, c, cm, st, fr, 1, "Available", v);
+    } else {
+        crd_row(s, c, cm, st, fr, 0, "In use", "unreadable");
+        crd_row(s, c, cm, st, fr, 1, "Available", "unreadable");
+    }
+    char legend[64];
+    if (m->mem_ok)
+        snprintf(legend, sizeof(legend), "used, last %d samples", m->mem_len);
+    else
+        snprintf(legend, sizeof(legend), "memory: no history");
+    crd_spark(s, c, cm, fs, legend, color_alpha(st->text, 0.40f),
+              m->hist_mem, m->mem_head, m->mem_len, RING_N, 1.0f, st->accent);
+}
+
+static void draw_net_card(Surface *s, const CrdRect *c, const CrdMetrics *cm,
+                          const CrdStyle *st, Font *ft, Font *fr,
+                          const SysMon *m) {
+    char meta[64];
+    snprintf(meta, sizeof(meta), "rates = delta over %.2f s", m->dt_ms / 1000.0);
+    crd_begin(s, c, cm, st, ft, "NETWORK", meta, 0);
+    int shown = m->nif < 2 ? m->nif : 2;
+    int row = 0;
+    char label[32], v[96], tot[24], rate[24];
+    for (int i = 0; i < shown; i++) {
+        const Iface *f = &m->ifs[i];
+        fmt_bytes((double)f->rx, tot, sizeof(tot));
+        fmt_bytes(f->rx_rate, rate, sizeof(rate));
+        snprintf(label, sizeof(label), "%s rx", f->name);
+        snprintf(v, sizeof(v), "%s  %s/s", tot, rate);
+        crd_row(s, c, cm, st, fr, row++, label, v);
+
+        fmt_bytes((double)f->tx, tot, sizeof(tot));
+        fmt_bytes(f->tx_rate, rate, sizeof(rate));
+        snprintf(label, sizeof(label), "%s tx", f->name);
+        snprintf(v, sizeof(v), "%s  %s/s", tot, rate);
+        crd_row(s, c, cm, st, fr, row++, label, v);
+    }
+    if (m->nif > shown) {
+        snprintf(v, sizeof(v), "+%d interfaces", m->nif - shown);
+        crd_row(s, c, cm, st, fr, row++, "other", v);
+    }
+}
+
+/* ------------------------------------------------------------ frame */
+
+static void draw_frame(SysMon *m, Surface *s, const SysLayout *L,
+                       const Fonts *F, const ProcView *pv, int w, int h) {
+    gfx_gradient(s, 0, 0, w, h, C_BG_TOP, C_BG_BOT);
+    CrdStyle sty = crd_style();
+    CrdMetrics cm = crd_metrics(F->head, F->body, F->small);
+
+    for (int i = 0; i < L->nsum; i++) {
+        switch (L->kind[i]) {
+        case K_SYS: draw_sys_card(s, &L->sum[i], &cm, &sty, F->head, F->body, F->small, m); break;
+        case K_MEM: draw_mem_card(s, &L->sum[i], &cm, &sty, F->head, F->body, F->small, m); break;
+        case K_NET: draw_net_card(s, &L->sum[i], &cm, &sty, F->head, F->body, m); break;
+        default: break;
+        }
+    }
+
+    char meta[64];
+    if (m->dt_ms > 0.5)
+        snprintf(meta, sizeof(meta), "cpu%% = delta over %.2f s", m->dt_ms / 1000.0);
+    else
+        snprintf(meta, sizeof(meta), "cpu%% needs a second sample");
+    proc_draw(s, &L->pc, &cm, &sty, F->head, F->body, F->small, pv, "PROCESSES", meta);
+
+    if (L->legend) {
+        char legend[192], out[192];
+        snprintf(legend, sizeof(legend),
+                 "1-5 or click: sort    S: reverse    f: filter    j/k: move    K: kill    q: quit");
+        crd_fit(F->small, legend, out, sizeof(out), (float)w - 2.0f * L->margin);
+        float ly = (float)h - L->legend_h;
+        font_draw(s, F->small, L->margin,
+                  crd_top(F->small, crd_base(F->small, ly, L->legend_h)), out,
+                  color_alpha(C_TEXT, 0.40f));
+    }
+
+    if (m->dlg) {
+        surf_blend(s, 0, 0, w, h, color_alpha(RGB(0, 0, 0), 0.55f));
+        gfx_rrect_aa(s, L->dlg.x, L->dlg.y, L->dlg.w, L->dlg.h, 8.0f,
                      C_PANEL, C_WARN, 1.5f);
-        font_draw(s, F->head, (float)L->dlg.x + 16.0f, (float)L->dlg.y + 14.0f,
+        char line[160];
+        font_draw(s, F->head, L->dlg.x + cm.pad, L->dlg.y + cm.pad,
                   "Kill this process?", C_TEXT);
-        snprintf(buf, sizeof(buf), "pid %d   %s", m->kill_pid, m->kill_comm);
-        font_draw(s, F->mono, (float)L->dlg.x + 16.0f,
-                  (float)L->dlg.y + 14.0f + font_height(F->head) + 6.0f,
-                  buf, C_TEXT);
-        snprintf(buf, sizeof(buf),
+        snprintf(line, sizeof(line), "pid %d   %s", m->kill_pid, m->kill_comm);
+        font_draw(s, F->mono, L->dlg.x + cm.pad,
+                  L->dlg.y + cm.pad + font_height(F->head) + cm.gap, line, C_TEXT);
+        snprintf(line, sizeof(line),
                  "SIGTERM now; SIGKILL after %.1f s if it is still alive.",
                  KILL_GRACE_MS / 1000.0);
-        fit(buf, F->small, (float)(L->dlg.w - 32));
-        font_draw(s, F->small, (float)L->dlg.x + 16.0f,
-                  (float)L->dlg.y + 14.0f + font_height(F->head) + 6.0f +
-                      font_height(F->small) + 4.0f,
-                  buf, C_DIM);
-        gfx_rrect_aa(s, (float)L->dlg_ok.x, (float)L->dlg_ok.y,
-                     (float)L->dlg_ok.w, (float)L->dlg_ok.h, 4.0f,
+        crd_fit(F->small, line, line, sizeof(line), L->dlg.w - 2.0f * cm.pad);
+        font_draw(s, F->small, L->dlg.x + cm.pad,
+                  L->dlg.y + cm.pad + font_height(F->head) + cm.gap +
+                      font_height(F->body) + cm.gap,
+                  line, C_DIM);
+
+        gfx_rrect_aa(s, L->dlg_ok.x, L->dlg_ok.y, L->dlg_ok.w, L->dlg_ok.h, 4.0f,
                      color_alpha(C_WARN, 0.22f), C_WARN, 1.0f);
-        font_draw(s, F->body, (float)L->dlg_ok.x + 12.0f,
-                  (float)L->dlg_ok.y + 3.0f, "Send SIGTERM", C_TEXT);
-        gfx_rrect_aa(s, (float)L->dlg_no.x, (float)L->dlg_no.y,
-                     (float)L->dlg_no.w, (float)L->dlg_no.h, 4.0f,
-                     C_PANEL, color_alpha(C_TEXT, 0.20f), 1.0f);
-        font_draw(s, F->body, (float)L->dlg_no.x + 12.0f,
-                  (float)L->dlg_no.y + 3.0f, "Cancel", C_DIM);
+        font_draw(s, F->body,
+                  L->dlg_ok.x + (L->dlg_ok.w - font_width(F->body, "Send SIGTERM")) * 0.5f,
+                  crd_top(F->body, crd_base(F->body, L->dlg_ok.y, L->dlg_ok.h)),
+                  "Send SIGTERM", C_TEXT);
+        gfx_rrect_aa(s, L->dlg_no.x, L->dlg_no.y, L->dlg_no.w, L->dlg_no.h, 4.0f,
+                     C_PANEL, C_BORDER, 1.0f);
+        font_draw(s, F->body,
+                  L->dlg_no.x + (L->dlg_no.w - font_width(F->body, "Cancel")) * 0.5f,
+                  crd_top(F->body, crd_base(F->body, L->dlg_no.y, L->dlg_no.h)),
+                  "Cancel", C_DIM);
     }
 }
 
@@ -983,34 +1312,74 @@ static void do_kill(SysMon *m) {
     set_msg(m, buf);
 }
 
-static int check_pending(SysMon *m) {
-    if (m->pending_pid <= 0) return 0;
-    if (mono_ms() < m->pending_at) return 0;
+static void check_pending(SysMon *m) {
+    if (m->pending_pid <= 0) return;
+    if (mono_ms() < m->pending_at) return;
     int pid = m->pending_pid;
     m->pending_pid = 0;
     char buf[160];
     if (!proc_alive(pid)) {
         snprintf(buf, sizeof(buf), "pid %d exited after SIGTERM", pid);
-        set_msg(m, buf);
-        return 1;
-    }
-    if (kill(pid, SIGKILL) == 0)
+    } else if (kill(pid, SIGKILL) == 0) {
         snprintf(buf, sizeof(buf), "pid %d ignored SIGTERM: SIGKILL sent", pid);
-    else
+    } else {
         snprintf(buf, sizeof(buf), "SIGKILL to %d failed: %s", pid, strerror(errno));
+    }
     set_msg(m, buf);
-    return 1;
 }
 
-static void open_kill_dialog(SysMon *m, const int *view, int view_n) {
-    int i = view_index_of(m, view, view_n, m->sel_pid);
+static void open_kill_dialog(SysMon *m) {
+    int i = proc_view_index(m->procs, m->view, m->nview, m->sel_pid);
     if (i < 0) { set_msg(m, "select a process first"); return; }
-    const Proc *p = &m->procs[view[i]];
+    const Proc *p = &m->procs[m->view[i]];
     if (p->pid == 1) { set_msg(m, "refusing to kill pid 1 (init)"); return; }
     if (p->pid == (int)getpid()) { set_msg(m, "refusing to kill this monitor"); return; }
     m->kill_pid = p->pid;
     snprintf(m->kill_comm, sizeof(m->kill_comm), "%s", p->comm);
     m->dlg = 1;
+}
+
+/* ------------------------------------------------------------ view helpers */
+
+static void refresh_view(SysMon *m) {
+    m->nview = proc_view_build(m->procs, m->nproc, m->sort_key, m->sort_dir,
+                               m->filter, m->view);
+    int sel = proc_view_index(m->procs, m->view, m->nview, m->sel_pid);
+    if (sel < 0 && m->nview > 0) {
+        m->sel_pid = m->procs[m->view[0]].pid;
+        m->scroll = 0;
+    }
+}
+
+static void reveal_selection(SysMon *m) {
+    int sel = proc_view_index(m->procs, m->view, m->nview, m->sel_pid);
+    if (sel < 0) return;
+    if (sel < m->scroll) m->scroll = sel;
+    if (m->rows > 0 && sel >= m->scroll + m->rows) m->scroll = sel - m->rows + 1;
+    if (m->rows > 0 && m->scroll > m->nview - m->rows) m->scroll = m->nview - m->rows;
+    if (m->scroll < 0) m->scroll = 0;
+}
+
+static void move_sel(SysMon *m, int delta) {
+    if (m->nview <= 0) return;
+    int sel = proc_view_index(m->procs, m->view, m->nview, m->sel_pid);
+    if (sel < 0) sel = 0;
+    sel += delta;
+    if (sel < 0) sel = 0;
+    if (sel >= m->nview) sel = m->nview - 1;
+    m->sel_pid = m->procs[m->view[sel]].pid;
+    reveal_selection(m);
+}
+
+static void set_sort(SysMon *m, int key) {
+    if (m->sort_key == key) m->sort_dir = -m->sort_dir;
+    else {
+        m->sort_key = key;
+        m->sort_dir = (key == S_CPU || key == S_MEM) ? -1 : 1;
+    }
+    m->scroll = 0;
+    refresh_view(m);
+    reveal_selection(m);
 }
 
 /* ------------------------------------------------------------ main */
@@ -1024,7 +1393,11 @@ int main(void) {
         return 1;
     }
 
-    font_init("/usr/share/fonts");
+    if (font_init("/usr/share/fonts") != 0) {
+        fprintf(stderr, "sysmon: no fonts in /usr/share/fonts\n");
+        mc_close(&c);
+        return 1;
+    }
     Fonts F;
     F.head  = font_get(FONT_SEMIBOLD, 12);
     F.body  = font_get(FONT_REGULAR, 11);
@@ -1044,22 +1417,14 @@ int main(void) {
     if (m.page_kb <= 0) m.page_kb = 4;
     m.sort_key = S_CPU;
     m.sort_dir = -1;
-    m.hover = -1;
-    m.sel_pid = -1;
-    m.msg_at = 0.0;
-
-    static int view[MAX_PROC];
-    int view_n = 0;
+    m.sel_pid = 0;
 
     int cap_w = c.w, cap_h = c.h;
     int vw = c.w, vh = c.h;
-    Layout L;
-    layout_build(vw, vh, &F, &L);
 
     double last_ms = mono_ms();
     sample(&m, 0.0);
-    view_n = build_view(&m, view);
-    if (view_n > 0) m.sel_pid = m.procs[view[0]].pid;
+    refresh_view(&m);
 
     double next_sample = mono_ms() + 1000.0;
     int dirty = 1;
@@ -1068,25 +1433,50 @@ int main(void) {
     for (;;) {
         double now = mono_ms();
 
+        check_pending(&m);
         if (now >= next_sample) {
             sample(&m, now - last_ms);
             last_ms = now;
-            view_n = build_view(&m, view);
+            refresh_view(&m);
             next_sample = now + 1000.0;
-            if (view_index_of(&m, view, view_n, m.sel_pid) < 0 && view_n > 0)
-                m.sel_pid = m.procs[view[0]].pid;
             dirty = 1;
         }
-        if (m.pending_pid > 0 && check_pending(&m)) dirty = 1;
         if (m.msg[0] && m.msg_at > 0.0 && now - m.msg_at > 8000.0) {
             m.msg[0] = 0;
             dirty = 1;
         }
 
+        CrdMetrics cm = crd_metrics(F.head, F.body, F.small);
+        SysLayout L = sysmon_layout_for(&m, vw, vh, &F, &cm);
+        m.rows = L.pc.rows;
+        reveal_selection(&m);
+        if (m.scroll > m.nview - L.pc.rows) m.scroll = m.nview - L.pc.rows;
+        if (m.scroll < 0) m.scroll = 0;
+
         if (dirty) {
-            layout_build(vw, vh, &F, &L);
-            draw_frame(&m, &(Surface){ .px = c.px, .w = vw, .h = vh, .stride = c.stride },
-                       &L, &F, view, view_n);
+            ProcView pv;
+            memset(&pv, 0, sizeof(pv));
+            pv.procs = m.procs;
+            pv.view = m.view;
+            pv.nview = m.nview;
+            pv.ntotal = m.nproc;
+            pv.scroll = m.scroll;
+            pv.sel_pid = m.sel_pid;
+            pv.sort_key = m.sort_key;
+            pv.sort_dir = m.sort_dir;
+            snprintf(pv.filter, sizeof(pv.filter), "%s", m.filter);
+            pv.filter_edit = m.filter_edit;
+            char note[160];
+            note[0] = 0;
+            if (m.msg[0] && mono_ms() - m.msg_at < 8000.0)
+                snprintf(note, sizeof(note), "%s", m.msg);
+            else if (m.truncated)
+                snprintf(note, sizeof(note), "list full: %d in /proc", m.nproc);
+            pv.note = note;
+            pv.note_warn = m.truncated;
+
+            Surface s = { .px = c.px, .w = vw, .h = vh, .stride = c.stride };
+            draw_frame(&m, &s, &L, &F, &pv, vw, vh);
             mc_present(&c);
             dirty = 0;
         }
@@ -1107,7 +1497,6 @@ int main(void) {
                 vh = ev.h < cap_h ? ev.h : cap_h;
                 if (vw < 1) vw = 1;
                 if (vh < 1) vh = 1;
-                layout_build(vw, vh, &F, &L);
                 dirty = 1;
                 break;
 
@@ -1129,23 +1518,31 @@ int main(void) {
                         }
                     } else if (ch == '/') {
                         m.filter_edit = 1;
+                    } else if (ch == 'f') {
+                        m.filter_edit = 1;
+                    } else if (ch == 'c') {
+                        m.filter[0] = 0;
                     } else if (ch == 'q' || ch == 'Q') {
                         quit = 1;
-                    } else if (ch == 'k' || ch == 'K') {
-                        open_kill_dialog(&m, view, view_n);
+                    } else if (ch == 'K') {
+                        open_kill_dialog(&m);
+                    } else if (ch == 's') {
+                        set_sort(&m, (m.sort_key + 1) % S_N);
+                    } else if (ch == 'S') {
+                        m.sort_dir = -m.sort_dir;
+                        m.scroll = 0;
+                    } else if (ch >= '1' && ch < '1' + S_N) {
+                        set_sort(&m, ch - '1');
                     } else if ((unsigned char)ch >= 32 && ch != 127) {
-                        /* "filter by typing": any other printable key starts
-                         * the filter with that character */
+                        /* typing a letter that is not a command starts the
+                         * filter with that letter */
                         m.filter_edit = 1;
                         m.filter[0] = ch;
                         m.filter[1] = 0;
                     }
                 }
-                /* filtering is live: rebuild the view on every keystroke */
-                view_n = build_view(&m, view);
-                m.scroll = 0;
-                if (view_index_of(&m, view, view_n, m.sel_pid) < 0 && view_n > 0)
-                    m.sel_pid = m.procs[view[0]].pid;
+                refresh_view(&m);
+                reveal_selection(&m);
                 dirty = 1;
                 break;
             }
@@ -1158,62 +1555,39 @@ int main(void) {
                     break;
                 }
                 if (m.filter_edit) {
-                    if (ev.key == 1) {                 /* Esc leaves editing */
+                    if (ev.key == 1) {
                         m.filter_edit = 0;
-                        if (!m.filter[0]) view_n = build_view(&m, view);
+                        if (!m.filter[0]) refresh_view(&m);
                         dirty = 1;
-                    } else if (ev.key == 28) {         /* Enter also leaves */
+                    } else if (ev.key == 28) {
                         m.filter_edit = 0;
                         dirty = 1;
-                    } else if (ev.key == 14) {         /* Backspace */
+                    } else if (ev.key == 14) {
                         size_t n = strlen(m.filter);
                         if (n) m.filter[n - 1] = 0;
-                        view_n = build_view(&m, view);
+                        refresh_view(&m);
                         m.scroll = 0;
                         dirty = 1;
                     }
                     break;
                 }
-                int sel = view_index_of(&m, view, view_n, m.sel_pid);
-                if (sel < 0) sel = 0;
-                int moved = 0;
                 switch (ev.key) {
-                case 1:                                /* Esc clears the filter */
+                case 1:
                     if (m.filter[0]) {
                         m.filter[0] = 0;
-                        view_n = build_view(&m, view);
+                        refresh_view(&m);
                         m.scroll = 0;
                         dirty = 1;
                     }
                     break;
-                case 103: if (sel > 0) { sel--; moved = 1; } break;             /* up */
-                case 108: if (sel + 1 < view_n) { sel++; moved = 1; } break;    /* down */
-                case 104:                                                       /* page up */
-                    sel -= L.rows_visible;
-                    if (sel < 0) sel = 0;
-                    moved = 1;
-                    break;
-                case 109:                                                       /* page down */
-                    sel += L.rows_visible;
-                    if (sel > view_n - 1) sel = view_n - 1;
-                    if (sel < 0) sel = 0;
-                    moved = 1;
-                    break;
-                case 102: sel = 0; moved = 1; break;                             /* home */
-                case 107: sel = view_n - 1; moved = 1; break;                    /* end */
-                case 28: open_kill_dialog(&m, view, view_n); dirty = 1; break;
+                case 103: move_sel(&m, -1); dirty = 1; break;
+                case 108: move_sel(&m,  1); dirty = 1; break;
+                case 104: move_sel(&m, -L.pc.rows); dirty = 1; break;
+                case 109: move_sel(&m,  L.pc.rows); dirty = 1; break;
+                case 102: move_sel(&m, -m.nview); dirty = 1; break;
+                case 107: move_sel(&m,  m.nview); dirty = 1; break;
+                case 28:  open_kill_dialog(&m); dirty = 1; break;
                 default: break;
-                }
-                if (moved && view_n > 0) {
-                    if (sel < 0) sel = 0;
-                    m.sel_pid = m.procs[view[sel]].pid;
-                    if (sel < m.scroll) m.scroll = sel;
-                    if (sel >= m.scroll + L.rows_visible)
-                        m.scroll = sel - L.rows_visible + 1;
-                    if (m.scroll > view_n - L.rows_visible)
-                        m.scroll = view_n - L.rows_visible;
-                    if (m.scroll < 0) m.scroll = 0;
-                    dirty = 1;
                 }
                 break;
             }
@@ -1221,8 +1595,7 @@ int main(void) {
             case MC_WHEEL: {
                 if (m.dlg) break;
                 m.scroll -= ev.wheel * 3;
-                if (m.scroll > view_n - L.rows_visible)
-                    m.scroll = view_n - L.rows_visible;
+                if (m.scroll > m.nview - L.pc.rows) m.scroll = m.nview - L.pc.rows;
                 if (m.scroll < 0) m.scroll = 0;
                 dirty = 1;
                 break;
@@ -1231,46 +1604,22 @@ int main(void) {
             case MC_MOUSE: {
                 int x = ev.x, y = ev.y;
                 int down = ev.buttons & 1;
-                int over_rows = rect_hit(&L.rows, x, y);
-                int hov = -1;
-                if (over_rows) {
-                    int r = (y - L.rows_top) / (L.row_h > 0 ? L.row_h : 1);
-                    if (r >= 0 && r < L.rows_visible) hov = m.scroll + r;
-                    if (hov >= view_n) hov = -1;
-                }
-                if (hov != m.hover) { m.hover = hov; dirty = 1; }
-
                 if (down && !was_down) {
                     if (m.dlg) {
-                        if (rect_hit(&L.dlg_ok, x, y)) do_kill(&m);
-                        else if (rect_hit(&L.dlg_no, x, y)) m.dlg = 0;
+                        if (crd_hit(&L.dlg_ok, x, y)) do_kill(&m);
+                        else if (crd_hit(&L.dlg_no, x, y)) m.dlg = 0;
                         dirty = 1;
-                    } else if (rect_hit(&L.kill_btn, x, y)) {
-                        open_kill_dialog(&m, view, view_n);
-                        dirty = 1;
-                    } else if (rect_hit(&L.filter, x, y)) {
+                    } else if (L.pc.show_filter && crd_hit(&L.pc.filter, x, y)) {
                         m.filter_edit = 1;
                         dirty = 1;
-                    } else if (rect_hit(&L.thead, x, y)) {
-                        /* click a column heading: same column flips direction */
-                        int col = -1;
-                        for (int i = 0; i < 5; i++)
-                            if (x >= L.col[i] && x < L.col[i + 1]) col = i;
-                        if (col >= 0) {
-                            if (m.sort_key == col) m.sort_dir = -m.sort_dir;
-                            else {
-                                m.sort_key = col;
-                                m.sort_dir = (col == S_CPU || col == S_MEM) ? -1 : 1;
-                            }
-                            view_n = build_view(&m, view);
-                            m.scroll = 0;
-                            dirty = 1;
-                        }
-                    } else if (over_rows) {
-                        int r = (y - L.rows_top) / (L.row_h > 0 ? L.row_h : 1);
+                    } else if (L.pc.show_head && crd_hit(&L.pc.head, x, y)) {
+                        set_sort(&m, proc_col_at(&L.pc, x));
+                        dirty = 1;
+                    } else if (y >= (int)L.pc.body_y) {
+                        int r = (int)(((float)y - L.pc.body_y) / L.pc.row_h);
                         int vi = m.scroll + r;
-                        if (vi >= 0 && vi < view_n) {
-                            m.sel_pid = m.procs[view[vi]].pid;
+                        if (r >= 0 && r < L.pc.rows && vi >= 0 && vi < m.nview) {
+                            m.sel_pid = m.procs[m.view[vi]].pid;
                             dirty = 1;
                         }
                     }
@@ -1294,307 +1643,7 @@ int main(void) {
 
 #else /* SYSMON_HOST_TEST */
 
-/* ============================================================
- *  Host-only self test (never compiled into the OS app).
- *  It builds a /proc fixture out of real files, points the same
- *  parsers at it, and checks the arithmetic and the state machines.
- * ============================================================ */
-
-#ifdef _WIN32
-#  include <direct.h>
-#  define host_mkdir(p) _mkdir(p)
-#else
-#  define host_mkdir(p) mkdir((p), 0755)
-#endif
-
-static int fails;
-static int checks;
-
-static void chk(int cond, const char *what) {
-    checks++;
-    printf("%-62s %s\n", what, cond ? "ok" : "FAIL");
-    if (!cond) fails++;
-}
-
-static void wr(const char *path, const char *text) {
-    FILE *f = fopen(path, "w");
-    if (!f) { printf("cannot write %s\n", path); fails++; return; }
-    fputs(text, f);
-    fclose(f);
-}
-
-static void stat_file(int pid, const char *comm, char state,
-                      unsigned long long utime, unsigned long long stime,
-                      long rss_pages, long size_pages) {
-    char path[128];
-    char buf[640];
-    snprintf(buf, sizeof(buf),
-             "%d (%s) %c 1 100 100 0 -1 4194304 500 0 0 0 %llu %llu 0 0 20 0 1 0 500 0 250 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n",
-             pid, comm, state, utime, stime);
-    snprintf(path, sizeof(path), PROC_ROOT "/%d/stat", pid);
-    wr(path, buf);
-    snprintf(buf, sizeof(buf), "%ld %ld 100 10 0 50 0\n", size_pages, rss_pages);
-    snprintf(path, sizeof(path), PROC_ROOT "/%d/statm", pid);
-    wr(path, buf);
-}
-
-static const Proc *by_pid(SysMon *m, int pid) { return find_pid(m, pid); }
-
-static void render_bmp(const char *path, const u32 *px, int w, int h) {
-    int row = (w * 3 + 3) & ~3;
-    size_t size = 54u + (size_t)row * (size_t)h;
-    u8 *b = calloc(1, size);
-    if (!b) return;
-    b[0] = 'B'; b[1] = 'M';
-    b[2] = (u8)size; b[3] = (u8)(size >> 8); b[4] = (u8)(size >> 16); b[5] = (u8)(size >> 24);
-    b[10] = 54; b[14] = 40;
-    b[18] = (u8)w; b[19] = (u8)(w >> 8); b[20] = (u8)(w >> 16); b[21] = (u8)(w >> 24);
-    b[22] = (u8)h; b[23] = (u8)(h >> 8); b[24] = (u8)(h >> 16); b[25] = (u8)(h >> 24);
-    b[26] = 1; b[28] = 24;
-    for (int y = 0; y < h; y++) {
-        u8 *dst = b + 54u + (size_t)(h - 1 - y) * (size_t)row;
-        for (int x = 0; x < w; x++) {
-            u32 c = px[(size_t)y * (size_t)w + (size_t)x];
-            dst[x * 3 + 0] = GET_B(c);
-            dst[x * 3 + 1] = GET_G(c);
-            dst[x * 3 + 2] = GET_R(c);
-        }
-    }
-    FILE *f = fopen(path, "wb");
-    if (f) { fwrite(b, 1, size, f); fclose(f); }
-    free(b);
-}
-
-int sysmon_selftest(void);
-int sysmon_render(const char *normal, const char *dialog);
-
-int sysmon_selftest(void) {
-    host_mkdir(".work/paintmon/fake");
-    host_mkdir(".work/paintmon/fake/proc");
-    host_mkdir(".work/paintmon/fake/proc/net");
-    host_mkdir(PROC_ROOT "/1");
-    host_mkdir(PROC_ROOT "/100");
-    host_mkdir(PROC_ROOT "/200");
-    host_mkdir(PROC_ROOT "/300");
-    host_mkdir(PROC_ROOT "/400");
-
-    wr(PROC_ROOT "/loadavg", "0.42 0.31 0.20 1/57 12345\n");
-    wr(PROC_ROOT "/meminfo",
-       "MemTotal:        8000000 kB\n"
-       "MemFree:          500000 kB\n"
-       "MemAvailable:    3000000 kB\n");
-    wr(PROC_ROOT "/uptime", "123456.78 999.00\n");
-    wr(PROC_ROOT "/cpuinfo",
-       "processor\t: 0\nmodel name\t: fake\n"
-       "processor\t: 1\nmodel name\t: fake\n"
-       "processor\t: 2\nmodel name\t: fake\n"
-       "processor\t: 3\nmodel name\t: fake\n");
-    wr(PROC_ROOT "/net/dev",
-       "Inter-|   Receive                                                |  Transmit\n"
-       " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n"
-       "    lo: 1000 1 0 0 0 0 0 0 2000 1 0 0 0 0 0 0\n"
-       "  eth0: 5000000 10 0 0 0 0 0 0 7000000 20 0 0 0 0 0 0\n");
-
-    stat_file(1, "init", 'S', 10, 5, 100, 1000);
-    stat_file(100, "bash", 'S', 100, 20, 250, 1000);
-    stat_file(200, "sys monitor", 'R', 5, 0, 500, 2000);
-    stat_file(300, "odd)name", 'S', 1000, 0, 4000, 8000);
-    stat_file(400, "defunct", 'Z', 0, 0, 0, 0);
-
-    SysMon m;
-    memset(&m, 0, sizeof(m));
-    m.hz = 100;
-    m.page_kb = 4;
-    m.sort_key = S_CPU;
-    m.sort_dir = -1;
-    m.sel_pid = -1;
-
-    sample(&m, 0.0);
-    printf("sample 1: %d procs, %d cpus, load %.2f %.2f %.2f, net %d ifaces\n",
-           m.nproc, m.ncpu, m.load[0], m.load[1], m.load[2], m.nif);
-    chk(m.nproc == 5, "stat/sample: five pids read");
-    chk(m.ncpu == 4, "cpuinfo: four processor lines");
-    chk(m.load[0] > 0.419 && m.load[0] < 0.421, "loadavg: 1 min read");
-    chk(m.load[2] > 0.199 && m.load[2] < 0.201, "loadavg: 15 min read");
-    chk(m.total_kb == 8000000, "meminfo: MemTotal read");
-    chk(m.avail_kb == 3000000, "meminfo: MemAvailable read");
-    chk(m.uptime > 123456.7 && m.uptime < 123456.8, "uptime: read");
-    chk(m.nif == 2, "net/dev: two interfaces");
-    chk(!strcmp(m.ifs[1].name, "eth0") && m.ifs[1].rx == 5000000 && m.ifs[1].tx == 7000000,
-        "net/dev: eth0 counters");
-    {
-        const Proc *p = by_pid(&m, 200);
-        chk(p && !strcmp(p->comm, "sys monitor"), "stat: comm with a space");
-        p = by_pid(&m, 300);
-        chk(p && !strcmp(p->comm, "odd)name"), "stat: comm containing ')'");
-        p = by_pid(&m, 400);
-        chk(p && p->state == 'Z', "stat: zombie state letter");
-        p = by_pid(&m, 100);
-        chk(p && p->mem_kb == 1000, "statm: 250 pages x 4 kB = 1000 kB");
-        chk(p && p->cpu10 == -1, "cpu: first sample has no delta");
-    }
-    chk(m.hist_len == 1, "ring: one sample after the first pass");
-
-    /* ---- second sample, one second later, with new jiffies ---- */
-    stat_file(100, "bash", 'S', 150, 20, 250, 1000);       /* +50 jiffies = 0.50 s */
-    stat_file(300, "odd)name", 'S', 1100, 0, 4000, 8000);  /* +100 jiffies = 1.00 s */
-    stat_file(200, "sys monitor", 'R', 5, 0, 500, 2000);   /* unchanged */
-    wr(PROC_ROOT "/net/dev",
-       "Inter-|   Receive                                                |  Transmit\n"
-       " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n"
-       "    lo: 1000 1 0 0 0 0 0 0 2000 1 0 0 0 0 0 0\n"
-       "  eth0: 5002000 10 0 0 0 0 0 0 7010000 20 0 0 0 0 0 0\n");
-    sample(&m, 1000.0);
-
-    {
-        const Proc *p = by_pid(&m, 100);
-        printf("cpu: pid 100 +50 jiffies over 1.000 s at 100 Hz -> %d tenths of a percent\n",
-               p ? p->cpu10 : -999);
-        chk(p && p->cpu10 == 500, "cpu% = jiffies x 1000 / (hz x dt)  => 50.0%");
-        p = by_pid(&m, 300);
-        chk(p && p->cpu10 == 1000, "cpu% = 100.0% for one full second of cpu");
-        p = by_pid(&m, 200);
-        chk(p && p->cpu10 == 0, "cpu% = 0.0% for an unchanged process");
-        chk(m.dt_ms == 1000.0, "sample: dt is the measured 1000 ms");
-    }
-    chk(m.hist_len == 2, "ring: two samples");
-    chk(m.ifs[1].rx_rate > 1999.0 && m.ifs[1].rx_rate < 2001.0,
-        "net rate: +2000 bytes in 1 s = 2000 B/s");
-    chk(m.ifs[1].tx_rate > 9999.0 && m.ifs[1].tx_rate < 10001.0,
-        "net rate: +10000 bytes in 1 s = 10000 B/s");
-
-    static int view[MAX_PROC];
-    int n = build_view(&m, view);
-    chk(n == 5, "view: five rows");
-    chk(m.procs[view[0]].pid == 300, "sort: cpu descending puts pid 300 first");
-    m.sort_key = S_MEM;
-    m.sort_dir = -1;
-    n = build_view(&m, view);
-    chk(m.procs[view[0]].pid == 300, "sort: memory descending puts the 16000 kB pid first");
-    chk(m.procs[view[4]].pid == 400, "sort: the 0 kB zombie sorts last");
-    m.sort_key = S_NAME;
-    m.sort_dir = 1;
-    n = build_view(&m, view);
-    chk(!strcmp(m.procs[view[0]].comm, "bash"), "sort: name ascending starts at bash");
-    m.sort_key = S_PID;
-    m.sort_dir = 1;
-    n = build_view(&m, view);
-    chk(m.procs[view[0]].pid == 1, "sort: pid ascending starts at 1");
-
-    snprintf(m.filter, sizeof(m.filter), "odd");
-    n = build_view(&m, view);
-    chk(n == 1 && m.procs[view[0]].pid == 300, "filter: 'odd' matches only odd)name");
-    snprintf(m.filter, sizeof(m.filter), "20");
-    n = build_view(&m, view);
-    chk(n == 1 && m.procs[view[0]].pid == 200, "filter: '20' matches pid 200");
-    snprintf(m.filter, sizeof(m.filter), "BASH");
-    n = build_view(&m, view);
-    chk(n == 1 && m.procs[view[0]].pid == 100, "filter: case-insensitive");
-    snprintf(m.filter, sizeof(m.filter), "zzz");
-    n = build_view(&m, view);
-    chk(n == 0, "filter: no match gives no rows");
-    m.filter[0] = 0;
-    n = build_view(&m, view);
-
-    /* ---- kill: refusal and the two signals ---- */
-    g_kill_n = 0;
-    m.kill_pid = 1;
-    snprintf(m.kill_comm, sizeof(m.kill_comm), "init");
-    do_kill(&m);
-    printf("kill pid 1 -> %s\n", m.msg);
-    chk(strstr(m.msg, "refusing") != NULL && g_kill_n == 0, "kill: pid 1 refused, no signal sent");
-    m.kill_pid = (int)getpid();
-    do_kill(&m);
-    chk(strstr(m.msg, "refusing") != NULL && g_kill_n == 0, "kill: own pid refused");
-
-    m.kill_pid = 300;
-    snprintf(m.kill_comm, sizeof(m.kill_comm), "odd)name");
-    do_kill(&m);
-    printf("kill pid 300 -> %s\n", m.msg);
-    chk(g_kill_n == 1 && g_kill_pid[0] == 300 && g_kill_sig[0] == SIGTERM,
-        "kill: SIGTERM is the first signal");
-    chk(m.pending_pid == 300, "kill: escalation is armed");
-    check_pending(&m);
-    chk(g_kill_n == 1, "kill: no SIGKILL before the grace period");
-    host_advance(KILL_GRACE_MS + 100.0);
-    check_pending(&m);
-    printf("after %.1f s -> %s\n", KILL_GRACE_MS / 1000.0, m.msg);
-    chk(g_kill_n == 2 && g_kill_pid[1] == 300 && g_kill_sig[1] == SIGKILL,
-        "kill: SIGKILL after the grace period");
-    chk(m.pending_pid == 0, "kill: pending cleared");
-
-    m.kill_pid = 999999;
-    snprintf(m.kill_comm, sizeof(m.kill_comm), "ghost");
-    do_kill(&m);
-    printf("kill 999999 -> %s\n", m.msg);
-    chk(strstr(m.msg, "failed") != NULL && m.pending_pid == 0,
-        "kill: a failed kill(2) is reported with strerror and not armed");
-
-    printf("checks %d, failures %d\n", checks, fails);
-    printf("RESULT: %s\n", fails ? "FAIL" : "PASS");
-    return fails ? 1 : 0;
-}
-
-int sysmon_render(const char *normal, const char *dialog) {
-    ui_scale_set_effective(1.4f);
-    if (font_init("assets/fonts") != 0) { printf("render: font_init failed\n"); return 2; }
-    Fonts F;
-    F.head  = font_get(FONT_SEMIBOLD, 12);
-    F.body  = font_get(FONT_REGULAR, 11);
-    F.small = font_get(FONT_REGULAR, 10);
-    F.mono  = font_get(FONT_MONO, 10);
-    if (!F.head || !F.body || !F.small || !F.mono) { printf("render: fonts\n"); return 2; }
-
-    static SysMon m;
-    memset(&m, 0, sizeof(m));
-    m.hz = 100;
-    m.page_kb = 4;
-    m.sort_key = S_CPU;
-    m.sort_dir = -1;
-    m.hover = -1;
-    m.sel_pid = -1;
-    sample(&m, 0.0);
-
-    /* a few more ring points so the graphs have a shape, every one of
-     * them read back from the fixture files */
-    for (int i = 0; i < 40; i++) {
-        char la[64];
-        double v = 0.30 + 0.02 * (double)((i * 7) % 11);
-        snprintf(la, sizeof(la), "%.2f 0.31 0.20 1/57 12345\n", v);
-        wr(PROC_ROOT "/loadavg", la);
-        stat_file(100, "bash", 'S', (unsigned long long)(100 + i * 3), 20, 250, 1000);
-        stat_file(300, "odd)name", 'S', (unsigned long long)(1000 + i * 9), 0, 4000, 8000);
-        sample(&m, 1000.0);
-    }
-    m.sort_key = S_CPU;
-    m.sort_dir = -1;
-    static int view[MAX_PROC];
-    int n = build_view(&m, view);
-    if (n > 0) m.sel_pid = m.procs[view[0]].pid;
-    m.filter[0] = 0;
-    m.msg[0] = 0;
-
-    int vw = WIN_W, vh = WIN_H;
-    u32 *px = calloc((size_t)vw * (size_t)vh, sizeof(u32));
-    if (!px) return 2;
-    Layout L;
-    layout_build(vw, vh, &F, &L);
-    Surface s = { .px = px, .w = vw, .h = vh, .stride = vw };
-
-    draw_frame(&m, &s, &L, &F, view, n);
-    render_bmp(normal, px, vw, vh);
-    printf("render          %s\n", normal);
-
-    m.dlg = 1;
-    m.kill_pid = 300;
-    snprintf(m.kill_comm, sizeof(m.kill_comm), "odd)name");
-    m.sel_pid = 300;
-    draw_frame(&m, &s, &L, &F, view, n);
-    render_bmp(dialog, px, vw, vh);
-    printf("render          %s\n", dialog);
-
-    free(px);
-    return 0;
-}
+/* The host harness lives in .work/systemui; this file keeps only the clock
+ * and kill stand-ins above. Nothing here is compiled into the OS app. */
 
 #endif /* SYSMON_HOST_TEST */

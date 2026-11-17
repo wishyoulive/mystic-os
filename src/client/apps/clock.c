@@ -1188,7 +1188,10 @@ int main(void) {
      * /etc/mystic/ui.conf here: inside the app jail there is no /etc at all,
      * and ui_scale_load() would fall back to 1.0 and throw away the scale the
      * window server passed in MYSTIC_UI_SCALE. */
-    if (!font_init("/usr/share/fonts")) {
+    /* font_init() returns 0 on success, -1 on failure. This used to be
+     * the other way round, so "if (!font_init(...))" quit on SUCCESS and the
+     * app never drew a window at all. */
+    if (font_init("/usr/share/fonts") != 0) {
         fprintf(stderr, "clock: no fonts in /usr/share/fonts\n");
         mc_close(&c);
         return 1;

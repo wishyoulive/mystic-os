@@ -402,7 +402,7 @@ static void mkdirp_for(const char *jail, const char *sub) {
     mkdir(buf, 0755);
 }
 
-static void sandbox_child(const char *exe, const char *id, int net) {
+static void sandbox_child(const char *exe, const char *id, int net, const char *arg) {
     char jail[192], path[256];
     snprintf(jail, sizeof(jail), "/run/mystic/jail/%s", id);
 
@@ -497,6 +497,19 @@ static void sandbox_child(const char *exe, const char *id, int net) {
         mkdirp_for(jail, "/usr/share/fonts");
         if (mount("/usr/share/fonts", path, NULL, MS_BIND | MS_RDONLY, NULL) < 0)
             fprintf(stderr, "wms: sandbox fonts bind failed: %s\n", strerror(errno));
+        {
+            /* an app with no fonts is a blank window: say what the jail sees */
+            DIR *fd2 = opendir(path);
+            int nf = 0;
+            if (fd2) {
+                struct dirent *de2;
+                while ((de2 = readdir(fd2))) if (de2->d_name[0] != '.') nf++;
+                closedir(fd2);
+            } else {
+                fprintf(stderr, "wms: jail fonts opendir failed: %s\n", strerror(errno));
+            }
+            fprintf(stderr, "wms: jail fonts for %s: %d entries\n", id, nf);
+        }
 
         snprintf(path, sizeof(path), "%s/dev/shm", jail);
         mkdirp_for(jail, "/dev/shm");
@@ -509,6 +522,32 @@ static void sandbox_child(const char *exe, const char *id, int net) {
         int ufd = open(path, O_CREAT | O_RDWR, 0666);
         if (ufd >= 0) close(ufd);
         mount("/dev/urandom", path, NULL, MS_BIND | MS_RDONLY, NULL);
+
+        /* The document the user asked to open. The desktop validated the
+         * path; here it is bound READ-ONLY, on its own, into the jail at the
+         * same path. So the app can read exactly the file it was asked to
+         * show - not the directory it lives in, not anything beside it, and
+         * it cannot write to it. */
+        if (arg && arg[0] == '/' && !strstr(arg, "..")) {
+            char dirpart[512];
+            snprintf(dirpart, sizeof(dirpart), "%s", arg);
+            char *slash2 = strrchr(dirpart, '/');
+            if (slash2) {
+                *slash2 = 0;                       /* parent path, no name */
+                char jaildir[768];
+                snprintf(jaildir, sizeof(jaildir), "%s%s", jail, dirpart);
+                mkdirp_for(jail, dirpart);
+                int dfd = open(jaildir, O_RDONLY | O_DIRECTORY);
+                if (dfd >= 0) close(dfd);
+                char filepath[768];
+                snprintf(filepath, sizeof(filepath), "%s%s", jail, arg);
+                int ffd = open(filepath, O_CREAT | O_RDONLY, 0444);
+                if (ffd >= 0) close(ffd);
+                if (mount(arg, filepath, NULL, MS_BIND | MS_RDONLY, NULL) < 0)
+                    fprintf(stderr, "wms: cannot bind %.120s into the jail: %s\n",
+                            arg, strerror(errno));
+            }
+        }
 
         snprintf(path, sizeof(path), "%s/proc", jail);
         mkdirp_for(jail, "/proc");
@@ -547,7 +586,7 @@ static void sandbox_child(const char *exe, const char *id, int net) {
     setenv("TMPDIR", "/tmp", 1);
 }
 
-int wms_launch(const WmApp *app, WmClient *cl, int slot) {
+static int wms_launch_arg(const WmApp *app, WmClient *cl, int slot, const char *arg) {
     if (!app || slot < 0) return -1;
     char exe[512];
     snprintf(exe, sizeof(exe), "%s/%s/%s", WM_APP_DIR, app->id, app->exe);
@@ -563,11 +602,29 @@ int wms_launch(const WmApp *app, WmClient *cl, int slot) {
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
-        sandbox_child(exe, app->id, app->net);
-        execl("/bin/app", "app", (char *)NULL);   /* inside the jail, or not at all */
+        sandbox_child(exe, app->id, app->net, arg);
+        (void)arg;
+        if (arg && arg[0]) {
+            /* an app that was asked to open a document gets the path as
+             * argv[1]; the path was validated by the desktop, and the app
+             * still cannot see anything outside its own jail */
+            execl("/bin/app", "app", arg, (char *)NULL);
+        } else {
+            execl("/bin/app", "app", (char *)NULL);   /* inside the jail, or not at all */
+        }
         fprintf(stderr, "wms: cannot exec the jailed %s\n", app->id);
         _exit(127);
     }
     (void)cl;
     return (int)pid;
 }
+/* Two entry points, one implementation: the launcher and the store use the
+ * plain one; Files passes a document path so the app can open it. */
+int wms_launch(const WmApp *app, WmClient *c, int slot) {
+    return wms_launch_arg(app, c, slot, NULL);
+}
+
+int wms_launch_path(const WmApp *app, WmClient *c, int slot, const char *path) {
+    return wms_launch_arg(app, c, slot, path);
+}
+

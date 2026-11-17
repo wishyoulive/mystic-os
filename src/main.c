@@ -6,21 +6,26 @@
  *  memory and processes from /proc, input from evdev.
  *
  *  Keys:   every binding lives in src/shortcuts.c, and Super+/ (or F1
- *          with nothing open) draws the list of them. The desktop-level
- *          ones: Esc close, Alt+Tab switch, Super launcher, Ctrl+Alt+L
- *          lock.
+ *          with nothing open) draws the list of them. Esc is a cancel
+ *          key - it dismisses the launcher, the shortcut panel, an open
+ *          menu, a drag in progress or the focused app's own modal, and
+ *          it never closes a window. Ctrl+W / Ctrl+Q close the window,
+ *          Alt+Tab switches, Super opens the launcher, Ctrl+Alt+L locks.
  *  Mouse:  drag a title bar to move a window, click a dock icon
  *          to launch an app, click a window's red dot to close it.
  * ============================================================ */
 #include <signal.h>
+#include <stdarg.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 
 #include "mystic.h"
+#include "filetypes.h"
 #include "ipc.h"
 #include "wallpaper.h"
 #include "shortcuts.h"
+#include "clipboard.h"
 #include "notify.h"
 #include <unistd.h>
 
@@ -117,8 +122,12 @@ typedef struct {
     Term *term;
     int   client;        /* index into clients[] when kind == WIN_CLIENT */
     int   hidden;        /* minimised: still alive, not drawn, not hit-tested */
-    int   maxed;         /* maximised by double-click */
+    int   maxed;         /* maximised by double-click; 2 full screen, 3 snapped */
     int   restore_x, restore_y, restore_w, restore_h;
+    int   on_top;        /* always-on-top: ranks above every ordinary window */
+    int   term_size;     /* FONT_MONO point size (scaled later by font_get) */
+    char  input_line[192];  /* bytes typed into this terminal since Enter */
+    int   input_len;
     int   z;
     unsigned gen;        /* slot generation: bumped whenever the slot changes hands */
 } Window;
@@ -126,9 +135,22 @@ typedef struct {
 static Window wins[MAX_WINDOWS];
 static int    z_top;
 static int    drag_win = -1, drag_dx, drag_dy;
+static int    drag_ox, drag_oy;   /* where the drag began, so Esc can put it back */
 static unsigned drag_gen;         /* generation of the window being dragged   */
 static int    resize_win = -1;
+static int    resize_ow, resize_oh; /* the size before the resize handle grabbed */
 static unsigned resize_gen;       /* generation of the window being resized   */
+
+/* Desktop context menu (right click on empty wallpaper). It is a modal for
+ * the same reason the launcher is: Esc and a click elsewhere dismiss it,
+ * and no key reaches a window while it is up. */
+static int    menu_open, menu_sel, menu_x, menu_y;
+
+/* A one-line confirmation above the dock. `status_t0` is 0 when there is
+ * nothing to say; the once-a-second tick clears it after a few seconds. */
+static char   status_msg[192];
+static double status_t0;
+static void   set_status(const char *fmt, ...);
 /* A compositor that dies silently leaves a frozen picture that looks like a
  * hang. Say which signal and where, so the serial console records it. */
 static void on_fatal(int sig, siginfo_t *si, void *ctx) {
@@ -183,7 +205,7 @@ static int    mouse_prev;
  *               a repaint the same way every other piece of code does.
  */
 static int super_down, super_lone;
-static int help_open, dnd_on;
+static int help_open, help_page, dnd_on;
 static int dirty = 1;
 
 /* ------------------------------------------------------------ helpers */
@@ -350,17 +372,45 @@ static IconFn icon_for_window(Window *w) {
 }
 
 /* ------------------------------------------------------------ window mgmt */
+
+/* The stacking rank: always-on-top windows outrank ordinary ones whatever
+ * their z is, and z orders within a layer. One function, so win_top(),
+ * the painter, hit-testing and the focus ring cannot disagree about which
+ * window is in front. */
+static long win_rank(const Window *w) {
+    return ((long)(w->on_top ? 1 : 0) << 30) + (long)w->z;
+}
+
 static Window *win_top(void) {
     Window *best = NULL;
     for (int i = 0; i < MAX_WINDOWS; i++)
-        if (wins[i].used && !wins[i].hidden && (!best || wins[i].z > best->z))
+        if (wins[i].used && !wins[i].hidden &&
+            (!best || win_rank(&wins[i]) > win_rank(best)))
             best = &wins[i];
     return best;
+}
+
+/* Keyboard focus is not the same thing as the top of the stack any more:
+ * an always-on-top window is drawn and hit-tested above ordinary ones, but
+ * clicking an ordinary window must still send the keyboard there. The slot
+ * is remembered with its generation, so a recycled slot is not mistaken
+ * for the window that used to live in it. */
+static int      focus_win = -1;
+static unsigned focus_gen;
+
+static Window *win_focused(void) {
+    if (focus_win >= 0 && focus_win < MAX_WINDOWS) {
+        Window *w = &wins[focus_win];
+        if (w->used && !w->hidden && w->gen == focus_gen) return w;
+    }
+    return win_top();
 }
 
 static void win_focus(Window *w) {
     if (!w) return;
     w->z = ++z_top;
+    focus_win = (int)(w - wins);
+    focus_gen = w->gen;
 }
 
 /* One place that tells a window's owner its content size changed: apps get a
@@ -488,7 +538,8 @@ static Window *win_open(int kind, const char *app_id) {
             w->w = ui_px(640); w->h = ui_px(380);
             w->x = 60 + (i % 3) * 40;
             w->y = 70 + (i % 3) * 40;
-            Font *fmc = font_get(FONT_MONO, 12);
+            w->term_size = 12;          /* Ctrl+Shift+= / - change it later */
+            Font *fmc = font_get(FONT_MONO, w->term_size);
             float cw = font_width(fmc, "M");
             float ch = font_height(fmc);
             if (cw < 4.0f) cw = 4.0f;
@@ -568,6 +619,7 @@ static int dock_rect(int *dx, int *dy, int *dw, int *dh) {
 }
 
 static void draw_launcher(Surface *s, const Theme *th);
+static void draw_menu(Surface *s, const Theme *th);
 static int  launcher_items(void);
 static void draw_lock_screen(Surface *s, const Theme *th);
 
@@ -778,7 +830,7 @@ static void draw_desktop(Surface *s, const Theme *th) {
     float rw = font_width(f11, right);
     font_draw(s, f11, (float)W - rw - 16, y11, right, th->text_dim);
 
-    Window *top = win_top();
+    Window *top = win_focused();
     if (top) {
         /* F10: clip by truncation to the band that is actually free, between
          * the brand label and the clock block. A symmetric band keeps the
@@ -802,17 +854,18 @@ static void draw_desktop(Surface *s, const Theme *th) {
     }
 
     /* ---------------- windows, drawn back to front ---------------- */
-    /* draw in ascending z order */
-    int last_z = -1;
+    /* draw in ascending rank order: always-on-top last */
+    long last_rank = -1;
     for (int n = 0; n < MAX_WINDOWS; n++) {
         Window *cur = NULL;
         for (int i = 0; i < MAX_WINDOWS; i++) {
             if (!wins[i].used || wins[i].hidden) continue;
-            if (wins[i].z <= last_z) continue;
-            if (!cur || wins[i].z < cur->z) cur = &wins[i];
+            long r = win_rank(&wins[i]);
+            if (r <= last_rank) continue;
+            if (!cur || r < win_rank(cur)) cur = &wins[i];
         }
         if (!cur) break;
-        last_z = cur->z;
+        last_rank = win_rank(cur);
 
         float cx = th->corner;
         gfx_shadow(s, (float)cur->x, (float)cur->y, (float)cur->w, (float)cur->h, cx, 24, 0.5f);
@@ -862,7 +915,7 @@ static void draw_desktop(Surface *s, const Theme *th) {
         if (cur->kind == WIN_TERM && cur->term) {
             /* a terminal needs a monospace face: with a proportional font the
              * columns drift and 'ls' output stops lining up at larger scales */
-            Font *fm = font_get(FONT_MONO, 12);
+            Font *fm = font_get(FONT_MONO, cur->term_size > 0 ? cur->term_size : 12);
             float cw_cell = font_width(fm, "M");
             float ch_cell = font_height(fm);
             if (cw_cell < 4.0f) cw_cell = 4.0f;
@@ -927,7 +980,7 @@ static void draw_desktop(Surface *s, const Theme *th) {
 
             const int isz = dock_isz(), gap = dock_gap(), pad = dock_pad();
             int n = taskbar_count();
-            Window *focused = win_top();
+            Window *focused = win_focused();
             int near_bar = (input.mouse_y > dy - 110 && input.mouse_y < dy + dh + 20);
 
             for (int i = 0; i < n; i++) {
@@ -980,6 +1033,29 @@ static void draw_desktop(Surface *s, const Theme *th) {
         }
     }
 
+    /* the status line sits above the windows and below the overlays: a
+     * confirmation must not be hidden by the thing that caused it, but the
+     * shortcut panel owns the middle of the screen while it is up */
+    if (status_t0 > 0 && status_msg[0]) {
+        Font *fs = font_get(FONT_MEDIUM, 12);
+        char shown[192];
+        float maxw = (float)s->w - (float)ui_px(60);
+        text_fit(fs, status_msg, shown, sizeof(shown), maxw);
+        float tw = font_width(fs, shown);
+        int bw = (int)tw + ui_px(28);
+        int bh = (int)font_height(fs) + ui_px(14);
+        int bx = (s->w - bw) / 2;
+        int by = s->h - ui_px(78) - bh;
+        if (by < topbar_h() + ui_px(8)) by = topbar_h() + ui_px(8);
+        gfx_shadow(s, (float)bx, (float)by, (float)bw, (float)bh, 9, 12, 0.45f);
+        gfx_rrect_aa(s, (float)bx, (float)by, (float)bw, (float)bh, 9,
+                     color_alpha(th->window_bg, 0.96f), th->panel_border, 1.0f);
+        font_draw(s, fs, (float)bx + ui_px(14),
+                  (float)by + ((float)bh - font_height(fs)) * 0.5f,
+                  shown, th->text);
+    }
+
+    if (menu_open) draw_menu(s, th);
     if (launcher_open) {
         int total = launcher_items();
         if (launcher_sel >= total) launcher_sel = total > 0 ? total - 1 : 0;
@@ -988,7 +1064,7 @@ static void draw_desktop(Surface *s, const Theme *th) {
     }
     /* the shortcut panel is above every window, and the lock screen is
      * above everything - it is a security boundary, not a decoration */
-    if (help_open) shortcuts_draw_panel(s, th, topbar_h());
+    if (help_open) shortcuts_draw_panel(s, th, topbar_h(), help_page);
     if (locked) draw_lock_screen(s, th);
 }
 
@@ -1056,7 +1132,9 @@ static void draw_launcher(Surface *s, const Theme *th) {
     int pw = gw + 48, ph = gh + 48;
 
     gfx_shadow(s, (float)px, (float)py, (float)pw, (float)ph, 22, 30, 0.55f);
-    if (th->blur > 0) gfx_blur_region(s, px, py, pw, ph, (int)(22 * th->blur));
+    /* The panel body is opaque, so blurring the wallpaper underneath it was
+     * invisible work - and it ran on every pointer move over the grid, which
+     * is exactly the lag the owner reported on the Apps screen. */
     gfx_rrect_aa(s, (float)px, (float)py, (float)pw, (float)ph, 22,
                  color_alpha(th->window_bg, 0.97f), th->window_border, 1.0f);
 
@@ -1236,6 +1314,10 @@ static void draw_cursor_at(Surface *s, int x, int y) {
 static void key_bytes_for(int code, char *out, int *n) {
     *n = 0;
     switch (code) {
+        case SC_KEY_ESC:
+            /* Esc is a cancel key, but an app that owns its own modal needs
+             * the byte: cancel_action() forwards it through here */
+            out[(*n)++] = 0x1B; return;
         case 103: out[(*n)++] = 0x1B; out[(*n)++] = '['; out[(*n)++] = 'A'; return;   /* up */
         case 108: out[(*n)++] = 0x1B; out[(*n)++] = '['; out[(*n)++] = 'B'; return;   /* down */
         case 106: out[(*n)++] = 0x1B; out[(*n)++] = '['; out[(*n)++] = 'C'; return;   /* right */
@@ -1261,7 +1343,7 @@ static int taskbar_click(int mx, int my) {
         Window *w = taskbar_at(i);
         if (!w) continue;
         if (w->hidden) { w->hidden = 0; win_focus(w); }   /* restore */
-        else if (w == win_top()) { w->hidden = 1; }       /* put away */
+        else if (w == win_focused()) { w->hidden = 1; }   /* put away */
         else { win_focus(w); }                            /* focus */
         return 1;
     }
@@ -1311,6 +1393,317 @@ static void desk_area(int *x, int *y, int *w, int *h) {
     if (*h < ui_px(160)) *h = disp.h - top;
 }
 
+/* ------------------------------------------------------------ status
+ *
+ * One line above the dock, for things whose only evidence is that they
+ * happened: "Closed 3 windows", "Cancelled move", "Always on top on".
+ * The text is not a notification (src/notify.c owns those) and does not
+ * need acknowledging; the tick below clears it after a few seconds.
+ */
+static void set_status(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(status_msg, sizeof(status_msg), fmt, ap);
+    va_end(ap);
+    status_t0 = now_sec();
+    dirty = 1;
+    fprintf(stderr, "status: %s\n", status_msg);
+}
+
+/* Which desktop overlays are up. This is what makes the keyboard modal
+ * and what tells Esc what to dismiss. SC_MODAL_APP is deliberately not
+ * here: a merely focused window must not stop ordinary shortcuts. */
+static unsigned current_modals(void) {
+    unsigned m = 0;
+    if (help_open)          m |= SC_MODAL_HELP;
+    if (launcher_open)      m |= SC_MODAL_LAUNCHER;
+    if (menu_open)          m |= SC_MODAL_MENU;
+    if (drag_win >= 0)      m |= SC_MODAL_DRAG;
+    if (resize_win >= 0)    m |= SC_MODAL_RESIZE;
+    return m;
+}
+
+/* The overlays that own the keyboard. A drag or a resize is a mouse capture:
+ * it gives Esc something to cancel, but it does not stop Ctrl+W from
+ * closing the window being dragged. */
+static unsigned keyboard_modals(void) {
+    return current_modals() &
+           (SC_MODAL_HELP | SC_MODAL_LAUNCHER | SC_MODAL_MENU);
+}
+
+/* Esc reaches the focused window when nothing on the desktop is open: a
+ * terminal needs it to leave insert mode, an app may have an inline edit,
+ * a menu or a text selection of its own. This is the one place the cancel
+ * chain hands the key on; it never closes anything. */
+static void esc_to_window(Window *w) {
+    if (!w || !w->used) return;
+    if (w->term) {
+        term_key(w->term, "\x1b", 1);
+        dirty = 1;
+        return;
+    }
+    if (w->kind == WIN_CLIENT && w->client >= 0 && w->client < WM_MAX_CLIENTS &&
+        clients[w->client].used) {
+        int mods = (input.shift ? 1 : 0) | (input.ctrl ? 2 : 0) | (input.alt ? 4 : 0);
+        wms_notify_key(&clients[w->client], SC_KEY_ESC, mods, 1);
+        dirty = 1;
+        return;
+    }
+    if (w->app) {
+        app_key(w->app, "\x1b", 1);
+        dirty = 1;
+    }
+}
+
+static void cancel_drag(void) {
+    if (drag_win >= 0 && wins[drag_win].used && wins[drag_win].gen == drag_gen) {
+        Window *w = &wins[drag_win];
+        w->x = drag_ox;
+        w->y = drag_oy;
+    }
+    drag_win = -1;
+    dirty = 1;
+}
+
+static void cancel_resize(void) {
+    if (resize_win >= 0 && wins[resize_win].used && wins[resize_win].gen == resize_gen) {
+        Window *w = &wins[resize_win];
+        w->w = resize_ow;
+        w->h = resize_oh;
+        window_resized(w);
+    }
+    resize_win = -1;
+    dirty = 1;
+}
+
+/* Esc. The decision of WHAT to cancel is shortcuts_cancel_target(), which
+ * the host test walks for every state; this is only the effect. There is
+ * no window-close case here, by design: Esc cannot close a window. */
+static void cancel_action(void) {
+    unsigned mask = current_modals();
+    if (win_focused()) mask |= SC_MODAL_APP;
+    int target = shortcuts_cancel_target(mask);
+
+    switch (target) {
+    case SC_MODAL_HELP:
+        help_open = 0;
+        help_page = 0;
+        break;
+    case SC_MODAL_LAUNCHER:
+        launcher_open = 0;
+        break;
+    case SC_MODAL_MENU:
+        menu_open = 0;
+        break;
+    case SC_MODAL_DRAG:
+        cancel_drag();
+        break;
+    case SC_MODAL_RESIZE:
+        cancel_resize();
+        break;
+    case SC_MODAL_APP:
+        /* an app's own modal, selection or inline edit owns the Escape */
+        esc_to_window(win_focused());
+        return;
+    default:
+        return;                     /* nothing is open: nothing happens */
+    }
+    set_status("Cancelled %s", shortcuts_cancel_name(target));
+    dirty = 1;
+}
+
+/* ------------------------------------------------------------ window ops */
+
+static void win_min_all(void) {
+    int n = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!wins[i].used || wins[i].hidden) continue;
+        wins[i].hidden = 1;
+        n++;
+    }
+    Window *nx = win_top();
+    if (nx) win_focus(nx);
+    set_status("Minimised %d window%s", n, n == 1 ? "" : "s");
+    dirty = 1;
+}
+
+static void win_restore_all(void) {
+    int n = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!wins[i].used || !wins[i].hidden) continue;
+        wins[i].hidden = 0;
+        n++;
+    }
+    if (n) {
+        Window *nx = win_top();
+        if (nx) win_focus(nx);
+    }
+    set_status("Restored %d window%s", n, n == 1 ? "" : "s");
+    dirty = 1;
+}
+
+static void win_close_all(void) {
+    int n = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!wins[i].used) continue;
+        win_close(&wins[i]);
+        n++;
+    }
+    set_status("Closed %d window%s", n, n == 1 ? "" : "s");
+    dirty = 1;
+}
+
+/* Super+1..9 follows the dock, because that is the order the owner sees:
+ * the first icon is window 1. `idx` is 0-based. */
+static void focus_window_n(int idx) {
+    Window *w = taskbar_at(idx);
+    if (!w) {
+        set_status("No window %d", idx + 1);
+        return;
+    }
+    if (w->hidden) w->hidden = 0;
+    win_focus(w);
+    dirty = 1;
+}
+
+/* Super+Shift+arrows: half the desk on each side. Unlike win_snap() this
+ * also fills the top and bottom halves, which is what "edge" means. */
+static void win_edge(Window *w, int key) {
+    if (!w) return;
+    if (!w->maxed) {
+        w->restore_x = w->x; w->restore_y = w->y;
+        w->restore_w = w->w; w->restore_h = w->h;
+    }
+    int x, y, ww, hh;
+    desk_area(&x, &y, &ww, &hh);
+    w->maxed = 3;
+    if (key == SC_KEY_LEFT) {
+        w->x = x; w->y = y; w->w = ww / 2; w->h = hh;
+    } else if (key == SC_KEY_RIGHT) {
+        w->w = ww / 2; w->x = x + ww - w->w;
+        w->y = y; w->h = hh;
+    } else if (key == SC_KEY_UP) {
+        w->x = x; w->y = y; w->w = ww; w->h = hh / 2;
+    } else {
+        w->x = x; w->w = ww; w->h = hh / 2; w->y = y + hh - w->h;
+    }
+    window_resized(w);
+    dirty = 1;
+}
+
+static void win_grow(Window *w, int dir) {
+    if (!w) return;
+    if (w->maxed) win_toggle_max(w);   /* grow the size it would restore to */
+    int step = ui_px(24);
+    int nw = w->w + dir * step * 2;
+    int nh = w->h + dir * step;
+    if (nw < ui_px(220)) nw = ui_px(220);
+    if (nh < ui_px(150)) nh = ui_px(150);
+    if (w->x + nw > disp.w) nw = disp.w - w->x;
+    if (w->y + nh > disp.h) nh = disp.h - w->y;
+    if (nw < ui_px(120)) nw = ui_px(120);
+    if (nh < ui_px(100)) nh = ui_px(100);
+    if (nw == w->w && nh == w->h) {
+        set_status("Window is at its limit");
+        return;
+    }
+    w->w = nw;
+    w->h = nh;
+    window_resized(w);
+    dirty = 1;
+}
+
+static void win_centre(Window *w) {
+    if (!w) return;
+    if (w->maxed) win_toggle_max(w);
+    int x, y, ww, hh;
+    desk_area(&x, &y, &ww, &hh);
+    w->x = x + (ww - w->w) / 2;
+    w->y = y + (hh - w->h) / 2;
+    if (w->x < 0) w->x = 0;
+    if (w->y < topbar_h()) w->y = topbar_h();
+    dirty = 1;
+}
+
+/* Super+R: the focused window goes to the front, or to the back when it is
+ * already in front. Always-on-top windows keep their layer (see win_rank). */
+static void win_raise_lower(Window *w) {
+    if (!w) return;
+    int zmin = 0, any = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!wins[i].used) continue;
+        if (!any || wins[i].z < zmin) { zmin = wins[i].z; any = 1; }
+    }
+    if (w == win_top()) {
+        w->z = zmin - 1;
+        set_status("Lowered %s", w->title);
+    } else {
+        w->z = ++z_top;
+        set_status("Raised %s", w->title);
+    }
+    dirty = 1;
+}
+
+static void win_toggle_ontop(Window *w) {
+    if (!w) return;
+    w->on_top = !w->on_top;
+    if (w->on_top) w->z = ++z_top;
+    set_status("Always on top %s: %s", w->on_top ? "on" : "off", w->title);
+    dirty = 1;
+}
+
+/* Alt+Print: only the focused window's rectangle, cut from the composed
+ * scene. Same P6 writer as take_screenshot(), but the header carries the
+ * window's size, not the screen's. */
+static int shot_next;              /* first screenshot number to try */
+static void take_screenshot_window(void) {
+    Window *w = win_focused();
+    if (!w) { set_status("No window to capture"); return; }
+    if (mkdir("/root/screenshots", 0755) != 0 && errno != EEXIST) {
+        set_status("Screenshot: %s", strerror(errno));
+        return;
+    }
+    char path[96];
+    int slot = -1;
+    for (int n = shot_next; n < 10000; n++) {
+        struct stat st;
+        snprintf(path, sizeof(path), "/root/screenshots/window-%04d.ppm", n);
+        if (stat(path, &st) != 0) { slot = n; break; }
+    }
+    if (slot < 0) { set_status("Screenshot: no free name"); return; }
+    shot_next = slot + 1;
+
+    int x0 = w->x, y0 = w->y, ww = w->w, hh = w->h;
+    if (x0 < 0) { ww += x0; x0 = 0; }
+    if (y0 < 0) { hh += y0; y0 = 0; }
+    if (x0 + ww > scene.w) ww = scene.w - x0;
+    if (y0 + hh > scene.h) hh = scene.h - y0;
+    if (ww <= 0 || hh <= 0) { set_status("Screenshot: window is off screen"); return; }
+
+    FILE *f = fopen(path, "wb");
+    if (!f) { set_status("Screenshot: %s", strerror(errno)); return; }
+    unsigned char *row = malloc((size_t)ww * 3u);
+    if (!row) { fclose(f); remove(path); set_status("Screenshot: out of memory"); return; }
+    int ok = fprintf(f, "P6\n%d %d\n255\n", ww, hh) > 0;
+    for (int y = 0; y < hh && ok; y++) {
+        const u32 *src = scene.px + (size_t)(y0 + y) * (size_t)scene.stride + x0;
+        for (int x = 0; x < ww; x++) {
+            row[x * 3 + 0] = (unsigned char)((src[x] >> 16) & 0xFF);
+            row[x * 3 + 1] = (unsigned char)((src[x] >> 8) & 0xFF);
+            row[x * 3 + 2] = (unsigned char)(src[x] & 0xFF);
+        }
+        if (fwrite(row, 3, (size_t)ww, f) != (size_t)ww) ok = 0;
+    }
+    free(row);
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) {
+        remove(path);
+        set_status("Screenshot failed");
+        return;
+    }
+    set_status("Screenshot %s", path);
+}
+
 static void win_fullscreen(Window *w) {
     if (!w) return;
     if (w->maxed == 2) {            /* already full screen: give the size back */
@@ -1335,7 +1728,7 @@ static void win_restore_action(Window *w) {
     for (int i = 0; i < MAX_WINDOWS; i++) {
         Window *o = &wins[i];
         if (!o->used || !o->hidden) continue;
-        if (!back || o->z > back->z) back = o;
+        if (!back || win_rank(o) > win_rank(back)) back = o;
     }
     if (back) { back->hidden = 0; win_focus(back); dirty = 1; }
 }
@@ -1397,13 +1790,13 @@ static void win_resize_by(Window *w, int key) {
  * this one (what Alt+Tab always did here), "previous" starts from the other
  * end, so the two directions are not the same key. */
 static void focus_cycle(int dir) {
-    Window *cur = win_top(), *pick = NULL;
+    Window *cur = win_focused(), *pick = NULL;
     for (int i = 0; i < MAX_WINDOWS; i++) {
         Window *w = &wins[i];
         if (!w->used || w->hidden || w == cur) continue;
         if (!pick) { pick = w; continue; }
-        if (dir > 0) { if (w->z > pick->z) pick = w; }
-        else         { if (w->z < pick->z) pick = w; }
+        if (dir > 0) { if (win_rank(w) > win_rank(pick)) pick = w; }
+        else         { if (win_rank(w) < win_rank(pick)) pick = w; }
     }
     if (pick) { win_focus(pick); dirty = 1; }
 }
@@ -1420,7 +1813,7 @@ static const char *win_identity(const Window *w) {
 }
 
 static void focus_same_app(void) {
-    Window *cur = win_top();
+    Window *cur = win_focused();
     if (!cur) return;
     const char *id = win_identity(cur);
     if (!id[0]) return;
@@ -1429,8 +1822,9 @@ static void focus_same_app(void) {
         Window *w = &wins[i];
         if (!w->used || w->hidden || w == cur) continue;
         if (strcmp(win_identity(w), id) != 0) continue;
-        if (!top || w->z > top->z) top = w;
-        if (w->z < cur->z && (!below || w->z > below->z)) below = w;
+        if (!top || win_rank(w) > win_rank(top)) top = w;
+        if (win_rank(w) < win_rank(cur) &&
+            (!below || win_rank(w) > win_rank(below))) below = w;
     }
     Window *pick = below ? below : top;      /* wrap round to the newest */
     if (pick) { win_focus(pick); dirty = 1; }
@@ -1455,6 +1849,7 @@ static void theme_apply(int idx) {
     FILE *f = fopen("/etc/mystic/current-theme", "w");
     if (f) { fprintf(f, "%s\n", themes[idx].name); fclose(f); }
     persist_settings();
+    set_status("Theme: %s", themes[idx].name);
     dirty = 1;
 }
 
@@ -1466,9 +1861,314 @@ static void wallpaper_apply(int idx) {
         FILE *f = fopen("/etc/mystic/wallpaper", "w");
         if (f) { fprintf(f, "%s\n", name); fclose(f); }
         persist_settings();
+        set_status("Wallpaper: %s", name);
     }
     wall_t0 = now_sec();
     dirty = 1;
+}
+
+/* ------------------------------------------------------------ terminal
+ *
+ * The terminal chords act on the terminal wherever it is in the stack:
+ * they are chords for the terminal, and the focused window may well be
+ * the browser whose page you are copying from.
+ */
+static Window *term_window(void) {
+    Window *best = NULL;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window *w = &wins[i];
+        if (!w->used || w->hidden || !w->term) continue;
+        if (!best || win_rank(w) > win_rank(best)) best = w;
+    }
+    return best;
+}
+
+/* What the user has typed since the last Enter, kept so Ctrl+Shift+C has a
+ * real selection-less copy to offer: the line itself. term.c owns the
+ * grid and exposes no text accessor, so copying screen text would mean
+ * inventing it here. */
+static void term_note_input(Window *w, const char *bytes, int n) {
+    if (!w) return;
+    for (int i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)bytes[i];
+        if (c == '\r' || c == '\n') {
+            w->input_len = 0;
+            w->input_line[0] = 0;
+            continue;
+        }
+        if (c == 0x7f || c == '\b') {
+            if (w->input_len > 0) w->input_line[--w->input_len] = 0;
+            continue;
+        }
+        if (c == 0x1b) continue;            /* arrows and function keys */
+        if (c >= 0x20 && c < 0x7f &&
+            w->input_len < (int)sizeof(w->input_line) - 1) {
+            w->input_line[w->input_len++] = (char)c;
+            w->input_line[w->input_len] = 0;
+        }
+    }
+}
+
+static void term_clear(void) {
+    Window *w = term_window();
+    if (!w) { set_status("No terminal open"); return; }
+    /* the real Ctrl+L byte: the shell clears its screen and redraws the
+     * prompt, so the terminal and the shell agree about what is on it */
+    term_key(w->term, "\x0c", 1);
+    w->input_len = 0;
+    w->input_line[0] = 0;
+    set_status("Terminal: cleared");
+    dirty = 1;
+}
+
+static void term_copy(void) {
+    Window *w = term_window();
+    if (!w) { set_status("No terminal open"); return; }
+    if (w->input_len <= 0) {
+        set_status("Terminal: nothing typed to copy");
+        return;
+    }
+    int rc = clip_set_text(w->input_line);
+    if (rc == CLIP_OK)
+        set_status("Copied terminal line (%d bytes)", w->input_len);
+    else
+        set_status("Clipboard: %s", clip_strerror(rc));
+}
+
+static void term_paste(void) {
+    Window *w = term_window();
+    if (!w) { set_status("No terminal open"); return; }
+    ClipEntry *e = clip_get_current(CLIP_TYPE_TEXT);
+    if (!e) {
+        set_status("Clipboard: no text to paste");
+        return;
+    }
+    if (e->type == CLIP_TYPE_TEXT && e->text && e->text_len) {
+        term_scroll(w->term, -term_scroll_offset(w->term));
+        term_key(w->term, e->text, (int)e->text_len);
+        term_note_input(w, e->text, (int)e->text_len);
+        set_status("Pasted %u bytes into the terminal", (unsigned)e->text_len);
+        dirty = 1;
+    } else {
+        set_status("Clipboard: no text to paste");
+    }
+    clip_entry_free(e);
+}
+
+static void term_font(int dir) {
+    Window *w = term_window();
+    if (!w) { set_status("No terminal open"); return; }
+    int size = w->term_size > 0 ? w->term_size : 12;
+    size += dir;
+    if (size < 8) size = 8;
+    if (size > 28) size = 28;
+    if (size == w->term_size) { set_status("Terminal font at its limit"); return; }
+    w->term_size = size;
+    window_resized(w);                   /* pty reflows on the next paint */
+    set_status("Terminal font %d", size);
+    dirty = 1;
+}
+
+/* ------------------------------------------------------------ browser */
+
+static Window *browser_window(void) {
+    Window *best = NULL;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window *w = &wins[i];
+        if (!w->used || w->hidden) continue;
+        if (w->kind != WIN_CLIENT || w->client < 0 || w->client >= WM_MAX_CLIENTS)
+            continue;
+        if (!clients[w->client].used) continue;
+        if (strcmp(clients[w->client].id, "web") != 0) continue;
+        if (!best || win_rank(w) > win_rank(best)) best = w;
+    }
+    return best;
+}
+
+static void browser_reload(void) {
+    Window *w = browser_window();
+    if (!w) { set_status("Browser is not open - Super+B starts it"); return; }
+    WmClient *cl = &clients[w->client];
+    wms_notify_key(cl, SC_KEY_R, 2, 1);   /* mods bit 1 = Ctrl */
+    wms_notify_key(cl, SC_KEY_R, 2, 0);
+    set_status("Browser: reload");
+    dirty = 1;
+}
+
+static void browser_addr(void) {
+    Window *w = browser_window();
+    if (!w) { set_status("Browser is not open - Super+B starts it"); return; }
+    /* web.c documents Tab as "focus / leave the address bar"; the window
+     * server has no richer way to ask for the field itself */
+    wms_notify_text(&clients[w->client], "\t");
+    set_status("Browser: address bar");
+    dirty = 1;
+}
+
+/* ============================================================
+ *  Desktop context menu
+ *
+ *  Right click on the wallpaper. Small, real and modal: it makes the
+ *  "an open menu" case of the Esc cancel chain an actual thing rather
+ *  than a branch waiting for a menu that does not exist.
+ * ============================================================ */
+enum {
+    MENU_TERM = 0,
+    MENU_FILES,
+    MENU_SETTINGS,
+    MENU_SHORTCUTS,
+    MENU_SEP,
+    MENU_WALL,
+    MENU_THEME,
+    MENU_LOCK,
+    MENU_COUNT
+};
+
+static const char *const MENU_LABEL[MENU_COUNT] = {
+    "Open Terminal",
+    "Open Files",
+    "Open Settings",
+    "Keyboard shortcuts",
+    "",                       /* separator */
+    "Next wallpaper",
+    "Next theme",
+    "Lock screen"
+};
+
+static int menu_item_h(void) {
+    Font *f = font_get(FONT_REGULAR, 12);
+    return (int)(font_height(f) + (float)ui_px(10));
+}
+
+static int menu_sep_h(void) { return ui_px(9); }
+static int menu_pad(void) { return ui_px(10); }
+static int menu_side(void) { return ui_px(14); }
+
+static int menu_width(void) {
+    Font *f = font_get(FONT_MEDIUM, 12);
+    float w = 0.0f;
+    for (int i = 0; i < MENU_COUNT; i++) {
+        float tw = font_width(f, MENU_LABEL[i]);
+        if (tw > w) w = tw;
+    }
+    return (int)w + 2 * menu_side();
+}
+
+static int menu_height(void) {
+    int h = 2 * menu_pad();
+    for (int i = 0; i < MENU_COUNT; i++)
+        h += (i == MENU_SEP) ? menu_sep_h() : menu_item_h();
+    return h;
+}
+
+/* The menu's top-left, clamped so it never runs off the screen. */
+static void menu_origin(int *x, int *y) {
+    int w = menu_width(), h = menu_height();
+    *x = menu_x;
+    *y = menu_y;
+    if (*x + w > disp.w - 4) *x = disp.w - w - 4;
+    if (*y + h > disp.h - 4) *y = disp.h - h - 4;
+    if (*x < 4) *x = 4;
+    if (*y < topbar_h()) *y = topbar_h();
+}
+
+static int menu_item_at(int mx, int my) {
+    int x, y;
+    menu_origin(&x, &y);
+    int cy = y + menu_pad();
+    int w = menu_width();
+    for (int i = 0; i < MENU_COUNT; i++) {
+        int h = (i == MENU_SEP) ? menu_sep_h() : menu_item_h();
+        if (i != MENU_SEP && mx >= x && mx < x + w && my >= cy && my < cy + h)
+            return i;
+        cy += h;
+    }
+    return -1;
+}
+
+static void menu_run(int item) {
+    switch (item) {
+    case MENU_TERM:       win_open(WIN_TERM, NULL); break;
+    case MENU_FILES:      win_open(WIN_APP, "files"); break;
+    case MENU_SETTINGS:   win_open(WIN_APP, "settings"); break;
+    case MENU_SHORTCUTS:  help_open = 1; help_page = 0; break;
+    case MENU_WALL:       wallpaper_apply((wall_index + 1) % WALLPAPER_COUNT); break;
+    case MENU_THEME:
+        if (theme_count > 0) theme_apply((theme_index + 1) % theme_count);
+        break;
+    case MENU_LOCK:
+        locked = 1;
+        pin_len = 0;
+        pin[0] = 0;
+        lock_msg[0] = 0;
+        break;
+    default: break;
+    }
+    menu_open = 0;
+    dirty = 1;
+}
+
+static void draw_menu(Surface *s, const Theme *th) {
+    if (!menu_open) return;
+    Font *f = font_get(FONT_MEDIUM, 12);
+    int x, y;
+    menu_origin(&x, &y);
+    int w = menu_width(), h = menu_height();
+
+    gfx_shadow(s, (float)x, (float)y, (float)w, (float)h, 12, 16, 0.55f);
+    if (th->blur > 0) gfx_blur_region(s, x, y, w, h, (int)(12 * th->blur));
+    gfx_rrect_aa(s, (float)x, (float)y, (float)w, (float)h, 10,
+                 color_alpha(th->window_bg, 0.98f), th->window_border, 1.0f);
+
+    int cy = y + menu_pad();
+    int hover = menu_item_at(input.mouse_x, input.mouse_y);
+    for (int i = 0; i < MENU_COUNT; i++) {
+        if (i == MENU_SEP) {
+            surf_blend(s, x + menu_side(), cy + menu_sep_h() / 2,
+                       w - 2 * menu_side(), 1, color_alpha(th->panel_border, 0.9f));
+            cy += menu_sep_h();
+            continue;
+        }
+        int ih = menu_item_h();
+        if (i == menu_sel || i == hover)
+            gfx_rrect_aa(s, (float)(x + ui_px(4)), (float)cy,
+                         (float)(w - ui_px(8)), (float)ih, 6,
+                         color_alpha(th->accent, i == menu_sel ? 0.30f : 0.16f), 0, 0);
+        font_draw(s, f, (float)(x + menu_side()),
+                  (float)cy + ((float)ih - font_height(f)) * 0.5f,
+                  MENU_LABEL[i], th->text);
+        cy += ih;
+    }
+}
+
+static int menu_click(int mx, int my, int buttons) {
+    if (!menu_open) return 0;
+    if (buttons & 1) {
+        int item = menu_item_at(mx, my);
+        if (item >= 0) { menu_run(item); return 1; }
+    }
+    menu_open = 0;
+    dirty = 1;
+    return 1;
+}
+
+static int menu_key(int k) {
+    if (!menu_open) return 0;
+    if (k == SC_KEY_DOWN) {
+        do { menu_sel = (menu_sel + 1) % MENU_COUNT; } while (menu_sel == MENU_SEP);
+        dirty = 1;
+        return 1;
+    }
+    if (k == SC_KEY_UP) {
+        do { menu_sel = (menu_sel + MENU_COUNT - 1) % MENU_COUNT; } while (menu_sel == MENU_SEP);
+        dirty = 1;
+        return 1;
+    }
+    if (k == SC_KEY_ENTER) {
+        menu_run(menu_sel);
+        return 1;
+    }
+    return 0;
 }
 
 /* ui.conf stores the scale RELATIVE to ui.c's baseline, and the same file
@@ -1555,7 +2255,6 @@ static void dnd_toggle(void) {
 /* A screenshot of the desktop as it is on screen: `scene` is the composed
  * frame the framebuffer was last given, without the pointer. P6/PPM needs
  * no encoder and no dependency, and the pixels are the surface's own. */
-static int shot_next;
 static void take_screenshot(void) {
     if (mkdir("/root/screenshots", 0755) != 0 && errno != EEXIST) {
         fprintf(stderr, "shortcuts: screenshot dir: %s\n", strerror(errno));
@@ -1598,12 +2297,12 @@ static void take_screenshot(void) {
 static void shortcut_action(void *ctx, int id, int key, unsigned mods) {
     (void)ctx;
     (void)mods;
-    Window *w = win_top();
+    Window *w = win_focused();
 
     switch (id) {
     case SC_ACT_WIN_CLOSE:   if (w) win_close(w); break;
     case SC_ACT_WIN_MIN:
-        if (w) { w->hidden = 1; Window *nx = win_top(); if (nx) win_focus(nx); }
+        if (w) { w->hidden = 1; Window *nx = win_focused(); if (nx) win_focus(nx); }
         break;
     case SC_ACT_WIN_MAX:
         if (w) { if (w->maxed == 3) w->maxed = 0; win_toggle_max(w); }
@@ -1620,6 +2319,16 @@ static void shortcut_action(void *ctx, int id, int key, unsigned mods) {
         else if (key == SC_KEY_RIGHT) win_snap(w, 1);
         else                          win_snap(w, 0);
         break;
+    case SC_ACT_WIN_EDGE:    win_edge(w, key); break;
+    case SC_ACT_WIN_GROW:    win_grow(w, 1); break;
+    case SC_ACT_WIN_SHRINK:  win_grow(w, -1); break;
+    case SC_ACT_WIN_CENTRE:  win_centre(w); break;
+    case SC_ACT_WIN_RAISE:   win_raise_lower(w); break;
+    case SC_ACT_WIN_ONTOP:   win_toggle_ontop(w); break;
+    case SC_ACT_WIN_FOCUS:   focus_window_n(key - SC_KEY_1); break;
+    case SC_ACT_WIN_MIN_ALL: win_min_all(); break;
+    case SC_ACT_WIN_RESTORE_ALL: win_restore_all(); break;
+    case SC_ACT_WIN_CLOSE_ALL:   win_close_all(); break;
     case SC_ACT_LAUNCHER:
         /* a bare Super press is half of a tap: the launcher is toggled when
          * the key comes back up, so Super+E can still open Files */
@@ -1634,20 +2343,44 @@ static void shortcut_action(void *ctx, int id, int key, unsigned mods) {
     case SC_ACT_THEME_NEXT:
         if (theme_count > 0) theme_apply((theme_index + 1) % theme_count);
         break;
+    case SC_ACT_THEME_PREV:
+        if (theme_count > 0)
+            theme_apply((theme_index + theme_count - 1) % theme_count);
+        break;
     case SC_ACT_THEME_SET:   theme_apply(key - SC_KEY_1); break;
-    case SC_ACT_WALLPAPER:   wallpaper_apply((wall_index + 1) % WALLPAPER_COUNT); break;
+    case SC_ACT_WALLPAPER_NEXT:
+        wallpaper_apply((wall_index + 1) % WALLPAPER_COUNT);
+        break;
+    case SC_ACT_WALLPAPER_PREV:
+        wallpaper_apply((wall_index + WALLPAPER_COUNT - 1) % WALLPAPER_COUNT);
+        break;
     case SC_ACT_TEXT_UP:     text_size_step(1); break;
     case SC_ACT_TEXT_DOWN:   text_size_step(-1); break;
     case SC_ACT_TEXT_RESET:  text_size_step(0); break;
     case SC_ACT_DND:         dnd_toggle(); break;
     case SC_ACT_SHOT:        take_screenshot(); break;
+    case SC_ACT_SHOT_WINDOW: take_screenshot_window(); break;
     case SC_ACT_TERMINAL:    win_open(WIN_TERM, NULL); break;
     case SC_ACT_FILES:       win_open(WIN_APP, "files"); break;
     case SC_ACT_SETTINGS:    win_open(WIN_APP, "settings"); break;
     case SC_ACT_MONITOR:     win_open(WIN_APP, "monitor"); break;
     case SC_ACT_NOTES:       win_open(WIN_APP, "notes"); break;
+    case SC_ACT_STORE:       win_open(WIN_APP, "store"); break;
+    case SC_ACT_CALC:        win_open(WIN_APP, "calc"); break;
+    case SC_ACT_SYSINFO:     win_open(WIN_APP, "sysinfo"); break;
     case SC_ACT_BROWSER:     launch_bundle("web"); break;
-    case SC_ACT_HELP:        help_open = !help_open; break;
+    case SC_ACT_BROWSER_RELOAD: browser_reload(); break;
+    case SC_ACT_BROWSER_ADDR:   browser_addr(); break;
+    case SC_ACT_TERM_CLEAR:     term_clear(); break;
+    case SC_ACT_TERM_COPY:      term_copy(); break;
+    case SC_ACT_TERM_PASTE:     term_paste(); break;
+    case SC_ACT_TERM_FONT_UP:   term_font(1); break;
+    case SC_ACT_TERM_FONT_DOWN: term_font(-1); break;
+    case SC_ACT_HELP:
+        help_open = !help_open;
+        if (help_open) help_page = 0;
+        break;
+    case SC_ACT_CANCEL:      cancel_action(); break;
     case SC_ACT_NONE:
     case SC_ACT_COUNT:
     default:
@@ -1665,7 +2398,10 @@ static const ShortcutActions SHORTCUTS = { shortcut_action, NULL };
 
     /* the shortcut panel is modal: a click dismisses it and does nothing
      * else, so a half-seen key cannot be clicked "through" by accident */
-    if (help_open) { help_open = 0; dirty = 1; return 1; }
+    if (help_open) { help_open = 0; help_page = 0; dirty = 1; return 1; }
+
+    /* the desktop menu is modal too: an item runs, anywhere else dismisses */
+    if (menu_open) return menu_click(mx, my, input.buttons);
 
     /* The taskbar is drawn above the windows, so it must be hit first:
      * otherwise a window dragged over the bar swallows its clicks. */
@@ -1708,7 +2444,7 @@ static const ShortcutActions SHORTCUTS = { shortcut_action, NULL };
         Window *w = &wins[i];
         if (!w->used || w->hidden) continue;
         if (mx < w->x || mx >= w->x + w->w || my < w->y || my >= w->y + w->h) continue;
-        if (!hit || w->z > hit->z) hit = w;
+        if (!hit || win_rank(w) > win_rank(hit)) hit = w;
     }
     if (hit) {
         win_focus(hit);
@@ -1738,6 +2474,8 @@ int dot_y = traffic_y(tb);
         if (lx >= hit->w - 18 && ly >= hit->h - 18) {
             resize_win = (int)(hit - wins);
             resize_gen = hit->gen;          /* F9: remember which window, not just the slot */
+            resize_ow = hit->w;
+            resize_oh = hit->h;
             return 1;
         }
         /* double-click on the title bar toggles maximise */
@@ -1753,6 +2491,8 @@ int dot_y = traffic_y(tb);
             drag_gen = hit->gen;            /* F9: remember which window, not just the slot */
             drag_dx = lx;
             drag_dy = ly;
+            drag_ox = hit->x;               /* Esc puts it back here */
+            drag_oy = hit->y;
             return 1;
         }
         /* body */
@@ -1762,6 +2502,17 @@ int dot_y = traffic_y(tb);
             WmClient *cl = &clients[hit->client];
             if (cl->used) wms_notify_mouse(cl, lx - 1, ly - tb - 1, input.buttons);
         }
+        return 1;
+    }
+
+    /* empty wallpaper: a right click opens the desktop menu there; a left
+     * click on the desktop does nothing, as before */
+    if (input.buttons & 2) {
+        menu_open = 1;
+        menu_sel = MENU_TERM;
+        menu_x = mx;
+        menu_y = my;
+        dirty = 1;
         return 1;
     }
 
@@ -1835,18 +2586,6 @@ int main(void) {
         if (input.mouse_y < 0) input.mouse_y = 0;
         if (input.mouse_x >= disp.w) input.mouse_x = disp.w - 1;
         if (input.mouse_y >= disp.h) input.mouse_y = disp.h - 1;
-
-        if (input.ctrl && input.alt && input.key == 38) {   /* Ctrl+Alt+L */
-            locked = 1;
-            pin_len = 0;
-            pin[0] = 0;
-            lock_msg[0] = 0;
-            dirty = 1;
-            /* the 'l' of the shortcut itself arrives as a control character in
-             * this same frame - drop it or it becomes the first password byte */
-            input.text_len = 0;
-            input.key = 0;
-        }
 
         if (locked) {
             for (int i = 0; i < input.text_len; i++) {
@@ -1922,38 +2661,61 @@ int main(void) {
             if (k == SC_KEY_META) { super_down = 1; super_lone = 1; }
             else if (super_down) super_lone = 0;
 
-            /* the shortcut panel is modal: Esc, F1 or the chord that opened it
-             * closes it, and nothing behind it sees a key while it is up */
-            if (help_open) {
-                if (k == SC_KEY_ESC || k == SC_KEY_F1 ||
-                    (super_down && k == SC_KEY_SLASH)) {
-                    help_open = 0;
-                    dirty = 1;
-                    input.text_len = 0;
-                }
-                continue;
-            }
-
-            if (input.ctrl && input.alt && k == 38) {        /* Ctrl+Alt+L */
-                locked = 1;
-                pin_len = 0;
-                pin[0] = 0;
-                lock_msg[0] = 0;
-                input.text_len = 0;      /* the 'l' arrives as a control char */
-                dirty = 1;
-                continue;
-            }
-
-            /* What the dispatcher below will be asked with. Computed once so
-             * a binding means the same thing wherever it is reached from. */
+            /* What the dispatcher is asked with. Computed once so a binding
+             * means the same thing wherever it is reached from. */
             const unsigned sc_mods = (input.shift ? SC_MOD_SHIFT : 0u) |
                                      (input.ctrl  ? SC_MOD_CTRL  : 0u) |
                                      (input.alt   ? SC_MOD_ALT   : 0u) |
                                      (super_down  ? SC_MOD_SUPER : 0u);
-            const unsigned sc_cond = win_top() ? SC_WHEN_WINDOW : SC_WHEN_NO_WINDOW;
+            const unsigned sc_cond = win_focused() ? SC_WHEN_WINDOW : SC_WHEN_NO_WINDOW;
+            const unsigned sc_modals = keyboard_modals();
+
+            /* One table decides every desktop binding (src/shortcuts.c). It
+             * runs before every overlay and before the focused window gets
+             * the key, and it is told which desktop modals are up: only the
+             * rows marked SC_ALWAYS (Alt+Tab and Esc) act through one. A
+             * key it does not know falls through exactly as before. */
+            if (shortcuts_dispatch(&SHORTCUTS, k, sc_mods, sc_cond, sc_modals)) {
+                /* a chord that also types a character (Ctrl+W is 0x17) must
+                 * not type it into the window behind the action */
+                if (sc_mods & (SC_MOD_CTRL | SC_MOD_ALT | SC_MOD_SUPER)) {
+                    input.text_len = 0;
+                    input.text[0] = 0;
+                }
+                dirty = 1;
+                continue;
+            }
+
+            /* the shortcut panel is modal: PageUp/PageDown walk its pages,
+             * F1 or the chord that opened it closes it, and nothing behind
+             * it sees a key while it is up. Esc never reaches here - it is
+             * an SC_ALWAYS row, so shortcuts_dispatch() already cancelled
+             * the panel above. */
+            if (help_open) {
+                if (k == SC_KEY_PAGEUP || k == SC_KEY_UP) {
+                    if (help_page > 0) help_page--;
+                } else if (k == SC_KEY_PAGEDOWN || k == SC_KEY_DOWN) {
+                    help_page++;        /* the panel layout clamps to its last */
+                } else if (k == SC_KEY_HOME) {
+                    help_page = 0;
+                } else if (k == SC_KEY_F1 || (super_down && k == SC_KEY_SLASH)) {
+                    help_open = 0;
+                }
+                input.text_len = 0;
+                dirty = 1;
+                continue;
+            }
+
+            /* the desktop menu is modal: arrows and Enter walk it, Esc was
+             * handled above, and anything else types nothing */
+            if (menu_open) {
+                menu_key(k);
+                input.text_len = 0;
+                dirty = 1;
+                continue;
+            }
 
             if (launcher_open) {
-                if (k == 1) { launcher_open = 0; dirty = 1; continue; }
                 if (k == 105 || k == 106 || k == 103 || k == 108) {
                     int cols = 3, total = launcher_items(), step = 0;
                     if (k == 105) step = -1;
@@ -1994,34 +2756,15 @@ int main(void) {
                     continue;
                 }
 
-                /* modal overlay: nothing may leak to the window behind it,
-                 * except the bindings the table marks SC_ALWAYS - Alt+Tab
-                 * switched windows through the launcher long before this
-                 * table existed, and it still does */
-                const Shortcut *always = shortcuts_find(k, sc_mods, sc_cond);
-                if (always && (always->flags & SC_ALWAYS))
-                    shortcuts_dispatch(&SHORTCUTS, k, sc_mods, sc_cond);
+                /* modal overlay: nothing may leak to the window behind it.
+                 * Alt+Tab (an SC_ALWAYS row) already had its chance above. */
+                input.text_len = 0;
                 dirty = 1;
                 continue;
             }
 
-            /* One table decides every desktop binding (src/shortcuts.c). It
-             * runs before the focused window gets the key, so a chord always
-             * means the same thing; a key it does not know falls through to
-             * the window exactly as it did before there was a table. */
-            {
-                if (shortcuts_dispatch(&SHORTCUTS, k, sc_mods, sc_cond)) {
-                    /* a chord that also types a character (Ctrl+W is 0x17)
-                     * must not type it into the window behind the action */
-                    if (sc_mods & (SC_MOD_CTRL | SC_MOD_ALT | SC_MOD_SUPER))
-                        input.text_len = 0;
-                    dirty = 1;
-                    continue;
-                }
-            }
-
             /* the focused window gets the key */
-            Window *top = win_top();
+            Window *top = win_focused();
             if (!top) continue;
             if (top->term) {
                 char buf[64];
@@ -2061,7 +2804,7 @@ int main(void) {
         /* releases: the protocol carries a press flag that was always 1, so a
          * client could never tell when a key went back up */
         {
-            Window *top = win_top();
+            Window *top = win_focused();
             if (top && top->kind == WIN_CLIENT && top->client >= 0 && input.nkeys_up) {
                 WmClient *cl = &clients[top->client];
                 int mods = (input.shift ? 1 : 0) | (input.ctrl ? 2 : 0) | (input.alt ? 4 : 0);
@@ -2075,11 +2818,12 @@ int main(void) {
             /* a modal overlay owns the keyboard: nothing typed while the
              * launcher or the shortcut panel is up may reach the window
              * behind it */
-            Window *top = (launcher_open || help_open) ? NULL : win_top();
+            Window *top = (launcher_open || help_open || menu_open) ? NULL : win_focused();
             if (top && input.text_len) {
                 if (top->term) {
                     term_scroll(top->term, -(term_scroll_offset(top->term)));
                     term_key(top->term, input.text, input.text_len);
+                    term_note_input(top, input.text, input.text_len);
                 } else if (top->kind == WIN_CLIENT && top->client >= 0) {
                     wms_notify_text(&clients[top->client], input.text);
                     dirty = 1;
@@ -2100,7 +2844,7 @@ int main(void) {
                 if (!w->used || w->hidden) continue;
                 if (input.mouse_x < w->x || input.mouse_x >= w->x + w->w) continue;
                 if (input.mouse_y < w->y || input.mouse_y >= w->y + w->h) continue;
-                if (!under || w->z > under->z) under = w;
+                if (!under || win_rank(w) > win_rank(under)) under = w;
             }
             if (under) {
                 if (under->term) {
@@ -2241,7 +2985,7 @@ int main(void) {
         /* an external app needs motion, not just the press: without this a
          * drag draws one dot (paint) and sliders never move */
         {
-            Window *ct = win_top();
+            Window *ct = win_focused();
             if (ct && ct->kind == WIN_CLIENT && ct->client >= 0) {
                 WmClient *cl = &clients[ct->client];
                 int inside = (input.mouse_x >= ct->x && input.mouse_x < ct->x + ct->w &&
@@ -2269,6 +3013,12 @@ int main(void) {
         if (now != last_tick) {
             last_tick = now;
             dirty = 1;
+            /* the status line is a confirmation, not a notification: it goes
+             * away on its own after a couple of seconds */
+            if (status_t0 > 0 && now_sec() - status_t0 > 2.5) {
+                status_t0 = 0;
+                status_msg[0] = 0;
+            }
             /* Settings can change these at runtime: re-read both files once a
              * second (a whole-file read of two small files is cheap). */
             {
@@ -2359,6 +3109,35 @@ int main(void) {
                 fclose(lr);
                 remove("/run/mystic/launch.request");
             }
+
+            /* Files asks for a DOCUMENT to be opened. The app is chosen here
+             * from the type registry, not by the app that asked, so a
+             * sandboxed file manager cannot pick what runs: it only names a
+             * path, and this side decides. */
+            FILE *orp = fopen("/run/mystic/open.request", "r");
+            if (orp) {
+                char path[256] = {0};
+                if (fgets(path, sizeof(path), orp)) {
+                    char *nl = strchr(path, 10);
+                    if (nl) *nl = 0;
+                    const FileType *ft = filetype_for(path);
+                    const char *app = ft ? filetype_app(ft) : "viewer";
+                    int ok = path[0] == '/' && !strstr(path, "..");
+                    if (!ok) {
+                        fprintf(stderr, "open: refusing path %.60s\n", path);
+                    } else {
+                        for (int b = 0; ok && b < bundle_count; b++) {
+                            if (!strcmp(app, bundles[b].id)) {
+                                int pid = wms_launch_path(&bundles[b], clients, b, path);
+                                fprintf(stderr, "open: %s -> %s pid %d\n", path, app, pid);
+                                break;
+                            }
+                        }
+                    }
+                }
+                fclose(orp);
+                remove("/run/mystic/open.request");
+            }
         }
         /* A mouse move used to set dirty, which recomposed the whole desktop -
          * every window's shadow and blur - for every single motion event.
@@ -2366,6 +3145,20 @@ int main(void) {
          * cursor alone is redrawn, unless the pointer is over chrome that
          * highlights (the dock magnifies, the top bar reacts). */
         int over_chrome = input.mouse_y < topbar_h();
+        if (launcher_open) {
+            /* inside the panel, a one-pixel move must not recompose the
+             * desktop: only a change of hovered tile changes what is drawn */
+            static int last_tile = -2;
+            int tile = -1;
+            for (int i = 0; i < launcher_items(); i++) {
+                int tx, ty, tw, th2;
+                launcher_geom(i, &tx, &ty, &tw, &th2);
+                if (input.mouse_x >= tx && input.mouse_x < tx + tw &&
+                    input.mouse_y >= ty && input.mouse_y < ty + th2) { tile = i; break; }
+            }
+            if (tile != last_tile) { last_tile = tile; dirty = 1; }
+            over_chrome = 0;
+        }
         {
             int bdx, bdy, bdw, bdh;
             if (dock_rect(&bdx, &bdy, &bdw, &bdh) &&

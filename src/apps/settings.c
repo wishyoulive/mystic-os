@@ -88,16 +88,18 @@
  *                  /proc/meminfo, /proc/sys/kernel/osrelease and
  *                  /proc/uptime.
  *
- *  The same grid every row already used is still the only layout
- *  mechanism: Grid::row_h, head_h and line_h are built from the font
- *  line box plus ui_px() leading, and every label is centred on its
- *  real ink box (ascent..descent) inside its band.  The tab strip is
- *  measured from the heading font the same way.  There is no bare
- *  pixel height in this file, so the text scale cannot make rows
- *  overlap: they grow with the fonts that fill them.  A note that
- *  names several files wraps onto whole extra line_h bands instead of
- *  being shortened with "..", so the source of every value stays
- *  readable at every scale.
+ *  LOOK - one header with the app's name and no action, then the seven
+ *  pages either as a left rail (when the window is tall enough to show
+ *  all of them without scrolling) or as a single page bar with two
+ *  arrows.  A page is one column of rows: the label on the left, the
+ *  value right-aligned on the one right edge, and a mark gutter that
+ *  holds the theme's real colours or a tick on the row in effect.  The
+ *  one footer line says what Enter will do, or where the facts came
+ *  from, or the result of the last write.  Every padding and gap is a
+ *  multiple of the 8 px unit in SP(); the only three fonts are the
+ *  shared title/body/small faces; every row is ui_row_h() tall and
+ *  centred by ui_top(), so the text scale cannot make rows overlap.
+ *  Columns are dropped by measurement when a window is too narrow.
  *
  *  Input:
  *      Up/Down, j/k        move the selection on a page with controls
@@ -107,8 +109,9 @@
  *      wheel               move the selection (a page of facts scrolls)
  *      Ctrl+C              cancel a password prompt (Esc is consumed by
  *                          main.c before an app sees it)
- *      click a tab         change page
+ *      click a page        change page (rail, arrow or the page name)
  *      click a row         select and apply it
+ *      click Cancel/Submit in the password prompt
  *  ============================================================ */
 #include "mystic.h"
 #include "wallpaper.h"
@@ -188,22 +191,20 @@ static const char *TAB_LABEL[TAB_COUNT] = {
     "Text", "Theme", "Wallpaper", "Users", "Network", "Storage", "System"
 };
 
-enum { K_HEAD, K_ROW, K_NOTE, K_GAP };
-
 typedef struct {
     char  file[64];
     Theme theme;                /* parsed by theme_load(): the real colours */
 } ThemeRow;
 
-/* One row of whichever page is showing. Built from real data each frame. */
+/* One row of whichever page is showing. Built from real data each frame.
+ * id >= 0 marks a selectable picker row (Enter applies it); id == -1 is a
+ * fact row, which has a value but no action. */
 typedef struct {
-    int         kind;           /* K_HEAD, K_ROW, K_NOTE or K_GAP */
-    int         id;             /* selectable ordinal, -1 for a fact/heading */
+    int         id;
     char        label[192];
     char        value[224];
     int         current;        /* this row is what is in effect on disk */
     const Theme *swatch;        /* non-NULL: draw this theme's colours here */
-    int         lines;          /* K_NOTE only: bands it needs, from rows_measure */
 } PRow;
 
 typedef struct {
@@ -213,7 +214,8 @@ typedef struct {
     int      tab;
     int      sel;
     int      w, h;
-    float    scroll;            /* pixels the page body is scrolled down */
+    int      scroll;            /* first visible body row (whole rows only) */
+    int      px, py;            /* last pointer position reported to us */
     char     status[192];       /* real result of the last write */
     int      status_err;
 
@@ -225,26 +227,91 @@ typedef struct {
     char     pw_msg[192];
     int      pw_msg_err;
 
-    /* Hit boxes, in window-local coordinates, painted by the last frame.
-     * A click is tested against what was drawn, never against a second
-     * guess at the layout. */
-    float    tab_x[TAB_COUNT], tab_y[TAB_COUNT], tab_w[TAB_COUNT], tab_h;
-    float    hit_y[MAX_PAGE_ROWS], hit_yb[MAX_PAGE_ROWS];
 } Settings;
 
-/* ---- one grid, every metric from the fonts and ui_px() ------------------ */
+/* ============================================================
+ *  ONE VISUAL LANGUAGE
+ *
+ *  This block is identical, byte for byte, in files.c, store.c and
+ *  settings.c: the owner asked for one desktop, not three
+ *  improvisations. Change it in all three at once.
+ *
+ *  SPACING. One unit, 8 px, scaled by ui_px() so it follows the global
+ *  text scale. Every padding and every gap in this window is SP(n);
+ *  there is no other kind of space.
+ *
+ *  TYPE. Exactly three sizes, and the same three faces in all three
+ *  windows: semibold 15 is a title, regular 11 is body text, medium 9
+ *  is small print. No other font_get() call is allowed.
+ *
+ *  ROWS. Every list row is ui_row_h(): the body line box plus one unit
+ *  of leading. Hover and selection are the same rectangle with a
+ *  different colour, so a row never grows, shrinks or gains a border
+ *  when the pointer moves over it.
+ * ============================================================ */
+#define UI_UNIT 8
+static int SP(int n) { return ui_px(n * UI_UNIT); }
 
-/* font_draw() takes y as the ascender line and puts the baseline
- * font_ascent() below it (src/font.c:1316). stbtt_ScaleForPixelHeight() makes
- * ascent + descent exactly the nominal size while font_height() is
- * size * 1.4, so the glyphs reach font_height/1.4 below y. Centring THAT box
- * is what puts a label in the middle of its row at every text scale. */
-static float ink_h(Font *f) { return font_height(f) / 1.4f; }
+typedef struct { Font *title, *body, *small; } UiFont;
 
-static float base_y(Font *f, float top, float band_h) {
-    return top + (band_h - ink_h(f)) * 0.5f + font_ascent(f);
+static UiFont ui_fonts(void) {
+    UiFont f;
+    f.title = font_get(FONT_SEMIBOLD, 15);
+    f.body  = font_get(FONT_REGULAR,  11);
+    f.small = font_get(FONT_MEDIUM,    9);
+    return f;
 }
-static float top_y(Font *f, float base) { return base - font_ascent(f); }
+
+/* The ink of one line is font_height()/1.4 tall (src/font.c:119), and
+ * centring that box - not the line box, which includes leading - is what
+ * puts caps and descenders equally inside a band. No guessed baseline. */
+static int ui_top(Font *f, int band) {
+    int ink;
+    if (!f || band <= 0) return 0;
+    ink = (int)(font_height(f) / 1.4f + 0.5f);
+    if (ink >= band) return 0;
+    return (band - ink) / 2;
+}
+
+static int ui_ceilf(float v) {
+    int i = (int)v;
+    return (v > (float)i) ? i + 1 : i;
+}
+
+/* the one row height: body line box + one spacing unit */
+static int ui_row_h(Font *body) {
+    int h = ui_ceilf(font_height(body)) + SP(1);
+    return h < SP(3) ? SP(3) : h;
+}
+
+/* A filled rounded rectangle: the only shape hover and selection use. */
+static void ui_pill(Surface *s, int x, int y, int w, int h, float r, u32 c) {
+    if (w <= 0 || h <= 0) return;
+    gfx_rrect_aa(s, (float)x, (float)y, (float)w, (float)h, r, c, 0, 0);
+}
+
+/* A value on the shared right edge. */
+static void ui_text_right(Surface *s, Font *f, int right, int y, const char *t, u32 c) {
+    if (!f || !t || !t[0]) return;
+    font_draw(s, f, (float)right - font_width(f, t), (float)y, t, c);
+}
+
+/* One button: the header action and the dialog buttons share it, so a
+ * button looks the same wherever it appears. */
+static void ui_button(Surface *s, int x, int y, int w, int h, float r,
+                      const char *label, Font *f, int primary, const Theme *th) {
+    u32 fill = primary ? color_alpha(th->accent, 0.30f)
+                       : color_alpha(th->text, 0.07f);
+    u32 bord = primary ? color_alpha(th->accent, 0.85f)
+                       : color_alpha(th->panel_border, 0.85f);
+    if (w <= 0 || h <= 0 || !f) return;
+    gfx_rrect_aa(s, (float)x, (float)y, (float)w, (float)h, r, fill, bord, 1.0f);
+    float tw = font_width(f, label);
+    font_draw(s, f, (float)x + ((float)w - tw) * 0.5f,
+              (float)y + (float)ui_top(f, h), label,
+              primary ? th->text : color_alpha(th->text, 0.88f));
+}
+
 
 /* Copy src into out, shortened with ".." until it fits maxw. */
 static void fit_text(Font *f, const char *src, char *out, size_t cap, float maxw) {
@@ -266,49 +333,205 @@ static void fit_text(Font *f, const char *src, char *out, size_t cap, float maxw
     out[0] = 0;
 }
 
-/* Best effort: the password buffers are cleared before the page moves on.
- * volatile keeps the stores from being folded away at -Os. */
+/* Draw text clipped to maxw pixels, ending in ".." when it does not fit. */
+static void draw_clipped(Surface *s, Font *f, float x, float y, float maxw,
+                         const char *text, u32 color) {
+    char buf[512];
+    if (!text || !text[0] || maxw < 4.0f) return;
+    snprintf(buf, sizeof(buf), "%s", text);
+    if (font_width(f, buf) <= maxw + 0.5f) {
+        font_draw(s, f, x, y, buf, color);
+        return;
+    }
+    size_t n = strlen(buf);
+    while (n > 0) {
+        buf[n] = 0;
+        if (font_width(f, buf) + font_width(f, "..") <= maxw) break;
+        n--;
+    }
+    snprintf(buf + n, sizeof(buf) - n, "..");
+    font_draw(s, f, x, y, buf, color);
+}
+
+/* Best effort: the password buffers are cleared before the page moves on. */
 static void secure_zero(void *p, size_t n) {
     volatile unsigned char *v = (volatile unsigned char *)p;
     while (n--) *v++ = 0;
 }
 
-/* The page on one grid. Every x is one of three edges:
+/* The page on one grid. The navigation is a rail down the left when the
+ * window is tall enough to show all seven pages without scrolling, and a
+ * single page bar with two arrows when it is not - never a cramped strip
+ * of wrapped tabs.
  *
- *      lab_x                the left column: every label, heading, note
- *      val_r                the right column: every value, right-aligned
- *      x + m .. lab_x - gap the ordinal or theme-swatch gutter
+ * Every x is one of three edges:
  *
- * and every y is one of four bands: row_h, head_h, line_h and gap. The
- * heights come from the font that fills them, the margins from ui_px(), so
- * the grid holds at every text scale and nothing is a bare pixel count. */
+ *      body_x        the content edge (the page-name column, or the
+ *                    window margin in bar mode)
+ *      label_x       the left edge of every label
+ *      val_r         the right column: every value, right-aligned
+ *
+ * and every y is one of the bands, all built from the fonts and SP().
+ */
 typedef struct {
-    float m;        /* page margin, inside the window's own edge       */
-    float gap;      /* air between blocks, and gutter before the label */
-    float gut;      /* ordinal / swatch column                          */
-    float row_h;    /* one list row / one fact row                     */
-    float head_h;   /* one page heading band                           */
-    float line_h;   /* one small band (note, status)                   */
-    float lab_x;    /* left edge of every label and heading            */
-    float val_r;    /* right edge of every value                       */
-    float sw_w;     /* theme swatch width                              */
-    float sw_h;     /* theme swatch height                             */
-} Grid;
+    UiFont f;
 
-static Grid grid_of(int x, int w, Font *fh, Font *fr, Font *fd) {
-    Grid g;
-    g.m      = (float)ui_px(12);
-    g.gap    = (float)ui_px(8);
-    g.row_h  = font_height(fr) + (float)ui_px(8);
-    g.head_h = font_height(fh) + (float)ui_px(10);
-    g.line_h = font_height(fr) + (float)ui_px(6);
-    g.sw_w   = font_height(fr) * 1.8f;
-    g.sw_h   = font_height(fr) * 0.62f;
-    g.gut    = font_width(fd, "00");
-    if (g.sw_w > g.gut) g.gut = g.sw_w;
-    g.lab_x  = (float)x + g.m + g.gut + g.gap;
-    g.val_r  = (float)(x + w) - g.m;
-    return g;
+    int m, gap;
+    int header_h, footer_h;
+
+    int mode;                   /* 0 = rail, 1 = page bar */
+    int rail_x, rail_y, rail_w;
+
+    int bar_y, bar_h;
+    int prev_x, next_x, arrow_w, name_x, name_w;
+
+    int body_x, body_r, body_y, body_bot;
+    int rows, row_h, row_dy, small_dy;
+
+    /* the row grid: mark gutter, label, value */
+    int gut, mark_sz, sw_w, sw_h;
+    int label_x, val_r;
+
+    int radius, rule, bar_w2, footer_dy;
+} Layout;
+
+/* Does every page name fit down the left side without scrolling? */
+static int rail_rows_fit(int body_h, int row_h) {
+    return body_h - 2 * SP(1) >= TAB_COUNT * row_h;
+}
+
+static int layout_settings(Layout *L, const Settings *st, int w, int h) {
+    memset(L, 0, sizeof(*L));
+    if (w < 1 || h < 1) return 0;
+
+    L->f = ui_fonts();
+    if (!L->f.title || !L->f.body || !L->f.small) return 0;
+
+    L->m = SP(2);
+    L->gap = SP(1);
+    L->rule = ui_px(1);
+    L->radius = SP(1);
+    L->bar_w2 = ui_px(3);
+    L->row_h = ui_row_h(L->f.body);
+    L->row_dy = ui_top(L->f.body, L->row_h);
+    L->small_dy = ui_top(L->f.small, L->row_h);
+
+    L->header_h = ui_ceilf(font_height(L->f.title)) + 2 * SP(1);
+    L->footer_h = ui_ceilf(font_height(L->f.small)) + 2 * SP(1);
+    if (L->header_h + L->footer_h + L->row_h > h) L->footer_h = 0;
+    if (L->header_h + L->row_h > h) L->header_h = h;
+
+    int top = L->header_h;
+    int bottom = h - L->footer_h;
+    if (bottom < top) bottom = top;
+
+    L->footer_dy = L->footer_h > 0 ? ui_top(L->f.small, L->footer_h) : 0;
+
+    /* one navigation column, chosen by what actually fits */
+    L->mode = 1;
+    if (rail_rows_fit(bottom - top, L->row_h) && w >= SP(40)) {
+        int widest = 0;
+        for (int i = 0; i < TAB_COUNT; i++) {
+            int tw = ui_ceilf(font_width(L->f.body, TAB_LABEL[i]));
+            if (tw > widest) widest = tw;
+        }
+        L->mode = 0;
+        L->rail_w = widest + 2 * SP(2);
+        if (L->rail_w > w - 2 * L->m - SP(20))
+            L->rail_w = w - 2 * L->m - SP(20);
+        if (L->rail_w < SP(8)) L->rail_w = SP(8);
+        L->rail_x = L->m;
+        L->rail_y = top + SP(1);
+        L->body_x = L->rail_x + L->rail_w + SP(2);
+        L->body_y = top + SP(1);
+    } else {
+        L->bar_h = L->row_h;
+        L->bar_y = top + SP(1);
+        L->arrow_w = SP(4);
+        L->prev_x = L->m;
+        L->next_x = w - L->m - L->arrow_w;
+        L->name_x = L->prev_x + L->arrow_w + L->gap;
+        L->name_w = L->next_x - L->gap - L->name_x;
+        if (L->name_w < SP(6)) L->name_w = SP(6);
+        L->body_x = L->m;
+        L->body_y = L->bar_y + L->bar_h + SP(1);
+    }
+    L->body_r = w - L->m;
+    L->body_bot = bottom - SP(1);
+    if (L->body_bot < L->body_y) L->body_bot = L->body_y;
+
+    /* the mark gutter only exists on pages that carry a mark */
+    L->mark_sz = SP(2);
+    L->sw_h = L->row_h - SP(1);
+    if (L->sw_h > SP(3)) L->sw_h = SP(3);
+    L->sw_w = SP(6);
+    L->gut = 0;
+    if (st->tab == TAB_THEME) L->gut = L->sw_w + L->gap;
+    else if (st->tab == TAB_TEXT || st->tab == TAB_WALL) L->gut = L->mark_sz + L->gap;
+    L->label_x = L->body_x + L->gut;
+    L->val_r = L->body_r;
+
+    {
+        int avail = L->body_bot - L->body_y;
+        L->rows = avail > 0 ? avail / L->row_h : 0;
+        if (L->rows > MAX_PAGE_ROWS) L->rows = MAX_PAGE_ROWS;
+    }
+    return 1;
+}
+
+/* the rail entry (page i) */
+static int rail_rect(const Layout *L, int i, int *bx, int *by, int *bw, int *bh) {
+    if (L->mode != 0 || i < 0 || i >= TAB_COUNT) return 0;
+    *bx = L->rail_x;
+    *by = L->rail_y + i * L->row_h;
+    *bw = L->rail_w;
+    *bh = L->row_h;
+    if (*by + *bh > L->rail_y + L->row_h * TAB_COUNT) return 0;
+    return 1;
+}
+
+/* the page bar's two arrows */
+static int arrow_rect(const Layout *L, int which, int *bx, int *by, int *bw, int *bh) {
+    if (L->mode != 1) return 0;
+    *bx = which ? L->next_x : L->prev_x;
+    *by = L->bar_y;
+    *bw = *bh = L->arrow_w;
+    return 1;
+}
+
+/* visible body row i: the same rectangle the painter uses */
+static int page_row_rect(const Layout *L, int i, int *ry, int *rh) {
+    if (i < 0 || i >= L->rows || L->row_h <= 0) return 0;
+    *ry = L->body_y + i * L->row_h;
+    *rh = L->row_h;
+    return (*ry + *rh <= L->body_bot);
+}
+
+/* the inverse: which visible body row holds cy, or -1 */
+static int page_row_at(const Layout *L, int cy) {
+    if (L->row_h <= 0 || cy < L->body_y || cy >= L->body_bot) return -1;
+    int i = (cy - L->body_y) / L->row_h;
+    int ry, rh;
+    if (!page_row_rect(L, i, &ry, &rh)) return -1;
+    return i;
+}
+
+/* The two buttons of the password prompt, in the footer band. Both the
+ * painter and the click handler call this, so they cannot disagree. */
+static int pw_btn_rect(const Layout *L, int w, int which,
+                       int *bx, int *by, int *bw, int *bh) {
+    if (L->footer_h <= 0) return 0;
+    int h = ui_ceilf(font_height(L->f.small)) + SP(1);
+    if (h > L->footer_h) h = L->footer_h;
+    const char *lab = which ? "Submit" : "Cancel";
+    int wd = ui_ceilf(font_width(L->f.small, lab)) + 2 * SP(2);
+    *bw = wd;
+    *bh = h;
+    *by = -(L->footer_h - h) / 2;              /* relative to the footer top */
+    if (which) *bx = w - L->m - wd;
+    else       *bx = w - L->m - wd - SP(1) - wd;
+    if (*bx < L->m) *bx = L->m;
+    return 1;
 }
 
 /* ---- painting ------------------------------------------------------------ */
@@ -334,134 +557,49 @@ static void swatch_draw(Surface *s, float x, float y, float w, float h,
                      color_alpha(t->text, 0.90f), 0, 0);
 }
 
-/* Every list/fact row in this window goes through this function. The
- * highlight is the full width of the window, the value ends at val_r, and a
- * theme row draws its swatch where every other row draws its ordinal. */
-static void row_draw(Surface *s, Font *fr, Font *fd, const Grid *g,
-                     int x, int w, float ry, const char *num,
-                     const char *name, const char *value,
-                     int sel, int cur, const Theme *th,
-                     const Theme *swatch, float vfrac) {
-    char nb[256], vb[256];
-    float vw = 0.0f;
+static void tick_draw(Surface *s, float x, float y, float sz, u32 c) {
+    gfx_line(s, x, y + sz * 0.52f, x + sz * 0.38f, y + sz * 0.88f, sz * 0.16f, c);
+    gfx_line(s, x + sz * 0.38f, y + sz * 0.88f, x + sz, y + sz * 0.10f, sz * 0.16f, c);
+}
 
-    snprintf(vb, sizeof(vb), "%s", value ? value : "");
-    if (vb[0]) {
-        /* the value column never takes more than vfrac of the row, so the
-         * label stays readable in a narrow window */
-        fit_text(fr, vb, vb, sizeof(vb), (g->val_r - g->lab_x) * vfrac);
-        if (vb[0]) vw = font_width(fr, vb) + g->gap;
-    }
-    fit_text(fr, name, nb, sizeof(nb), g->val_r - vw - g->lab_x);
-
+/* One body row: the label on its left column, the value right-aligned on
+ * the one right edge. A theme row draws that theme's real colours in the
+ * mark gutter; the current row of a picker draws a tick there. Hover and
+ * selection are the same rectangle with a different colour. */
+static void page_row_draw(Surface *s, const Layout *L, const Theme *th,
+                          const PRow *r, int ry, int selectable, int sel) {
     if (sel)
-        surf_blend(s, x, (int)(ry + 0.5f), w, (int)(g->row_h + 0.5f),
-                   color_alpha(th->accent, 0.18f));
+        ui_pill(s, L->body_x, ry, L->body_r - L->body_x, L->row_h,
+                (float)L->radius, color_alpha(th->accent, 0.18f));
 
-    if (swatch) {
-        float sy = ry + (g->row_h - g->sw_h) * 0.5f;
-        swatch_draw(s, (float)x + g->m, sy, g->sw_w, g->sw_h, swatch);
-    } else if (num && num[0]) {
-        float nw = font_width(fd, num);
-        font_draw(s, fd, g->lab_x - g->gap - nw,
-                  top_y(fd, base_y(fd, ry, g->row_h)), num,
-                  color_alpha(th->text, 0.42f));
+    if (r->swatch) {
+        float sy = (float)ry + ((float)L->row_h - (float)L->sw_h) * 0.5f;
+        swatch_draw(s, (float)L->body_x, sy, (float)L->sw_w, (float)L->sw_h,
+                    r->swatch);
+    } else if (r->current && L->gut > 0) {
+        float sy = (float)ry + ((float)L->row_h - (float)L->mark_sz) * 0.5f;
+        tick_draw(s, (float)L->body_x + (float)SP(1), sy, (float)L->mark_sz,
+                  th->accent);
     }
 
-    font_draw(s, fr, g->lab_x, top_y(fr, base_y(fr, ry, g->row_h)), nb,
-              sel ? th->text : color_alpha(th->text, 0.85f));
-    if (vb[0])
-        font_draw(s, fr, g->val_r - font_width(fr, vb),
-                  top_y(fr, base_y(fr, ry, g->row_h)), vb,
-                  cur ? th->accent : color_alpha(th->text, 0.72f));
-}
-
-/* A page heading: the title on the left column, the live value (what the
- * desktop is using now) on the value column's right edge, one baseline. */
-static void head_draw(Surface *s, Font *fh, Font *fr, const Grid *g,
-                      float ry, const char *title, const char *value,
-                      const Theme *th) {
     char vb[256];
-    float base = base_y(fh, ry, g->head_h);
-    font_draw(s, fh, g->lab_x, top_y(fh, base), title, th->text);
-    if (!value || !value[0]) return;
-    snprintf(vb, sizeof(vb), "%s", value);
-    fit_text(fr, vb, vb, sizeof(vb),
-             g->val_r - g->lab_x - font_width(fh, title) - g->gap);
+    snprintf(vb, sizeof(vb), "%s", r->value);
+    float vw = 0.0f;
+    if (vb[0]) {
+        fit_text(L->f.small, vb, vb, sizeof(vb),
+                 (float)(L->val_r - L->label_x) * 0.62f);
+        if (vb[0]) vw = font_width(L->f.small, vb) + (float)L->gap;
+    }
+
+    char nb[256];
+    fit_text(L->f.body, r->label, nb, sizeof(nb),
+             (float)L->val_r - vw - (float)L->label_x);
+    font_draw(s, L->f.body, (float)L->label_x, (float)(ry + L->row_dy), nb,
+              selectable && sel ? th->text : color_alpha(th->text, 0.86f));
     if (vb[0])
-        font_draw(s, fr, g->val_r - font_width(fr, vb), top_y(fr, base), vb,
-                  th->text_dim);
-}
-
-/* A small explanatory line, wrapped onto as many font-derived lines as it
- * needs. A note that names four files does not fit one row of a 518 px window,
- * and shortening it with ".." throws away exactly the part that says where
- * the value came from, so the note is split at spaces instead and its band
- * grows by whole line_h rows. The grid is still the grid: line_h comes from
- * the font, nothing here is a bare pixel count. */
-
-/* Split `text` into at most four lines, each of which fits maxw, and return
- * how many lines were produced. The last line is shortened with ".." only
- * when a single word is wider than the whole column. */
-static int note_split(const char *text, Font *fd, float maxw,
-                      char out[4][384]) {
-    char b[384];
-    snprintf(b, sizeof(b), "%s", text ? text : "");
-    int nl = 0;
-    char *p = b;
-    while (*p && nl < 4) {
-        char line[384] = {0};
-        while (*p == ' ') p++;
-        while (*p) {
-            char *e = p;
-            while (*e && *e != ' ') e++;
-            int wl = (int)(e - p);
-            char word[192];
-            if (wl > (int)sizeof(word) - 1) wl = (int)sizeof(word) - 1;
-            memcpy(word, p, (size_t)wl);
-            word[wl] = 0;
-            char trial[384];
-            if (line[0]) snprintf(trial, sizeof(trial), "%s %s", line, word);
-            else         snprintf(trial, sizeof(trial), "%s", word);
-            /* a word that does not fit starts the next line, unless it is the
-             * first word of this one - then it is shortened, never dropped */
-            if (font_width(fd, trial) > maxw && line[0]) break;
-            snprintf(line, sizeof(line), "%s", trial);
-            p = e;
-            while (*p == ' ') p++;
-        }
-        if (!line[0]) break;
-        fit_text(fd, line, out[nl], 384, maxw);
-        nl++;
-    }
-    if (nl == 0) { out[0][0] = 0; nl = 1; }
-    return nl;
-}
-
-/* The number of bands each note needs, filled in once per frame before the
- * page's offsets are summed. */
-static void rows_measure(PRow *rows, int nr, Font *fd, const Grid *g) {
-    float maxw = g->val_r - g->lab_x;
-    for (int i = 0; i < nr; i++) {
-        rows[i].lines = 0;
-        if (rows[i].kind != K_NOTE) continue;
-        char tmp[4][384];
-        int n = note_split(rows[i].label, fd, maxw, tmp);
-        rows[i].lines = n < 1 ? 1 : n;
-    }
-}
-
-static void note_draw(Surface *s, Font *fd, const Grid *g, float ry,
-                      const char *text, int lines, const Theme *th) {
-    char out[4][384];
-    int nl = note_split(text, fd, g->val_r - g->lab_x, out);
-    if (lines > 0 && nl > lines) nl = lines;
-    for (int i = 0; i < nl; i++) {
-        if (!out[i][0]) continue;
-        float y = ry + (float)i * g->line_h;
-        font_draw(s, fd, g->lab_x, top_y(fd, base_y(fd, y, g->line_h)), out[i],
-                  color_alpha(th->text, 0.52f));
-    }
+        ui_text_right(s, L->f.small, L->val_r, ry + L->small_dy, vb,
+                      r->current ? color_alpha(th->accent, 0.95f)
+                                 : color_alpha(th->text, 0.55f));
 }
 
 /* ---- reading the facts back off the disk --------------------------------- */
@@ -1128,28 +1266,17 @@ static void usage_line(const char *path, char *out, size_t n) {
 
 /* ---- the page content ---------------------------------------------------- */
 
-static int page_add(PRow *r, int n, int max, int kind, int id,
+static int page_add(PRow *r, int n, int max, int id,
                     const char *label, const char *value, int current,
                     const Theme *swatch) {
     if (n >= max) return n;
     PRow *p = &r[n];
-    p->kind = kind;
     p->id = id;
     p->current = current;
     p->swatch = swatch;
-    p->lines = 0;
     snprintf(p->label, sizeof(p->label), "%s", label ? label : "");
     snprintf(p->value, sizeof(p->value), "%s", value ? value : "");
     return n + 1;
-}
-
-static float band_h(const PRow *r, const Grid *g) {
-    switch (r->kind) {
-        case K_HEAD: return g->head_h;
-        case K_ROW:  return g->row_h;
-        case K_NOTE: return g->line_h * (float)(r->lines > 0 ? r->lines : 1);
-        default:     return g->gap;
-    }
 }
 
 static void fmt_uptime(long s, char *out, size_t n) {
@@ -1163,7 +1290,8 @@ static void fmt_uptime(long s, char *out, size_t n) {
 
 /* Build the rows of the current page from real data. Every frame starts
  * from the files, so an external edit, a failed write, or a missing source
- * is what the page shows. */
+ * is what the page shows. A row with id >= 0 is selectable and applies on
+ * Enter; a fact row has id -1 and no selection at all. */
 static int build_page(Settings *st, const Theme *live, PRow *rows, int max) {
     int n = 0;
     char v[224];
@@ -1172,168 +1300,69 @@ static int build_page(Settings *st, const Theme *live, PRow *rows, int max) {
     case TAB_TEXT: {
         float now = 1.0f;
         int have = read_scale(&now);
-        if (have) snprintf(v, sizeof(v), "now %.1fx", now);
-        else      snprintf(v, sizeof(v), "now 1.0x (no ui.conf)");
-        n = page_add(rows, n, max, K_HEAD, -1, "Text size", v, 0, NULL);
-        n = page_add(rows, n, max, K_NOTE, -1,
-                     "1.0x is the shipped readable size - the baseline every "
-                     "label and row is measured from.", "", 0, NULL);
+        if (!have) now = 1.0f;
         for (int i = 0; i < SIZE_COUNT; i++) {
             int cur = fabsf(now - SIZE_VALUE[i]) < 0.005f;
-            snprintf(v, sizeof(v), "%.1fx%s", SIZE_VALUE[i], cur ? " now" : "");
-            n = page_add(rows, n, max, K_ROW, i, SIZE_LABEL[i], v, cur, NULL);
+            snprintf(v, sizeof(v), "%.1fx", (double)SIZE_VALUE[i]);
+            n = page_add(rows, n, max, i, SIZE_LABEL[i], v, cur, NULL);
         }
-        n = page_add(rows, n, max, K_GAP, -1, "", "", 0, NULL);
-        n = page_add(rows, n, max, K_NOTE, -1,
-                     "Writes baseline = 1.4 and scale = <value> to "
-                     "/etc/mystic/ui.conf; main.c re-reads it once a second.",
-                     "", 0, NULL);
         break;
     }
     case TAB_THEME: {
         int cur = -1;
         for (int i = 0; i < st->theme_count; i++)
-            if (live && !strcmp(live->name, st->themes[i].theme.name)) cur = i;
-        if (st->theme_count == 0) {
-            if (live && live->name[0])
-                snprintf(v, sizeof(v), "now %s (no theme files)", live->name);
-            else
-                snprintf(v, sizeof(v), "%s", "none installed");
-        } else if (live && live->name[0]) {
-            snprintf(v, sizeof(v), "now %s", live->name);
-        } else {
-            snprintf(v, sizeof(v), "%s", "now: unknown");
-        }
-        n = page_add(rows, n, max, K_HEAD, -1, "Theme", v, 0, NULL);
-        n = page_add(rows, n, max, K_NOTE, -1,
-                     "Swatch = that file's bg_top, bg_bottom, accent and text, "
-                     "read now.", "", 0, NULL);
-        if (st->theme_count == 0) {
-            if (st->theme_errno)
-                snprintf(v, sizeof(v), "Cannot read %s: %s", MYSTIC_THEME_DIR,
-                         strerror(st->theme_errno));
-            else
-                snprintf(v, sizeof(v), "No *%s file in %s loaded.", ".theme",
-                         MYSTIC_THEME_DIR);
-            n = page_add(rows, n, max, K_NOTE, -1, v, "", 0, NULL);
-            n = page_add(rows, n, max, K_NOTE, -1,
-                         "No theme file could be read now; the desktop keeps "
-                         "the theme it already has.", "", 0, NULL);
-        }
+            if (live && live->name[0] && !strcmp(live->name, st->themes[i].theme.name))
+                cur = i;
         for (int i = 0; i < st->theme_count; i++) {
             int is_cur = (i == cur);
-            n = page_add(rows, n, max, K_ROW, i, st->themes[i].theme.name,
-                         is_cur ? "now" : "", is_cur, &st->themes[i].theme);
+            n = page_add(rows, n, max, i, st->themes[i].theme.name, "",
+                         is_cur, &st->themes[i].theme);
         }
-        n = page_add(rows, n, max, K_GAP, -1, "", "", 0, NULL);
-        n = page_add(rows, n, max, K_NOTE, -1,
-                     "Enter writes the theme's own name to "
-                     "/etc/mystic/current-theme.", "", 0, NULL);
         break;
     }
     case TAB_WALL: {
         int dw = read_wallpaper();
         int cur = dw >= 0 ? dw : (dw == -2 ? 0 : -1);
-        if (cur >= 0)
-            snprintf(v, sizeof(v), "now %s%s", wallpaper_name(cur),
-                     dw == -2 ? " (default)" : "");
-        else
-            snprintf(v, sizeof(v), "%s", "now: unknown name");
-        n = page_add(rows, n, max, K_HEAD, -1, "Wallpaper", v, 0, NULL);
-        n = page_add(rows, n, max, K_NOTE, -1,
-                     "Every wallpaper wallpaper.c paints, by the name it "
-                     "answers to. Enter applies one.", "", 0, NULL);
         for (int i = 0; i < WALLPAPER_COUNT; i++) {
             const char *nm = wallpaper_name(i);
-            int is_cur = (i == cur);
-            n = page_add(rows, n, max, K_ROW, i, nm ? nm : "?",
-                         is_cur ? "now" : "", is_cur, NULL);
+            n = page_add(rows, n, max, i, nm ? nm : "?", "", i == cur, NULL);
         }
-        n = page_add(rows, n, max, K_GAP, -1, "", "", 0, NULL);
-        n = page_add(rows, n, max, K_NOTE, -1,
-                     "Enter writes the name to /etc/mystic/wallpaper; the "
-                     "desktop re-reads it within a second.", "", 0, NULL);
         break;
     }
     case TAB_USERS: {
-        n = page_add(rows, n, max, K_HEAD, -1, "Lock-screen password",
-                     st->pw_stage ? "in progress" : "", 0, NULL);
-        n = page_add(rows, n, max, K_NOTE, -1,
-                     "The lock screen verifies /etc/mystic/passwd: SHA-256 "
-                     "over salt||password, 20000 rounds.", "", 0, NULL);
         if (st->pw_stage == 0) {
-            n = page_add(rows, n, max, K_ROW, 0, "Change password", "Enter",
-                         0, NULL);
-            n = page_add(rows, n, max, K_NOTE, -1,
-                         "Enter starts; the current password is checked "
-                         "before a new one is accepted.", "", 0, NULL);
-            /* The prompt is gone but its result is not: a change, a refusal
-             * and a cancel each leave a line here, so the outcome of the
-             * action is readable after the fact instead of only in the
-             * status band. */
-            if (st->pw_msg[0])
-                n = page_add(rows, n, max, K_NOTE, -1, st->pw_msg, "", 0, NULL);
+            n = page_add(rows, n, max, 0, "Change password", "", 0, NULL);
         } else {
-            char mask[64];
+            char mask[96];
             pw_mask(st->pw_buf, st->pw_len, mask, sizeof(mask));
-            n = page_add(rows, n, max, K_ROW, -1, pw_prompt(st), mask, 0, NULL);
-            if (st->pw_msg[0]) {
-                snprintf(v, sizeof(v), "%s", st->pw_msg);
-                n = page_add(rows, n, max, K_NOTE, -1, v, "", 0, NULL);
-            }
-            n = page_add(rows, n, max, K_NOTE, -1,
-                         "Enter submits; Ctrl+C cancels. Nothing you type is "
-                         "shown.", "", 0, NULL);
-            if (st->pw_msg_err) {
-                /* the message above already names the reason; this line is
-                 * only here to keep the error visible in the status line */
-                n = page_add(rows, n, max, K_NOTE, -1,
-                             "The password has not been changed.", "", 0, NULL);
-            }
+            n = page_add(rows, n, max, -1, pw_prompt(st), mask, 0, NULL);
         }
-        n = page_add(rows, n, max, K_GAP, -1, "", "", 0, NULL);
-        n = page_add(rows, n, max, K_NOTE, -1,
-                     "The new line is written to a temp file, fsync'd, then "
-                     "renamed over the real file, and read back to verify.",
-                     "", 0, NULL);
         break;
     }
     case TAB_NET: {
         NetInfo ni;
         read_net(&ni);
-        n = page_add(rows, n, max, K_HEAD, -1, "Network", "", 0, NULL);
         if (!strcmp(ni.ifname, "none") || !strcmp(ni.ifname, "unavailable"))
             snprintf(v, sizeof(v), "%s", ni.ifname);
         else
             snprintf(v, sizeof(v), "%s (%s)", ni.ifname, ni.state);
-        n = page_add(rows, n, max, K_ROW, -1, "Interface", v, 0, NULL);
-        n = page_add(rows, n, max, K_ROW, -1, "IPv4 address", ni.ip, 0, NULL);
-        n = page_add(rows, n, max, K_ROW, -1, "Gateway", ni.gw, 0, NULL);
-        n = page_add(rows, n, max, K_ROW, -1, "DNS", ni.dns, 0, NULL);
-        n = page_add(rows, n, max, K_GAP, -1, "", "", 0, NULL);
-        n = page_add(rows, n, max, K_NOTE, -1,
-                     "Sources: /proc/net/route, SIOCGIFADDR on the interface, "
-                     "/sys/class/net/<if>/operstate, /etc/resolv.conf.",
-                     "", 0, NULL);
+        n = page_add(rows, n, max, -1, "Interface", v, 0, NULL);
+        n = page_add(rows, n, max, -1, "IPv4 address", ni.ip, 0, NULL);
+        n = page_add(rows, n, max, -1, "Gateway", ni.gw, 0, NULL);
+        n = page_add(rows, n, max, -1, "DNS", ni.dns, 0, NULL);
         break;
     }
     case TAB_STORAGE: {
-        n = page_add(rows, n, max, K_HEAD, -1, "Storage", "", 0, NULL);
         usage_line("/", v, sizeof(v));
-        n = page_add(rows, n, max, K_ROW, -1, "/", v, 0, NULL);
+        n = page_add(rows, n, max, -1, "/", v, 0, NULL);
         usage_line("/root", v, sizeof(v));
-        n = page_add(rows, n, max, K_ROW, -1, "/root", v, 0, NULL);
-        n = page_add(rows, n, max, K_GAP, -1, "", "", 0, NULL);
-        n = page_add(rows, n, max, K_NOTE, -1,
-                     "statvfs(2) on each path: f_blocks and f_bfree times "
-                     "f_frsize, read this frame.", "", 0, NULL);
+        n = page_add(rows, n, max, -1, "/root", v, 0, NULL);
         break;
     }
     case TAB_SYSTEM:
     default: {
-        n = page_add(rows, n, max, K_HEAD, -1, "System", "", 0, NULL);
         read_file("/sys/class/graphics/fb0/virtual_size", v, sizeof(v));
-        n = page_add(rows, n, max, K_ROW, -1, "Display", v, 0, NULL);
+        n = page_add(rows, n, max, -1, "Display", v, 0, NULL);
 
         long total = mem_kb("MemTotal:"), avail = mem_kb("MemAvailable:");
         if (total > 0 && avail >= 0) {
@@ -1343,10 +1372,10 @@ static int build_page(Settings *st, const Theme *live, PRow *rows, int max) {
         } else {
             snprintf(v, sizeof(v), "%s", "unavailable");
         }
-        n = page_add(rows, n, max, K_ROW, -1, "Memory", v, 0, NULL);
+        n = page_add(rows, n, max, -1, "Memory", v, 0, NULL);
 
         read_file("/proc/sys/kernel/osrelease", v, sizeof(v));
-        n = page_add(rows, n, max, K_ROW, -1, "Kernel", v, 0, NULL);
+        n = page_add(rows, n, max, -1, "Kernel", v, 0, NULL);
 
         {
             char up[64];
@@ -1354,13 +1383,8 @@ static int build_page(Settings *st, const Theme *live, PRow *rows, int max) {
                 fmt_uptime((long)atol(v), up, sizeof(up));
             else
                 snprintf(up, sizeof(up), "%s", "unavailable");
-            n = page_add(rows, n, max, K_ROW, -1, "Uptime", up, 0, NULL);
+            n = page_add(rows, n, max, -1, "Uptime", up, 0, NULL);
         }
-        n = page_add(rows, n, max, K_GAP, -1, "", "", 0, NULL);
-        n = page_add(rows, n, max, K_NOTE, -1,
-                     "Sources: /sys/class/graphics/fb0/virtual_size, "
-                     "/proc/meminfo, /proc/sys/kernel/osrelease, /proc/uptime.",
-                     "", 0, NULL);
         break;
     }
     }
@@ -1377,71 +1401,107 @@ static int tab_rows(const Settings *s) {
     }
 }
 
-static const char *tab_hint(const Settings *s) {
+/* One line for the empty case - never a blank pane. */
+static const char *page_empty(const Settings *s, char *buf, size_t n) {
+    if (s->tab != TAB_THEME) return NULL;
+    if (s->theme_errno)
+        snprintf(buf, n, "Cannot read %s: %s", MYSTIC_THEME_DIR,
+                 strerror(s->theme_errno));
+    else
+        snprintf(buf, n, "No .theme files in %s", MYSTIC_THEME_DIR);
+    return buf;
+}
+
+/* One footer line: what Enter will do, or where the values come from. */
+static const char *page_hint(const Settings *s, const Theme *live, char *buf, size_t n) {
     switch (s->tab) {
         case TAB_TEXT:
-            return "Enter applies; the desktop re-reads ui.conf within a second.";
+            return "Enter applies - writes /etc/mystic/ui.conf";
         case TAB_THEME:
-            return "Enter applies; each swatch is read from its real theme file.";
+            if (live && live->name[0]) {
+                int found = 0;
+                for (int i = 0; i < s->theme_count && !found; i++)
+                    if (!strcmp(live->name, s->themes[i].theme.name)) found = 1;
+                if (!found) {
+                    snprintf(buf, n, "In use: %s - no theme file has that name",
+                             live->name);
+                    return buf;
+                }
+            }
+            return "Enter applies - writes /etc/mystic/current-theme";
         case TAB_WALL:
-            return "Enter applies; the desktop re-reads wallpaper within a second.";
+            return "Enter applies - writes /etc/mystic/wallpaper";
         case TAB_USERS:
             return s->pw_stage
-                 ? "Ctrl+C cancels. Nothing you type is shown."
-                 : "Enter starts. The current password is checked first "
-                   "when one is set.";
+                 ? "Enter submits - Ctrl+C cancels - nothing is echoed"
+                 : "Enter starts - the current password is checked first";
         case TAB_NET:
-            return "Read now from /proc/net/route, the interface and resolv.conf.";
+            return "Read now: /proc/net/route, SIOCGIFADDR, /etc/resolv.conf";
         case TAB_STORAGE:
-            return "Read now with statvfs(2) on / and /root.";
+            return "Read now: statvfs(2) on / and /root";
         default:
-            return "Read now from /proc and /sys.";
+            return "Read now: /proc and /sys";
     }
 }
 
-/* ---- the tab strip ------------------------------------------------------- */
+/* ---- navigation ---------------------------------------------------------- */
 
-/* Tab labels are laid out left to right and wrap by measurement, never by a
- * fixed count: at a narrow window or a larger text scale the strip becomes
- * two rows and the body moves down. Each pill's painted rectangle is recorded
- * for settings_click(). */
-static float tabs_draw(Surface *s, Font *fh, const Grid *g, int x, int y,
-                       int w, Settings *st, const Theme *th) {
-    float pad = (float)ui_px(6);
-    float gap = (float)ui_px(4);
-    float th_h = font_height(fh) + (float)ui_px(8);
-    float left = (float)x + g->m;
-    float right = (float)(x + w) - g->m;
-    float tx = left, ty = (float)y + g->m * 0.5f;
-
-    st->tab_h = th_h;
-    for (int i = 0; i < TAB_COUNT; i++) {
-        const char *lab = TAB_LABEL[i];
-        float tw = font_width(fh, lab) + pad * 2.0f;
-        if (tx > left && tx + tw > right) {
-            tx = left;
-            ty += th_h + gap;
-        }
-        if (tw > right - left) tw = right - left;
-        if (tw < 1.0f) tw = 1.0f;
-
-        int on = (i == st->tab);
-        if (on)
-            gfx_rrect_aa(s, tx, ty, tw, th_h, th_h * 0.5f,
-                         color_alpha(th->accent, 0.16f),
-                         color_alpha(th->accent, 0.75f), 1.0f);
-
-        char shown[40];
-        fit_text(fh, lab, shown, sizeof(shown), tw - pad * 2.0f);
-        font_draw(s, fh, tx + pad, top_y(fh, base_y(fh, ty, th_h)), shown,
-                  on ? th->text : color_alpha(th->text, 0.52f));
-
-        st->tab_x[i] = tx - (float)x;
-        st->tab_y[i] = ty - (float)y;
-        st->tab_w[i] = tw;
-        tx += tw + gap;
+static void nav_arrow(Surface *s, int dir, float x, float y, float sz, u32 c) {
+    if (dir < 0) {
+        gfx_line(s, x + sz * 0.26f, y + sz * 0.5f, x + sz * 0.70f, y + sz * 0.5f,
+                 sz * 0.12f, c);
+        float pts[6] = { x + sz * 0.28f, y + sz * 0.5f,
+                         x + sz * 0.64f, y + sz * 0.28f,
+                         x + sz * 0.64f, y + sz * 0.72f };
+        gfx_polygon(s, pts, 3, c);
+    } else {
+        gfx_line(s, x + sz * 0.30f, y + sz * 0.5f, x + sz * 0.74f, y + sz * 0.5f,
+                 sz * 0.12f, c);
+        float pts[6] = { x + sz * 0.72f, y + sz * 0.5f,
+                         x + sz * 0.36f, y + sz * 0.28f,
+                         x + sz * 0.36f, y + sz * 0.72f };
+        gfx_polygon(s, pts, 3, c);
     }
-    return ty + th_h - (float)y;
+}
+
+/* The rail (all seven names, the current one in an accent pill) or the
+ * page bar (one name, two arrows). Both are built from Layout rectangles
+ * the click handler also uses. */
+static void nav_draw(Surface *s, int x, int y, const Layout *L,
+                     const Settings *st, const Theme *th) {
+    if (L->mode == 0) {
+        for (int i = 0; i < TAB_COUNT; i++) {
+            int bx, by, bw, bh;
+            if (!rail_rect(L, i, &bx, &by, &bw, &bh)) continue;
+            int on = (i == st->tab);
+            if (on)
+                ui_pill(s, x + bx, y + by, bw, bh, (float)L->radius,
+                        color_alpha(th->accent, 0.16f));
+            font_draw(s, L->f.body, (float)(x + bx + SP(2)),
+                      (float)(y + by) + (float)ui_top(L->f.body, bh),
+                      TAB_LABEL[i],
+                      on ? th->text : color_alpha(th->text, 0.58f));
+        }
+        return;
+    }
+
+    for (int which = 0; which < 2; which++) {
+        int bx, by, bw, bh;
+        if (!arrow_rect(L, which, &bx, &by, &bw, &bh)) continue;
+        int hot = st->px >= bx && st->px < bx + bw &&
+                  st->py >= by && st->py < by + bh;
+        if (hot)
+            ui_pill(s, x + bx, y + by, bw, bh, (float)L->radius,
+                    color_alpha(th->accent, 0.18f));
+        int sz = L->arrow_w - 2 * SP(1);
+        nav_arrow(s, which ? 1 : -1,
+                  (float)(x + bx) + (float)SP(1),
+                  (float)(y + by) + (float)SP(1),
+                  (float)sz, color_alpha(th->text, hot ? 0.95f : 0.55f));
+    }
+    font_draw(s, L->f.body, (float)(x + L->name_x),
+              (float)(y + L->bar_y) + (float)ui_top(L->f.body, L->bar_h),
+              TAB_LABEL[st->tab], th->text);
 }
 
 /* ---- AppVT --------------------------------------------------------------- */
@@ -1452,14 +1512,9 @@ static void settings_init(App *a, int w, int h) {
     s->w = w;
     s->h = h;
     s->tab = TAB_TEXT;
-    /* -1 is "no row here": 0.0f would look like a real hit box at the top */
-    for (int i = 0; i < MAX_PAGE_ROWS; i++) {
-        s->hit_y[i] = -1.0f;
-        s->hit_yb[i] = -1.0f;
-    }
+    s->px = s->py = -1;
     scan_themes(s);
-    /* start with the row that matches the scale really in effect, not with
-     * Small; every "now" marker is still re-read from the file when drawn */
+    /* start with the row that matches the scale really in effect */
     {
         float now = 1.0f;
         read_scale(&now);
@@ -1481,9 +1536,7 @@ static void settings_free(App *a) {
     a->state = NULL;
 }
 
-/* Clip to the rectangle we were given. The window manager hands over the
- * whole scene surface, so keeping pixels inside the app rect is the app's
- * job; negative x/y is rejected by every drawing call's bounds check. */
+/* Clip to the rectangle we were given. */
 static Surface rect_clip(Surface *s, int x, int y, int w, int h) {
     Surface c = *s;
     int right = x + w, bottom = y + h;
@@ -1505,168 +1558,122 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h,
     Surface clip = rect_clip(s, x, y, w, h);
     s = &clip;
 
-    Font *fh = font_get(FONT_MEDIUM, 13);
-    Font *fr = font_get(FONT_REGULAR, 11);
-    Font *fd = font_get(FONT_REGULAR, 10);
-    if (!fh || !fr || !fd) return;
-
-    const Grid g = grid_of(x, w, fh, fr, fd);
-
     /* the theme list is the disk: pick up a file edited since the last frame */
     scan_themes(st);
 
-    for (int i = 0; i < MAX_PAGE_ROWS; i++)
-        st->hit_y[i] = st->hit_yb[i] = -1.0f;
+    Layout L;
+    if (!layout_settings(&L, st, w, h)) return;
 
-    /* ---- tab strip ---- */
-    float tabs_h = tabs_draw(s, fh, &g, x, y, w, st, th);
+    /* ---- header: the app's name, no action ---- */
+    surf_blend(s, x, y, w, L.header_h, th->panel);
+    font_draw(s, L.f.title, (float)(x + L.m), (float)(y + ui_top(L.f.title, L.header_h)),
+              "Settings", th->text);
+    surf_blend(s, x, y + L.header_h - L.rule, w, L.rule,
+               color_alpha(th->panel_border, 0.80f));
 
-    /* ---- body and status bands ---- */
-    float body_top = (float)y + tabs_h + g.gap;
-    float status_y = (float)(y + h) - g.m - g.line_h;
-    int have_status = status_y > body_top;
-    float body_bottom = have_status ? status_y - g.gap * 0.5f
-                                    : (float)(y + h) - g.m;
-    float body_h = body_bottom - body_top;
-    if (body_h < 0.0f) body_h = 0.0f;
+    nav_draw(s, x, y, &L, st, th);
 
     /* ---- one measure pass: the whole page ---- */
     PRow rows[MAX_PAGE_ROWS];
-    float off[MAX_PAGE_ROWS];
     int nr = build_page(st, th, rows, MAX_PAGE_ROWS);
-    rows_measure(rows, nr, fd, &g);          /* how many lines each note takes */
-    float cy = 0.0f;
-    for (int i = 0; i < nr; i++) {
-        off[i] = cy;
-        cy += band_h(&rows[i], &g);
-    }
-    const float content_h = cy;
 
-    int sel_n = 0;
-    for (int i = 0; i < nr; i++)
-        if (rows[i].kind == K_ROW && rows[i].id >= 0) sel_n++;
-
-    if (sel_n <= 0) {
-        st->sel = 0;
-    } else {
+    int sel_n = tab_rows(st);
+    if (sel_n <= 0) st->sel = 0;
+    else {
         if (st->sel < 0) st->sel = 0;
         if (st->sel >= sel_n) st->sel = sel_n - 1;
     }
 
-    float max_scroll = content_h - body_h;
-    if (max_scroll < 0.0f) max_scroll = 0.0f;
-
-    if (sel_n > 0) {
-        float sel_top = -1.0f, sel_bot = 0.0f;
-        for (int i = 0; i < nr; i++) {
-            if (rows[i].kind != K_ROW || rows[i].id != st->sel) continue;
-            sel_top = off[i];
-            sel_bot = off[i] + g.row_h;
-            break;
-        }
-        if (sel_top >= 0.0f) {
-            if (sel_top - st->scroll < 0.0f) st->scroll = sel_top;
-            if (sel_bot - st->scroll > body_h) st->scroll = sel_bot - body_h;
-        }
+    int max_scroll = nr - L.rows;
+    if (max_scroll < 0) max_scroll = 0;
+    if (sel_n > 0 && st->sel >= 0) {
+        if (st->sel < st->scroll) st->scroll = st->sel;
+        if (st->sel >= st->scroll + L.rows) st->scroll = st->sel - L.rows + 1;
     }
-    if (st->scroll < 0.0f) st->scroll = 0.0f;
+    if (st->scroll < 0) st->scroll = 0;
     if (st->scroll > max_scroll) st->scroll = max_scroll;
 
-    /* The body is its own surface whose first row is the body's top edge, so
-     * a row scrolled past it is rejected by the same bounds check every other
-     * draw uses - it cannot creep over the tabs or the status line. */
-    int btop = (int)body_top;
-    Surface bs = *s;
-    if (btop > 0 && btop < bs.h) {
-        bs.px += (size_t)btop * (size_t)bs.stride;
-        bs.h -= btop;
-    } else if (btop >= bs.h) {
-        bs.h = 0;
+    /* ---- rows ---- */
+    if (nr == 0) {
+        char buf[256];
+        const char *msg = page_empty(st, buf, sizeof(buf));
+        if (msg)
+            draw_clipped(s, L.f.body, (float)(x + L.label_x),
+                         (float)(y + L.body_y + L.row_dy),
+                         (float)(L.val_r - L.label_x), msg, th->text_dim);
+    } else {
+        for (int i = 0; i < L.rows; i++) {
+            int idx = st->scroll + i;
+            if (idx >= nr) break;
+            int ryt, rh;
+            if (!page_row_rect(&L, i, &ryt, &rh)) break;
+            int selectable = rows[idx].id >= 0;
+            int sel = selectable && rows[idx].id == st->sel;
+            page_row_draw(s, &L, th, &rows[idx], y + ryt, selectable, sel);
+        }
     }
-    if (bs.h > (int)body_h) bs.h = (int)body_h;
-    if (bs.h < 0) bs.h = 0;
 
-    for (int i = 0; i < nr; i++) {
-        float ry = off[i] - st->scroll;
-        float bh = band_h(&rows[i], &g);
+    /* ---- a map of the page, in the right margin ---- */
+    if (nr > L.rows && L.rows > 0) {
+        int band = L.body_bot - L.body_y;
+        int bx = x + w - L.bar_w2;
+        if (band > 0) {
+            int thumb = band * L.rows / nr;
+            if (thumb < SP(2)) thumb = SP(2);
+            if (thumb > band) thumb = band;
+            int span = band - thumb;
+            int off = max_scroll > 0 ? span * st->scroll / max_scroll : 0;
+            ui_pill(s, bx, y + L.body_y, L.bar_w2, band,
+                    (float)L.bar_w2 * 0.5f, color_alpha(th->text, 0.06f));
+            ui_pill(s, bx, y + L.body_y + off, L.bar_w2, thumb,
+                    (float)L.bar_w2 * 0.5f, color_alpha(th->accent, 0.55f));
+        }
+    }
 
-        if (rows[i].kind == K_ROW && rows[i].id >= 0) {
-            float top = ry, bot = ry + g.row_h;
-            if (top < 0.0f) top = 0.0f;
-            if (bot > body_h) bot = body_h;
-            if (bot > top) {
-                st->hit_y[rows[i].id] = (float)(btop - y) + top;
-                st->hit_yb[rows[i].id] = (float)(btop - y) + bot;
+    /* ---- one status line: the last real result, else this page's hint ---- */
+    if (L.footer_h > 0) {
+        int fy = y + h - L.footer_h;
+        surf_blend(s, x, fy, w, L.footer_h, th->panel);
+        surf_blend(s, x, fy, w, L.rule, th->panel_border);
+
+        char buf[256];
+        const char *line;
+        u32 col;
+        if (st->pw_stage && st->pw_msg[0]) {
+            line = st->pw_msg;
+            col = st->pw_msg_err ? color_mix(th->accent, RGB(255, 92, 92), 0.65f)
+                                 : color_alpha(th->accent, 0.85f);
+        } else if (st->status[0]) {
+            line = st->status;
+            col = st->status_err ? color_mix(th->accent, RGB(255, 92, 92), 0.65f)
+                                 : color_alpha(th->accent, 0.85f);
+        } else if (st->pw_msg[0] && !st->pw_stage) {
+            line = st->pw_msg;
+            col = st->pw_msg_err ? color_mix(th->accent, RGB(255, 92, 92), 0.65f)
+                                 : color_alpha(th->accent, 0.85f);
+        } else {
+            line = page_hint(st, th, buf, sizeof(buf));
+            col = color_alpha(th->text, 0.45f);
+        }
+
+        int text_r = x + w - L.m;
+        if (st->pw_stage) {
+            int bx, by, bw, bh;
+            if (pw_btn_rect(&L, w, 0, &bx, &by, &bw, &bh)) {
+                text_r = x + bx - L.gap;
+                ui_button(s, x + bx, fy + by, bw, bh, (float)L.radius,
+                          "Cancel", L.f.small, 0, th);
+            }
+            if (pw_btn_rect(&L, w, 1, &bx, &by, &bw, &bh)) {
+                int hot = st->px >= bx && st->px < bx + bw &&
+                          st->py >= fy + by && st->py < fy + by + bh;
+                ui_button(s, x + bx, fy + by, bw, bh, (float)L.radius,
+                          "Submit", L.f.small, hot, th);
             }
         }
-
-        if (ry + bh <= 0.0f || ry >= body_h) continue;
-
-        switch (rows[i].kind) {
-            case K_HEAD:
-                head_draw(&bs, fh, fr, &g, ry, rows[i].label, rows[i].value, th);
-                break;
-            case K_ROW: {
-                char num[8];
-                num[0] = 0;
-                if (rows[i].id >= 0 && !rows[i].swatch)
-                    snprintf(num, sizeof(num), "%d", rows[i].id + 1);
-                int sel = rows[i].id >= 0 && rows[i].id == st->sel;
-                float vfrac = rows[i].id >= 0 ? 0.50f : 0.62f;
-                row_draw(&bs, fr, fd, &g, x, w, ry, num, rows[i].label,
-                         rows[i].value, sel, rows[i].current, th,
-                         rows[i].swatch, vfrac);
-                break;
-            }
-            case K_NOTE:
-                note_draw(&bs, fd, &g, ry, rows[i].label, rows[i].lines, th);
-                break;
-            default:
-                break;
-        }
-    }
-
-    /* A scroll bar in the page's right margin, clear of the value column, and
-     * only when the page really continues past an edge. The old pair of
-     * triangles sat on the first and last row's value text; a thumb in the
-     * margin cannot collide with a label and also says how far down the page
-     * you are. Track and thumb are sized from ui_px(), so they scale with the
-     * text like every other margin here. */
-    if (content_h > body_h + 0.5f && body_h > g.line_h * 0.5f) {
-        float tw = (float)ui_px(4);
-        if (tw < 1.0f) tw = 1.0f;
-        float tx = (float)(x + w) - g.m * 0.5f - tw * 0.5f;
-        float ty = body_top + (float)ui_px(2);
-        float track_h = body_h - (float)ui_px(4);
-        if (track_h > tw) {
-            gfx_rrect_aa(s, tx, ty, tw, track_h, tw * 0.5f,
-                         color_alpha(th->text, 0.16f), 0, 0);
-            float frac = body_h / content_h;
-            float thumb = track_h * frac;
-            if (thumb < tw * 2.0f) thumb = tw * 2.0f;
-            if (thumb > track_h) thumb = track_h;
-            float t = st->scroll / (content_h - body_h);
-            if (t < 0.0f) t = 0.0f;
-            if (t > 1.0f) t = 1.0f;
-            float thumb_y = ty + (track_h - thumb) * t;
-            gfx_rrect_aa(s, tx, thumb_y, tw, thumb, tw * 0.5f,
-                         color_alpha(th->text, 0.50f), 0, 0);
-        }
-    }
-
-    /* ---- status line: the last real result, or this page's honest hint ---- */
-    if (have_status) {
-        char hint[384];
-        snprintf(hint, sizeof(hint), "%s",
-                 st->status[0] ? st->status : tab_hint(st));
-        fit_text(fd, hint, hint, sizeof(hint), g.val_r - g.lab_x);
-        u32 col = st->status[0]
-                ? (st->status_err
-                       ? color_mix(th->accent, RGB(255, 92, 92), 0.65f)
-                       : th->accent)
-                : color_alpha(th->text, 0.42f);
-        font_draw(s, fd, g.lab_x, top_y(fd, base_y(fd, status_y, g.line_h)),
-                  hint, col);
+        draw_clipped(s, L.f.small, (float)(x + L.m),
+                     (float)(fy + L.footer_dy), (float)(text_r - (x + L.m)),
+                     line, col);
     }
 }
 
@@ -1679,7 +1686,7 @@ static void set_tab(Settings *s, int t) {
     if (s->pw_stage) pw_cancel(s);
     s->tab = t;
     s->sel = 0;
-    s->scroll = 0.0f;
+    s->scroll = 0;
 }
 
 static void move_sel(Settings *s, int delta) {
@@ -1688,30 +1695,6 @@ static void move_sel(Settings *s, int delta) {
     s->sel += delta;
     if (s->sel < 0) s->sel = 0;
     if (s->sel >= n) s->sel = n - 1;
-}
-
-/* Row height at a key event uses the same font the painter used, so page
- * scrolling and rows cannot disagree. */
-static float key_row_h(void) {
-    Font *fr = font_get(FONT_REGULAR, 11);
-    return fr ? font_height(fr) + (float)ui_px(8) : 0.0f;
-}
-
-static void scroll_by(Settings *s, float dy) {
-    s->scroll += dy;
-    if (s->scroll < 0.0f) s->scroll = 0.0f;
-}
-
-/* Length of an escape sequence (arrow, Home/End, PageUp/PageDown) or 0 if
- * this byte does not start one. */
-static int esc_len(const char *b, int i, int n) {
-    if ((unsigned char)b[i] != 0x1b) return 0;
-    if (i + 2 < n && b[i + 1] == '[') {
-        if (b[i + 2] >= '0' && b[i + 2] <= '9')
-            return (i + 3 < n && b[i + 3] == '~') ? 4 : 3;
-        return 3;
-    }
-    return 1;
 }
 
 static void activate(Settings *s) {
@@ -1733,8 +1716,7 @@ static void activate(Settings *s) {
     }
 }
 
-/* A digit picks the nth row of the page's own short list - 1..5 for the text
- * sizes, 1..12 for the themes, 1..6 for the wallpapers. */
+/* A digit picks the nth row of the page's own short list. */
 static void pick_digit(Settings *s, int idx) {
     switch (s->tab) {
         case TAB_TEXT:
@@ -1751,6 +1733,32 @@ static void pick_digit(Settings *s, int idx) {
     }
 }
 
+/* Length of an escape sequence (arrow, Home/End, PageUp/PageDown) or 0 if
+ * this byte does not start one. */
+static int esc_len(const char *b, int i, int n) {
+    if ((unsigned char)b[i] != 0x1b) return 0;
+    if (i + 2 < n && b[i + 1] == '[') {
+        if (b[i + 2] >= '0' && b[i + 2] <= '9')
+            return (i + 3 < n && b[i + 3] == '~') ? 4 : 3;
+        return 3;
+    }
+    return 1;
+}
+
+/* Scroll a page of facts by whole rows, clamped to what there is. */
+static void scroll_rows(Settings *s, int delta) {
+    PRow rows[MAX_PAGE_ROWS];
+    int nr = build_page(s, NULL, rows, MAX_PAGE_ROWS);
+    Layout L;
+    int visible = 0;
+    if (layout_settings(&L, s, s->w, s->h)) visible = L.rows;
+    int maxs = nr - visible;
+    if (maxs < 0) maxs = 0;
+    s->scroll += delta;
+    if (s->scroll < 0) s->scroll = 0;
+    if (s->scroll > maxs) s->scroll = maxs;
+}
+
 static void settings_key(App *a, const char *bytes, int n) {
     Settings *s = a->state;
     if (!s || !bytes) return;
@@ -1761,14 +1769,14 @@ static void settings_key(App *a, const char *bytes, int n) {
         /* While a password is being entered every byte is a secret. */
         if (s->pw_stage) {
             int el = esc_len(bytes, i, n);
-            if (el) { i += el; continue; }          /* arrows are not password bytes */
+            if (el) { i += el; continue; }
             i++;
             if (c == '\r' || c == '\n') { pw_enter(s); continue; }
             if (c == '\b' || c == 0x7f) {
                 if (s->pw_len > 0) s->pw_buf[--s->pw_len] = 0;
                 continue;
             }
-            if (c == 3) { pw_cancel(s); continue; } /* Ctrl+C */
+            if (c == 3) { pw_cancel(s); continue; }
             if (c == '\t') continue;
             if (c >= 0x20 && s->pw_len < PW_MAX) {
                 s->pw_buf[s->pw_len++] = (char)c;
@@ -1777,40 +1785,38 @@ static void settings_key(App *a, const char *bytes, int n) {
             continue;
         }
 
-        /* arrows arrive as CSI sequences from src/main.c:key_bytes_for() */
         int el = esc_len(bytes, i, n);
         if (el >= 3) {
             char f = bytes[i + 2];
-            float rh = key_row_h();
+            Layout L;
+            int page = 1;
+            if (layout_settings(&L, s, s->w, s->h) && L.rows > 1) page = L.rows - 1;
             if (f == 'A') {
                 if (tab_rows(s) > 0) move_sel(s, -1);
-                else scroll_by(s, -rh);
+                else scroll_rows(s, -1);
             } else if (f == 'B') {
                 if (tab_rows(s) > 0) move_sel(s, +1);
-                else scroll_by(s, rh);
+                else scroll_rows(s, +1);
             } else if (f == 'C') {
                 set_tab(s, s->tab + 1);
             } else if (f == 'D') {
                 set_tab(s, s->tab - 1);
-            } else if (f == '5') {                  /* PageUp */
-                if (tab_rows(s) > 0) move_sel(s, -5);
-                else scroll_by(s, -rh * 4.0f);
-            } else if (f == '6') {                  /* PageDown */
-                if (tab_rows(s) > 0) move_sel(s, +5);
-                else scroll_by(s, rh * 4.0f);
-            } else if (f == 'H') {                  /* Home */
+            } else if (f == '5') {
+                if (tab_rows(s) > 0) move_sel(s, -page);
+                else scroll_rows(s, -page);
+            } else if (f == '6') {
+                if (tab_rows(s) > 0) move_sel(s, +page);
+                else scroll_rows(s, +page);
+            } else if (f == 'H') {
                 if (tab_rows(s) > 0) s->sel = 0;
-                else s->scroll = 0.0f;
-            } else if (f == 'F') {                  /* End */
+                else s->scroll = 0;
+            } else if (f == 'F') {
                 if (tab_rows(s) > 0) s->sel = tab_rows(s) - 1;
             }
             i += el;
             continue;
         }
-        if (el == 1) {                              /* a bare Esc: ignore */
-            i += 1;
-            continue;
-        }
+        if (el == 1) { i += 1; continue; }
 
         i++;
         if (c == '\t') { set_tab(s, s->tab + 1); continue; }
@@ -1823,30 +1829,62 @@ static void settings_key(App *a, const char *bytes, int n) {
 
 static void settings_click(App *a, int x, int y, int buttons) {
     Settings *s = a->state;
-    (void)buttons;
     if (!s) return;
+    if (buttons && !(buttons & 1)) return;
+    if (x < 0 || y < 0 || x >= s->w || y >= s->h) return;
+    s->px = x;
+    s->py = y;
 
+    Layout L;
+    if (!layout_settings(&L, s, s->w, s->h)) return;
+
+    /* navigation first: it is above and beside the body */
     for (int i = 0; i < TAB_COUNT; i++) {
-        float tx = s->tab_x[i], ty = s->tab_y[i], tw = s->tab_w[i];
-        if (tw <= 0.0f) continue;
-        if ((float)x >= tx && (float)x < tx + tw &&
-            (float)y >= ty && (float)y < ty + s->tab_h) {
+        int bx, by, bw, bh;
+        if (!rail_rect(&L, i, &bx, &by, &bw, &bh)) continue;
+        if (x >= bx && x < bx + bw && y >= by && y < by + bh) {
             set_tab(s, i);
             return;
         }
     }
-
-    int n = tab_rows(s);
-    if (n > MAX_PAGE_ROWS) n = MAX_PAGE_ROWS;
-    for (int i = 0; i < n; i++) {
-        float ry = s->hit_y[i], yb = s->hit_yb[i];
-        if (ry < 0.0f || yb <= ry) continue;   /* not on screen, not hittable */
-        if ((float)y >= ry && (float)y < yb) {
-            s->sel = i;
-            activate(s);
+    for (int which = 0; which < 2; which++) {
+        int bx, by, bw, bh;
+        if (!arrow_rect(&L, which, &bx, &by, &bw, &bh)) continue;
+        if (x >= bx && x < bx + bw && y >= by && y < by + bh) {
+            set_tab(s, which ? s->tab + 1 : s->tab - 1);
             return;
         }
     }
+    if (L.mode == 1 && x >= L.name_x && x < L.name_x + L.name_w &&
+        y >= L.bar_y && y < L.bar_y + L.bar_h) {
+        set_tab(s, s->tab + 1);
+        return;
+    }
+
+    /* the password prompt's two buttons */
+    if (s->pw_stage) {
+        for (int which = 0; which < 2; which++) {
+            int bx, by, bw, bh;
+            if (!pw_btn_rect(&L, s->w, which, &bx, &by, &bw, &bh)) continue;
+            int fy = s->h - L.footer_h;
+            if (x >= bx && x < bx + bw && y >= fy + by && y < fy + by + bh) {
+                if (which) pw_enter(s);
+                else pw_cancel(s);
+                return;
+            }
+        }
+    }
+
+    /* a body row: the same rectangle the painter used */
+    int vis = page_row_at(&L, y);
+    if (vis < 0) return;
+    PRow rows[MAX_PAGE_ROWS];
+    int nr = build_page(s, NULL, rows, MAX_PAGE_ROWS);
+    int idx = s->scroll + vis;
+    if (idx < 0 || idx >= nr) return;
+    if (rows[idx].id < 0) return;              /* a fact row has no action */
+    s->sel = rows[idx].id;
+    activate(s);
 }
 
 static void settings_resize(App *a, int w, int h) {
@@ -1854,14 +1892,14 @@ static void settings_resize(App *a, int w, int h) {
     if (s) { s->w = w; s->h = h; }
 }
 
-/* The wheel walks the selection three rows a notch, like every other list in
- * the desktop; a page of facts scrolls instead of moving a selection it does
- * not have. */
+/* The wheel walks the selection a few rows a notch, like every other list
+ * in the desktop; a page of facts scrolls instead of moving a selection it
+ * does not have. */
 static void settings_wheel(App *a, int notches) {
     Settings *s = a->state;
     if (!s || !notches) return;
-    if (tab_rows(s) > 0) move_sel(s, -notches * 3);
-    else scroll_by(s, -(float)notches * 3.0f * key_row_h());
+    if (tab_rows(s) > 0) move_sel(s, -notches * 2);
+    else scroll_rows(s, -notches * 2);
 }
 
 const AppVT app_vt_settings = {

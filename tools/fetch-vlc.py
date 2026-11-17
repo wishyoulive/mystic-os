@@ -1,44 +1,74 @@
 #!/usr/bin/env python3
 """
-fetch-vlc.py - resolve (and optionally fetch) the libVLC closure for Mystic OS.
+fetch-vlc.py - build the libVLC video player package for Mystic OS.
 
-Why this exists: `apk add vlc` on Alpine is one package that ships *every*
-plugin, so its D: line lists every shared library any plugin links against -
-GTK, X11, EGL/mesa, samba, gstreamer. That closure is the first number this
-script prints, so nobody has to take it on faith.
+This is the whole supply chain for the one app that needs a third-party
+media stack, and it is deliberately one command:
 
-The second number is the one we might afford: libVLC itself (vlc-libs:
-libvlc.so.5 + libvlccore.so.9) plus only the plugin .so files a "video in a
-window" player needs. Their real DT_NEEDED entries are read out of the
-downloaded .apk with the ELF reader below, and only those `so:` names are
-resolved against the index - the closure comes from the actual binaries, not
-from a guessed list.
+    python tools/fetch-vlc.py                 # resolve, download, unpack, pack
+    python tools/fetch-vlc.py --dry-run       # resolve and print only
+    python tools/fetch-vlc.py --profile minimal
+    python tools/fetch-vlc.py --force         # ignore the caches
 
-    python tools/fetch-vlc.py                      # dry run: full vlc closure
-    python tools/fetch-vlc.py --profile trim       # dry run: libvlc + vmem+ffmpeg
-    python tools/fetch-vlc.py --profile minimal    # dry run: libvlc + vmem, no ffmpeg
-    python tools/fetch-vlc.py --profile trim --download
+What it produces:
 
-Dry run is the default and nothing is written outside build/.  A plan bigger
-than --max-download-mb is refused (pass --force to override).  A plugin profile
-does fetch the two small vlc packages (~7 MB) even in a dry run, because the
-closure is derived from their binaries; that is the only exception and it is
-printed when it happens.
+    build/vlc-root/            the vmem closure (libs + the plugin subset)
+    build/vlc-pkg/             the package stage (manifest, libexec, lib/)
+    build/repo/vlc.tar.gz      the installable package, plus an index row
+    build/repo/index.tsv       updated in place and re-signed if a key exists
 
-Caches: build/vlc-index/ and build/vlc-apks/.  Destination: build/vlc-root/.
-All under build/, which is outside the image - the image is built from stage/.
+The package layout is the normal Mystic one, with one addition:
 
-Field note, because it bit us in tools/fetch-browser.py: APKINDEX `S:` is the
-.apk download size and `I:` is the *installed* size.  fetch-browser.py prints
-I: as "compressed", which overstates the download.  Both are printed here,
-labelled.
+    manifest                   name/desc/exec/version
+    bin -> libexec/vlcplayer   symlink, so exec = bin is a bare filename
+    libexec/vlcplayer          the player, a DYNAMIC musl executable
+    lib/                       libvlc, libvlccore and their real closure
+    lib/vlc/plugins/...        only the plugin files a player needs
+
+Why the player is dynamic, and what that costs
+----------------------------------------------
+Alpine ships libVLC as shared objects only; there is no libvlc.a. A static
+musl program also cannot dlopen (the dynamic linker is not part of a static
+image), so a static player could never call libVLC. The app is therefore
+built as a dynamically linked musl executable: its only DT_NEEDED is
+libc.musl-x86_64.so.1, which the Alpine base rootfs already provides, and
+it loads libvlc.so.5 with dlopen() from the package's own lib/ directory
+(after one re-exec with LD_LIBRARY_PATH, because musl reads that at process
+start). Nothing is linked with -lvlc at build time.
+
+The closure is not a guessed list. For a trimmed profile this script
+downloads vlc + vlc-libs, unpacks the selected plugin .so files, reads
+their real ELF DT_NEEDED entries, and resolves only those `so:` names
+against the Alpine index. The emitted package contains exactly the
+libraries that closure produced.
+
+Index fields: `S:` is the .apk download size, `I:` the installed size.
+Both are printed, labelled. Caches: build/vlc-index/, build/vlc-apks/.
+Everything is written under build/, which is not part of the OS image.
+
+Honesty notes:
+  * The download cap is enforced before anything big is fetched. A profile
+    over --max-download-mb is refused unless --force is given.
+  * `--profile playback` (the default) decodes H.264/HEVC/MPEG-2/VP8/VP9/
+    AV1/AAC/MP3/AC-3 through Alpine's libavcodec. That is a large closure;
+    the printed numbers are the real ones.
+  * No sound driver is staged in the image and QEMU is started without a
+    sound device, so this package contains only the dummy audio output.
+    libVLC still decodes audio; nothing can play it until a PCM device
+    exists. See docs/MULTIMEDIA.md.
 """
 
 import argparse
+import glob
+import gzip
+import hashlib
 import io
+import json
 import os
 import re
+import shutil
 import struct
+import subprocess
 import sys
 import tarfile
 import urllib.request
@@ -50,27 +80,49 @@ ARCH = "x86_64"
 INDEX_CACHE = os.path.join("build", "vlc-index")
 APK_CACHE = os.path.join("build", "vlc-apks")
 DEST = os.path.join("build", "vlc-root")
+PKG_STAGE = os.path.join("build", "vlc-pkg")
+REPO = os.path.join("build", "repo")
+PKG_NAME = "vlc"
+PKG_VERSION = "3.0.23"
+MANIFEST = os.path.join("src", "client", "apps", "vlcplayer.manifest")
+APP_SRC = [
+    "src/client/apps/vlcplayer.c",
+    "src/client/mystic_client.c",
+    "src/gfx.c",
+    "src/font.c",
+    "src/ui.c",
+]
 
-# "libvlc" is not a package name in Alpine: vlc-libs provides both shared
+# libVLC is not a package name in Alpine: vlc-libs provides both shared
 # objects, so the roots are written the way the index writes them.
 BASE_ROOTS = ["so:libvlc.so.5", "so:libvlccore.so.9"]
 
+# A package that only exists to satisfy /bin/sh or the C library must not be
+# copied into the tree: the Alpine base image already has both, and a second
+# musl in an overlay is how you get a loader that cannot find itself.
+BASE_PACKAGES = {
+    "musl", "busybox", "busybox-binsh", "alpine-baselayout",
+    "alpine-baselayout-data", "apk-tools", "scanelf", "libc-utils",
+}
+
 # ---------------------------------------------------------------------------
-# Which plugin .so files a player needs. Paths are relative to
-# /usr/lib/vlc/plugins. Read out of the plugin directory of vlc-3.0.23-r4.apk;
-# a runtime VLC may still load extra modules (a text renderer for subtitles,
-# a demuxer for another container), which is what a first run in the VM says.
+# Plugin sets. Paths are relative to /usr/lib/vlc/plugins inside vlc.apk.
+# These are the files vmem playback actually loads; a missing one is an
+# error below, not a silent omission.
 # ---------------------------------------------------------------------------
 PLUGINS = {
-    # vmem = decode into memory we own; rv32/i420_rgb = convert to RV32, which
-    # is byte-identical to a Mystic window; chain = the chroma filter chain.
+    # vmem hands us each decoded picture. rv32 converts RV24 -> RV32; the
+    # i420_rgb converters do the common YUV -> RGB step. No swscale: this
+    # player scales into the window itself.
     "vout": [
         "video_output/libvmem_plugin.so",
         "video_chroma/librv32_plugin.so",
         "video_chroma/libchain_plugin.so",
+        "video_chroma/libi420_rgb_plugin.so",
         "video_chroma/libi420_rgb_sse2_plugin.so",
+        "video_chroma/libi420_rgb_mmx_plugin.so",
     ],
-    # VLC's own decoders: no external codec library at all.
+    # Still images and raw video: the cheapest thing that proves the path.
     "image": [
         "demux/libimage_plugin.so",
         "demux/librawvid_plugin.so",
@@ -79,34 +131,62 @@ PLUGINS = {
         "codec/libjpeg_plugin.so",
     ],
     "file": ["access/libfilesystem_plugin.so"],
-    # H.264 / HEVC / VP9 / AAC: everything that needs libavcodec.
-    "ffmpeg": [
+    # Containers. Each one is VLC's own demuxer, not libavformat.
+    "demux": [
         "demux/libmp4_plugin.so",
         "demux/libmkv_plugin.so",
         "demux/libavi_plugin.so",
+        "demux/libts_plugin.so",
+        "demux/libps_plugin.so",
+        "demux/libwav_plugin.so",
+        "demux/libogg_plugin.so",
+    ],
+    # H.264 / HEVC / MPEG-2 / VC-1 / VP8 / VP9 / AV1 / AAC / MP3 / AC-3:
+    # everything that needs libavcodec. The packetizers split elementary
+    # streams inside mp4/mkv/ts.
+    "ffmpeg": [
         "codec/libavcodec_plugin.so",
         "packetizer/libpacketizer_h264_plugin.so",
         "packetizer/libpacketizer_hevc_plugin.so",
-        "access/libhttp_plugin.so",
+        "packetizer/libpacketizer_mpeg4video_plugin.so",
+        "packetizer/libpacketizer_mpeg4audio_plugin.so",
+        "packetizer/libpacketizer_mpegvideo_plugin.so",
+        "packetizer/libpacketizer_vc1_plugin.so",
     ],
+    # The image has no sound device; this is what --aout=dummy resolves to.
+    # It adds 14 KB and no library, so "no sound" is a clean state instead
+    # of a failing ALSA probe per media.
+    "aout": ["audio_output/libadummy_plugin.so"],
+    "http": ["access/libhttp_plugin.so"],
     "subs": ["text_renderer/libfreetype_plugin.so"],
 }
 
 PROFILES = {
-    # cheapest thing that proves the display path works: a PNG or raw frame
-    # decoded by VLC's own decoders and handed to our buffer.
+    # images + raw frames, no external codec library.
     "minimal": PLUGINS["vout"] + PLUGINS["image"] + PLUGINS["file"],
-    # plus H.264/HEVC/VP9/AAC via libavcodec.
-    "trim": PLUGINS["vout"] + PLUGINS["image"] + PLUGINS["file"] + PLUGINS["ffmpeg"],
+    # the same, plus local containers and libavcodec. This is the default.
+    "playback": (PLUGINS["vout"] + PLUGINS["image"] + PLUGINS["file"]
+                 + PLUGINS["demux"] + PLUGINS["ffmpeg"] + PLUGINS["aout"]),
+    # playback over HTTP as well (adds TLS, more libraries).
+    "network": (PLUGINS["vout"] + PLUGINS["image"] + PLUGINS["file"]
+                + PLUGINS["demux"] + PLUGINS["ffmpeg"] + PLUGINS["aout"]
+                + PLUGINS["http"]),
     # plus subtitle rendering.
-    "trim+subs": (PLUGINS["vout"] + PLUGINS["image"] + PLUGINS["file"]
-                  + PLUGINS["ffmpeg"] + PLUGINS["subs"]),
+    "subs": (PLUGINS["vout"] + PLUGINS["image"] + PLUGINS["file"]
+             + PLUGINS["demux"] + PLUGINS["ffmpeg"] + PLUGINS["aout"]
+             + PLUGINS["subs"]),
     # what `apk add vlc` would do.
     "full": None,
 }
 
-LIBVLC_FILES = ["usr/lib/libvlc.so.5.6.1", "usr/lib/libvlccore.so.9.0.1",
-                "usr/lib/vlc/vlc-cache-gen"]
+# Files taken out of vlc-libs / vlc. The plugin set is added to this.
+LIBVLC_FILES = [
+    "usr/lib/libvlc.so.5.6.1",
+    "usr/lib/libvlccore.so.9.0.1",
+    "usr/lib/vlc/vlc-cache-gen",
+]
+
+STAMP_VERSION = "mystic-vlc-root-v2"
 
 
 # ---------------------------------------------------------------------------
@@ -124,9 +204,11 @@ def fetch(url, path=None, timeout=120):
     return data
 
 
-def load_index(repo):
+def load_index(repo, refresh=False):
     """{package: {version,file,download,installed,depends,provides,repo}}."""
     path = os.path.join(INDEX_CACHE, "%s-%s.idx.tar.gz" % (repo, ARCH))
+    if refresh and os.path.exists(path):
+        os.remove(path)
     if os.path.exists(path):
         with open(path, "rb") as f:
             blob = f.read()
@@ -149,7 +231,7 @@ def load_index(repo):
         ver = (d.get("V") or [""])[0]
         pkgs[name] = {
             "version": ver,
-            # APKINDEX v3 has no filename field: it is <name>-<version>.apk
+            # APKINDEX v3 has no filename field: the file is <name>-<version>.apk
             "file": (d.get("F") or ["%s-%s.apk" % (name, ver)])[0],
             "download": int((d.get("S") or ["0"])[0] or 0),    # .apk size
             "installed": int((d.get("I") or ["0"])[0] or 0),   # unpacked size
@@ -160,10 +242,10 @@ def load_index(repo):
     return pkgs
 
 
-def build_world():
+def build_world(refresh=False):
     pkgs, provides = {}, {}
     for repo in REPOS:
-        idx = load_index(repo)
+        idx = load_index(repo, refresh)
         print("==> %-10s %5d packages" % (repo + ":", len(idx)))
         for name, info in idx.items():
             pkgs.setdefault(name, info)
@@ -228,23 +310,44 @@ def report(pkgs, closure, missing, label, top=10):
 
 
 # ---------------------------------------------------------------------------
-# ELF DT_NEEDED - the plugin closure comes from the binaries themselves
+# ELF DT_NEEDED / PT_INTERP - the closure comes from the binaries themselves
 # ---------------------------------------------------------------------------
-def elf_needed(path):
-    """DT_NEEDED sonames of an ELF file; [] if it is not readable as one."""
+def elf_info(path):
+    """(interp or '', [DT_NEEDED]) for an ELF file; ('', []) if unreadable."""
     try:
         with open(path, "rb") as f:
             b = f.read()
         if b[:4] != b"\x7fELF" or len(b) < 64:
-            return []
+            return "", []
         is64 = b[4] == 2
         le = "<" if b[5] == 1 else ">"
         if is64:
+            phoff, = struct.unpack_from(le + "Q", b, 0x20)
             shoff, = struct.unpack_from(le + "Q", b, 0x28)
+            phentsize, phnum = struct.unpack_from(le + "HH", b, 0x36)
             shentsize, shnum, shstrndx = struct.unpack_from(le + "HHH", b, 0x3a)
         else:
+            phoff, = struct.unpack_from(le + "I", b, 0x1c)
             shoff, = struct.unpack_from(le + "I", b, 0x20)
+            phentsize, phnum = struct.unpack_from(le + "HH", b, 0x2a)
             shentsize, shnum, shstrndx = struct.unpack_from(le + "HHH", b, 0x2e)
+
+        # PT_INTERP (type 3): the dynamic loader the kernel must find
+        interp = ""
+        for i in range(phnum):
+            off = phoff + i * phentsize
+            if is64:
+                p_type, = struct.unpack_from(le + "I", b, off)
+                p_offset, = struct.unpack_from(le + "Q", b, off + 8)
+                p_filesz, = struct.unpack_from(le + "Q", b, off + 32)
+            else:
+                p_type, = struct.unpack_from(le + "I", b, off)
+                p_offset, = struct.unpack_from(le + "I", b, off + 4)
+                p_filesz, = struct.unpack_from(le + "I", b, off + 16)
+            if p_type == 3:
+                interp = b[p_offset:p_offset + p_filesz].split(b"\0")[0].decode(
+                    "utf-8", "replace")
+                break
 
         def sh(i):
             off = shoff + i * shentsize
@@ -266,19 +369,27 @@ def elf_needed(path):
                 dyn = sh(i)
             elif s == ".dynstr":
                 dstr = sh(i)[4]
-        if dyn is None or dstr is None:
-            return []
-        out, off, end = [], dyn[4], dyn[4] + dyn[5]
-        while off + 16 <= end:
-            tag, val = struct.unpack_from(le + "qQ", b, off)
-            off += 16
-            if tag == 0:
-                break
-            if tag == 1:                        # DT_NEEDED
-                out.append(name_at(dstr + val))
-        return out
+        needed = []
+        if dyn is not None and dstr is not None:
+            off, end = dyn[4], dyn[4] + dyn[5]
+            while off + (16 if is64 else 8) <= end:
+                if is64:
+                    tag, val = struct.unpack_from(le + "qQ", b, off)
+                    off += 16
+                else:
+                    tag, val = struct.unpack_from(le + "iI", b, off)
+                    off += 8
+                if tag == 0:
+                    break
+                if tag == 1:                    # DT_NEEDED
+                    needed.append(name_at(dstr + val))
+        return interp, needed
     except (ValueError, IndexError, struct.error, OSError):
-        return []
+        return "", []
+
+
+def elf_needed(path):
+    return elf_info(path)[1]
 
 
 # ---------------------------------------------------------------------------
@@ -388,37 +499,439 @@ def tree_bytes(dest):
     return total, files
 
 
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json_atomic(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".part"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=1, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# the closure tree
+# ---------------------------------------------------------------------------
+def root_signature(profile, closure, pkgs, plugins):
+    return {
+        "stamp": STAMP_VERSION,
+        "profile": profile,
+        "packages": [[n, pkgs[n]["version"]] for n in sorted(closure) if n in pkgs],
+        "plugins": sorted(plugins) if plugins else ["*"],
+    }
+
+
+def tree_is_under_build(path):
+    """Refuse to rmtree a directory that is not build/'s child."""
+    root = os.path.realpath("build")
+    real = os.path.realpath(path)
+    return real == root or real.startswith(root + os.sep)
+
+
+def build_root(pkgs, closure, dest, profile, plugins, stamp, force=False):
+    """Download (if needed) and unpack the closure into dest.
+
+    Idempotent: if dest carries the same signature stamp the whole step is a
+    cache hit and no network call is made. The tree is built beside dest and
+    renamed, so a crash cannot leave a half-populated root.
+    """
+    if not tree_is_under_build(dest):
+        print("error: --dest must be inside build/ (got %s)" % dest, file=sys.stderr)
+        return False
+    sig = hashlib.sha256(json.dumps(stamp, sort_keys=True).encode()).hexdigest()
+    old = read_json(os.path.join(dest, ".vlc-stamp"))
+    if (not force and old and old.get("sig") == sig
+            and os.path.isfile(os.path.join(dest, "usr", "lib", "libvlc.so.5"))):
+        print("==> root cache hit: %s is up to date for profile %r"
+              % (dest, profile))
+        b, n = tree_bytes(dest)
+        print("    %d files, %.2f MB on disk" % (n, b / 1e6))
+        return True
+
+    # everything except the base image; vlc/vlc-libs are taken selectively
+    # for a trimmed profile and whole for the full one.
+    wanted = set(LIBVLC_FILES + ["usr/lib/vlc/plugins/" + p for p in plugins]) \
+        if plugins else None
+    if plugins is None:
+        todo = [n for n in sorted(closure)
+                if n in pkgs and n not in BASE_PACKAGES and n != "vlc-libs"]
+        need = ["vlc-libs"] if "vlc-libs" in pkgs else []
+    else:
+        todo = [n for n in sorted(closure)
+                if n in pkgs and n not in BASE_PACKAGES
+                and n not in ("vlc", "vlc-libs")]
+        need = [n for n in ("vlc-libs", "vlc") if n in pkgs]
+
+    got, size, files = 0, 0, []
+    for name in todo + need:
+        path = get_apk(pkgs, name, True)
+        if not path:
+            print("error: could not fetch %s" % name, file=sys.stderr)
+            return False
+        got += 1
+        size += os.path.getsize(path)
+        files.append((name, path))
+        if got % 25 == 0:
+            print("    %d/%d packages, %.1f MB" % (got, len(todo) + len(need), size / 1e6))
+    print("==> downloaded %d packages, %.1f MB" % (got, size / 1e6))
+
+    tmp = dest + ".new"
+    if os.path.isdir(tmp):
+        shutil.rmtree(tmp)
+    os.makedirs(tmp, exist_ok=True)
+
+    written = fixed = 0
+    if wanted is not None:
+        # only the plugin files and libVLC itself out of the two vlc packages
+        for need_name in need:
+            w, f = unpack_apk(apk_path(pkgs, need_name), tmp, members=wanted)
+            written += w
+            fixed += f
+    for name, path in files:
+        if name in need:
+            continue
+        if name == "vlc" and wanted is None:
+            # full profile: take the whole package, plugins and all
+            pass
+        w, f = unpack_apk(path, tmp)
+        written += w
+        fixed += f
+
+    b, n = tree_bytes(tmp)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if os.path.isdir(dest):
+        shutil.rmtree(dest)
+    os.replace(tmp, dest)
+    out = dict(stamp)
+    out["sig"] = sig
+    out["files"] = n
+    out["bytes"] = b
+    write_json_atomic(os.path.join(dest, ".vlc-stamp"), out)
+    print("==> extracted to %s: %d files, %.2f MB on disk, %d symlinks copied"
+          % (dest, n, b / 1e6, fixed))
+    return True
+
+
+# ---------------------------------------------------------------------------
+# the app + the package
+# ---------------------------------------------------------------------------
+def find_zig():
+    z = os.environ.get("ZIG")
+    if z:
+        return z
+    z = shutil.which("zig") or shutil.which("zig.exe")
+    if z:
+        return z
+    for cand in glob.glob(os.path.expanduser(
+            "~/AppData/Local/Microsoft/WinGet/Packages/zig.zig_*/"
+            "zig-x86_64-windows-*/zig.exe")):
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def app_inputs_digest(zig):
+    h = hashlib.sha256()
+    for p in APP_SRC:
+        with open(p, "rb") as f:
+            h.update(p.encode() + b"\0" + f.read() + b"\0")
+    try:
+        h.update(subprocess.check_output([zig, "version"]).strip())
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    h.update(open(MANIFEST, "rb").read())
+    return h.hexdigest()
+
+
+def build_app(stage, zig):
+    """Compile the player as a dynamic musl executable and verify that it is
+    one. Returns (path, interp, needed, size)."""
+    out = os.path.join(stage, "libexec", "vlcplayer")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    cmd = [zig, "cc", "-target", "x86_64-linux-musl", "-O2",
+           "-Isrc", "-Isrc/client", "-o", out] + APP_SRC + ["-lm", "-pthread"]
+    print("==> compiling %s" % out)
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        raise RuntimeError("zig cc failed with status %d" % r.returncode)
+    interp, needed = elf_info(out)
+    if not interp:
+        raise RuntimeError("the compiled player has no PT_INTERP: a static "
+                           "musl binary cannot dlopen libVLC")
+    if "libvlc" in " ".join(needed):
+        raise RuntimeError("the player is linked against libVLC; it must "
+                           "load it with dlopen so the package stays relocatable")
+    return out, interp, needed, os.path.getsize(out)
+
+
+def collect_libs(root):
+    """Every shared object under usr/lib, except the plugin subtree.
+
+    Returns {basename: absolute path}. A duplicate basename with different
+    bytes is a hard error: flattening two libraries into one name would
+    silently give one of them the other's DT_NEEDED.
+    """
+    libdir = os.path.join(root, "usr", "lib")
+    out = {}
+    for dirpath, _dirs, names in os.walk(libdir):
+        rel = os.path.relpath(dirpath, libdir)
+        if rel.split(os.sep)[0] == "vlc":
+            continue
+        for n in names:
+            if ".so" not in n:
+                continue
+            src = os.path.join(dirpath, n)
+            if not os.path.isfile(src):
+                continue
+            if n in out:
+                if sha256_file(src) != sha256_file(out[n]):
+                    raise RuntimeError("two libraries named %s with different "
+                                       "contents: %s and %s" % (n, out[n], src))
+                continue
+            out[n] = src
+    return out
+
+
+def plan_symlinks(libs):
+    """name -> target for identical copies that differ only by version suffix.
+
+    Our unpacker materialises Alpine symlinks as copies (Windows cannot make
+    them), so libvlc.so.5 and libvlc.so.5.6.1 both exist with the same bytes.
+    The package stores the longest name once and links the others to it, or
+    the install would be twice the size it needs to be.
+    """
+    links = {}
+    by_size = {}
+    for name, path in libs.items():
+        by_size.setdefault(os.path.getsize(path), []).append(name)
+    for size, names in by_size.items():
+        if len(names) < 2 or size == 0:
+            continue
+        groups = {}
+        for n in names:
+            groups.setdefault(sha256_file(libs[n]), []).append(n)
+        for _sha, group in groups.items():
+            if len(group) < 2:
+                continue
+            group.sort(key=lambda x: (-len(x), x))
+            target = group[0]
+            for n in group[1:]:
+                # only a real soname/version pair, not two unrelated libs
+                if target.startswith(n + "."):
+                    links[n] = target
+    return links
+
+
+def plugin_list(root, profile, plugins):
+    if plugins is not None:
+        return sorted(plugins)
+    base = os.path.join(root, "usr", "lib", "vlc", "plugins")
+    out = []
+    for dirpath, _dirs, names in os.walk(base):
+        for n in names:
+            if n.endswith(".so"):
+                out.append(os.path.relpath(os.path.join(dirpath, n), base))
+    return sorted(out)
+
+
+def build_stage(root, stage, profile, plugins, app_digest, zig):
+    """Create build/vlc-pkg and the tar entry list."""
+    if os.path.isdir(stage):
+        shutil.rmtree(stage)
+    os.makedirs(os.path.join(stage, "libexec"), exist_ok=True)
+    os.makedirs(os.path.join(stage, "lib"), exist_ok=True)
+
+    with open(MANIFEST, "r", encoding="utf-8") as f:
+        manifest = f.read()
+    with open(os.path.join(stage, "manifest"), "w", encoding="utf-8", newline="\n") as f:
+        f.write(manifest)
+    app, interp, needed, app_size = build_app(stage, zig)
+
+    libs = collect_libs(root)
+    links = plan_symlinks(libs)
+    entries = []
+    entries.append(("manifest", "file", os.path.join(stage, "manifest"), 0o644, ""))
+    entries.append(("bin", "symlink", None, 0o777, "libexec/vlcplayer"))
+    entries.append(("libexec/vlcplayer", "file", app, 0o755, ""))
+    for name in sorted(libs):
+        dst = os.path.join(stage, "lib", name)
+        if name in links:
+            entries.append(("lib/" + name, "symlink", None, 0o777, links[name]))
+        else:
+            shutil.copyfile(libs[name], dst)
+            os.chmod(dst, 0o644)
+            entries.append(("lib/" + name, "file", dst, 0o644, ""))
+
+    plist = plugin_list(root, profile, plugins)
+    base = os.path.join(root, "usr", "lib", "vlc", "plugins")
+    for rel in plist:
+        src = os.path.join(base, rel)
+        if not os.path.isfile(src):
+            raise RuntimeError("missing selected plugin: %s" % rel)
+        dst = os.path.join(stage, "lib", "vlc", "plugins", rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copyfile(src, dst)
+        os.chmod(dst, 0o644)
+        entries.append(("lib/vlc/plugins/" + rel, "file", dst, 0o644, ""))
+
+    # directories, so an empty lib/vlc tree still exists after unpack
+    dirs = set()
+    for arc, _kind, _src, _mode, _ln in entries:
+        parts = arc.split("/")[:-1]
+        for i in range(1, len(parts) + 1):
+            dirs.add("/".join(parts[:i]))
+    for d in sorted(dirs):
+        entries.append((d, "dir", None, 0o755, ""))
+    entries.sort(key=lambda e: (e[0], e[1]))
+
+    info = {
+        "profile": profile,
+        "app_digest": app_digest,
+        "plugins": plist,
+        "app_size": app_size,
+        "interp": interp,
+        "needed": needed,
+    }
+    write_json_atomic(os.path.join(stage, ".vlc-pkg.json"), info)
+    return entries, info
+
+
+def pack_tarball(entries, stage, out_path):
+    """Deterministic gzip tar: sorted entries, mtime 0, uid/gid 0, no names."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.GNU_FORMAT) as tf:
+        root = tarfile.TarInfo("./")
+        root.type = tarfile.DIRTYPE
+        root.mode = 0o755
+        root.mtime = 0
+        tf.addfile(root)
+        for arc, kind, src, mode, link in entries:
+            ti = tarfile.TarInfo("./" + arc)
+            ti.mtime = 0
+            ti.uid = ti.gid = 0
+            ti.uname = ti.gname = ""
+            ti.mode = mode
+            if kind == "dir":
+                ti.type = tarfile.DIRTYPE
+                tf.addfile(ti)
+            elif kind == "symlink":
+                ti.type = tarfile.SYMTYPE
+                ti.linkname = link
+                tf.addfile(ti)
+            else:
+                ti.type = tarfile.REGTYPE
+                ti.size = os.path.getsize(src)
+                with open(src, "rb") as f:
+                    tf.addfile(ti, f)
+    data = gzip.compress(buf.getvalue(), compresslevel=6, mtime=0)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    tmp = out_path + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, out_path)
+    return len(data)
+
+
+def upsert_index(tarball):
+    """Put the vlc row into build/repo/index.tsv and re-sign it if we can.
+
+    tools/serve-repo.sh rebuilds index.tsv from stage/usr/share/mystic/apps,
+    so a later run of that script will drop this row; the tarball stays. The
+    final report says so instead of implying the repository is permanent.
+    """
+    os.makedirs(REPO, exist_ok=True)
+    idx = os.path.join(REPO, "index.tsv")
+    rows = []
+    if os.path.isfile(idx):
+        with open(idx, "r", encoding="utf-8", newline="") as f:
+            for line in f.read().splitlines():
+                if not line.strip():
+                    continue
+                if line.split("\t", 1)[0] == PKG_NAME:
+                    continue
+                rows.append(line)
+    size = os.path.getsize(tarball)
+    sha = sha256_file(tarball)
+    desc = "libVLC video player: vmem output, real H.264/HEVC/VP9 decode"
+    rows.append("%s\t%s\t%d\t%s\t%s.tar.gz\t%s"
+                % (PKG_NAME, PKG_VERSION, size, sha, PKG_NAME, desc))
+    tmp = idx + ".part"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(rows) + "\n")
+    os.replace(tmp, idx)
+    with open(os.path.join(REPO, "vlc.row"), "w", encoding="utf-8", newline="\n") as f:
+        f.write(rows[-1] + "\n")
+
+    key = os.path.join("build", "sign", "repo.key")
+    pub = os.path.join("stage", "etc", "mystic", "repo.pub")
+    if os.path.isfile(key):
+        cmd = [sys.executable, os.path.join("tools", "sign-index.py"), "sign",
+               "--seed", key, "--in", idx]
+        if os.path.isfile(pub):
+            cmd += ["--pub", pub]
+        r = subprocess.run(cmd)
+        if r.returncode != 0:
+            print("warning: could not sign index.tsv", file=sys.stderr)
+        elif os.path.isfile(pub):
+            shutil.copyfile(pub, os.path.join(REPO, "index.pub"))
+    else:
+        print("    no build/sign/repo.key: index.tsv is UNSIGNED and pkg will "
+              "refuse it", file=sys.stderr)
+    return size, sha
+
+
 # ---------------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="resolve the libVLC closure "
-                                             "from the Alpine index")
-    ap.add_argument("--profile", default="full", choices=sorted(PROFILES),
-                    help="full (default) = what apk add vlc pulls; trim = libvlc"
-                         "+vmem+ffmpeg; minimal = libvlc+vmem, VLC decoders only")
+    ap = argparse.ArgumentParser(
+        description="build the libVLC vmem player package for Mystic OS")
+    ap.add_argument("--profile", default="playback", choices=sorted(PROFILES),
+                    help="playback (default) = local files + libavcodec; "
+                         "minimal = images/raw only; full = apk add vlc")
     ap.add_argument("--root", action="append", default=None,
                     help="extra package or so:name to add to the closure")
     ap.add_argument("--dest", default=DEST)
-    ap.add_argument("--download", action="store_true",
-                    help="actually download and unpack (default: dry run)")
+    ap.add_argument("--repo", default=REPO)
     ap.add_argument("--dry-run", action="store_true",
-                    help="the default, stated explicitly")
+                    help="resolve and print; download nothing beyond the "
+                         "two vlc packages needed to read DT_NEEDED")
+    ap.add_argument("--download", action="store_true",
+                    help="accepted for compatibility; the default builds")
+    ap.add_argument("--no-pack", action="store_true",
+                    help="build the root but do not create the package")
     ap.add_argument("--max-download-mb", type=float, default=300.0,
                     help="refuse a plan bigger than this (default 300)")
-    ap.add_argument("--force", action="store_true", help="download past the cap")
+    ap.add_argument("--force", action="store_true",
+                    help="ignore the root/package caches and the download cap")
+    ap.add_argument("--refresh-index", action="store_true",
+                    help="re-download the Alpine APKINDEX files")
     ap.add_argument("--list", action="store_true", help="print the whole closure")
     args = ap.parse_args()
 
-    download = args.download and not args.dry_run
     if not os.path.isdir("src"):
         print("error: run this from the repository root", file=sys.stderr)
         return 2
     os.makedirs(INDEX_CACHE, exist_ok=True)
 
-    pkgs, provides = build_world()
+    pkgs, provides = build_world(args.refresh_index)
     print("==> provides: %d" % len(provides))
     plugins = PROFILES[args.profile]
     extra = args.root or []
-    wanted = None          # files to take out of the vlc package, if not whole
+    wanted = None          # files to take out of the vlc package, if trimmed
     for bad in check_roots(pkgs, provides, extra):
         print("==> warning: --root %r is neither a package nor a provide in the index"
               % bad)
@@ -429,7 +942,7 @@ def main():
         plugin_files = None
     else:
         # The closure has to be derived from the plugin binaries, so the two
-        # small vlc packages are always needed - 7 MB, cached after the first
+        # small vlc packages are always needed - 6 MB, cached after the first
         # run. Say so out loud rather than hiding a download in a "dry" run.
         print("==> probing plugin DT_NEEDED: vlc + vlc-libs (%.2f MB of .apk, cached)"
               % ((pkgs["vlc"]["download"] + pkgs["vlc-libs"]["download"]) / 1e6))
@@ -437,22 +950,35 @@ def main():
             if not get_apk(pkgs, need, True):
                 print("error: could not fetch %s" % need, file=sys.stderr)
                 return 1
-        wanted = set(["usr/lib/vlc/plugins/" + p for p in plugins] + LIBVLC_FILES)  # noqa: E501
+        wanted = set(LIBVLC_FILES + ["usr/lib/vlc/plugins/" + p for p in plugins])
         # probe into the cache, not into --dest: a dry run must not populate the
         # tree it says it would build.
         probe = os.path.join(APK_CACHE, "_probe")
+        if os.path.isdir(probe):
+            shutil.rmtree(probe)
         for need in ("vlc", "vlc-libs"):
             unpack_apk(apk_path(pkgs, need), probe, members=wanted)
 
         needed = set()
-        for p in ["usr/lib/vlc/plugins/" + x for x in plugins] + ["usr/lib/libvlc.so.5.6.1"]:
-            f = os.path.join(probe, p)
+        missing_plugins = []
+        for p in plugins:
+            f = os.path.join(probe, "usr/lib/vlc/plugins", p)
             if not os.path.exists(f):
-                print("    MISSING in the package: %s" % p, file=sys.stderr)
+                missing_plugins.append(p)
                 continue
             for so in elf_needed(f):
                 if so != "libc.musl-x86_64.so.1":     # the base image has musl
                     needed.add("so:" + so)
+        for p in LIBVLC_FILES:
+            f = os.path.join(probe, p)
+            if os.path.exists(f):
+                for so in elf_needed(f):
+                    if so != "libc.musl-x86_64.so.1":
+                        needed.add("so:" + so)
+        if missing_plugins:
+            print("error: plugin files named by the profile are not in vlc.apk: %s"
+                  % ", ".join(missing_plugins), file=sys.stderr)
+            return 1
         print("==> DT_NEEDED of those files: %s" % ", ".join(sorted(needed)))
         closure, missing = resolve(pkgs, provides, sorted(needed) + extra)
         label = "profile %r (libvlc + %d plugins)" % (args.profile, len(plugins))
@@ -482,47 +1008,69 @@ def main():
         print("    Nothing else was downloaded. Re-run with --force to override.")
         return 0
 
-    if not download:
-        print("==> dry run: nothing further downloaded. --download fetches %.2f MB "
-              "into %s" % (dl / 1e6, args.dest))
+    if args.dry_run:
+        print("==> dry run: nothing further downloaded. Without --dry-run this "
+              "builds %s and %s/%s.tar.gz" % (args.dest, args.repo, PKG_NAME))
         return 0
 
-    # ---- download + unpack ----------------------------------------------
-    os.makedirs(APK_CACHE, exist_ok=True)
-    os.makedirs(args.dest, exist_ok=True)
-    got, size, files = 0, 0, []
-    for name in sorted(n for n in closure if n in pkgs):
-        path = get_apk(pkgs, name, True)
-        if not path:
-            continue
-        got += 1
-        size += os.path.getsize(path)
-        files.append((name, path))
-        if got % 25 == 0:
-            print("    %d/%d packages, %.1f MB" % (got, len(closure), size / 1e6))
-    print("==> downloaded %d packages, %.1f MB" % (got, size / 1e6))
+    stamp = root_signature(args.profile, closure, pkgs, plugins)
+    if not build_root(pkgs, closure, args.dest, args.profile, plugins, stamp,
+                      force=args.force):
+        return 1
 
-    written = fixed = 0
-    # the plugin files come from the vlc package, which is *not* a dependency of
-    # vlc-libs and therefore not in the closure - take just what we asked for.
-    if wanted is not None:
-        for need in ("vlc", "vlc-libs"):
-            w, f = unpack_apk(apk_path(pkgs, need), args.dest, members=wanted)
-            written += w
-            fixed += f
-    for _name, path in files:
-        w, f = unpack_apk(path, args.dest)
-        written += w
-        fixed += f
-    total, nfiles = tree_bytes(args.dest)
-    print("==> extracted to %s: %d files written, %.2f MB on disk, "
-          "%d symlinks copied" % (args.dest, nfiles, total / 1e6, fixed))
+    if args.no_pack:
+        print("==> --no-pack: %s left as the loose tree" % args.dest)
+        return 0
 
-    cachegen = os.path.join(args.dest, "usr/lib/vlc/vlc-cache-gen")
-    print("==> plugin cache: %s"
-          % ("vlc-cache-gen present - run it against usr/lib/vlc/plugins at image build"
-             if os.path.exists(cachegen) else
-             "vlc-cache-gen absent - libvlccore will scan the plugin directory"))
+    zig = find_zig()
+    if not zig:
+        print("error: zig not found (set ZIG or put zig on PATH); the player "
+              "cannot be compiled into the package", file=sys.stderr)
+        return 1
+    digest = app_inputs_digest(zig)
+    stage = PKG_STAGE
+    pkg_stamp_path = os.path.join("build", "vlc-pkg.stamp")
+    tarball = os.path.join(args.repo, PKG_NAME + ".tar.gz")
+    prev = read_json(pkg_stamp_path)
+    cache_hit = (not args.force and prev and prev.get("app_digest") == digest
+                 and prev.get("profile") == args.profile
+                 and os.path.isfile(tarball)
+                 and os.path.getsize(tarball) == prev.get("size")
+                 and sha256_file(tarball) == prev.get("sha256"))
+    if cache_hit:
+        print("==> package cache hit: %s is up to date" % tarball)
+        info = {"interp": prev.get("interp", "?"), "needed": prev.get("needed", []),
+                "app_size": prev.get("app_size", 0), "plugins": prev.get("plugins", [])}
+        size = prev["size"]
+        sha = prev["sha256"]
+        usize, ufiles = prev.get("installed", 0), prev.get("files", 0)
+    else:
+        try:
+            entries, info = build_stage(args.dest, stage, args.profile, plugins,
+                                        digest, zig)
+        except (RuntimeError, OSError) as e:
+            print("error: %s" % e, file=sys.stderr)
+            return 1
+        size = pack_tarball(entries, stage, tarball)
+        print("==> packed %s: %.2f MB, %d entries, %d libraries, %d plugins"
+              % (tarball, size / 1e6, len(entries) + 1,
+                 len(collect_libs(args.dest)), len(info["plugins"])))
+        sha = sha256_file(tarball)
+        usize, ufiles = tree_bytes(stage)
+        write_json_atomic(pkg_stamp_path, {
+            "app_digest": digest, "profile": args.profile,
+            "size": size, "sha256": sha, "interp": info["interp"],
+            "needed": info["needed"], "app_size": info["app_size"],
+            "plugins": info["plugins"], "installed": usize, "files": ufiles,
+        })
+    print("==> package: %s  %.2f MB compressed, %.2f MB installed, %d files"
+          % (tarball, size / 1e6, usize / 1e6, ufiles + 1))
+    print("    app: %d bytes, dynamic musl ELF, PT_INTERP %s"
+          % (info["app_size"], info["interp"]))
+    print("    app DT_NEEDED: %s" % (", ".join(info["needed"]) or "(none)"))
+    print("    libvlc.so.5 is dlopen()ed from lib/ (no -lvlc at build time)")
+    isz, isha = upsert_index(tarball)
+    print("    index row: %s %s %d %s..." % (PKG_NAME, PKG_VERSION, isz, isha[:16]))
     return 0
 
 

@@ -25,27 +25,28 @@
  *      WM_APP_DIR                     bundles (a subdir with a manifest) and
  *                                     the total size of every regular file
  *
- *  Layout: one grid, derived from the fonts at draw time - the same
- *  grid the other apps use.
+ *  LAYOUT - one card per topic, the same visual language as Monitor
+ *  (src/apps/monitor.c) and System Monitor (src/client/apps/sysmon.c):
  *
- *      lab_x   every label, every section heading, the memory bar's left end
- *      val_r   every value, right-aligned, and the memory bar's right end
- *      row_h   one fact row: a font line box plus ui_px(8) of air
- *      head_h  one section heading: font line box plus ui_px(10)
+ *      a rounded panel          the theme's panel fill and border
+ *      a title line             uppercase, accent, hairline underneath
+ *      label/value rows         every value ends on one column
+ *      no history strip        this panel is the static facts panel; it
+ *                              keeps no samples, so it draws no graph
  *
- *  A label is centred on its real ink box (ascent..descent) inside the
- *  row, so it stays centred at every text scale. Nothing here is a bare
- *  pixel height: the panel was built to survive the text-size setting,
- *  and the values all share one right edge because val_r is measured
- *  from the window edge, not from the longest string.
+ *  Cards flow into 1-3 columns of equal width, each new card under the
+ *  shortest column, so nothing overlaps at any window size. The grid is
+ *  measured from the real fonts (font_height/font_ascent) and ui_px(), so
+ *  the text scale changes the cards instead of breaking them. The recipe
+ *  is in the CARDS block below, copied byte for byte from monitor.c; the
+ *  copies exist because sysinfo/monitor are linked into the desktop while
+ *  sysmon is a separate client process built from src/client - a shared
+ *  header would have to be added to both build systems.
  *
- *  The list scrolls (wheel, j/k, arrows, PageUp/PageDown, Home/End)
- *  because the whole report does not fit in the 520x360 window the
- *  desktop opens it with - the window is not resized to fit the app.
- *  The scroll is clamped against the measured content height, and the
- *  rows are painted through a scissor surface that starts at the list's
- *  top, so a half-scrolled row is clipped instead of overwriting the
- *  header.
+ *  The report scrolls (wheel, j/k, arrows, PageUp/PageDown, Home/End)
+ *  because it does not fit the 520x360 window the desktop opens it with.
+ *  Rows are painted through a surface that starts at the list's top edge,
+ *  so a half-scrolled card is clipped instead of overwriting the footer.
  * ============================================================ */
 #include "mystic.h"
 
@@ -80,20 +81,195 @@
 #define SI_DISK "/root"
 #endif
 
-#define MAX_ROWS     48
+#define MAX_CARDS      8
+#define MAX_CARD_ROWS  8
 #define MAX_WALK_DEPTH 8
 #define MAX_WALK_FILES 4096
-#define FACTS_TTL    1.0     /* seconds a "does not change per frame" fact lives */
+#define FACTS_TTL      1.0     /* seconds a "does not change per frame" fact lives */
 
-/* ------------------------------------------------------------ rows */
-enum { R_HEAD, R_ROW, R_BAR };
+/* ------------------------------------------------------------
+ *  CARDS - one visual language for sysinfo, monitor and sysmon.
+ *
+ *  The frame, title, row and margin code below is identical in
+ *  src/apps/monitor.c; sysmon.c carries the same block plus the
+ *  sparkline painter. Change one and change all three.
+ * ------------------------------------------------------------ */
+typedef struct { float x, y, w, h; } CrdRect;
 
 typedef struct {
-    int   kind;
-    char  label[64];
-    char  value[160];
-    float frac;              /* R_BAR: filled fraction, 0..1 */
-} Row;
+    u32 panel, border, text, dim, accent, warn;
+    float corner;
+} CrdStyle;
+
+typedef struct {
+    float pad;        /* air between the card edge and its content      */
+    float gap;        /* air between bands, and between label and value */
+    float title_h;    /* the title line box (text centred inside)       */
+    float row_h;      /* one label/value row                            */
+    float line_h;     /* one single-line band: filter, column headings  */
+    float spark_h;    /* a history strip: legend line + plot            */
+} CrdMetrics;
+
+static float crd_ink(Font *f) { return font_height(f) / 1.4f; }
+static float crd_base(Font *f, float top, float band) {
+    return top + (band - crd_ink(f)) * 0.5f + font_ascent(f);
+}
+static float crd_top(Font *f, float base) { return base - font_ascent(f); }
+
+static CrdMetrics crd_metrics(Font *ft, Font *fr, Font *fs) {
+    CrdMetrics m;
+    m.pad     = (float)ui_px(10);
+    m.gap     = (float)ui_px(6);
+    m.title_h = font_height(ft) + (float)ui_px(6);
+    m.row_h   = font_height(fr) + (float)ui_px(6);
+    m.line_h  = font_height(fs) + (float)ui_px(4);
+    m.spark_h = font_height(fs) + (float)ui_px(4) + font_height(fs) * 1.6f;
+    return m;
+}
+
+/* Height of a card with `rows` rows and optionally a history strip. The
+ * painter never lays anything past this, so the rect always contains exactly
+ * the bands that were asked for. */
+static float crd_height(const CrdMetrics *m, int rows, int spark) {
+    float h = m->pad * 2.0f + m->title_h + m->gap + (float)rows * m->row_h;
+    if (spark) h += m->gap + m->spark_h;
+    return h;
+}
+
+/* Fit text into maxw with ".." when it has to be cut. The source is copied
+ * first, because callers pass the same buffer for label and destination and
+ * snprintf() with src == dst is undefined. */
+static void crd_fit(Font *f, const char *text, char *out, size_t cap, float maxw) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s", text ? text : "");
+    snprintf(out, cap, "%s", tmp);
+    if (maxw <= 0.0f) { out[0] = 0; return; }
+    if (font_width(f, out) <= maxw) return;
+    size_t n = strlen(tmp);
+    while (n > 0) {
+        n--;
+        snprintf(out, cap, "%.*s..", (int)n, tmp);
+        if (font_width(f, out) <= maxw) return;
+    }
+    out[0] = 0;
+}
+
+/* The two strings one row will draw, after the column fit. Both the pain and
+ * the layout test call this, so "it fits" is measured on the drawn strings. */
+static void crd_row_text(Font *fr, float inner_w, float gap,
+                         const char *label, const char *value,
+                         char *lb, size_t lcap, char *vb, size_t vcap) {
+    /* The value gets what the label does not need, with a floor at 40% so a
+     * long label can never squeeze a number down to nothing. Then the label
+     * is fitted into the remainder, which is what keeps the two apart. */
+    float lw = font_width(fr, label ? label : "");
+    float maxv = inner_w - lw - gap;
+    if (maxv < inner_w * 0.40f) maxv = inner_w * 0.40f;
+    if (maxv < 0.0f) maxv = 0.0f;
+    crd_fit(fr, value, vb, vcap, maxv);
+    float vw = vb[0] ? font_width(fr, vb) + gap : 0.0f;
+    crd_fit(fr, label, lb, lcap, inner_w - vw);
+}
+
+/* y of row i's band inside a card. */
+static float crd_row_y(const CrdRect *c, const CrdMetrics *m, int i) {
+    return c->y + m->pad + m->title_h + m->gap + (float)i * m->row_h;
+}
+
+/* The panel, its title and the hairline under the title. `meta` is optional
+ * right-aligned text on the title line (a count, or "delta over 0.42 s"); it
+ * is dropped rather than overlapped when the card is too narrow for both. */
+static void crd_begin(Surface *s, const CrdRect *c, const CrdMetrics *m,
+                      const CrdStyle *st, Font *ft,
+                      const char *title, const char *meta, int meta_warn) {
+    float r = st->corner;
+    float lim = (c->w < c->h ? c->w : c->h) * 0.5f;
+    if (r > lim) r = lim;
+    if (r < 0.0f) r = 0.0f;
+    gfx_rrect_aa(s, c->x, c->y, c->w, c->h, r, st->panel, st->border, 1.0f);
+    float base = crd_base(ft, c->y + m->pad, m->title_h);
+    font_draw(s, ft, c->x + m->pad, crd_top(ft, base), title,
+              color_alpha(st->accent, 0.92f));
+    if (meta && meta[0]) {
+        float mw = font_width(ft, meta);
+        if (mw + m->pad * 2.0f + font_width(ft, title) <= c->w)
+            font_draw(s, ft, c->x + c->w - m->pad - mw, crd_top(ft, base), meta,
+                      meta_warn ? color_alpha(st->warn, 0.95f)
+                                : color_alpha(st->text, 0.45f));
+    }
+    float ry = c->y + m->pad + m->title_h;
+    surf_blend(s, (int)(c->x + m->pad), (int)ry,
+               (int)(c->w - 2.0f * m->pad), 1, color_alpha(st->text, 0.10f));
+}
+
+/* One label/value row: label left, value right-aligned on the card's value
+ * column. Nothing is drawn longer than the row, and the label keeps at least
+ * a gap away from the value because crd_row_text() fits both to that. */
+static void crd_row(Surface *s, const CrdRect *c, const CrdMetrics *m,
+                    const CrdStyle *st, Font *fr, int i,
+                    const char *label, const char *value) {
+    float ys = crd_row_y(c, m, i);
+    float inner = c->w - 2.0f * m->pad;
+    char lb[128], vb[192];
+    crd_row_text(fr, inner, m->gap, label, value, lb, sizeof(lb), vb, sizeof(vb));
+    float base = crd_base(fr, ys, m->row_h);
+    font_draw(s, fr, c->x + m->pad, crd_top(fr, base), lb,
+              color_alpha(st->text, 0.62f));
+    if (vb[0])
+        font_draw(s, fr, c->x + c->w - m->pad - font_width(fr, vb),
+                  crd_top(fr, base), vb, st->text);
+}
+
+static CrdStyle crd_style(const Theme *th) {
+    CrdStyle st;
+    st.panel  = th->panel;
+    st.border = th->panel_border;
+    st.text   = th->text;
+    st.dim    = th->text_dim;
+    st.accent = th->accent;
+    st.warn   = RGB(0xE0, 0x6C, 0x5C);
+    st.corner = th->corner * 0.55f;
+    if (st.corner < 3.0f) st.corner = 3.0f;
+    return st;
+}
+
+/* ------------------------------------------------------------ report */
+typedef struct {
+    char label[64];
+    char value[160];
+} CardRowData;
+
+typedef struct {
+    const char *title;
+    CardRowData row[MAX_CARD_ROWS];
+    int nrows;
+} CardData;
+
+typedef struct {
+    CardData card[MAX_CARDS];
+    int n;
+} Report;
+
+typedef struct {
+    int   n, cols;
+    CrdRect card[MAX_CARDS];
+    float content_h;
+} CardGrid;
+
+static void card_row_add(CardData *c, const char *label, const char *value) {
+    if (c->nrows >= MAX_CARD_ROWS) return;
+    CardRowData *r = &c->row[c->nrows++];
+    snprintf(r->label, sizeof(r->label), "%s", label);
+    snprintf(r->value, sizeof(r->value), "%s", value);
+}
+
+static CardData *card_new(Report *rep, const char *title) {
+    if (rep->n >= MAX_CARDS) return NULL;
+    CardData *c = &rep->card[rep->n++];
+    memset(c, 0, sizeof(*c));
+    c->title = title;
+    return c;
+}
 
 /* Things that do not change from frame to frame, so they are read once a
  * second instead of sixty times - a recursive directory walk per frame on a
@@ -102,7 +278,7 @@ typedef struct {
     char  kernel[64];   int kernel_ok;
     char  host[64];     int host_ok;
     char  cpu[96];      int cpu_ok;
-    int   cores;        int cores_ok;
+    int   cores;
     char  fs_dev[64];
     char  fs_type[32];
     char  fs_mnt[64];   int fs_ok;
@@ -116,9 +292,9 @@ typedef struct {
 
 typedef struct {
     int   w, h;
-    float scroll;        /* pixels the list is scrolled down from the top */
+    float scroll;        /* pixels the cards are scrolled up from the top  */
     float view_h;        /* list viewport, measured by the last draw       */
-    float content_h;     /* total height of every row, measured there too  */
+    float content_h;     /* total height of the card grid, measured there  */
     float row_h;         /* one fact row, for the wheel and the keys       */
     Facts facts;
 } SysInfo;
@@ -150,21 +326,6 @@ static void trim_left(char *s) {
     char *p = s;
     while (*p == ' ' || *p == '\t') p++;
     if (p != s) memmove(s, p, strlen(p) + 1);
-}
-
-/* Trim a name so it fits a column, with ".." when it had to be cut: the value
- * column only has so much room and a path may not overrun the label. */
-static void fit_text(Font *f, const char *src, char *out, size_t cap, float maxw) {
-    snprintf(out, cap, "%s", src ? src : "");
-    if (maxw <= 0.0f) { out[0] = 0; return; }
-    if (font_width(f, out) <= maxw) return;
-    size_t n = strlen(src ? src : "");
-    while (n > 0) {
-        n--;
-        snprintf(out, cap, "%.*s..", (int)n, src);
-        if (font_width(f, out) <= maxw) return;
-    }
-    out[0] = 0;
 }
 
 /* ------------------------------------------------------------ formatting */
@@ -200,9 +361,9 @@ static void fmt_uptime(char *out, size_t cap, double secs) {
     long hh = s / 3600; s %= 3600;
     long mm = s / 60;
     long ss = s % 60;
-    if (d > 0)      snprintf(out, cap, "%ldd %02ldh %02ldm", d, hh, mm);
+    if (d > 0)       snprintf(out, cap, "%ldd %02ldh %02ldm", d, hh, mm);
     else if (hh > 0) snprintf(out, cap, "%ldh %02ldm %02lds", hh, mm, ss);
-    else            snprintf(out, cap, "%ldm %02lds", mm, ss);
+    else             snprintf(out, cap, "%ldm %02lds", mm, ss);
 }
 
 /* ------------------------------------------------------------ /proc readers */
@@ -421,236 +582,183 @@ static void facts_read(Facts *f) {
     f->at = mono_now();
 }
 
-/* Only the cheap half is re-read per frame; the rest lives for one second. */
+/* Only the "does not change per frame" half is re-read once a second. */
 static void facts_refresh(Facts *f, int force) {
     double now = mono_now();
     if (!force && f->at > 0.0 && now >= f->at && now - f->at < FACTS_TTL) return;
     facts_read(f);
 }
 
-/* ------------------------------------------------------------ geometry */
+/* ------------------------------------------------------------ report builder */
 
-/* font_draw() takes y as the ascender line and puts the baseline font_ascent()
- * below it (src/font.c:229); ascent+descent is the nominal size while
- * font_height() is size*1.4, so the ink box is font_height/1.4 tall. Centring
- * that box - not font_height() - is what keeps a label in the middle of its row
- * at every text scale. */
-static float ink_h(Font *f) { return font_height(f) / 1.4f; }
-static float base_y(Font *f, float top, float band) {
-    return top + (band - ink_h(f)) * 0.5f + font_ascent(f);
-}
-static float top_y(Font *f, float base) { return base - font_ascent(f); }
-
-typedef struct {
-    float m, gap;        /* margins */
-    float top;           /* list top, inside the window */
-    float row_h;         /* one fact row */
-    float head_h;        /* one section heading */
-    float bar_h;         /* memory bar thickness */
-    float foot_h;        /* legend band at the bottom */
-    float lab_x, val_r;  /* the two columns */
-} Geo;
-
-static Geo geo_of(int x, int w, Font *fh, Font *fr, Font *fd) {
-    Geo g;
-    g.m      = (float)ui_px(12);
-    g.gap    = (float)ui_px(8);
-    g.top    = (float)ui_px(8);
-    g.row_h  = font_height(fr) + (float)ui_px(8);
-    g.head_h = font_height(fh) + (float)ui_px(10);
-    g.bar_h  = font_height(fr) * 0.45f;
-    if (g.bar_h < 3.0f) g.bar_h = 3.0f;
-    g.foot_h = font_height(fd) + (float)ui_px(6);
-    g.lab_x  = (float)x + g.m;
-    g.val_r  = (float)(x + w) - g.m - font_width(fd, "  ");   /* room for the bar */
-    return g;
-}
-
-/* Row height, one place for the painter and the measure pass. */
-static float row_height(const Geo *g, const Row *r) {
-    switch (r->kind) {
-        case R_HEAD: return g->head_h;
-        case R_BAR:  return g->bar_h + (float)ui_px(10);
-        default:     return g->row_h;
-    }
-}
-
-/* One fact row: label on the left column, value ending on the right one.
- * A value never takes more than half the row, so the label stays readable in
- * the smallest window; the label gets whatever is left. */
-static void draw_row(Surface *s, Font *fr, const Geo *g,
-                     float ry, const char *label, const char *value,
-                     u32 lc, u32 vc) {
-    char raw[192], vb[192], nb[192];
-    float vw = 0.0f;
-    /* fit from a separate buffer: snprintf() with src == dst is undefined, and
-     * fit_text() formats into the destination it was given */
-    snprintf(raw, sizeof(raw), "%s", value ? value : "");
-    vb[0] = 0;
-    if (raw[0]) {
-        fit_text(fr, raw, vb, sizeof(vb), (g->val_r - g->lab_x) * 0.55f);
-        if (vb[0]) vw = font_width(fr, vb) + g->gap;
-    }
-    fit_text(fr, label, nb, sizeof(nb), g->val_r - vw - g->lab_x);
-    float base = base_y(fr, ry, g->row_h);
-    font_draw(s, fr, g->lab_x, top_y(fr, base), nb, lc);
-    if (vb[0])
-        font_draw(s, fr, g->val_r - font_width(fr, vb), top_y(fr, base), vb, vc);
-}
-
-/* A section heading: small caps in the accent, on its own taller band, with a
- * hairline under it that runs from the label column to the value column. */
-static void draw_head(Surface *s, Font *fd, const Geo *g, float ry, const char *text,
-                      const Theme *th) {
-    char nb[96];
-    fit_text(fd, text, nb, sizeof(nb), g->val_r - g->lab_x);
-    float base = base_y(fd, ry, g->head_h);
-    font_draw(s, fd, g->lab_x, top_y(fd, base), nb, color_alpha(th->accent, 0.85f));
-    float line_y = ry + g->head_h - 1.0f;
-    gfx_line(s, g->lab_x, line_y, g->val_r, line_y, 1.0f, color_alpha(th->text, 0.12f));
-}
-
-/* ------------------------------------------------------------ row builder */
-
-static void add_head(Row *rows, int *n, const char *label) {
-    if (*n >= MAX_ROWS) return;
-    Row *r = &rows[(*n)++];
-    memset(r, 0, sizeof(*r));
-    r->kind = R_HEAD;
-    snprintf(r->label, sizeof(r->label), "%s", label);
-}
-
-static void add_row(Row *rows, int *n, const char *label, const char *value) {
-    if (*n >= MAX_ROWS) return;
-    Row *r = &rows[(*n)++];
-    memset(r, 0, sizeof(*r));
-    r->kind = R_ROW;
-    snprintf(r->label, sizeof(r->label), "%s", label);
-    snprintf(r->value, sizeof(r->value), "%s", value);
-}
-
-static void add_bar(Row *rows, int *n, float frac) {
-    if (*n >= MAX_ROWS) return;
-    Row *r = &rows[(*n)++];
-    memset(r, 0, sizeof(*r));
-    r->kind = R_BAR;
-    if (frac < 0.0f) frac = 0.0f;
-    if (frac > 1.0f) frac = 1.0f;
-    r->frac = frac;
-}
-
-/* Build the report. Everything volatile is read here, on this frame. */
-static void build_rows(Row *rows, int *n, const Facts *f) {
-    *n = 0;
+/* Build the cards. Everything volatile is read here, on this frame. */
+static void report_build(Report *rep, const Facts *f) {
+    memset(rep, 0, sizeof(*rep));
     char v[160], a[64], b[64];
     long online = sysconf(_SC_NPROCESSORS_ONLN);
 
-    add_head(rows, n, "SYSTEM");
-    add_row(rows, n, "Kernel", f->kernel);
-    add_row(rows, n, "Host", f->host);
-    double up = -1.0;
-    if (uptime_read(&up) != 0) up = -1.0;
-    fmt_uptime(v, sizeof(v), up);
-    add_row(rows, n, "Uptime", v);
-
-    add_head(rows, n, "CPU");
-    add_row(rows, n, "Processor", f->cpu);
-    if (f->cores <= 0)
-        snprintf(v, sizeof(v), "unreadable");
-    else if (online > 0)
-        snprintf(v, sizeof(v), "%d logical, %ld online", f->cores, online);
-    else
-        /* sysconf() failed: the logical count is still a real reading, the
-         * online count is not, so it is reported as missing rather than copied
-         * from the logical count. */
-        snprintf(v, sizeof(v), "%d logical, online unreadable", f->cores);
-    add_row(rows, n, "Cores", v);
-    double l1, l5, l15;
-    int run = -1, threads = -1;
-    if (loadavg_read(&l1, &l5, &l15, &run, &threads) == 0)
-        snprintf(v, sizeof(v), "%.2f  %.2f  %.2f", l1, l5, l15);
-    else
-        snprintf(v, sizeof(v), "unreadable");
-    add_row(rows, n, "Load 1/5/15", v);
-    if (run >= 0 && threads >= 0)
-        snprintf(v, sizeof(v), "%d running, %d threads", run, threads);
-    else
-        snprintf(v, sizeof(v), "unreadable");
-    add_row(rows, n, "Tasks", v);
-
-    add_head(rows, n, "MEMORY");
-    Mem m;
-    mem_read(&m);
-    long used = (m.ok & (MEM_TOTAL | MEM_AVAIL)) ? m.total - m.avail : -1;
-    if (used < 0) used = -1;
-    if (used >= 0) {
-        fmt_kb(a, sizeof(a), used);
-        fmt_kb(b, sizeof(b), m.total);
-        snprintf(v, sizeof(v), "%s of %s", a, b);
-    } else {
-        snprintf(v, sizeof(v), "unreadable");
-    }
-    add_row(rows, n, "In use", v);
-    add_bar(rows, n, (m.ok & MEM_TOTAL) && m.total > 0 && used >= 0
-                          ? (float)used / (float)m.total : 0.0f);
-    if (m.ok & MEM_FREE) fmt_kb(v, sizeof(v), m.free_kb); else snprintf(v, sizeof(v), "unreadable");
-    add_row(rows, n, "Free", v);
-    if (m.ok & MEM_AVAIL) fmt_kb(v, sizeof(v), m.avail); else snprintf(v, sizeof(v), "unreadable");
-    add_row(rows, n, "Available", v);
-    if (m.ok & MEM_CACHED) fmt_kb(v, sizeof(v), m.cached); else snprintf(v, sizeof(v), "unreadable");
-    add_row(rows, n, "Cached", v);
-    if ((m.ok & (MEM_SWAP | MEM_SWAP_FREE)) != (MEM_SWAP | MEM_SWAP_FREE))
-        snprintf(v, sizeof(v), "unreadable");
-    else if (m.swap_total <= 0) snprintf(v, sizeof(v), "none");
-    else {
-        long swap_used = m.swap_total - m.swap_free;
-        if (swap_used < 0) swap_used = 0;
-        fmt_kb(a, sizeof(a), swap_used);
-        fmt_kb(b, sizeof(b), m.swap_total);
-        snprintf(v, sizeof(v), "%s of %s", a, b);
-    }
-    add_row(rows, n, "Swap", v);
-
-    add_head(rows, n, "STORAGE");
-    add_row(rows, n, "Mount", f->fs_mnt);
-    add_row(rows, n, "Device", f->fs_dev);
-    add_row(rows, n, "Filesystem", f->fs_type);
-    struct statvfs vfs;
-    int vfs_ok = statvfs(SI_DISK, &vfs) == 0;
-    unsigned long long frs = vfs_ok ? (unsigned long long)vfs.f_frsize : 0;
-    if (vfs_ok && frs == 0) frs = (unsigned long long)vfs.f_bsize;
-    if (vfs_ok && frs > 0) {
-        unsigned long long total = (unsigned long long)vfs.f_blocks * frs;
-        unsigned long long freeb = (unsigned long long)vfs.f_bfree * frs;
-        unsigned long long usedb = total > freeb ? total - freeb : 0;
-        fmt_bytes(a, sizeof(a), usedb);
-        fmt_bytes(b, sizeof(b), total);
-        int pct = total ? (int)(usedb * 100ULL / total) : 0;
-        snprintf(v, sizeof(v), "%s of %s (%d%%)", a, b, pct);
-        add_row(rows, n, "Disk used", v);
-        fmt_bytes(v, sizeof(v), (unsigned long long)vfs.f_bavail * frs);
-        add_row(rows, n, "Disk free", v);
-    } else {
-        add_row(rows, n, "Disk used", "unreadable");
-        add_row(rows, n, "Disk free", "unreadable");
+    CardData *c = card_new(rep, "SYSTEM");
+    if (c) {
+        card_row_add(c, "Host", f->host);
+        card_row_add(c, "Kernel", f->kernel);
+        double up = -1.0;
+        if (uptime_read(&up) != 0) up = -1.0;
+        fmt_uptime(v, sizeof(v), up);
+        card_row_add(c, "Uptime", v);
+        card_row_add(c, "Framebuffer", f->fb);
     }
 
-    add_head(rows, n, "DISPLAY");
-    add_row(rows, n, "Framebuffer", f->fb);
-
-    add_head(rows, n, "PACKAGES");
-    add_row(rows, n, "Root", f->apps_root);
-    if (f->bundles_ok) snprintf(v, sizeof(v), "%d", f->bundles);
-    else               snprintf(v, sizeof(v), "unreadable");
-    add_row(rows, n, "Bundles", v);
-    if (f->apps_ok) {
-        fmt_bytes(v, sizeof(v), f->apps_bytes);
-        snprintf(a, sizeof(a), "%s", v);
-        snprintf(v, sizeof(v), "%s (%d files)", a, f->apps_files);
-    } else {
-        snprintf(v, sizeof(v), "unreadable");
+    c = card_new(rep, "CPU");
+    if (c) {
+        card_row_add(c, "Processor", f->cpu);
+        if (f->cores <= 0)
+            snprintf(v, sizeof(v), "unreadable");
+        else if (online > 0)
+            snprintf(v, sizeof(v), "%d logical, %ld online", f->cores, online);
+        else
+            /* sysconf() failed: the logical count is still a real reading, the
+             * online count is not, so it is reported as missing rather than copied
+             * from the logical count. */
+            snprintf(v, sizeof(v), "%d logical, online unreadable", f->cores);
+        card_row_add(c, "Cores", v);
+        double l1, l5, l15;
+        int run = -1, threads = -1;
+        if (loadavg_read(&l1, &l5, &l15, &run, &threads) == 0)
+            snprintf(v, sizeof(v), "%.2f  %.2f  %.2f", l1, l5, l15);
+        else
+            snprintf(v, sizeof(v), "unreadable");
+        card_row_add(c, "Load 1/5/15", v);
+        if (run >= 0 && threads >= 0)
+            snprintf(v, sizeof(v), "%d running, %d threads", run, threads);
+        else
+            snprintf(v, sizeof(v), "unreadable");
+        card_row_add(c, "Tasks", v);
     }
-    add_row(rows, n, "Size", v);
+
+    c = card_new(rep, "MEMORY");
+    if (c) {
+        Mem m;
+        mem_read(&m);
+        long used = (m.ok & (MEM_TOTAL | MEM_AVAIL)) ? m.total - m.avail : -1;
+        if (used < 0) used = -1;
+        if (used >= 0) {
+            fmt_kb(a, sizeof(a), used);
+            fmt_kb(b, sizeof(b), m.total);
+            snprintf(v, sizeof(v), "%s of %s", a, b);
+        } else {
+            snprintf(v, sizeof(v), "unreadable");
+        }
+        card_row_add(c, "In use", v);
+        if (m.ok & MEM_FREE) fmt_kb(v, sizeof(v), m.free_kb); else snprintf(v, sizeof(v), "unreadable");
+        card_row_add(c, "Free", v);
+        if (m.ok & MEM_AVAIL) fmt_kb(v, sizeof(v), m.avail); else snprintf(v, sizeof(v), "unreadable");
+        card_row_add(c, "Available", v);
+        if (m.ok & MEM_CACHED) fmt_kb(v, sizeof(v), m.cached); else snprintf(v, sizeof(v), "unreadable");
+        card_row_add(c, "Cached", v);
+        if ((m.ok & (MEM_SWAP | MEM_SWAP_FREE)) != (MEM_SWAP | MEM_SWAP_FREE))
+            snprintf(v, sizeof(v), "unreadable");
+        else if (m.swap_total <= 0) snprintf(v, sizeof(v), "none");
+        else {
+            long swap_used = m.swap_total - m.swap_free;
+            if (swap_used < 0) swap_used = 0;
+            fmt_kb(a, sizeof(a), swap_used);
+            fmt_kb(b, sizeof(b), m.swap_total);
+            snprintf(v, sizeof(v), "%s of %s", a, b);
+        }
+        card_row_add(c, "Swap", v);
+    }
+
+    c = card_new(rep, "STORAGE");
+    if (c) {
+        card_row_add(c, "Mount", f->fs_mnt);
+        card_row_add(c, "Device", f->fs_dev);
+        card_row_add(c, "Filesystem", f->fs_type);
+        struct statvfs vfs;
+        int vfs_ok = statvfs(SI_DISK, &vfs) == 0;
+        unsigned long long frs = vfs_ok ? (unsigned long long)vfs.f_frsize : 0;
+        if (vfs_ok && frs == 0) frs = (unsigned long long)vfs.f_bsize;
+        if (vfs_ok && frs > 0) {
+            unsigned long long total = (unsigned long long)vfs.f_blocks * frs;
+            unsigned long long freeb = (unsigned long long)vfs.f_bfree * frs;
+            unsigned long long usedb = total > freeb ? total - freeb : 0;
+            fmt_bytes(a, sizeof(a), usedb);
+            fmt_bytes(b, sizeof(b), total);
+            int pct = total ? (int)(usedb * 100ULL / total) : 0;
+            snprintf(v, sizeof(v), "%s / %s (%d%%)", a, b, pct);
+            card_row_add(c, "Used", v);
+            fmt_bytes(v, sizeof(v), (unsigned long long)vfs.f_bavail * frs);
+            card_row_add(c, "Free", v);
+        } else {
+            card_row_add(c, "Used", "unreadable");
+            card_row_add(c, "Free", "unreadable");
+        }
+    }
+
+    c = card_new(rep, "PACKAGES");
+    if (c) {
+        card_row_add(c, "Root", f->apps_root);
+        if (f->bundles_ok) snprintf(v, sizeof(v), "%d", f->bundles);
+        else               snprintf(v, sizeof(v), "unreadable");
+        card_row_add(c, "Bundles", v);
+        if (f->apps_ok) {
+            fmt_bytes(v, sizeof(v), f->apps_bytes);
+            snprintf(a, sizeof(a), "%s", v);
+            snprintf(v, sizeof(v), "%s (%d files)", a, f->apps_files);
+        } else {
+            snprintf(v, sizeof(v), "unreadable");
+        }
+        card_row_add(c, "Size", v);
+    }
+}
+
+/* ------------------------------------------------------------ card grid */
+
+/* Cards flow into columns: 1 on a narrow window, up to 3 when the width can
+ * hold three cards at a readable width. Each card goes under the shortest
+ * column, which is what keeps the grid balanced - and, because a card is only
+ * ever placed below the last one in its column, is what makes overlap
+ * impossible by construction.
+ *
+ * Coordinates are window-local: x starts at the margin, the first card's top
+ * is the top margin. content_h includes the bottom margin. */
+static CardGrid card_grid(int w, int h, const CrdMetrics *m,
+                          const int *rows, int n) {
+    CardGrid g;
+    memset(&g, 0, sizeof(g));
+    (void)h;
+    float margin = (float)ui_px(10);
+    float gap = (float)ui_px(10);
+    int cols = (int)(((float)w - 2.0f * margin + gap) / ((float)ui_px(240) + gap));
+    if (cols < 1) cols = 1;
+    if (cols > 3) cols = 3;
+    if (n > 0 && cols > n) cols = n;
+    float colw = ((float)w - 2.0f * margin - (float)(cols - 1) * gap) / (float)cols;
+    if (colw < 1.0f) colw = 1.0f;
+    g.cols = cols;
+    g.n = n;
+    float col_y[3] = { margin, margin, margin };
+    float maxy = margin;
+    for (int i = 0; i < n; i++) {
+        int ci = 0;
+        for (int k = 1; k < cols; k++) if (col_y[k] < col_y[ci]) ci = k;
+        float ch = crd_height(m, rows[i], 0);
+        g.card[i].x = margin + (float)ci * (colw + gap);
+        g.card[i].y = col_y[ci];
+        g.card[i].w = colw;
+        g.card[i].h = ch;
+        col_y[ci] += ch + gap;
+        if (col_y[ci] - gap > maxy) maxy = col_y[ci] - gap;
+    }
+    g.content_h = maxy + margin;
+    return g;
+}
+
+/* The footer is only reserved when a card row still fits above it: in a very
+ * short window the cards get the space instead of an empty strip. */
+static float foot_height(const CrdMetrics *m, Font *fd, int h) {
+    float fh = font_height(fd) + (float)ui_px(6);
+    if ((float)h - 2.0f * (float)ui_px(10) - fh < crd_height(m, 1, 0)) return 0.0f;
+    return fh;
 }
 
 /* ------------------------------------------------------------ AppVT */
@@ -686,33 +794,30 @@ static void sysinfo_draw(App *a, Surface *s, int x, int y, int w, int h, const T
     st->w = w;
     st->h = h;
 
-    Font *fh = font_get(FONT_MEDIUM, 13);
-    Font *fr = font_get(FONT_REGULAR, 11);
-    Font *fd = font_get(FONT_REGULAR, 10);
-    if (!fh || !fr || !fd) return;
+    Font *ft = font_get(FONT_MEDIUM, 11);   /* card title   */
+    Font *fr = font_get(FONT_REGULAR, 11);  /* label/value  */
+    Font *fd = font_get(FONT_REGULAR, 10);  /* footer       */
+    if (!ft || !fr || !fd) return;
 
     facts_refresh(&st->facts, 0);
+    Report rep;
+    report_build(&rep, &st->facts);
+    if (rep.n < 1) return;
 
-    Row rows[MAX_ROWS];
-    int n = 0;
-    build_rows(rows, &n, &st->facts);
-
-    const Geo g = geo_of(x, w, fh, fr, fd);
-
-    /* One measure pass; the scroll clamp, the painter and the key handler all
-     * read these numbers, so none of them can disagree about the content. The
-     * legend band is only reserved when a row still fits above it - in a very
-     * short window the list gets the space instead of an empty strip. */
-    float total = 0.0f;
-    for (int i = 0; i < n; i++) total += row_height(&g, &rows[i]);
-    int foot_ok = (float)h - g.top - g.foot_h >= g.row_h;
-    float view_h = (float)h - g.top - (foot_ok ? g.foot_h : 0.0f);
+    const CrdMetrics m = crd_metrics(ft, fr, fd);
+    const CrdStyle sty = crd_style(th);
+    const float foot_h = foot_height(&m, fd, h);
+    float view_h = (float)h - foot_h;
     if (view_h < 0.0f) view_h = 0.0f;
-    st->content_h = total;
-    st->view_h = view_h;
-    st->row_h = g.row_h;
 
-    float max_scroll = total - view_h;
+    int rows[MAX_CARDS];
+    for (int i = 0; i < rep.n && i < MAX_CARDS; i++) rows[i] = rep.card[i].nrows;
+    CardGrid g = card_grid(w, h, &m, rows, rep.n);
+    st->content_h = g.content_h;
+    st->view_h = view_h;
+    st->row_h = m.row_h;
+
+    float max_scroll = g.content_h - view_h;
     if (max_scroll < 0.0f) max_scroll = 0.0f;
     if (st->scroll > max_scroll) st->scroll = max_scroll;
     if (st->scroll < 0.0f) st->scroll = 0.0f;
@@ -720,80 +825,62 @@ static void sysinfo_draw(App *a, Surface *s, int x, int y, int w, int h, const T
     Surface clip = rect_clip(s, x, y, w, h);
     s = &clip;
 
-    /* The list is its own surface whose first row of pixels is the list's top
-     * edge: every draw below is in list coordinates, so a row that is half
-     * scrolled out is clipped by the surface's own bounds instead of painting
-     * over the header. */
+    /* The card surface's first pixel row is the list's top edge: cards are
+     * drawn with y relative to it, so a half-scrolled card is clipped by the
+     * surface bounds instead of painting over the footer. */
     Surface list = clip;
-    int list_top = y + (int)(g.top + 0.5f);
+    int list_top = y;
     int list_h = (int)(view_h + 0.5f);
     if (list_h < 0) list_h = 0;
     if (list_h > 0 && list_top >= 0 && list_top < clip.h) {
         list.px = clip.px + (size_t)list_top * clip.stride;
         list.h = list_h < clip.h - list_top ? list_h : clip.h - list_top;
+        list.cx0 = list.cy0 = list.cx1 = list.cy1 = 0;   /* bounds are the clip */
     } else {
         list.h = 0;
     }
 
-    float ry = -st->scroll;
-    for (int i = 0; i < n && list.h > 0; i++) {
-        Row *r = &rows[i];
-        float rh = row_height(&g, r);
-        if (ry + rh >= 0.0f && ry <= (float)list.h) {
-            switch (r->kind) {
-                case R_HEAD:
-                    draw_head(&list, fd, &g, ry, r->label, th);
-                    break;
-                case R_ROW:
-                    draw_row(&list, fr, &g, ry, r->label, r->value,
-                             color_alpha(th->text, 0.85f),
-                             color_alpha(th->text, 0.55f));
-                    break;
-                case R_BAR: {
-                    float by = ry + (row_height(&g, r) - g.bar_h) * 0.5f;
-                    float bw = g.val_r - g.lab_x;
-                    if (bw > 1.0f) {
-                        gfx_rrect_aa(&list, g.lab_x, by, bw, g.bar_h, g.bar_h * 0.5f,
-                                     color_alpha(th->text, 0.10f), 0, 0);
-                        if (r->frac > 0.005f)
-                            gfx_rrect_aa(&list, g.lab_x, by, bw * r->frac, g.bar_h,
-                                         g.bar_h * 0.5f, th->accent, 0, 0);
-                    }
-                    break;
-                }
-                default:
-                    break;
-            }
-        }
-        ry += rh;
+    for (int i = 0; i < g.n; i++) {
+        CrdRect c = g.card[i];
+        c.x += (float)x;
+        c.y -= st->scroll;
+        if (c.y > (float)list.h || c.y + c.h < 0.0f) continue;
+        crd_begin(&list, &c, &m, &sty, ft, rep.card[i].title, NULL, 0);
+        for (int r = 0; r < rep.card[i].nrows; r++)
+            crd_row(&list, &c, &m, &sty, fr, r,
+                    rep.card[i].row[r].label, rep.card[i].row[r].value);
     }
 
     /* Scroll indicator: where the view is inside the content, on the window's
-     * own right edge (outside val_r, so it never touches a value). */
-    if (total > view_h + 0.5f && view_h > 1.0f) {
+     * own right edge (outside the cards, so it never touches a value). */
+    if (g.content_h > view_h + 0.5f && view_h > 1.0f) {
         float bar_w = (float)ui_px(3);
-        float track_x = (float)(x + w) - (float)g.m * 0.5f;
-        float track_h = view_h;
-        float thumb_h = track_h * (view_h / total);
-        if (thumb_h < ui_px(18)) thumb_h = (float)ui_px(18);
-        if (thumb_h > track_h) thumb_h = track_h;
-        float thumb_y = y + g.top + (track_h - thumb_h) * (st->scroll / (total - view_h));
-        surf_blend(s, (int)track_x, (int)(y + g.top), (int)bar_w, (int)track_h,
-                   color_alpha(th->text, 0.08f));
-        surf_blend(s, (int)track_x, (int)thumb_y, (int)bar_w, (int)thumb_h,
-                   color_alpha(th->accent, 0.75f));
+        float track_x = (float)(x + w) - (float)ui_px(4);
+        float track_h = view_h - (float)ui_px(10);
+        if (track_h > 4.0f) {
+            float thumb_h = track_h * (view_h / g.content_h);
+            if (thumb_h < (float)ui_px(18)) thumb_h = (float)ui_px(18);
+            if (thumb_h > track_h) thumb_h = track_h;
+            float thumb_y = (float)y + (float)ui_px(5) +
+                            (track_h - thumb_h) * (st->scroll / (g.content_h - view_h));
+            surf_blend(s, (int)track_x, y + ui_px(5), (int)bar_w, (int)track_h,
+                       color_alpha(th->text, 0.08f));
+            surf_blend(s, (int)track_x, (int)thumb_y, (int)bar_w, (int)thumb_h,
+                       color_alpha(th->accent, 0.75f));
+        }
     }
 
-    /* Footer: what the keys do, and where these numbers come from. It lives on
-     * the window, not in the list, so it is never scrolled away. */
-    if (foot_ok) {
-        char legend[160];
-        snprintf(legend, sizeof(legend), "wheel / j k / PgUp PgDn scroll - r rereads /proc");
-        char nb[160];
-        fit_text(fd, legend, nb, sizeof(nb), (float)w - g.m * 2.0f);
-        float ly = (float)(y + h) - g.foot_h;
-        surf_blend(s, x, (int)ly, w, (int)g.foot_h, color_alpha(th->text, 0.05f));
-        font_draw(s, fd, g.lab_x, top_y(fd, base_y(fd, ly, g.foot_h)), nb,
+    /* Footer: what the keys do, and where these numbers come from. It lives
+     * on the window, not in the scrolled list, so it is never scrolled away. */
+    if (foot_h > 0.0f) {
+        char legend[160], nb[160];
+        snprintf(legend, sizeof(legend),
+                 "wheel / j k / PgUp PgDn scroll    r rereads /proc");
+        crd_fit(fd, legend, nb, sizeof(nb), (float)w - 2.0f * (float)ui_px(12));
+        float ly = (float)(y + h) - foot_h;
+        surf_blend(s, x, (int)ly, w, (int)foot_h, color_alpha(th->text, 0.05f));
+        font_draw(s, fd, (float)x + (float)ui_px(12),
+                  crd_top(fd, crd_base(fd, ly, foot_h)), nb,
                   color_alpha(th->text, 0.45f));
     }
 }

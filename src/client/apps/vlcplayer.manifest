@@ -1,0 +1,4 @@
+name = Video
+desc = libVLC video player: vmem output, real H.264/HEVC/VP9/AAC decode
+exec = bin
+version = 3.0.23

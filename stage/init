@@ -43,8 +43,22 @@ load_modules() {
     depmod -a "$KV" 2>/dev/null
     for m in drm drm_kms_helper ttm drm_ttm_helper drm_vram_helper \
              drm_shmem_helper drm_client_lib fb_sys_fops sysimgblt sysfillrect \
-             bochs virtio-gpu evdev psmouse              virtio_blk virtio_net net_failover failover af_packet crc16 mbcache jbd2 ext4 fat vfat nls_cp437 nls_iso8859-1; do
+             bochs virtio-gpu evdev psmouse              virtio_blk virtio_net net_failover failover af_packet crc16 mbcache jbd2 ext4 fat vfat nls_cp437 nls_iso8859-1 \
+             snd snd-pcm snd-timer snd-hda-intel snd-hda-codec snd-hda-codec-generic soundcore; do
         modprobe "$m" 2>/dev/null
+    done
+    # Audio: say whether a card appeared, because "no sound" with no message is
+    # the worst possible outcome.
+    if [ -r /proc/asound/cards ]; then
+        cards=$(grep -c '^ *[0-9]' /proc/asound/cards 2>/dev/null)
+        pcm=$(ls /dev/snd/ 2>/dev/null | grep -c '^pcmC')
+        echo "sound: $cards card(s), $pcm pcm device(s)"
+        grep -E '^ *[0-9]' /proc/asound/cards 2>/dev/null | head -2 | sed 's/^/sound: /' 
+    else
+        echo "sound: no /proc/asound - kernel sound support not loaded"
+    fi
+    for m in unused; do
+        :
     done
 }
 

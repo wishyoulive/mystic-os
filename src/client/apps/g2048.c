@@ -1018,7 +1018,10 @@ int main(void) {
     /* font_get() applies the desktop's text scale itself. Do not call
      * ui_scale_load() here: inside the app jail there is no /etc, so it
      * would fall back to 1.0 and throw away MYSTIC_UI_SCALE. */
-    if (!font_init("/usr/share/fonts")) {
+    /* font_init() returns 0 on success, -1 on failure. This used to be
+     * the other way round, so "if (!font_init(...))" quit on SUCCESS and the
+     * app never drew a window at all. */
+    if (font_init("/usr/share/fonts") != 0) {
         fprintf(stderr, "g2048: no fonts in /usr/share/fonts\n");
         mc_close(&c);
         return 1;
