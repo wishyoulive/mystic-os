@@ -589,27 +589,13 @@ void term_scroll(Term *t, int lines) {
 
 int term_scroll_offset(Term *t) { return t ? t->scroll : 0; }
 
-/* Close the pty, hang up the shell, reap it, and free the grid, the
- * scrollback and the struct. The only correct way to throw a terminal away:
- * close(2) alone leaks 426 KiB (88x20 grid + 88x600 scrollback) and leaves the
- * shell running (or its zombie behind when a background job holds the slave).
- *
- * Before signalling anything we ask the kernel whether the pid is still ours.
- * main() runs waitpid(-1, ..., WNOHANG) every frame (main.c:1148), and
- * term_pump reaps too, so by the time a window is closed an exited shell has
- * usually been reaped already and t->pid may name a recycled process - a blind
- * kill() would then HUP an unrelated one. close(master) has already delivered
- * SIGHUP to the terminal's foreground group, so nothing is lost by skipping
- * the kill when the probe says the pid is not ours any more.
- * Reaping is bounded: a shell that ignores SIGHUP is SIGKILLed after ~100 ms
- * and waited on for at most another ~100 ms, so closing a window can never
- * wedge the desktop. */
 /* Hang the shell up / kill it. When a pidfd is open the signal is delivered
  * through the handle, which is bound to *this* process instance: even if the
  * pid has been recycled (main() reaps with waitpid(-1) every frame, so a dead
  * shell's number is free again immediately) the signal goes to nobody rather
  * than to the new owner of the number. Without a pidfd we fall back to kill(2)
- * on a number we have just probed. */
+ * on a number we have just probed - best effort, because waitpid(2) cannot tell
+ * our still-running child from a different child that got the same number. */
 static void term_signal(Term *t, int sig) {
     if (t->pidfd >= 0)
         syscall(SYS_pidfd_send_signal, (long)t->pidfd, (long)sig, (void *)0, 0L);
@@ -617,6 +603,22 @@ static void term_signal(Term *t, int sig) {
         kill(t->pid, sig);
 }
 
+/* Close the pty, hang up the shell, reap it, and free the grid, the
+ * scrollback and the struct. The only correct way to throw a terminal away:
+ * close(2) alone leaks 426 KiB (88x20 grid + 88x600 scrollback) and leaves the
+ * shell running (or its zombie behind when a background job holds the slave).
+ *
+ * Before signalling anything we ask the kernel whether the pid is still ours.
+ * main() reaps with waitpid(-1, ..., WNOHANG) every frame, and term_pump reaps
+ * too, so by the time a window is closed an exited shell has usually been
+ * reaped already and t->pid may name a recycled process. The waitpid probe
+ * covers that for the kill(2) fallback; with a pidfd the signal never resolves
+ * through the number at all. close(master) has already delivered SIGHUP to the
+ * terminal's foreground group, so nothing is lost by skipping the kill when the
+ * probe says the pid is not ours any more.
+ * Reaping is bounded: a shell that ignores SIGHUP is SIGKILLed after ~100 ms
+ * and waited on for at most another ~100 ms, so closing a window can never
+ * wedge the desktop. */
 void term_destroy(Term *t) {
     if (!t) return;
 

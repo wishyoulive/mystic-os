@@ -114,6 +114,16 @@ static void icon_gear(Surface *s, float x, float y, float sz, u32 fg) {
     gfx_rrect_aa(s, cx - sz * 0.19f, cy - sz * 0.19f, sz * 0.38f, sz * 0.38f, sz * 0.19f, 0, fg, sz * 0.08f);
 }
 
+static void icon_calc(Surface *s, float x, float y, float sz, u32 fg) {
+    gfx_rrect_aa(s, x + sz * 0.18f, y + sz * 0.10f, sz * 0.64f, sz * 0.80f, sz * 0.10f,
+                 0, fg, sz * 0.055f);
+    gfx_rrect(s, x + sz * 0.27f, y + sz * 0.19f, sz * 0.46f, sz * 0.16f, sz * 0.03f, fg);
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++)
+            gfx_rrect(s, x + sz * (0.27f + c * 0.17f), y + sz * (0.44f + r * 0.15f),
+                      sz * 0.11f, sz * 0.10f, sz * 0.02f, fg);
+}
+
 static void icon_grid(Surface *s, float x, float y, float sz, u32 fg) {
     float q = sz * 0.30f, gap = sz * 0.12f;
     float ox = x + (sz - 2 * q - gap) / 2, oy = y + (sz - 2 * q - gap) / 2;
@@ -541,6 +551,7 @@ static const LauncherItem LAUNCHER[] = {
     { "monitor",  "Monitor",  icon_bars },
     { "notes",    "Notes",    icon_pencil },
     { "store",    "Apps",     icon_grid },
+    { "calc",     "Calculator", icon_calc },
     { "sysinfo",  "System",   icon_gear },
 };
 #define LAUNCHER_N ((int)(sizeof(LAUNCHER) / sizeof(LAUNCHER[0])))
@@ -940,12 +951,17 @@ int main(void) {
             }
         }
 
-        /* theme keys arrive as text, so they are handled once per frame */
-        for (int i = 0; i < input.text_len; i++) {
-            char c = input.text[i];
-            if (c >= '1' && c <= '9') {
-                int idx = c - '1';
-                if (idx < theme_count) { theme_index = idx; dirty = 1; }
+        /* Theme switching is Ctrl+1..9. Plain digits must reach the focused
+         * app: with a calculator open, typing 2342 used to change the theme
+         * instead of entering a number. */
+        if (input.ctrl) {
+            for (int i = 0; i < input.text_len; i++) {
+                char c = input.text[i];
+                if (c >= '1' && c <= '9') {
+                    int idx = c - '1';
+                    if (idx < theme_count) { theme_index = idx; dirty = 1; }
+                    input.text[i] = 0;      /* consumed */
+                }
             }
         }
 
