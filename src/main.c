@@ -33,6 +33,13 @@
  * hardcoded pixel height, which is what made scaling unsafe before. */
 static int title_h(void) { return ui_px(40); }      /* window title bar */
 static int topbar_h(void) { return ui_px(34); }     /* screen top bar   */
+
+/* Traffic-light diameter. Fixed on purpose: only its position follows the
+ * scale. Draw and click must use the same centre, or the target drifts. */
+#define DOT_SZ 10
+/* F12: the dots, the title text and the click targets all hang off this one
+ * vertical centre, so nothing drifts when the text scale changes the bar. */
+static int traffic_y(int bar_h) { return (bar_h - DOT_SZ) / 2; }
 static int dock_isz(void) { return ui_px(40); }     /* taskbar icon     */
 static int dock_gap(void) { return ui_px(16); }
 static int dock_pad(void) { return ui_px(12); }
@@ -59,12 +66,15 @@ typedef struct {
     int   maxed;         /* maximised by double-click */
     int   restore_x, restore_y, restore_w, restore_h;
     int   z;
+    unsigned gen;        /* slot generation: bumped whenever the slot changes hands */
 } Window;
 
 static Window wins[MAX_WINDOWS];
 static int    z_top;
 static int    drag_win = -1, drag_dx, drag_dy;
+static unsigned drag_gen;         /* generation of the window being dragged   */
 static int    resize_win = -1;
+static unsigned resize_gen;       /* generation of the window being resized   */
 static int    launcher_open = 0;
 static int    wall_index = 0;
 static double wall_t0 = 0.0;
@@ -240,6 +250,33 @@ static void win_focus(Window *w) {
     w->z = ++z_top;
 }
 
+/* One place that tells a window's owner its content size changed: apps get a
+ * resize callback, external clients a RESIZE message, and terminals recompute
+ * their pty grid (without this the shell kept wrapping at the old width). */
+static void window_resized(Window *w) {
+    if (!w || !w->used) return;
+    int cw = w->w - 2;
+    int chh = w->h - title_h() - 2;
+    if (cw < 40) cw = 40;
+    if (chh < 30) chh = 30;
+    if (w->term) {
+        term_resize_px(w->term, cw, chh);
+    } else if (w->kind == WIN_CLIENT && w->client >= 0) {
+        wms_notify_resize(&clients[w->client], cw, chh);
+    } else if (w->app && w->app->vt && w->app->vt->resize) {
+        w->app->vt->resize(w->app, cw, chh);
+    }
+}
+
+/* F9: a drag stores a slot index, and slots are reused. win_reset bumps the
+ * slot's generation every time it changes hands, so a drag or a resize that
+ * outlives its window is dropped instead of moving whatever moved in. */
+static void win_reset(Window *w) {
+    unsigned g = w->gen;
+    memset(w, 0, sizeof(*w));
+    w->gen = g + 1;
+}
+
 static void win_close(Window *w) {
     if (!w || !w->used) return;
     if (w->term) {
@@ -254,14 +291,14 @@ static void win_close(Window *w) {
         wms_notify_close(&clients[w->client]);
         wms_shutdown_client(&clients[w->client]);
     }
-    memset(w, 0, sizeof(*w));
+    win_reset(w);
 }
 
 static Window *win_open(int kind, const char *app_id) {
     for (int i = 0; i < MAX_WINDOWS; i++) {
         Window *w = &wins[i];
         if (w->used) continue;
-        memset(w, 0, sizeof(*w));
+        win_reset(w);
         w->used = 1;
         w->kind = kind;
         w->z = ++z_top;
@@ -279,13 +316,13 @@ static Window *win_open(int kind, const char *app_id) {
             int rows = (int)((w->h - 56) / ch);
             w->term = term_create(cols, rows, "/bin/sh");
             snprintf(w->title, sizeof(w->title), "Terminal");
-            if (!w->term) { memset(w, 0, sizeof(*w)); return NULL; }
+            if (!w->term) { win_reset(w); return NULL; }
         } else {
             w->w = ui_px(520); w->h = ui_px(360);
             w->x = 140 + (i % 3) * 40;
             w->y = 110 + (i % 3) * 40;
             w->app = app_new(app_id, w->w - 2, w->h - 40 - 2);
-            if (!w->app) { memset(w, 0, sizeof(*w)); return NULL; }
+            if (!w->app) { win_reset(w); return NULL; }
             snprintf(w->title, sizeof(w->title), "%s", app_title(w->app));
         }
         if (w->x + w->w > disp.w) w->x = disp.w - w->w - 20;
@@ -451,6 +488,52 @@ static void draw_start_button(Surface *s, const Theme *th) {
 }
 
 /* ------------------------------------------------------------ compose */
+
+/* F10: font_draw paints whatever it is handed and has no clip rectangle, so a
+ * long window title ran across the frame, over the clock and into the next
+ * window. Fit the string into `avail` pixels by truncating on UTF-8 codepoint
+ * boundaries and marking the cut with an ellipsis. The stored title is never
+ * touched - the caller passes a scratch buffer. */
+static void text_fit(Font *f, const char *src, char *dst, size_t dstsz, float avail) {
+    if (!dst || dstsz < 4) return;
+    dst[0] = '\0';
+    if (!f || !src) return;
+    if (font_width(f, src) <= avail) { snprintf(dst, dstsz, "%s", src); return; }
+
+    const char *ell = "\xE2\x80\xA6";             /* U+2026 HORIZONTAL ELLIPSIS */
+    float ew = font_width(f, ell);
+    /* a face without U+2026 would draw nothing, leaving a silent cut */
+    if (ew <= 0.0f) { ell = "..."; ew = font_width(f, ell); }
+    size_t elen = strlen(ell);
+    float room = avail - ew;
+    /* the marker itself does not fit: draw nothing rather than overflow */
+    if (room < 0.0f || dstsz <= elen + 1) return;
+
+    size_t out = 0;
+    float w = 0.0f;
+    const unsigned char *p = (const unsigned char *)src;
+    while (*p) {
+        int len = 1;
+        unsigned char c = *p;
+        if ((c & 0xE0) == 0xC0 && p[1]) len = 2;
+        else if ((c & 0xF0) == 0xE0 && p[1] && p[2]) len = 3;
+        else if ((c & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) len = 4;
+        if (out + (size_t)len + elen >= dstsz) break;
+        char one[5];
+        memcpy(one, p, (size_t)len);
+        one[len] = '\0';
+        float adv = font_width(f, one);
+        if (w + adv > room) break;
+        memcpy(dst + out, p, (size_t)len);
+        out += (size_t)len;
+        w += adv;
+        p += len;
+    }
+    memcpy(dst + out, ell, elen);
+    out += elen;
+    dst[out] = '\0';
+}
+
 static void draw_desktop(Surface *s, const Theme *th) {
     int W = s->w;
     (void)(s->h);
@@ -468,14 +551,14 @@ static void draw_desktop(Surface *s, const Theme *th) {
     Font *f13 = font_get(FONT_MEDIUM, 13);
     Font *f11 = font_get(FONT_REGULAR, 11);
 
-    draw_start_button(s, th);
-    font_draw(s, f13, 46, 9, "Mystic", th->text);
+    /* F12: the bar grows with the text scale, so no baseline may be a magic
+     * number. Centre every item on the bar from its own font metrics. */
+    const float y13 = ((float)bar - font_height(f13)) * 0.5f;
+    const float y11 = ((float)bar - font_height(f11)) * 0.5f;
 
-    Window *top = win_top();
-    if (top) {
-        float tw = font_width(f11, top->title);
-        font_draw(s, f11, (float)W * 0.5f - tw * 0.5f, 11, top->title, th->text_dim);
-    }
+    draw_start_button(s, th);
+    float brand_w = font_width(f13, "Mystic");
+    font_draw(s, f13, 46, y13, "Mystic", th->text);
 
     char right[128];
     char clock[16];
@@ -486,7 +569,30 @@ static void draw_desktop(Surface *s, const Theme *th) {
     if (used < 0) used = 0;
     snprintf(right, sizeof(right), "%s      %ld MB used of %ld MB", clock, used / 1024, mem / 1024);
     float rw = font_width(f11, right);
-    font_draw(s, f11, (float)W - rw - 16, 11, right, th->text_dim);
+    font_draw(s, f11, (float)W - rw - 16, y11, right, th->text_dim);
+
+    Window *top = win_top();
+    if (top) {
+        /* F10: clip by truncation to the band that is actually free, between
+         * the brand label and the clock block. A symmetric band keeps the
+         * title on the screen centre; on a narrow screen at a large scale the
+         * band is lopsided, so use what is left rather than draw nothing.
+         * Before this a long title painted straight over both. */
+        const float pad = 12.0f;
+        float band_lo = 46.0f + brand_w + pad;
+        float band_hi = (float)W - rw - 16.0f - pad;
+        float mid = (float)W * 0.5f;
+        float half = mid - band_lo;
+        if (band_hi - mid < half) half = band_hi - mid;
+        float centre = mid, wmax = half * 2.0f;
+        if (half <= 0.0f) { centre = (band_lo + band_hi) * 0.5f; wmax = band_hi - band_lo; }
+        if (wmax > 0.0f) {
+            char shown[96];
+            text_fit(f11, top->title, shown, sizeof(shown), wmax);
+            float tw = font_width(f11, shown);
+            font_draw(s, f11, centre - tw * 0.5f, y11, shown, th->text_dim);
+        }
+    }
 
     /* ---------------- windows, drawn back to front ---------------- */
     /* draw in ascending z order */
@@ -511,12 +617,28 @@ static void draw_desktop(Surface *s, const Theme *th) {
         surf_blend(s, cur->x + 1, cur->y + 1, cur->w - 2, tb, color_alpha(th->panel, 0.30f));
         surf_blend(s, cur->x + 1, cur->y + tb, cur->w - 2, 1, th->panel_border);
 
-        /* traffic lights: red closes */
-        gfx_rrect_aa(s, (float)cur->x + 14, (float)cur->y + 15, 10, 10, 5, 0xFFFF5F57u, 0, 0);
-        gfx_rrect_aa(s, (float)cur->x + 32, (float)cur->y + 15, 10, 10, 5, 0xFFFEBC2Eu, 0, 0);
-        gfx_rrect_aa(s, (float)cur->x + 50, (float)cur->y + 15, 10, 10, 5, 0xFF28C840u, 0, 0);
+        /* traffic lights: red closes. F12: the dots sit on the same vertical
+         * centre as the title and the click targets (traffic_y) instead of a
+         * fixed y+15 that fell out of the bar as it grew. */
+        const int dot_y = traffic_y(tb);
+        gfx_rrect_aa(s, (float)cur->x + 14, (float)cur->y + dot_y, DOT_SZ, DOT_SZ, DOT_SZ * 0.5f,
+                     0xFFFF5F57u, 0, 0);
+        gfx_rrect_aa(s, (float)cur->x + 32, (float)cur->y + dot_y, DOT_SZ, DOT_SZ, DOT_SZ * 0.5f,
+                     0xFFFEBC2Eu, 0, 0);
+        gfx_rrect_aa(s, (float)cur->x + 50, (float)cur->y + dot_y, DOT_SZ, DOT_SZ, DOT_SZ * 0.5f,
+                     0xFF28C840u, 0, 0);
 
-        font_draw(s, f13, (float)cur->x + 72, (float)cur->y + 13, cur->title, th->text);
+        /* F10: a title wider than the bar was painted outside the window, over
+         * the frame and the window behind it. Truncate to the bar.
+         * F12: centre it on the bar from the real font height. */
+        {
+            char shown[96];
+            text_fit(f13, cur->title, shown, sizeof(shown),
+                     (float)cur->w - 72.0f - 12.0f);
+            font_draw(s, f13, (float)cur->x + 72,
+                      (float)cur->y + ((float)tb - font_height(f13)) * 0.5f,
+                      shown, th->text);
+        }
 
         /* resize grip */
         for (int g = 0; g < 3; g++) {
@@ -945,13 +1067,17 @@ static int handle_click(void) {
         win_focus(hit);
         int tb = title_h();
         int lx = mx - hit->x, ly = my - hit->y;
-        /* red closes, yellow minimises - only on the dots themselves, which
-         * sit at y+15..y+25; a full-height hit box killed windows by accident */
-        if (ly >= 13 && ly < 27 && lx >= 14 && lx < 24) { win_close(hit); return 1; }
-        if (ly >= 13 && ly < 27 && lx >= 32 && lx < 42) { hit->hidden = 1; return 1; }
+        /* F12: red closes, yellow minimises - only on the dots themselves.
+         * The band is derived from the same centre the dots are drawn on, so
+         * at scale 1.6 the target still sits on the dot instead of the fixed
+         * 13..27 band the dots had already left. */
+        int dot_y = traffic_y(tb);
+        if (ly >= dot_y - 2 && ly < dot_y + DOT_SZ + 2 && lx >= 14 && lx < 24) { win_close(hit); return 1; }
+        if (ly >= dot_y - 2 && ly < dot_y + DOT_SZ + 2 && lx >= 32 && lx < 42) { hit->hidden = 1; return 1; }
         /* bottom-right corner resizes */
         if (lx >= hit->w - 18 && ly >= hit->h - 18) {
             resize_win = (int)(hit - wins);
+            resize_gen = hit->gen;          /* F9: remember which window, not just the slot */
             return 1;
         }
         /* double-click on the title bar toggles maximise */
@@ -971,14 +1097,14 @@ static int handle_click(void) {
                 hit->w = hit->restore_w; hit->h = hit->restore_h;
                 hit->maxed = 0;
             }
-            if (hit->app && hit->app->vt && hit->app->vt->resize)
-                hit->app->vt->resize(hit->app, hit->w - 2, hit->h - 42);
+            window_resized(hit);
             return 1;
         }
 
         /* title bar = drag */
         if (ly < tb) {
             drag_win = (int)(hit - wins);
+            drag_gen = hit->gen;            /* F9: remember which window, not just the slot */
             drag_dx = lx;
             drag_dy = ly;
             return 1;
@@ -1281,7 +1407,7 @@ int main(void) {
         }
         if (input.clicked & 1) { if (handle_click()) dirty = 1; }
         if (input.released & 1) {
-            if (drag_win >= 0 && wins[drag_win].used) {
+            if (drag_win >= 0 && wins[drag_win].used && wins[drag_win].gen == drag_gen) {
                 Window *w = &wins[drag_win];
                 const int bar = topbar_h();
                 if (w->y <= bar + 6) {                       /* top edge: full width */
@@ -1292,8 +1418,7 @@ int main(void) {
                     w->w = disp.w / 2; w->x = disp.w - w->w;
                     w->y = bar; w->h = disp.h - bar - 90;
                 }
-                if (w->app && w->app->vt && w->app->vt->resize)
-                    w->app->vt->resize(w->app, w->w - 2, w->h - 42);
+                window_resized(w);
                 dirty = 1;
             }
             drag_win = -1;
@@ -1301,7 +1426,9 @@ int main(void) {
         }
         if ((input.buttons & 1) && resize_win >= 0) {
             Window *w = &wins[resize_win];
-            if (w->used) {
+            /* F9: the window closed and the slot was reused - not our window */
+            if (!w->used || w->gen != resize_gen) { resize_win = -1; }
+            else {
                 int nw = input.mouse_x - w->x + 1;
                 int nh = input.mouse_y - w->y + 1;
                 if (nw < 280) nw = 280;
@@ -1309,17 +1436,16 @@ int main(void) {
                 if (nw != w->w || nh != w->h) {
                     w->w = nw;
                     w->h = nh;
-                    if (w->app && w->app->vt && w->app->vt->resize)
-                        w->app->vt->resize(w->app, w->w - 2, w->h - 42);
-                    else if (w->kind == WIN_CLIENT && w->client >= 0)
-                        wms_notify_resize(&clients[w->client], w->w - 2, w->h - 42);
+                    window_resized(w);
                     dirty = 1;
                 }
             }
         }
         if ((input.buttons & 1) && drag_win >= 0) {
             Window *w = &wins[drag_win];
-            if (w->used) {
+            /* F9: the window closed and the slot was reused - not our window */
+            if (!w->used || w->gen != drag_gen) { drag_win = -1; }
+            else {
                 int nx = input.mouse_x - drag_dx, ny = input.mouse_y - drag_dy;
                 if (nx < 0) nx = 0;
                 if (ny < 0) ny = 34;
@@ -1357,7 +1483,7 @@ int main(void) {
                 Window *w = NULL;
                 for (int k = 0; k < MAX_WINDOWS; k++) if (!wins[k].used) { w = &wins[k]; break; }
                 if (w) {
-                    memset(w, 0, sizeof(*w));
+                    win_reset(w);
                     w->used = 1;
                     w->kind = WIN_CLIENT;
                     w->client = i;

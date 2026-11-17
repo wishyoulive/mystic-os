@@ -376,8 +376,15 @@ radii. That cost is why the blur runs at quarter resolution.
 `font_init()` — the scale has to be known before the first glyph is
 rasterised, or the first window would be laid out at the wrong size. The parser
 looks for the first line beginning with `scale`, takes the `atof()` of the text
-after `=`, and clamps it to 0.8 … 1.6. A missing file, or a file with no `scale`
-line, leaves 1.0. The shipped file is `scale = 1.0`.
+after `=`, rejects a non-finite value (`!isfinite(v)`: `NaN` passes both
+comparisons below and would make every metric 1 px and every font 5 px), clamps
+it to 0.8 … 1.6, and stops. A missing file, or a file with no `scale` line,
+leaves 1.0. The shipped file is `scale = 1.0`.
+
+The same function is called again once per wall-clock second (§3.6), which is how
+a change to the file — from Settings or from a shell — takes effect without a
+restart: the next `font_get()` loads new sizes and the next compose lays every
+band out with the new `ui_px()` value.
 
 Two accessors use it:
 
@@ -392,8 +399,9 @@ Two accessors use it:
 plus `dock_gap()` = `ui_px(16)` and `dock_pad()` = `ui_px(12)` for the taskbar.
 Window open sizes (`ui_px(640) × ui_px(380)` for a terminal,
 `ui_px(520) × ui_px(360)` for an app), the launcher grid (`ui_px(128)` tiles,
-`ui_px(118)` rows, `ui_px(18)` gaps, `ui_px(52)` icons) and the lock panel
-(`ui_px(380) × ui_px(210)`) all go through `ui_px()` too. The in-desktop apps do
+`ui_px(18)` gaps, rows fitted between `ui_px(56)` and `ui_px(118)`, icons capped
+at `ui_px(52)`) and the lock panel (`ui_px(380) × ui_px(210)`) all go through
+`ui_px()` too. The in-desktop apps do
 the same in their own `layout_build()`-style code: `src/apps/files.c` derives its
 toolbar, breadcrumb, row and footer heights from the fonts it draws with, so the
 whole app grows with the scale rather than clipping.
@@ -425,14 +433,15 @@ Every colour is derived from `th` — `bg_top`, `bg_bottom`, `glow`, `accent`,
 instead of assuming one palette. Dusk is deliberately the original background:
 same three lights, same positions, same strengths.
 
-The index comes from `/etc/mystic/wallpaper` at startup: `main()` reads the first
-line, `wallpaper_from_name()` matches it case-insensitively (ignoring spaces and a
-stray `\r`), and an unknown name leaves the default of 0. `wall_index`, `wall_t0`
-and `wall_last` are statics in `main.c`; `wallpaper_animated()` decides whether
-the loop forces a repaint, and it does so at most every 0.08 s so a still
-wallpaper never keeps the CPU awake. `wallpaper_draw()` clamps an out-of-range
-index to 0 and fills black if the theme is missing, so the screen can never be
-left unpainted.
+The index comes from `/etc/mystic/wallpaper`: `main()` reads the first line at
+startup and again on the once-per-second tick (§3.6), `wallpaper_from_name()`
+matches it case-insensitively (ignoring spaces and a stray `\r`), and an unknown
+name leaves the current wallpaper alone. `wall_index`, `wall_t0` and `wall_last`
+are statics in `main.c`; `wallpaper_animated()` decides whether the loop forces a
+repaint, and it does so at most every 0.08 s (about 12 fps) so a still wallpaper
+never keeps the CPU awake. `wallpaper_draw()` clamps an out-of-range index to 0
+and fills black if the theme is missing, so the screen can never be left
+unpainted.
 
 The shipped `stage/etc/mystic/wallpaper` says `Orbits`, so the desktop animates
 out of the box.
@@ -443,7 +452,7 @@ out of the box.
 
 ### 3.1 State
 
-Abridged from `src/main.c` (the launcher and lock-screen statics are omitted):
+Abridged from `src/main.c` (the lock-screen statics are omitted):
 
 ```c
 /* ------------------------------------------------------------ windows */
@@ -621,8 +630,13 @@ The wheel is not routed to windows: `main()` finds the topmost **terminal**
 window under the pointer and calls `term_scroll(t, wheel * 3)`, so three lines per
 notch. Apps and clients never see `input.wheel`.
 
-Once per wall-clock second the loop also re-reads two files:
+Once per wall-clock second the loop re-reads four things, which is what lets the
+in-desktop apps change the desktop without a private API:
 
+* `/etc/mystic/ui.conf` — the text scale (§2.9); a changed value marks the frame
+  dirty.
+* `/etc/mystic/wallpaper` — the wallpaper name (§2.10); a different valid name
+  switches the background and marks the frame dirty.
 * `/etc/mystic/current-theme` — the first line is matched against `Theme::name`
   (the `name =` field inside the file, not its file name) and switches the theme.
   `src/apps/settings.c` writes exactly that name, so choosing a theme there works;
@@ -648,6 +662,17 @@ The cell grid is sized from the font, not from a constant: the caller passes
 the terminal uses JetBrains Mono: with a proportional face the columns drift and
 `ls` output stops lining up, and at a larger text scale the drift only grows.
 
+`term_key()` does not assume the pty accepts a whole chunk: `write()` on a
+non-blocking master can return a short count or `EAGAIN`, so it loops from the
+bytes the kernel accepted, retries `EINTR`, and on `EAGAIN` waits for `POLLOUT`
+for a bounded number of polls before dropping the rest. A stopped reader costs the
+frame about 100 ms instead of losing the user's keystrokes or hanging the desktop.
+
+`term_resize(t, cols, rows)` reallocates the grid and the scrollback ring at the
+new width (keeping the surviving top-left cells, blanking the rest, rebuilding the
+history in age order) and sends `TIOCSWINSZ`, which is what makes the shell reflow
+with `SIGWINCH`; `term_resize_px()` is the same thing from the pixel rectangle the
+terminal is drawn into, using the cell metrics above.
 `term_pump()` reads 2048-byte chunks up to a 64 KiB budget per call and feeds
 them one at a time to `feed_byte()`, a small state machine: state 0 is text (CR,
 LF, BS, TAB and BEL are handled there), state 1 is `ESC`, state 2 accumulates CSI
@@ -676,8 +701,16 @@ three-column tile panel centred over a full-screen dim. `LAUNCHER[]` is a list o
 `{ app_id, label, icon }` — Terminal, Files, Settings, Monitor, Notes, Apps
 (`store`), Calculator (`calc`), System (`sysinfo`) — and `launcher_items()` adds
 one more tile per installed bundle, in the id order `wms_scan_apps()` sorted them
-into. `launcher_geom(i, …)` lays the tiles out in three columns of
-`ui_px(128) × ui_px(118)`, `ui_px(18)` apart, centred on the display.
+into.
+
+`launcher_geom(i, …)` is the one place the grid is computed, and both the painter
+and the hit test call it. Tiles are `ui_px(128)` wide and `ui_px(18)` apart in
+three columns, but the row height is fitted rather than fixed: rows are
+`(disp.h - ui_px(96) - (rows-1)*gap) / rows`, clamped to `ui_px(56)` …
+`ui_px(118)`, and the grid origin is pushed down to at least `ui_px(44)`. That is
+what keeps 14 tiles at text scale 1.6 on the screen; with a fixed 118 px tile the
+first row's icons went above the top edge. Inside a tile the icon shrinks to
+`grid_h - label_h - 12` (capped at `ui_px(52)`) so the label always fits under it.
 
 `draw_launcher()` first darkens the frame with
 `surf_blend(s, 0, 0, s->w, s->h, 0xAA000000u)`, then paints a rounded panel
@@ -703,7 +736,10 @@ input, and the loop `continue`s instead of falling through.
 
 The lock branch redraws only when something changed — a new minute on the clock or
 input — rather than every 16 ms; the full-screen blur is the most expensive single
-frame in the system.
+frame in the system. It still lets the world behind it make progress: every
+iteration calls `wms_poll()`, reaps children with `waitpid(-1, …, WNOHANG)` and
+`term_pump()`s each terminal, so an external app does not block on its socket and
+shells do not pile up as zombies while the screen is locked.
 
 `draw_lock_screen()` blurs the whole frame at a fixed radius of 40 when
 `th->blur > 0`. Unlike the four direct backdrop blurs (top bar 18, window 14,
@@ -722,6 +758,10 @@ SHA-256, then re-hashes the previous 32-byte digest together with the salt
 `rounds - 1` more times, and the result is compared against the stored digest with
 a full-length constant-time XOR loop. A mismatch shows `"wrong password"`; a
 match clears `locked`.
+
+With no password file at all the lock fails *open* rather than closed: any input
+unlocks and the panel says `"no password file - any input unlocks"`. Deleting the
+file used to make the session unrecoverable without a reboot.
 
 The password file ships in the initramfs (`stage/etc/mystic/passwd`), so this
 locks the *session*, not the machine: anyone who can read the image can also read
@@ -912,7 +952,8 @@ architecture is:
   no partial damage: `FRAME` means "the whole window is new".
 * The window is created by the frame loop, not by `win_open()`: as soon as a
   client has a buffer, a free `Window` is bound to it with `kind = WIN_CLIENT`,
-  `w = cl->w + 2`, `h = cl->h + 42`, a cascade position, and the client's title.
+  `w = cl->w + 2`, `h = cl->h + title_h() + 2`, a cascade position, and the
+  client's title.
   The blit clips to *both* the client buffer and the screen, and shifts the source
   when the window's content origin is off-screen, because clamping only the
   right/bottom edges wrote before the buffer for a negative origin.
@@ -991,9 +1032,9 @@ console: a boot without a mounted `/root` still reaches the desktop, it just has
 nowhere to persist.
 
 Because `/init` runs from the initramfs, everything outside `/root` is RAM:
-`/etc/mystic/themes/*.theme`, `/etc/mystic/ui.conf` and `/etc/mystic/passwd` are
-unpacked from the cpio at boot, and writes to `/etc` (the theme request file)
-disappear on reboot. `/run` and `/tmp` are ordinary directories in that ramfs;
+`/etc/mystic/themes/*.theme`, `/etc/mystic/ui.conf`, `/etc/mystic/wallpaper`
+and `/etc/mystic/passwd` are unpacked from the cpio at boot, and writes to `/etc`
+(the theme request file) disappear on reboot. `/run` and `/tmp` are ordinary directories in that ramfs;
 `/dev/shm` is a tmpfs mounted by `/init`, so a client's shared pixel buffer is
 released when the machine goes down — there is nothing to clean up on the disk.
 
@@ -1053,10 +1094,10 @@ zig cc -target x86_64-linux-musl -Os -static -fno-sanitize=all -Isrc \
        -o build/mystic-desktop $SRC $DEFS -lm -lutil
 ```
 
-Sources: the eleven core files — `main.c`, `apps.c`, `term.c`, `sha256.c`,
-`wmsrv.c`, `ui.c`, `gfx.c`, `font.c`, `fb.c`, `input.c`, `theme.c` — plus
-`apps/sysinfo.c`, and every optional app that exists, each with its `-DWITH_*`
-define (today: files, settings, monitor, notes, store, calc). `-static` plus musl
+Sources: the twelve core files — `main.c`, `apps.c`, `term.c`, `sha256.c`,
+`wmsrv.c`, `ui.c`, `wallpaper.c`, `gfx.c`, `font.c`, `fb.c`, `input.c`,
+`theme.c` — plus `apps/sysinfo.c`, and every optional app that exists, each with
+its `-DWITH_*` define (today: files, settings, monitor, notes, store, calc). `-static` plus musl
 means the binary needs nothing but the kernel; `-lutil` is for `forkpty`. The
 result is copied to `stage/usr/bin/mystic-desktop` (and `chmod +x`), and the font
 files — the three Lato faces, `JetBrainsMono-Regular.ttf` and
@@ -1204,7 +1245,7 @@ keeps the `.ttf` files (and their OFL licence) as the source of the copies that
 | Display protocol: messages, shm, fork/exec, bundle scan | ours | `src/ipc.h`, `src/wmsrv.c` |
 | Client SDK for external apps | ours | `src/client/mystic_client.c`, `src/client/mystic_client.h` |
 | External apps, one process each | ours | `src/client/apps/*.c` |
-| Procedural wallpapers (not yet wired into the desktop) | ours | `src/wallpaper.c`, `src/wallpaper.h` |
+| Procedural wallpapers (four, theme-derived, two animated) | ours | `src/wallpaper.c`, `src/wallpaper.h` |
 | SHA-256, iterated salted password hash, password-file check | ours | `src/sha256.c` |
 | PID 1: mounts, module loading, network, disk setup, fbcon unbind, desktop exec | ours | `stage/init` |
 | initramfs builder (newc writer) | ours | `tools/mkimage.py` |
@@ -1225,22 +1266,18 @@ keeps the `.ttf` files (and their OFL licence) as the source of the copies that
 
 These are behaviours of the current tree, not intentions:
 
-* `title_h()` is `ui_px(40)` and the draw rectangle uses it, but `win_open()`
-  passes an app `h-42`, and the drag/snap/maximise paths call
-  `vt->resize(w-2, h-42)` — which is `title_h() + 2` only at scale 1.0. At 1.2 an
-  app is told it has 8 px more height than is drawn (its last rows are clipped);
-  at 0.8 it is told it has 8 px less (a strip is left empty).
-* The same literals show up around the top bar: the drag clamp is `y >= 34` and a
-  maximised window is placed at `y = 34`, while the bar itself is `topbar_h()`.
-  Above scale 1.0 a maximised window covers the bottom of the top bar.
+* `title_h()` is `ui_px(40)` and the draw rectangle and the client-window size
+  use it, but `win_open()` still passes an in-desktop app `h-42`, and the
+  drag/snap/maximise/resize paths call `vt->resize(w-2, h-42)` — which is
+  `title_h() + 2` only at scale 1.0. At 1.2 an app is told it has 8 px more height
+  than is drawn (its last rows are clipped); at 0.8 it is told it has 8 px less (a
+  strip is left empty).
+* The drag clamp is still `y >= 34` while the bar it protects is `topbar_h()`, so
+  above scale 1.0 a window can be dragged a few pixels into the top bar (the
+  maximise path does use `topbar_h()` and leaves the taskbar its space).
 * Everything that does not hold text keeps its 1.0-scale size: the traffic-light
   dots, the eye's 30×28 target, the 18 px resize corner and the lock panel's inner
   offsets. At 1.6 the eye sits in the upper half of the taller bar.
-* Mouse motion is forwarded to a client window with a hardcoded 41 px offset
-  (`mouse_y - y - 41`) while the click path uses `title_h() + 1`. Above scale 1.0
-  a drag inside an external app is offset from the pixel under the pointer.
-* Alt+Tab can select a minimised window: `win_focus()` does not clear `hidden`,
-  and `win_top()` skips hidden windows, so the keystroke appears to do nothing.
 * `/run/mystic/launch.request` is only polled once per wall-clock second, so an
   Enter in the Apps window can take up to a second to start the app.
 * `wms_scan_apps()` runs once at startup, so a bundle packaged while the desktop
@@ -1252,8 +1289,9 @@ These are behaviours of the current tree, not intentions:
   literal `\n` (backslash + `n`), which bash turns into an extra argument `n`
   before `-netdev`. `bash -c` on that array shows the stray element, so the boot
   command needs that token removed before `-netdev`/`-device` mean anything.
-* `src/wallpaper.c` implements four procedural backgrounds but nothing calls
-  `wallpaper_draw()`; the desktop still paints `gfx_gradient` plus three glows.
+* The wallpaper can be changed at runtime by writing `/etc/mystic/wallpaper`, but
+  there is no in-desktop app that does it yet — it is a file and a text editor
+  away, not a Settings row.
 * The README's feature table still says the disk is FAT and that there are three
   themes and a dock; `setup_disk()` formats and mounts ext4, six `.theme` files
   ship, and the bottom bar is the taskbar of §3.11. The `fat`/`vfat` modules are

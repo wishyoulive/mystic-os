@@ -47,11 +47,11 @@ PYTHONIOENCODING=utf-8 python tools/mkimage.py --base "$ROOTFS" --stage stage -o
 
 DISK=$BUILD/disk.img
 if [ ! -f "$DISK" ]; then
-    echo "==> creating 64 MB disk image (the OS formats it on first boot)"
-    dd if=/dev/zero of="$DISK" bs=1048576 count=64 2>/dev/null
+    echo "==> creating ${MYSTIC_DISK_MB:-64} MB disk image (the OS formats it on first boot)"
+    dd if=/dev/zero of="$DISK" bs=1048576 count="${MYSTIC_DISK_MB:-64}" 2>/dev/null
 fi
 
-BOOT=( -kernel "$KERNEL" -initrd "$CPIO" -m 256 -vga std -no-reboot
+BOOT=( -kernel "$KERNEL" -initrd "$CPIO" -m "${MYSTIC_RAM:-256}" -vga std -no-reboot
        -drive file="$DISK",format=raw,if=virtio \n       -netdev user,id=n0 -device virtio-net-pci,netdev=n0 )
 [ -n "$ACCEL" ] && BOOT+=( $ACCEL )
 

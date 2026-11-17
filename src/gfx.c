@@ -210,13 +210,48 @@ void gfx_rrect_aa(Surface *s, float x, float y, float w, float h, float radius,
     }
 }
 
+/* ---------------------------------------------------------- scratch
+ * This is a single-threaded compositor, so scratch memory lives at file
+ * scope and simply keeps the largest size it has ever needed. Every repaint
+ * used to calloc and free a few megabytes per visible window; now the first
+ * frame allocates and every later frame reuses the same pages, which are
+ * already resident (a fresh calloc of 5 MB also costs the page faults that
+ * come with touching brand new pages). Nothing here is thread safe, and
+ * nothing here needs to be.
+ */
+static void *scratch_grow(void **buf, size_t *cap, size_t bytes) {
+    if (bytes <= *cap) return *buf;
+    size_t ncap = *cap ? *cap : 64 * 1024;
+    while (ncap < bytes) {
+        if (ncap > (size_t)-1 / 2) { ncap = bytes; break; }
+        ncap *= 2;
+    }
+    void *p = realloc(*buf, ncap);
+    if (!p) return NULL;              /* realloc keeps the old buffer intact */
+    *buf = p;
+    *cap = ncap;
+    return p;
+}
+
+static u32   *shadow_mask;                       /* gfx_shadow's scratch surface */
+static size_t shadow_mask_cap;                   /* bytes */
+
+static float *blur_small, *blur_tmp;             /* gfx_blur_region's work buffers */
+static size_t blur_small_cap, blur_tmp_cap;      /* bytes */
+
 /* ---------------------------------------------------------- blur
  * Separable box blur, run on a 4x-downsampled copy. Three passes of a
  * box approximates a gaussian well enough that nobody can tell, and it
  * costs a fraction of the CPU. This is what makes the glass read as
  * glass: the backdrop is visibly, correctly blurred - not a flat tint.
+ *
+ * ch is how many colour channels are carried: 3 for a normal surface blur,
+ * 1 for the shadow mask (whose red, green and blue are the same number) so
+ * that a shadow pays a third of the arithmetic and a third of the memory.
+ * Each channel is blurred completely independently, so the 3-channel maths
+ * is unchanged, value for value.
  */
-void gfx_blur_region(Surface *s, int rx, int ry, int rw, int rh, int radius) {
+static void blur_run(Surface *s, int rx, int ry, int rw, int rh, int radius, int ch) {
     if (rw <= 2 || rh <= 2 || radius <= 0) return;
     int x0 = rx < 0 ? 0 : rx, y0 = ry < 0 ? 0 : ry;
     int x1 = rx + rw > s->w ? s->w : rx + rw;
@@ -228,38 +263,64 @@ void gfx_blur_region(Surface *s, int rx, int ry, int rw, int rh, int radius) {
     int sw = (w + F - 1) / F, sh = (h + F - 1) / F;
     if (sw < 1 || sh < 1) return;
 
-    float *small = calloc((size_t)sw * sh * 3, sizeof(float));
-    float *tmp = calloc((size_t)sw * sh * 3, sizeof(float));
-    if (!small || !tmp) { free(small); free(tmp); return; }
+    size_t cells = (size_t)sw * (size_t)sh;
+    if (cells / (size_t)sh != (size_t)sw) return;
+    if (cells > (size_t)-1 / (sizeof(float) * 3)) return;
+    size_t need = cells * (size_t)ch * sizeof(float);
+
+    float *small = scratch_grow((void **)&blur_small, &blur_small_cap, need);
+    float *tmp = scratch_grow((void **)&blur_tmp, &blur_tmp_cap, need);
+    if (!small || !tmp) return;          /* out of memory: draw nothing, as before */
 
     /* downsample (box average) */
-    for (int y = 0; y < sh; y++) {
-        for (int x = 0; x < sw; x++) {
-            int cnt = 0, sr = 0, sg = 0, sb = 0;
-            for (int yy = 0; yy < F; yy++) {
-                int sy = y0 + y * F + yy;
-                if (sy >= y1) break;
-                u32 *row = s->px + (size_t)sy * s->stride;
-                for (int xx = 0; xx < F; xx++) {
-                    int sx = x0 + x * F + xx;
-                    if (sx >= x1) break;
-                    u32 c = row[sx];
-                    sr += GET_R(c); sg += GET_G(c); sb += GET_B(c);
-                    cnt++;
+    if (ch == 3) {
+        for (int y = 0; y < sh; y++) {
+            for (int x = 0; x < sw; x++) {
+                int cnt = 0, sr = 0, sg = 0, sb = 0;
+                for (int yy = 0; yy < F; yy++) {
+                    int sy = y0 + y * F + yy;
+                    if (sy >= y1) break;
+                    u32 *row = s->px + (size_t)sy * s->stride;
+                    for (int xx = 0; xx < F; xx++) {
+                        int sx = x0 + x * F + xx;
+                        if (sx >= x1) break;
+                        u32 c = row[sx];
+                        sr += GET_R(c); sg += GET_G(c); sb += GET_B(c);
+                        cnt++;
+                    }
                 }
+                if (cnt < 1) cnt = 1;
+                float *o = small + ((size_t)y * sw + x) * 3;
+                o[0] = (float)sr / cnt;
+                o[1] = (float)sg / cnt;
+                o[2] = (float)sb / cnt;
             }
-            if (cnt < 1) cnt = 1;
-            size_t i = ((size_t)y * sw + x) * 3;
-            small[i + 0] = (float)sr / cnt;
-            small[i + 1] = (float)sg / cnt;
-            small[i + 2] = (float)sb / cnt;
+        }
+    } else {
+        for (int y = 0; y < sh; y++) {
+            for (int x = 0; x < sw; x++) {
+                int cnt = 0, sr = 0;
+                for (int yy = 0; yy < F; yy++) {
+                    int sy = y0 + y * F + yy;
+                    if (sy >= y1) break;
+                    u32 *row = s->px + (size_t)sy * s->stride;
+                    for (int xx = 0; xx < F; xx++) {
+                        int sx = x0 + x * F + xx;
+                        if (sx >= x1) break;
+                        sr += GET_R(row[sx]);
+                        cnt++;
+                    }
+                }
+                if (cnt < 1) cnt = 1;
+                small[(size_t)y * sw + x] = (float)sr / cnt;
+            }
         }
     }
 
     int r = radius / F;
     if (r < 1) r = 1;
 
-    /* horizontal box, three times */
+    /* horizontal box, then vertical box, three times */
     for (int pass = 0; pass < 3; pass++) {
         for (int y = 0; y < sh; y++) {
             for (int x = 0; x < sw; x++) {
@@ -269,16 +330,15 @@ void gfx_blur_region(Surface *s, int rx, int ry, int rw, int rh, int radius) {
                     int sx = x + k;
                     if (sx < 0) sx = 0;
                     if (sx >= sw) sx = sw - 1;
-                    size_t i = ((size_t)y * sw + sx) * 3;
-                    acc[0] += small[i + 0]; acc[1] += small[i + 1]; acc[2] += small[i + 2];
+                    const float *i = small + ((size_t)y * sw + sx) * ch;
+                    for (int c = 0; c < ch; c++) acc[c] += i[c];
                     n++;
                 }
-                size_t o = ((size_t)y * sw + x) * 3;
-                tmp[o + 0] = acc[0] / n; tmp[o + 1] = acc[1] / n; tmp[o + 2] = acc[2] / n;
+                float *o = tmp + ((size_t)y * sw + x) * ch;
+                for (int c = 0; c < ch; c++) o[c] = acc[c] / n;
             }
         }
-        memcpy(small, tmp, (size_t)sw * sh * 3 * sizeof(float));
-        /* vertical box */
+        memcpy(small, tmp, cells * (size_t)ch * sizeof(float));
         for (int y = 0; y < sh; y++) {
             for (int x = 0; x < sw; x++) {
                 float acc[3] = {0, 0, 0};
@@ -287,36 +347,50 @@ void gfx_blur_region(Surface *s, int rx, int ry, int rw, int rh, int radius) {
                     int sy = y + k;
                     if (sy < 0) sy = 0;
                     if (sy >= sh) sy = sh - 1;
-                    size_t i = ((size_t)sy * sw + x) * 3;
-                    acc[0] += small[i + 0]; acc[1] += small[i + 1]; acc[2] += small[i + 2];
+                    const float *i = small + ((size_t)sy * sw + x) * ch;
+                    for (int c = 0; c < ch; c++) acc[c] += i[c];
                     n++;
                 }
-                size_t o = ((size_t)y * sw + x) * 3;
-                tmp[o + 0] = acc[0] / n; tmp[o + 1] = acc[1] / n; tmp[o + 2] = acc[2] / n;
+                float *o = tmp + ((size_t)y * sw + x) * ch;
+                for (int c = 0; c < ch; c++) o[c] = acc[c] / n;
             }
         }
-        memcpy(small, tmp, (size_t)sw * sh * 3 * sizeof(float));
+        memcpy(small, tmp, cells * (size_t)ch * sizeof(float));
     }
 
     /* upsample (nearest, the blur hides it) */
-    for (int y = 0; y < h; y++) {
-        u32 *row = s->px + (size_t)(y0 + y) * s->stride;
-        int sy = y / F; if (sy >= sh) sy = sh - 1;
-        for (int x = 0; x < w; x++) {
-            int sx = x / F; if (sx >= sw) sx = sw - 1;
-            size_t i = ((size_t)sy * sw + sx) * 3;
-            int r8 = (int)(small[i + 0] + 0.5f);
-            int g8 = (int)(small[i + 1] + 0.5f);
-            int b8 = (int)(small[i + 2] + 0.5f);
-            if (r8 > 255) r8 = 255;
-            if (g8 > 255) g8 = 255;
-            if (b8 > 255) b8 = 255;
-            row[x0 + x] = 0xFF000000u | ((u32)r8 << 16) | ((u32)g8 << 8) | (u32)b8;
+    if (ch == 3) {
+        for (int y = 0; y < h; y++) {
+            u32 *row = s->px + (size_t)(y0 + y) * s->stride;
+            int sy = y / F; if (sy >= sh) sy = sh - 1;
+            for (int x = 0; x < w; x++) {
+                int sx = x / F; if (sx >= sw) sx = sw - 1;
+                size_t i = ((size_t)sy * sw + sx) * 3;
+                int r8 = (int)(small[i + 0] + 0.5f);
+                int g8 = (int)(small[i + 1] + 0.5f);
+                int b8 = (int)(small[i + 2] + 0.5f);
+                if (r8 > 255) r8 = 255;
+                if (g8 > 255) g8 = 255;
+                if (b8 > 255) b8 = 255;
+                row[x0 + x] = 0xFF000000u | ((u32)r8 << 16) | ((u32)g8 << 8) | (u32)b8;
+            }
+        }
+    } else {
+        for (int y = 0; y < h; y++) {
+            u32 *row = s->px + (size_t)(y0 + y) * s->stride;
+            int sy = y / F; if (sy >= sh) sy = sh - 1;
+            for (int x = 0; x < w; x++) {
+                int sx = x / F; if (sx >= sw) sx = sw - 1;
+                int v = (int)(small[(size_t)sy * sw + sx] + 0.5f);
+                if (v > 255) v = 255;
+                row[x0 + x] = 0xFF000000u | ((u32)v << 16) | ((u32)v << 8) | (u32)v;
+            }
         }
     }
+}
 
-    free(small);
-    free(tmp);
+void gfx_blur_region(Surface *s, int rx, int ry, int rw, int rh, int radius) {
+    blur_run(s, rx, ry, rw, rh, radius, 3);
 }
 
 /* shadow = a blurred dark rounded rect, drawn underneath */
@@ -325,24 +399,64 @@ void gfx_shadow(Surface *s, float x, float y, float w, float h, float radius,
     int pad = (int)(spread * 3);
     int rx = (int)x - pad, ry = (int)y - pad;
     int rw = (int)w + pad * 2, rh = (int)h + pad * 2;
-    /* paint a black rounded rect on a scratch surface, blur it, blend it */
-    Surface tmp = {0};
-    tmp.w = rw; tmp.h = rh; tmp.stride = rw;
-    tmp.px = calloc((size_t)rw * rh, 4);
-    if (!tmp.px) return;
-    /* white, not black: the blur of a white shape is the shadow mask we
-     * read back from the red channel. Painting black made every
-     * alpha 0, so this function drew nothing while still costing
-     * a calloc and a 3-pass blur per window per frame. */
-    gfx_rrect_aa(&tmp, pad, pad, w, h, radius, 0xFFFFFFFFu, 0, 0);
-    gfx_blur_region(&tmp, 0, 0, rw, rh, (int)spread);
-    for (int yy = 0; yy < rh; yy++) {
-        int dy = ry + yy;
+    if (rw <= 0 || rh <= 0 || s->w <= 0 || s->h <= 0) return;
+
+    /* Only the part of that rectangle that can reach a pixel of the
+     * destination has to exist. The blur inside the temp reaches at most
+     * 3*spread pixels (three box passes on a 4x-downsampled copy), so the
+     * temp is clipped to the destination grown by pad plus slack, and the
+     * clip is kept on whole F=4 cells so the downsample grid - and every
+     * blurred value with it - stays exactly where it was. For a window
+     * that is on screen the clip does not bite at all, because the temp
+     * only ever overhangs the destination by pad. */
+    const int F = 4;
+    int margin = pad + 4 * F;
+    int tx = rx, ty = ry, tw = rw, th = rh;
+    if (tx < -margin) {
+        int k = (-margin - tx + F - 1) / F;      /* whole cells only */
+        tx += k * F;
+    }
+    if (ty < -margin) {
+        int k = (-margin - ty + F - 1) / F;
+        ty += k * F;
+    }
+    if (tx + tw > s->w + margin) {
+        int keep = s->w + margin - tx;
+        keep -= keep % F;
+        tw = keep;
+    }
+    if (ty + th > s->h + margin) {
+        int keep = s->h + margin - ty;
+        keep -= keep % F;
+        th = keep;
+    }
+    if (tw <= 0 || th <= 0) return;              /* never touches the destination */
+
+    size_t need = (size_t)tw * (size_t)th;
+    if (need / (size_t)th != (size_t)tw) return;
+    if (need > (size_t)-1 / 4) return;
+    u32 *mask = scratch_grow((void **)&shadow_mask, &shadow_mask_cap, need * 4);
+    if (!mask) return;
+    /* gfx_rrect_aa only writes pixels the shape covers, so the rest has to be
+     * cleared first: the blur reads it as "no shadow". Only the part that is
+     * used is cleared, never the whole capacity. */
+    memset(mask, 0, need * 4);
+
+    /* Paint a white rounded rect on the scratch surface: the blur of a white
+     * shape is the shadow mask we read back from the red channel. */
+    Surface tmp;
+    tmp.px = mask; tmp.w = tw; tmp.h = th; tmp.stride = tw;
+    gfx_rrect_aa(&tmp, (float)((int)x - tx), (float)((int)y - ty), w, h, radius,
+                 0xFFFFFFFFu, 0, 0);
+    blur_run(&tmp, 0, 0, tw, th, (int)spread, 1);
+
+    for (int yy = 0; yy < th; yy++) {
+        int dy = ty + yy;
         if ((unsigned)dy >= (unsigned)s->h) continue;
         u32 *drow = s->px + (size_t)dy * s->stride;
-        u32 *srow = tmp.px + (size_t)yy * rw;
-        for (int xx = 0; xx < rw; xx++) {
-            int dx = rx + xx;
+        u32 *srow = mask + (size_t)yy * tw;
+        for (int xx = 0; xx < tw; xx++) {
+            int dx = tx + xx;
             if ((unsigned)dx >= (unsigned)s->w) continue;
             int a = GET_R(srow[xx]);
             if (a <= 0) continue;
@@ -354,7 +468,6 @@ void gfx_shadow(Surface *s, float x, float y, float w, float h, float radius,
                      |  (u32)((GET_B(d) * ia) / 255);
         }
     }
-    free(tmp.px);
 }
 
 void gfx_line(Surface *s, float x0, float y0, float x1, float y1, float width, u32 color) {
