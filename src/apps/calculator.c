@@ -76,7 +76,6 @@ typedef struct {
     int   err_pos;
     char  err_ch;               /* the offending character, 0 if none */
     char  err_name[24];         /* the offending identifier for E_NAME */
-    int   nest;                 /* current recursion depth */
     double ans;
     int   have_ans;
 } Parser;
@@ -447,7 +446,7 @@ static void draw_clipped(Surface *s, Font *f, float x, float y, float maxw,
                          const char *text, u32 color) {
     if (!text || !text[0] || maxw < 6.0f) return;
 
-    char buf[EXPR_MAX + 8];
+    char buf[MSG_MAX + 8];
     size_t len = strlen(text);
     if (len >= sizeof(buf) - 4) len = sizeof(buf) - 4;
     memcpy(buf, text, len);
@@ -481,8 +480,13 @@ static float draw_tail(Surface *s, Font *f, float right, float y, float maxw,
     const char *start = text;
 
     if (tw > maxw) {
-        size_t cut = strlen(text);
-        while (cut > 0 && font_width(f, text + cut) > maxw) cut--;
+        /* Drop characters from the front until the rest fits: the longest
+         * suffix, so the character just typed stays on screen. Starting the
+         * search at the end would accept the empty string immediately and
+         * draw nothing at all. */
+        size_t len = strlen(text);
+        size_t cut = 0;
+        while (cut < len && font_width(f, text + cut) > maxw) cut++;
         start = text + cut;
         tw = font_width(f, start);
     }
@@ -668,9 +672,9 @@ static void calc_draw(App *a, Surface *s, int x, int y, int w, int h,
     float right = (float)(x + w) - (float)PAD;
     float maxw  = right - left;
 
-    /* ---- the expression, big, right aligned ---- */
+    /* ---- the expression, big, right aligned like a calculator display ---- */
     if (c->len == 0) {
-        font_draw(s, fbig, left, (float)(y + L.expr_y), "0",
+        draw_tail(s, fbig, right, (float)(y + L.expr_y), maxw, "0",
                   color_alpha(th->text, 0.28f));
     } else {
         float endx = draw_tail(s, fbig, right, (float)(y + L.expr_y), maxw,
@@ -716,15 +720,20 @@ static void calc_draw(App *a, Surface *s, int x, int y, int w, int h,
                   color_alpha(th->text, 0.40f));
 
         int lines = c->nhist < L.hist_lines ? c->nhist : L.hist_lines;
+        if (lines == 0)
+            draw_clipped(s, frow, left, (float)(y + L.hist_top), maxw,
+                         "no results yet", color_alpha(th->text, 0.30f));
         for (int i = 0; i < lines; i++) {
             float hy = (float)(y + L.hist_top) + (float)i * (float)HIST_H;
-            float vw = font_width(frow, c->hist[i].value);
+            char vb[RESULT_MAX + 4];
+            snprintf(vb, sizeof vb, "= %s", c->hist[i].value);
+            float vw = font_width(frow, vb);
             if (vw + 40.0f > maxw) {
                 draw_clipped(s, frow, left, hy, maxw, c->hist[i].expr,
                              color_alpha(th->text, 0.55f));
                 continue;
             }
-            font_draw(s, frow, right - vw, hy, c->hist[i].value,
+            font_draw(s, frow, right - vw, hy, vb,
                       color_alpha(th->accent, 0.80f));
             draw_clipped(s, frow, left, hy, (right - vw - 10.0f) - left,
                          c->hist[i].expr, color_alpha(th->text, 0.55f));

@@ -96,19 +96,24 @@
 #define BASE_CIM  (0.0)
 #define BASE_SPAN (2.6)
 
-/* Zoom limits. 2.6 / 0.00127 is about 2000x in, and that is as far as
- * 64 iterations can honestly go: at 4000x only a third of the frame
- * still escapes and at 10000x all but 2% of it collapses into "inside",
- * i.e. the picture would be a black rectangle rather than the set. The
- * zoom stops while the picture is still true. 13 units out is 0.2x,
- * enough to see the set in context without it shrinking to a dot. */
+/* Zoom limits. 2.6 / 0.00127 is about 2000x in, and the cap is still
+ * honest there: zoomed onto the boundary at c = -0.101+0.956i, 99.7%
+ * of the frame is still escaping at the limit, so the detail on screen
+ * is real. Push much further and the cap starts deciding the picture
+ * instead of the set - at 10000x, on the boundary near -0.744+0.132i,
+ * only about 2% of the frame still shows any structure and the rest is
+ * painted as "inside", i.e. a black rectangle. The zoom stops while
+ * the picture is still true. 13 units out is 0.2x, enough to see the
+ * set in context without it shrinking to a dot. */
 #define MIN_SPAN (0.00127)
 #define MAX_SPAN (13.0)
 
-/* evdev key codes (input-event-codes.h): KEY_Q == 16, KEY_R == 19.
- * The server forwards raw codes, the same ones paint.c switches on. */
-#define KEYC_Q 16
-#define KEYC_R 19
+/* Keys are handled on the TEXT channel only. The server sends a press
+ * twice - once as "KEY <evdev> <mods> 1" and once as "TEXT <chars>" in
+ * the same frame - so an app that listens to both sees every keystroke
+ * twice. Both of ours are printable ('r', 'q'), so TEXT alone is enough
+ * and there is no evdev keycode to keep in step. Closing the window is
+ * the other way out, and that arrives as CLOSE. */
 
 #define TAU 6.283185307179586
 
@@ -248,13 +253,16 @@ static void render_rows(int y0, int y1) {
 static void clamp_view(void) {
     if (M.span < MIN_SPAN) M.span = MIN_SPAN;
     if (M.span > MAX_SPAN) M.span = MAX_SPAN;
-    /* a safety net: zooming about a click can only ever put the centre
-     * inside the view, but zooming out around the edge of the plane
-     * could otherwise walk it away from the set entirely */
-    if (M.cre < -2.5) M.cre = -2.5;
-    if (M.cre >  1.5) M.cre =  1.5;
-    if (M.cim < -1.5) M.cim = -1.5;
-    if (M.cim >  1.5) M.cim =  1.5;
+    /* A safety net, not a pan limit. The base view spans re
+     * [-2.588, 1.388] and im [-1.3, 1.3], so this box contains every
+     * pixel of it: a click anywhere in the starting picture is centred
+     * exactly as asked, and the box only ever bends the centre after
+     * the user has zoomed out past the starting framing, where it stops
+     * the view sailing off into empty plane. */
+    if (M.cre < -2.7) M.cre = -2.7;
+    if (M.cre >  1.7) M.cre =  1.7;
+    if (M.cim < -1.7) M.cim = -1.7;
+    if (M.cim >  1.7) M.cim =  1.7;
 }
 
 static void layout(void) {
@@ -439,12 +447,6 @@ int main(void) {
         while (mc_poll(&c, &ev)) {
             if (ev.type == MC_CLOSE) { quit = 1; break; }
 
-            if (ev.type == MC_KEY) {
-                if (!ev.press) continue;
-                if (ev.key == KEYC_Q) quit = 1;
-                else if (ev.key == KEYC_R) { reset_view(); render_start(); }
-                continue;
-            }
             if (ev.type == MC_TEXT) {
                 for (const char *p = ev.text; *p && !quit; p++) {
                     if (*p == 'q' || *p == 'Q') quit = 1;

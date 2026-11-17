@@ -77,13 +77,13 @@ on my machine" and "it booted" are the same sentence in this project.
 |  | **External app** (recommended) | **In-desktop app** (AppVT) |
 |---|---|---|
 | Runs as | its own Linux process, forked by the launcher | code inside `mystic-desktop` |
-| New files | one: `src/client/apps/<id>.c` | one: `src/apps/<id>.c`, plus edits to 3–4 shared files |
-| Talks to the desktop via | unix socket + shared memory (`src/ipc.h`) | the `AppVT` callback table (`src/mystic.h:158`) |
+| New files | one: `src/client/apps/<id>.c` | one: `src/apps/<id>.c`, plus edits to 4 shared files |
+| Talks to the desktop via | unix socket + shared memory (`src/ipc.h`) | the `AppVT` callback table in `src/mystic.h` |
 | Build | `./tools/mkapp.sh <id>` | `tools/build-desktop.sh` |
 | Appears in the launcher | automatically, once a bundle exists | only if you add it to `LAUNCHER[]` |
 | If it crashes | one dead window; the desktop keeps running | the whole desktop dies |
 | Drawing | you own a `w × h` pixel buffer | you draw into the scene surface, inside your rect |
-| Can use | libc, `gfx.c`, `font.c`, threads, anything static | libc, `gfx.c`, `font.c`, and the desktop's internals |
+| Can use | libc and anything you can link statically | libc, `gfx.c`, `font.c`, and the desktop's internals |
 
 **External is easier, and it is the recommended path.** Three reasons, all
 mechanical: you add exactly one file and run exactly one packaging command; you
@@ -92,32 +92,34 @@ do not touch `src/mystic.h`, `src/apps.c`, `src/main.c` or
 window instead of the session. `src/client/apps/clock.c` is a complete, working
 example of the shape.
 
-An in-desktop app is the right choice when the app must be *part of* the
-desktop — the theme switcher that writes `/etc/mystic/current-theme`, the store
-that writes `/run/mystic/launch.request`, anything that has to run without
-forking. Those need the desktop's process, not a socket.
+An in-desktop app is the right choice when the app has to *act on the desktop
+itself*: Settings writes `/etc/mystic/current-theme`, which the desktop re-reads
+once a second (`src/main.c`), and the store writes `/run/mystic/launch.request`
+because only the desktop may fork and exec a bundle (`src/apps/store.c:348`).
+Those need the desktop's process, not a socket.
 
 ### If you do want an in-desktop app
 
-The registry is opt-in at four places, and a missing one fails silently (the app
+The registry is opt-in at five places, and a missing one fails silently (the app
 compiles but nothing can open it):
 
 1. `src/apps/<id>.c` defines `const AppVT app_vt_<id> = { .id, .title, .init,
    .draw, .key, .click, .resize, .free };` — see `src/apps/sysinfo.c` (the
    reference app) or `src/apps/files.c`.
-2. `src/mystic.h:180` — an `#ifdef WITH_<ID> extern const AppVT app_vt_<id>;`
-   block.
-3. `src/apps.c:14` — add `&app_vt_<id>` to `REGISTRY[]` inside `#ifdef WITH_<ID>`.
+2. `src/mystic.h` — an `#ifdef WITH_<ID> extern const AppVT app_vt_<id>;`
+   block next to the existing ones.
+3. `src/apps.c` — add `&app_vt_<id>` to `REGISTRY[]` inside `#ifdef WITH_<ID>`.
 4. `tools/build-desktop.sh:28` — add the id to
    `for app in files settings monitor notes store`; that loop appends the source
    and defines `-DWITH_<ID>`.
-5. `src/main.c:530` — a `LauncherItem` in `LAUNCHER[]` (id, label, icon
-   routine), and/or an F-key case at `src/main.c:1004`. Without this, no code
-   path ever calls `win_open(WIN_APP, "<id>")` and the app is unreachable.
+5. `src/main.c` — a `LauncherItem` in `LAUNCHER[]` (id, label, icon routine),
+   and/or an F-key case in the `switch (k)` that launches F1…F5. Without one of
+   those, no code path ever calls `win_open(WIN_APP, "<id>")` and the app is
+   unreachable.
 
 Two rules for the drawing callback. You are given the **whole scene surface**
 plus a rectangle `(x, y, w, h)`; nothing clips for you — shorten the surface to
-the rect as `rect_clip()` in `src/apps/sysinfo.c:55` does, or every `gfx_*` call
+the rect as `rect_clip()` in `src/apps/sysinfo.c` does, or every `gfx_*` call
 will happily paint outside your window. And state lives in `a->state`; the same
 `App` is drawn every frame, so do not re-`readdir` on every paint.
 
@@ -222,8 +224,9 @@ What each part is doing, in the SDK's own terms (`src/client/mystic_client.h`):
   title (the manifest's `name` is only the launcher label — they are independent).
   The server clamps size to 80…1600 × 60…1200 (`src/wmsrv.c:114`).
 - `Surface s = { c.px, c.w, c.h, c.stride }` — field order is
-  `{ px, w, h, stride }` (`src/mystic.h:36`). Use `c->stride`, never assume it
-  equals the width; the protocol gives it to you in `OK` for that reason.
+  `{ px, w, h, stride }` (the `Surface` in `src/mystic.h`). Use `c->stride`,
+  never assume it equals the width; the protocol gives it to you in `OK` for
+  that reason.
 - `mc_present(&c)` writes `FRAME\n`; until you do, the server composites
   nothing. Draw first, then present.
 - `mc_poll(&c, &ev)` returns 1 per queued event, 0 when the socket is empty. The
@@ -232,9 +235,9 @@ What each part is doing, in the SDK's own terms (`src/client/mystic_client.h`):
   `57` = space. Printable text arrives separately as `MC_TEXT` in `ev.text`.
 - `MC_MOUSE` carries window-relative `x`, `y` and a button mask (1 left, 2 right,
   4 middle). Motion is forwarded while the pointer is inside your content rect,
-  even when another window has focus (`src/main.c:1197`). Keys and text are
-  forwarded only to the focused window (`src/main.c:1040`), so click your window
-  before wondering why typing does nothing.
+  even when another window has focus (the pointer-forwarding block in
+  `src/main.c`). Keys and text are forwarded only to the focused window, so
+  click your window before wondering why typing does nothing.
 - `MC_CLOSE` means the user pressed your red dot or the socket closed. Call
   `mc_close(&c)` and return — do not keep drawing into a window that is gone.
 
@@ -264,8 +267,8 @@ when it says no:
    `chmod +x` it.
 4. Writes `manifest` **only if it does not already exist**.
 
-If you want the compile command without the packaging side effect, run those
-four `zig cc` arguments by hand; the output path is yours to choose.
+If you want the compile command without the packaging side effect, run that
+`zig cc` command by hand; the output path is yours to choose.
 
 ### 4.3 The manifest
 
@@ -292,8 +295,7 @@ writes `desc = Mystic OS application` unless you pass a second argument:
 ```
 
 Because the manifest is never overwritten, changing the text afterwards means
-editing the file in `stage/` (and it is not tracked by git — `stage/` holds real
-files that get packed).
+editing `stage/usr/share/mystic/apps/<id>/manifest` by hand.
 
 The one rule that bites: **`exec` must name a file that is packed executable.**
 `tools/mkimage.py:110` cannot copy a Windows executable bit, so it decides the
@@ -311,11 +313,11 @@ headers back). Section 8.2 is what that looks like at runtime.
 ```
 
 Then Super, or click the eye, to open the launcher. Installed bundles are
-appended **after** the seven built-in tiles (`LauncherItem LAUNCHER[]`,
-`src/main.c:530` — Terminal, Files, Settings, Monitor, Notes, Apps, System), in
-id order (`qsort` by id, `src/wmsrv.c:267`). Your tile is labelled with the
-manifest `name` and drawn as the first letter of that name inside a rounded
-square (`src/main.c:589`).
+appended **after** the seven built-in tiles (the `LAUNCHER[]` table of
+`LauncherItem`s in `src/main.c`: Terminal, Files, Settings, Monitor, Notes,
+Apps, System), in id order (`qsort` by id, `src/wmsrv.c:267`). Your tile is
+labelled with the manifest `name` and drawn as the first letter of that name
+inside a rounded square (the bundle branch of `draw_launcher()` in `src/main.c`).
 
 Clicking the tile forks and execs `/usr/share/mystic/apps/demo/bin`
 (`wms_launch`, `src/wmsrv.c:271`) with two variables set for the child:
@@ -324,9 +326,9 @@ are listed (`WM_MAX_APPS`), and 8 clients may be connected at once (`WM_MAX_CLIE
 The ninth connection is accepted and closed immediately with no reply
 (`src/wmsrv.c:183`), so `mc_open` fails and no window appears.
 
-The bundle list is scanned once, at desktop start (`src/main.c:861`). A new
-bundle needs a reboot to appear — which you get for free, because adding the
-bundle means repacking the image anyway.
+The bundle list is scanned once, at desktop start (`wms_scan_apps()` in
+`main()`). A new bundle needs a reboot to appear — which you get for free,
+because adding the bundle means repacking the image anyway.
 
 ---
 
@@ -358,7 +360,7 @@ development, so the list is earned rather than invented:
 | disk: ext4 mounted on `/dev/vda` | the block device, filesystem and mount all worked | `virtio_blk`/`ext4` modules missing, or no disk attached |
 | boot counter increments | `/root/boots.txt` is one higher after the second boot | the disk is not persistent (mounted read-only, formatted every boot) |
 | desktop opened the display | `display: WxH 32bpp` on stderr (`src/fb.c:49`) | the desktop never got `/dev/fb0` |
-| desktop bound a keyboard | `input: keyboard <name>` (`src/input.c:65`) | no event device, or the capability probe classified nothing |
+| desktop bound a keyboard | `input: keyboard <name>` on stderr | no event device, or the capability probe classified nothing |
 | desktop did not crash | no `segfault` in the desktop boot log | your bug |
 | compiles clean: `src/<file>.c` | `-Wall -Wextra` clean, one check per file | a warning — the project treats warnings as failures |
 
@@ -373,9 +375,10 @@ the real module list, DRM/fb facts out of `/sys`, the input devices, the disk
 state, the boot counter and a permissions test file.
 
 **`./image.sh shot 10`** — boot headless and screendump at 10 s into
-`build/shot.png`. This is how the screenshots in `docs/screenshots/` were made,
-and it is the only objective evidence that your window drew what you think it
-drew. `./image.sh themes` does the same three times while pressing `2` and `3`.
+`build/shot.png`. The captures in `docs/screenshots/` are real captures from the
+running OS, and this is the same headless-screendump route; it is the only
+objective evidence that your window drew what you think it drew.
+`./image.sh themes` does the same three times while pressing `2` and `3`.
 
 ---
 
@@ -502,11 +505,12 @@ entry back, or boot and `ls -l /usr/share/mystic/apps/<id>/`.
 
 ### 8.3 A missing kernel module ("unknown symbol")
 
-**Symptom.** The console shows
-`modprobe: can't load module drm: unknown symbol in module` (or whichever module
-it is), and then either `/dev/fb0` never appears — so `stage/init` never starts
-the desktop and drops you to a shell with the banner — or `/dev/input/event0`
-never appears, so the desktop runs with no keyboard or mouse.
+**Symptom.** The console shows something like
+`modprobe: can't load module drm: unknown symbol in module, or unknown parameter`
+(or whichever module it is), and then either `/dev/fb0` never appears — so
+`stage/init` never starts the desktop and drops you to a shell with the banner —
+or `/dev/input/event0` never appears, so the desktop runs with no keyboard or
+mouse.
 
 **Cause.** Alpine's `linux-virt` builds the graphics, framebuffer, input and
 filesystem drivers as loadable modules, and `stage/init`'s `load_modules()`
@@ -521,8 +525,8 @@ this failure).
 **Fix.** Add the module name to the `modprobe` list in `stage/init`, and its
 subtree to `MODULE_TREES` in `tools/fetch-kernel.sh` if it is not already
 staged. Note that `image.sh` only calls `fetch-kernel.sh` when the kernel binary
-is absent, so after editing `MODULE_TREES` run `./tools/fetch-kernel.sh`
-explicitly. Then check `./image.sh probe`: the `modules :` line is
+or the unpacked module package is missing, so after editing `MODULE_TREES` run
+`./tools/fetch-kernel.sh` explicitly. Then check `./image.sh probe`: the `modules :` line is
 `/proc/modules`, i.e. what actually loaded, and `card0: yes` / `fb0 : yes` are
 the two facts the desktop needs.
 
@@ -537,8 +541,8 @@ no shell runs. `stage/init:18` mounts it (`mount -t devpts none /dev/pts`) with
 the comment "without devpts forkpty() cannot open the slave side"; it was added
 in the same commit as the terminal (`b4b8e83`).
 
-**Check.** `./image.sh probe` then look at `/dev/pts`, or simply open Terminal
-with `F1` — it is the only app that needs a pty, so it is the exact test.
+**Check.** Open Terminal with `F1` — it is the only app that needs a pty, so it
+is the exact test. From a shell, `ls /dev/pts` shows whether the mount is there.
 
 ### Debugging your own app, in order
 
@@ -554,9 +558,9 @@ with `F1` — it is the only app that needs a pty, so it is the exact test.
 | mouse does nothing | the pointer is outside the content rect, or you ignored `ev.buttons & 1` |
 | app appears twice in the launcher | two directories under `stage/usr/share/mystic/apps/`, or a stale `build/app-<id>` was reused |
 
-Your app's `stderr` is the console the desktop itself writes to — `fprintf` is
-the debugger. `getpid()` in the title bar style output is a cheap way to prove
-your app is a separate process, which is the entire point of the SDK.
+Your app inherits the desktop's stderr — the console PID 1 was started on — so
+`fprintf(stderr, …)` is the debugger, and printing `getpid()` is a cheap way to
+prove the app is a separate process, which is the entire point of the SDK.
 
 ---
 

@@ -156,7 +156,13 @@ static void win_focus(Window *w) {
 
 static void win_close(Window *w) {
     if (!w || !w->used) return;
-    if (w->term) { close(term_fd(w->term)); free(w->term); }
+    if (w->term) {
+        /* term_destroy closes the pty, reaps the shell and frees the grid and
+         * the 600-line scrollback ring. Freeing the struct here instead leaked
+         * 426 KB and one zombie per closed terminal. */
+        term_destroy(w->term);
+        w->term = NULL;
+    }
     if (w->app) app_free(w->app);
     if (w->kind == WIN_CLIENT && w->client >= 0 && w->client < WM_MAX_CLIENTS) {
         wms_notify_close(&clients[w->client]);
