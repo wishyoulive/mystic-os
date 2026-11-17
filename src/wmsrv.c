@@ -346,7 +346,18 @@ static void sandbox_child(const char *exe, const char *id) {
     if (unshare(CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS) == 0) {
         mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
 
-        mkdir(jail, 0755);
+        /* mkdir(2) does not create parents: /run/mystic/jail must exist
+         * before /run/mystic/jail/<id>, or every bind below fails ENOENT. */
+        mkdir("/run/mystic/jail", 0755);
+        if (mkdir(jail, 0755) != 0 && errno != EEXIST) {
+            fprintf(stderr, "wms: sandbox jail mkdir %s failed: %s", jail, strerror(errno));
+            fputc(10, stderr);
+        }
+        struct stat jst;
+        if (stat(jail, &jst) != 0) {
+            fprintf(stderr, "wms: sandbox jail %s does not exist after mkdir: %s", jail, strerror(errno));
+            fputc(10, stderr);
+        }
         snprintf(path, sizeof(path), "%s/bin", jail);        mkdir(path, 0755);
         snprintf(path, sizeof(path), "%s/dev", jail);        mkdir(path, 0755);
         snprintf(path, sizeof(path), "%s/tmp", jail);        mkdir(path, 0777);

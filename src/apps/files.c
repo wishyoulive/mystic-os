@@ -856,7 +856,7 @@ static void tb_icon(Surface *s, int kind, float x, float y, float sz, u32 c) {
 
 /* 20x20 nominal box (ui_px() and the row size it, so it grows with the
  * text scale) holding a folder, or a page with a folded corner and a mark
- * for the kind of file. The mark is what tells the eight kinds apart at a
+ * for the kind of file. The mark is what tells the nine kinds apart at a
  * glance; the page is the same for all of them so the list still reads as
  * one list. */
 
