@@ -19,18 +19,38 @@
  *  that was painted. Nothing here is a fixed 15 px.
  *
  *  ICONS are drawn geometry, in the same style as the desktop
- *  launcher's icon_folder()/icon_pencil() in src/main.c - no images:
- *  a 20x20 (at 100% scale, ui_px() grows it) folder with a tab, a page
- *  with a folded corner, and a mark on the page for the kind of file
- *  (a dot for .theme, text rules for .conf, a play triangle for an
- *  executable, a mountain and a sun for an image). The kind is decided
- *  from the real name and st_mode.
+ *  launcher's icon_folder()/icon_pencil() in src/main.c - no images.
+ *  A 20x20 box (ui_px() grows it with the text scale) holds one of
+ *  eight icons, chosen once per entry from the real name and st_mode:
  *
- *  The listing is opendir()/readdir()/lstat(), the size and stamp are
- *  the real st_size/st_mtime, the free-space figure is statvfs() on the
- *  directory being shown, and a symlink that points at a directory
- *  resolves through stat() so it opens like one. If opendir() fails the
- *  real strerror(errno) is drawn instead of rows.
+ *    folder with a tab          a directory
+ *    page, folded corner        a plain file (and the unknown type)
+ *    page + play triangle       executable, mode & 0111
+ *    page + mountain and sun    .png .jpg .jpeg .ppm .bmp .gif
+ *    page + gear                config: .conf .theme .cfg .ini
+ *    page + zip teeth           .zip .gz .tgz .tar .xz .bz2
+ *    page + ruled lines         .txt .md .log
+ *    page + arrow               a symlink (dimmed when it dangles)
+ *
+ *  The toolbar is five real buttons (Back, Up, Home, Refresh, the sort
+ *  cycle) drawn as rounded rects with an icon, a label when the width
+ *  allows it, a hover fill on the last pointer position the desktop
+ *  reported, and a depressed state for the 140 ms after a real click
+ *  (CLOCK_MONOTONIC, so it is a measured interval, not a guess). The
+ *  breadcrumb line is clickable per segment and the status line carries
+ *  the item count, the selected entry's name and size, and the free
+ *  space statvfs() reports for the directory being shown.
+ *
+ *  The listing is opendir()/readdir()/lstat(), the size and stamp are the
+ *  real st_size/st_mtime, the free-space figure is statvfs() on the
+ *  directory being shown. Names are kept up to the 255 bytes ext4 allows.
+ *
+ *  SYMLINKS are shown as what they stand for: stat() supplies the target's
+ *  size, mode and mtime (so an executable target gets the play mark and a
+ *  link to a regular file does not inherit lstat's 0777), readlink() names
+ *  the target in the footer, and a link to a directory opens like one. A
+ *  dangling link is drawn as a plain page and marked "(broken link)". If
+ *  opendir() fails the real strerror(errno) is drawn instead of rows.
  *
  *  KEYS   j/k, Up/Down   move          Enter      open (dir descends,
  *         Home/End       first/last               a file says so)
@@ -41,6 +61,11 @@
  *         450 ms (measured with CLOCK_MONOTONIC) opens it; the toolbar
  *         buttons and every breadcrumb segment are clickable.
  *
+ *  COLUMNS the modified-time column is dropped under 380 px of window (the
+ *         brief's literal number) and, regardless of width, whenever the
+ *         name column would fall under ui_px(90) - that fit test is what
+ *         actually decides, so a 480 px window at 1.4x keeps its dates.
+ *
  *  AppVT hands an app the pointer position only together with a click,
  *  so the toolbar highlight marks the button under the last pointer
  *  position the app was told about - it is a real position, never a
@@ -50,6 +75,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,8 +97,12 @@ enum { SORT_NAME = 0, SORT_SIZE = 1, SORT_TIME = 2, SORT_MODES = 3 };
 /* toolbar buttons, in drawing order; TB_SORT sits on the right edge */
 enum { TB_BACK, TB_UP, TB_HOME, TB_REFRESH, TB_SORT, TB_COUNT };
 
-/* what mark the icon carries - decided once per entry, at scan time */
-enum { IC_FOLDER, IC_FILE, IC_THEME, IC_CONF, IC_EXEC, IC_IMAGE };
+/* Which drawn icon an entry gets - decided once per entry, at scan time,
+ * from the real name and st_mode (see kind_of()). */
+enum { IC_FOLDER, IC_FILE, IC_EXEC, IC_IMAGE, IC_CONF, IC_ARCHIVE, IC_TEXT, IC_LINK };
+
+/* how long a toolbar button stays visibly pressed after a real click */
+#define PRESS_S 0.14
 
 typedef struct {
     char          name[NAME_LEN];
@@ -127,6 +157,8 @@ typedef struct {
     int    sort;
     int    w, h;
     int    px, py;                /* last pointer position reported to us */
+    int    pressed;               /* toolbar button pressed last, -1 = none */
+    double pressed_t;             /* CLOCK_MONOTONIC of that press */
     double last_click_t;          /* CLOCK_MONOTONIC of the last row click */
     int    last_click_idx;
     int    last_click_x, last_click_y;
@@ -172,19 +204,33 @@ static int ends_with_ci(const char *s, const char *suffix) {
     return 1;
 }
 
-/* Content first (theme/conf/image), then the execute bit, then plain.
- * A dangling symlink is just a page: it has no mode of its own to speak of
- * and must never inherit the 0777 that lstat() reports for a link. */
+/* Extension tables. A NULL ends each list, so has_ext() needs no count
+ * to get out of step with the data. */
+static const char *const EXT_CONF[]    = { ".conf", ".theme", ".cfg", ".ini", NULL };
+static const char *const EXT_IMAGE[]   = { ".png", ".jpg", ".jpeg", ".ppm", ".bmp", ".gif", NULL };
+static const char *const EXT_ARCHIVE[] = { ".zip", ".gz", ".tgz", ".tar", ".xz", ".bz2", NULL };
+static const char *const EXT_TEXT[]    = { ".txt", ".md", ".log", NULL };
+
+static int has_ext(const char *name, const char *const *list) {
+    for (const char *const *p = list; *p; p++)
+        if (ends_with_ci(name, *p)) return 1;
+    return 0;
+}
+
+/* A symlink is decided first: it is a pointer, not the thing it points at,
+ * so it keeps its own arrow icon even when the target is a directory (the
+ * trailing '/' and the status line still say the target is a folder). A
+ * dangling link has no mode of its own to speak of and must never inherit
+ * the 0777 that lstat() reports for a link. Then the name decides the
+ * config/image/archive/text families, then the execute bit, then plain. */
 static int kind_of(const Entry *e) {
-    if (e->is_link && !e->link_ok) return IC_FILE;
-    if (e->is_dir) return IC_FOLDER;
-    if (ends_with_ci(e->name, ".theme")) return IC_THEME;
-    if (ends_with_ci(e->name, ".conf"))  return IC_CONF;
-    if (ends_with_ci(e->name, ".png") || ends_with_ci(e->name, ".jpg") ||
-        ends_with_ci(e->name, ".jpeg") || ends_with_ci(e->name, ".ppm") ||
-        ends_with_ci(e->name, ".bmp") || ends_with_ci(e->name, ".gif"))
-        return IC_IMAGE;
-    if ((e->mode & 0111u) != 0) return IC_EXEC;
+    if (e->is_link) return IC_LINK;
+    if (e->is_dir)  return IC_FOLDER;
+    if (has_ext(e->name, EXT_CONF))    return IC_CONF;
+    if (has_ext(e->name, EXT_IMAGE))   return IC_IMAGE;
+    if (has_ext(e->name, EXT_ARCHIVE)) return IC_ARCHIVE;
+    if (has_ext(e->name, EXT_TEXT))    return IC_TEXT;
+    if ((e->mode & 0111u) != 0)        return IC_EXEC;
     return IC_FILE;
 }
 
@@ -368,6 +414,69 @@ static int layout_build(Layout *L, int w, int h) {
         if (!L->show_size) L->name_w = right - L->name_x;
         if (L->name_w < ui_px(16)) L->name_w = ui_px(16);
     }
+    return 1;
+}
+
+/* ------------------------------------------------------------
+ *  The handful of derived positions the painter and the hit-tester
+ *  must agree on. They live here, next to layout_build(), and there is
+ *  exactly one copy of each: draw_toolbar()/draw_list() paint from
+ *  tb_rect()/row_rect() and files_click() hit-tests with tb_btn_at()/
+ *  list_row_at(), which are built on the same two functions. So a click
+ *  always lands on the thing that was painted - at any text scale.
+ * ------------------------------------------------------------ */
+
+/* vertical offset of the toolbar button row inside the toolbar band */
+static int tb_y(const Layout *L) {
+    int y = (L->toolbar_h - L->btn) / 2;
+    return y < 0 ? 0 : y;
+}
+
+/* The rectangle of toolbar button i, app-local. 0 when the button did
+ * not fit and was therefore not drawn (a button that is not painted is
+ * not clickable either). */
+static int tb_rect(const Layout *L, int i, int *bx, int *by, int *bw, int *bh) {
+    if (i < 0 || i >= TB_COUNT || L->btn_w[i] <= 0 || L->btn <= 0) return 0;
+    *bx = L->btn_x[i];
+    *by = tb_y(L);
+    *bw = L->btn_w[i];
+    *bh = L->btn;
+    return 1;
+}
+
+/* which button is under (cx, cy), or -1 */
+static int tb_btn_at(const Layout *L, int cx, int cy) {
+    for (int i = 0; i < TB_COUNT; i++) {
+        int bx, by, bw, bh;
+        if (!tb_rect(L, i, &bx, &by, &bw, &bh)) continue;
+        if (cx >= bx && cx < bx + bw && cy >= by && cy < by + bh) return i;
+    }
+    return -1;
+}
+
+/* The rectangle of visible list row i (0 = topmost visible row), and
+ * whether that row is fully inside the list band. */
+static int row_rect(const Layout *L, int i, int *ry, int *rh) {
+    if (i < 0 || i >= L->rows || L->row_h <= 0) return 0;
+    *ry = L->list_y + i * L->row_h;
+    *rh = L->row_h;
+    return (*ry + *rh <= L->list_bot);
+}
+
+/* The inverse of row_rect(): which visible row holds cy, or -1. The
+ * division is exact because row_rect() only ever multiplies. */
+static int list_row_at(const Layout *L, int cy) {
+    if (L->row_h <= 0 || cy < L->list_y || cy >= L->list_bot) return -1;
+    int i = (cy - L->list_y) / L->row_h;
+    int ry, rh;
+    if (!row_rect(L, i, &ry, &rh)) return -1;
+    return i;
+}
+
+/* a button is live when the action it performs would do something */
+static int tb_enabled(const Files *f, int i) {
+    if (i == TB_BACK) return f->hist_n > 0;
+    if (i == TB_UP)   return strcmp(f->path, "/") != 0;
     return 1;
 }
 
