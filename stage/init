@@ -34,7 +34,7 @@ load_modules() {
     depmod -a "$KV" 2>/dev/null
     for m in drm drm_kms_helper ttm drm_ttm_helper drm_vram_helper \
              drm_shmem_helper drm_client_lib fb_sys_fops sysimgblt sysfillrect \
-             bochs virtio-gpu evdev psmouse              virtio_blk crc16 mbcache jbd2 ext4 fat vfat nls_cp437 nls_iso8859-1; do
+             bochs virtio-gpu evdev psmouse              virtio_blk virtio_net net_failover failover crc16 mbcache jbd2 ext4 fat vfat nls_cp437 nls_iso8859-1; do
         modprobe "$m" 2>/dev/null
     done
 }
@@ -42,6 +42,21 @@ load_modules() {
 # The disk is a real block device. On first boot it has no filesystem,
 # so we make one - after that we just mount it. Everything in /root then
 # survives a reboot, which is the difference between a demo and an OS.
+# Bring up the first network interface and get a DHCP lease. Written only
+# if an interface exists, so a machine without one still boots.
+setup_net() {
+    [ -d /sys/class/net/eth0 ] || { echo "net: no eth0"; return 0; }
+    ip link set eth0 up 2>/dev/null
+    if command -v udhcpc >/dev/null 2>&1; then
+        udhcpc -i eth0 -q -n -t 4 -T 2 -s /etc/udhcpc.script >/dev/null 2>&1
+    fi
+    if ip -4 addr show eth0 2>/dev/null | grep -q "inet "; then
+        echo "net: eth0 up, $(ip -4 addr show eth0 | awk '/inet /{print $2; exit}')"
+    else
+        echo "net: eth0 present but no lease"
+    fi
+}
+
 setup_disk() {
     [ -b /dev/vda ] || { echo "disk: no /dev/vda"; return 0; }
     mkdir -p /root
@@ -110,6 +125,7 @@ probe() {
 }
 
 load_modules
+setup_net
 setup_disk
 
 if grep -q 'mystic.probe=1' /proc/cmdline; then

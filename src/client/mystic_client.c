@@ -27,22 +27,36 @@ static int write_all(int fd, const char *buf, size_t len) {
     return 0;
 }
 
-/* read one line, blocking; returns length or -1 */
+/* Read one '\n'-terminated line, blocking, into out (max bytes including the
+ * terminator). Returns the length, or -1 on EOF, error, or a line that does
+ * not fit in out. In the last case the remainder of the line is still
+ * consumed, so a caller can never inherit a half-read greeting in the stream.
+ * A short read is not an error: bytes are collected until the newline, which
+ * is what makes a line that arrives in several pieces work. */
 static int read_line(int fd, char *out, int max) {
-    int n = 0;
-    while (n < max - 1) {
+    int n = 0, over = 0;
+    if (!out || max < 2) return -1;
+    for (;;) {
         char ch;
         ssize_t r = read(fd, &ch, 1);
-        if (r == 0) return -1;
+        if (r == 0) return -1;              /* EOF in the middle of a line */
         if (r < 0) {
             if (errno == EINTR) continue;
             return -1;
         }
-        if (ch == '\n') { out[n] = 0; return n; }
-        out[n++] = ch;
+        if (ch == '\n') break;
+        if (n < max - 1) out[n++] = ch;
+        else over = 1;                      /* keep draining to the '\n'  */
     }
     out[n] = 0;
-    return n;
+    return over ? -1 : n;
+}
+
+/* close the socket on any mc_open failure and report the error */
+static int mc_open_fail(MClient *c) {
+    if (c->fd >= 0) close(c->fd);
+    c->fd = -1;
+    return -1;
 }
 
 int mc_open(MClient *c, const char *id, const char *title, int w, int h) {
@@ -70,28 +84,32 @@ int mc_open(MClient *c, const char *id, const char *title, int w, int h) {
 
     char hello[512];
     snprintf(hello, sizeof(hello), "HELLO %s %d %d %s\n", id, w, h, title);
-    if (write_all(c->fd, hello, strlen(hello)) < 0) return -1;
+    if (write_all(c->fd, hello, strlen(hello)) < 0) return mc_open_fail(c);
 
     char line[512];
-    if (read_line(c->fd, line, sizeof(line)) < 0) return -1;
+    if (read_line(c->fd, line, sizeof(line)) < 0) return mc_open_fail(c);
     if (strncmp(line, "OK ", 3)) {
         fprintf(stderr, "mystic: server refused: %s\n", line);
-        return -1;
+        return mc_open_fail(c);
     }
 
     char shm[128];
     int stride = w;
-    if (sscanf(line + 3, "%127s %d", shm, &stride) < 1) return -1;
+    if (sscanf(line + 3, "%127s %d", shm, &stride) < 1) return mc_open_fail(c);
 
     snprintf(c->shm, sizeof(c->shm), "%s", shm);
     c->stride = stride;
 
     int fd = open(shm, O_RDWR);
-    if (fd < 0) { perror("open shm"); return -1; }
+    if (fd < 0) { perror("open shm"); return mc_open_fail(c); }
     size_t bytes = (size_t)stride * (size_t)h * 4;
     c->px = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
-    if (c->px == MAP_FAILED) { perror("mmap shm"); c->px = NULL; return -1; }
+    if (c->px == MAP_FAILED) {
+        perror("mmap shm");
+        c->px = NULL;
+        return mc_open_fail(c);
+    }
 
     fcntl(c->fd, F_SETFL, fcntl(c->fd, F_GETFL, 0) | O_NONBLOCK);
     return 0;
@@ -105,21 +123,42 @@ void mc_present(MClient *c) {
 int mc_poll(MClient *c, MEvent *ev) {
     if (!c || c->fd < 0) return 0;
 
+    int eof = 0;
     for (;;) {
-        ssize_t n = read(c->fd, c->rx + c->rxlen, sizeof(c->rx) - (size_t)c->rxlen - 1);
+        /* Never ask the kernel for 0 bytes. read(fd, buf, 0) returns 0, which
+         * is indistinguishable from EOF, so a full rx[] used to be reported as
+         * MC_CLOSE while the server was still alive and talking. When there is
+         * no room left we stop reading and let the caller consume a line; the
+         * unread bytes stay in the socket for the next call. */
+        size_t space = sizeof(c->rx) - (size_t)c->rxlen - 1;
+        if (space == 0) break;
+        ssize_t n = read(c->fd, c->rx + c->rxlen, space);
         if (n > 0) {
             c->rxlen += (int)n;
             c->rx[c->rxlen] = 0;
-        } else if (n == 0) {
-            ev->type = MC_CLOSE;
-            return 1;
-        } else {
-            break;
+            continue;
         }
+        if (n == 0) { eof = 1; break; }      /* genuine EOF */
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+        eof = 1;                             /* real error: the peer is gone */
+        break;
     }
 
     char *nl = strchr(c->rx, '\n');
-    if (!nl) return 0;
+    if (!nl) {
+        if (c->rxlen >= (int)sizeof(c->rx) - 1) {
+            /* One line longer than rx[]: it can never be completed in this
+             * buffer, so drop it instead of wedging the reader forever. The
+             * server's longest line is "TEXT " plus 31 bytes, so this can only
+             * be a broken peer. */
+            c->rxlen = 0;
+            c->rx[0] = 0;
+            return 0;
+        }
+        if (eof) { ev->type = MC_CLOSE; return 1; }
+        return 0;
+    }
     *nl = 0;
 
     char line[256];

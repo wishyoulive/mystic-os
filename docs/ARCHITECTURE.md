@@ -7,8 +7,10 @@ function; where the source and this text disagree, the source is right.
 Two rules shape the whole design and explain most of the odd-looking decisions:
 
 * **The desktop is one process.** `mystic-desktop` owns the framebuffer, the
-  input devices, the window list and every app. There is no X11, no Wayland, no
-  GPU driver, no toolkit, no udev, no display server.
+  input devices, the window list and every in-desktop app. There is no X11, no
+  Wayland, no GPU driver, no toolkit, no udev, no display server. Apps that need
+  their own address space are separate processes that speak a small protocol to
+  the desktop (§4.5, `docs/IPC.md`).
 * **Everything visible is computed from something real.** Resolution comes from
   `FBIOGET_VSCREENINFO`, memory from `/proc/meminfo`, processes from `/proc/<pid>`,
   input from `/dev/input/event*`, files from `readdir`/`stat`, persistence from a
@@ -20,19 +22,22 @@ Two rules shape the whole design and explain most of the odd-looking decisions:
 QEMU  ──►  firmware loads bzImage + initramfs          (image.sh: -kernel, -initrd)
       ──►  Linux 6.18.63-0-virt unpacks the cpio into rootfs (RAM)
       ──►  /init = stage/init, PID 1 (rdinit=/init)
-             mounts proc/sys/dev/devpts
-             depmod + modprobe  (drm, bochs, evdev, virtio_blk, ext4, …)
+             mounts proc/sys/dev/devpts/tmpfs
+             depmod + modprobe  (drm, bochs, evdev, virtio_blk, virtio_net, ext4, …)
+             udhcpc on eth0 when the machine has one
              mkfs/mount /dev/vda on /root        (ext4, first boot only)
              unbinds the framebuffer console
       ──►  exec /usr/bin/mystic-desktop = src/main.c
              fb.c     /dev/fb0            → Display
              input.c  /dev/input/event*   → Input
              theme.c  /etc/mystic/themes/*.theme → Theme
+             ui.c     /etc/mystic/ui.conf → the global text scale
              gfx.c    pixels              → Surface
-             font.c   Lato .ttf via stb_truetype → glyph bitmaps
+             font.c   Lato + JetBrains Mono via stb_truetype → glyph bitmaps
              term.c   forkpty + /bin/sh   → cell grid
              sha256.c password hashing    → lock screen check
-             apps/*.c AppVT implementations
+             wmsrv.c  /run/mystic/wm.sock → external app processes
+             apps/*.c AppVT implementations linked into the binary
 ```
 
 Everything under the desktop is Alpine's kernel and minirootfs with our
@@ -44,13 +49,14 @@ Everything under the desktop is Alpine's kernel and minirootfs with our
 
 ### 1.1 QEMU
 
-`image.sh` builds one command line and reuses it for every mode:
+`image.sh` builds one argument array and reuses it for every mode:
 
 ```
 -kernel build/cache/vmlinuz-virt
 -initrd build/initramfs.cpio.gz
 -m 256 -vga std -no-reboot
 -drive file=build/disk.img,format=raw,if=virtio
+-netdev user,id=n0 -device virtio-net-pci,netdev=n0
 -append "console=ttyS0 rdinit=/init loglevel=3 quiet"
 ```
 
@@ -58,7 +64,9 @@ Everything under the desktop is Alpine's kernel and minirootfs with our
 `probe` mode appends `mystic.probe=1 loglevel=0` and uses
 `-display none -serial stdio`. `-vga std` is QEMU's bochs-compatible VGA, which
 the kernel's `bochs` DRM driver binds; that is what creates `/dev/dri/card0` and
-`/dev/fb0`. `-drive …,if=virtio` is what the OS sees as `/dev/vda`.
+`/dev/fb0`. `-drive …,if=virtio` is what the OS sees as `/dev/vda`. The
+`-netdev user` / `-device virtio-net-pci` pair gives the guest an `eth0` behind
+QEMU's user-mode stack, which is what `setup_net()` in `stage/init` brings up.
 
 There is no bootloader in this path. QEMU's firmware loads the bzImage and the
 initrd with the Linux boot protocol and starts the kernel. `boot/boot.asm` and
@@ -78,31 +86,39 @@ the boot, and `/root` is the only path backed by a disk (§5).
 1. `mount -t proc none /proc`, `-t sysfs none /sys`, `-t devtmpfs none /dev`,
    and `-t devpts none /dev/pts` (devpts is required by `forkpty` in `term.c`).
 2. `hostname mystic`; `PATH=/sbin:/usr/sbin:/bin:/usr/bin`;
-   `mkdir -p /root /run /tmp /var/log`.
-3. `load_modules()` — `KV=$(uname -r)`, then `depmod -a "$KV"` to generate
+   `mkdir -p /root /run/mystic /tmp /var/log /dev/shm`.
+3. `mount -t tmpfs none /dev/shm` — the shared pixel buffers of the display
+   protocol live here (§4.5), and `wmsrv.c` creates them with `O_EXCL` in that
+   directory.
+4. `load_modules()` — `KV=$(uname -r)`, then `depmod -a "$KV"` to generate
    `modules.dep` from the module tree that `tools/fetch-kernel.sh` staged, then
    `modprobe` for an explicit list:
 
    ```
    drm drm_kms_helper ttm drm_ttm_helper drm_vram_helper drm_shmem_helper
    drm_client_lib fb_sys_fops sysimgblt sysfillrect bochs virtio-gpu evdev
-   psmouse virtio_blk crc16 mbcache jbd2 ext4 fat vfat nls_cp437 nls_iso8859-1
+   psmouse virtio_blk virtio_net net_failover failover crc16 mbcache jbd2
+   ext4 fat vfat nls_cp437 nls_iso8859-1
    ```
 
    Alpine's `linux-virt` builds these as modules, so without this step there is no
    framebuffer and no event device.
-4. `setup_disk()` — see §5.
-5. Probe mode: if `/proc/cmdline` contains `mystic.probe=1`, print kernel,
+5. `setup_net()` — returns silently unless `/sys/class/net/eth0` exists, so a
+   machine without a NIC still boots. With one: `ip link set eth0 up`, then
+   `udhcpc -i eth0 -q -n -t 4 -T 2 -s /etc/udhcpc.script`, then it prints either
+   the leased IPv4 address or `net: eth0 present but no lease`.
+6. `setup_disk()` — see §5.
+7. Probe mode: if `/proc/cmdline` contains `mystic.probe=1`, print kernel,
    `/proc/uptime`, `/proc/meminfo`, `/proc/modules`, DRM/fb facts from
    `/sys/class/drm/*` and `/sys/class/graphics/*/name`, input device names, the
    boot counter in `/root/boots.txt` and a permissions test file, then
    `sync; poweroff -f`. This is what `tools/smoke.sh` and `image.sh probe` read.
-6. Unbind the framebuffer console: for each `/sys/class/vtconsole/vtcon*`, read
+8. Unbind the framebuffer console: for each `/sys/class/vtconsole/vtcon*`, read
    `name`; if it contains `frame buffer`, write `0` to `bind`. Otherwise fbcon
    keeps painting its block cursor over the desktop's pixels. `src/fb.c`
    `claim_console()` applies a second guard: `open("/dev/tty0")` and
    `ioctl(KDSETMODE, KD_GRAPHICS)`.
-7. `exec /usr/bin/mystic-desktop`. If the binary or `/dev/fb0` is missing, print
+9. `exec /usr/bin/mystic-desktop`. If the binary or `/dev/fb0` is missing, print
    `/etc/mystic-banner` plus kernel/memory/display facts and `exec /bin/sh`.
 
 ### 1.4 Input devices without udev
@@ -124,15 +140,21 @@ Everything else is closed and logged as ignored. Both fds are opened
 * `REL_X`/`REL_Y` accumulate into `mouse_dx`/`mouse_dy` and move `mouse_x`/`mouse_y`;
   `ABS_X`/`ABS_Y` set the position directly; `REL_WHEEL` accumulates `wheel`.
 * `BTN_LEFT`/`BTN_RIGHT`/`BTN_MIDDLE` set bits 1/2/4 in `buttons` plus the
-  one-frame `clicked`/`released` masks.
+  one-frame `clicked`/`released` masks. A left press within 350 ms and 6 px of
+  the previous one also sets `clicked2`, which is the only thing double-click
+  means in this tree.
 * Other `EV_KEY` press events set `key` (raw evdev code), `key_pressed`, and the
-  modifier state carried on that event (`shift`, `alt`, `ctrl`), and append a
-  printable character to `text[]` via the explicit `KEYMAP` table and
-  `key_to_char()`. Ctrl+letter is folded to a control byte (`Ctrl+S` → `0x13`).
+  modifier state carried on that event (`shift`, `alt`, `ctrl`), append the code
+  to `keys[]` (`nkeys`), and append a printable character to `text[]` via the
+  explicit `KEYMAP` table and `key_to_char()`. Ctrl+letter is folded to a
+  control byte (`Ctrl+S` → `0x13`). Releases append to `keys_up[]` (`nkeys_up`)
+  so a window can see the press *and* the release, which the external app
+  protocol carries as the `press` field.
 
-`input_frame()` clears the per-frame fields at the top of every loop, so a click
-is consumed exactly once. The pointer starts at (640, 400) because a relative
-device has no absolute position to report until it moves.
+`input_frame()` clears the per-frame fields (`clicked`, `released`, `clicked2`,
+`wheel`, `key`, `nkeys`, `nkeys_up`, `mouse_dx`, `text_len`) at the top of every
+loop, so a click is consumed exactly once. The pointer starts at (640, 400)
+because a relative device has no absolute position to report until it moves.
 
 ---
 
@@ -161,7 +183,8 @@ the low three bytes are exactly the `0x00RRGGBB` the framebuffer wants, so a
 `Surface { u32 *px; int w, h, stride; }` is the only drawing target in the
 system. `surf_set` bounds-checks per pixel; `surf_fill`, `surf_blend`,
 `surf_copy` and `surf_push` clamp their rectangles to the surface. There is no
-per-window clip rectangle — see §4.
+per-window clip rectangle for in-desktop apps — see §4.3. The one blit that *is*
+clipped is the external client's buffer into its window (§4.5).
 
 ### 2.3 Two full-screen buffers
 
@@ -181,52 +204,61 @@ never has to be erased. At 1280×800 the pair costs 2 × 4.096 MB.
 ### 2.4 Full recompose on change
 
 There is no damage tracking. Every loop sets `dirty` for any of: a click that a
-window, the dock or the launcher handled, mouse motion (`mouse_dx || mouse_dy`), a
-key that opens or closes a window or changes the theme, a changed wall-clock
-second (`time(NULL)`), terminal output (`term_pump` is called for every terminal
-window and unconditionally sets `dirty`), and terminal keys/wheel scrolling. When
-`dirty` is set, the entire frame is rebuilt and presented, then `dirty = 0`. The
-loop ends with `poll(…, 16)` ms, which is the only pacing — there is no vsync and
-no partial redraw.
+window, the eye or the launcher handled, mouse motion (`mouse_dx || mouse_dy`),
+a key that opens or closes a window, moves the launcher selection or changes the
+theme, a changed wall-clock second, terminal output (`term_pump()` returning a
+positive byte count), a resize or a snap, a click on a window title that
+maximises it, a client that sent `FRAME` (`want_frame`), and — while it lasts —
+the eye blink. When `dirty` is set, the entire frame is rebuilt and presented,
+then `dirty = 0`. The loop ends with `poll(…, 16)` ms, which is the only pacing —
+there is no vsync and no partial redraw.
 
 `draw_desktop()` composes in this order:
 
 1. Background: `gfx_gradient` from `bg_top` to `bg_bottom`, then three
    `gfx_glow` calls (top-left, right, bottom) using the theme's `glow`/`accent`
-   and `glow_strength`.
-2. Top bar, 34 px: `gfx_blur_region` over the bar (radius `18 * blur`), then
-   `surf_blend(…, color_alpha(th->panel, 0.55f))` — the panel colour at 55 % of
-   *its own* alpha, which works out at ≈30 % opacity with Obsidian and Aurora
-   (`panel = #8C…`: 0x8C × 0.55 → 0x4D) and ≈42 % with Porcelain (`#C0…`:
-   0xC0 × 0.55 → 0x6A) — then a 1 px `panel_border` line. Text: `"Mystic OS"`,
-   the focused window's title centred, and on the right `clock_text()` +
+   and `glow_strength`. (`src/wallpaper.c` holds four procedural wallpapers that
+   also paint a background from the `Theme`; nothing calls it yet — see
+   *Known rough edges*.)
+2. Top bar, `topbar_h()` = `ui_px(34)`: `gfx_blur_region` over the bar (radius
+   `18 * blur`), then `surf_blend(…, color_alpha(th->panel, 0.55f))` — the panel
+   colour at 55 % of *its own* alpha, which works out at ≈30 % opacity with
+   Obsidian and Aurora (`panel = #8C…`: 0x8C × 0.55 → 0x4D) and ≈42 % with
+   Porcelain (`#C0…`: 0xC0 × 0.55 → 0x6A) — then a 1 px `panel_border` line.
+   Left to right: the start button (`draw_start_button()` → `draw_eye()`, §3.10),
+   the word `"Mystic"` in `FONT_MEDIUM` 13 at `x = 46`, the focused window's
+   title centred in `FONT_REGULAR` 11, and on the right `clock_text()` +
    `mem_field("MemTotal:")`/`"MemAvailable:"` from `/proc/meminfo`, formatted as
    `HH:MM      N MB used of M MB`. `clock_text()` uses `gmtime_r`, so the clock is
    UTC.
-3. Windows, back to front (§3). Each one is composed in this order:
-   `gfx_shadow(x, y, w, h, corner, 24, 0.5)` → a backdrop blur over the window
+3. Windows, back to front (§3.2). Minimised windows (`hidden`) are skipped
+   entirely. Each one is composed in this order:
+   `gfx_shadow(x, y, w, h, corner, 24, 0.5f)` → a backdrop blur over the window
    rect (radius `14 * blur`) → the rounded body in `window_bg` with a 1 px
-   `window_border` → a 40 px title strip tinted with the panel colour at 30 % of
-   its own alpha (`color_alpha(th->panel, 0.30f)`, ≈16 % with Obsidian/Aurora)
-   and a 1 px divider → three 10 px circles (the red one closes) → the title at
-   `x+72` → three grip strokes in the bottom-right corner → the content rectangle
-   `(x+1, y+41, w-2, h-43)` handed to `term_draw()` or `app_draw()`.
-4. Dock: `dock_rect()` gives a centred bar `DOCK_N*40 + (DOCK_N-1)*20 + 28` wide,
-   68 high, 22 px above the bottom edge; `gfx_shadow`, backdrop blur (radius
-   `20 * blur`), rounded `panel`, then one 40×40 icon per `DOCK[]` entry with a
-   hover tint and the icon drawn by a small vector routine
-   (`icon_terminal`, `icon_folder`, `icon_gear`, `icon_bars`, `icon_pencil`).
-   Under an icon whose app (or, for the terminal, whose pty) is open, a 4 px
-   accent dot is drawn. If the launcher is open, `draw_launcher()` runs after the
-   dock; if the screen is locked, `draw_lock_screen()` runs after that.
+   `window_border` → a title strip `title_h()` = `ui_px(40)` tall, tinted with
+   the panel colour at 30 % of its own alpha (`color_alpha(th->panel, 0.30f)`,
+   ≈16 % with Obsidian/Aurora) and a 1 px divider → three 10 px circles at
+   `+14/+32/+50`, y `+15` (red closes, yellow minimises, green is decoration) →
+   the title in `FONT_MEDIUM` 13 at `x+72` → three grip strokes in the
+   bottom-right corner → the content rectangle
+   `(x+1, y+title_h()+1, w-2, h-title_h()-2)` handed to `term_draw()`,
+   `app_draw()` or the client blit.
+4. Taskbar: `dock_rect()` returns 0 (and nothing is drawn) when no window is
+   open; otherwise a centred bar `n*dock_isz() + (n-1)*dock_gap() + 2*dock_pad()`
+   wide and `dock_isz() + 2*dock_pad()` high, 22 px above the bottom edge, with
+   `gfx_shadow` (spread 18), a backdrop blur (radius `20 * blur`), a rounded
+   `panel`, and one icon per **open window** (not per app — §3.11). The focused
+   window's tile is tinted with the accent and gets a 14×3 accent pill under it;
+   a hovered tile shows the window title in a tooltip above the bar.
+5. `draw_launcher()` if `launcher_open`, then `draw_lock_screen()` if `locked`.
 
 Every **direct** backdrop blur in that list is guarded by `th->blur > 0`: with
-`blur = 0` the top bar, windows, dock and launcher lose their blur (the lock
-screen's fixed radius 40 is skipped too). All three shipped themes use
+`blur = 0` the top bar, windows, taskbar and launcher lose their blur (the lock
+screen's fixed radius 40 is skipped too). All six shipped themes use
 `blur = 1.0`, so the radii above are the ones you actually get. The shadows are a
 separate path: `gfx_shadow()` blurs its own scratch surface inside
 `gfx_blur_region(&tmp, 0, 0, rw, rh, (int)spread)` (`src/gfx.c`) with a **fixed**
-radius equal to its `spread` argument — 24 for windows, 18 for the dock, 30 for
+radius equal to its `spread` argument — 24 for windows, 18 for the taskbar, 30 for
 the launcher, 26 for the lock panel — and it runs whether or not the theme has
 blur enabled.
 
@@ -280,22 +312,26 @@ visible, and doing it at quarter resolution cuts the work by 16×. If
 region.
 
 `gfx_shadow()` reuses it: allocate a scratch `Surface` of the shadow bounds
-(`pad = spread*3`), draw an opaque black rounded rect inset by `pad`, blur it with
-`radius = spread`, then darken the destination by the blurred red channel
-(`dst * (255 - a*alpha) / 255`). A shadow can therefore only darken, never paint.
+(`pad = spread*3`), paint a **white** rounded rect at `(pad, pad)` inset by `pad`,
+blur it with `radius = spread`, then use the blurred **red channel** as the shadow
+mask and multiply the destination by `(255 - a*alpha)/255` per channel. White, not
+black: the blurred alpha of a black rect is zero, so a black mask drew nothing at
+all. A shadow can therefore only darken, never paint.
 
 ### 2.7 Text: TrueType with a per-font glyph cache
 
-`src/font.c` rasterises real Lato files through `stb_truetype` (vendored as
-`src/stb_truetype.h`). `FONT_FILES` maps the three faces to
+`src/font.c` rasterises real typefaces through `stb_truetype` (vendored as
+`src/stb_truetype.h`). `FONT_FILES` maps the four faces to
 `Lato-Regular.ttf`, `Lato-Bold.ttf`, `Lato-Black.ttf` for `FONT_REGULAR`,
-`FONT_MEDIUM`, `FONT_SEMIBOLD`; they are read from `/usr/share/fonts`
-(`FONT_DIR` in `main.c`).
+`FONT_MEDIUM`, `FONT_SEMIBOLD` and to `JetBrainsMono-Regular.ttf` for
+`FONT_MONO`; they are read from `/usr/share/fonts` (`FONT_DIR` in `main.c`).
 
-`font_get(face, size)` walks a linked list of loaded `Font`s and returns a match
-within 0.01 px, otherwise `load_one()` reads the whole `.ttf` into memory,
-`stbtt_InitFont`, `stbtt_ScaleForPixelHeight`, and records ascent/descent.
-`font_height()` is `size * 1.4`.
+`font_get(face, size)` first multiplies the requested size by
+`ui_scale_get()` (§2.9), quantises it to half a pixel, clamps it to 5…96, then
+walks a linked list of loaded `Font`s and returns a match within 0.01 px;
+otherwise `load_one()` reads the whole `.ttf` into memory, `stbtt_InitFont`,
+`stbtt_ScaleForPixelHeight`, and records ascent/descent. `font_height()` is
+`size * 1.4`.
 
 Each `Font` owns its cache: `Glyph cache[2048]` keyed by **codepoint**, not by
 glyph index. `glyph_get(f, cp)` starts at `slot = cp % MAX_GLYPHS` and probes
@@ -326,11 +362,46 @@ pass a box top and get text that sits on `y + ascent`.
 
 Everything here is scalar C on one core, per pixel. The expensive primitive is
 the blur: with the shipped themes (`blur = 1.0`) every composed frame blurs the
-top bar, each visible window and the dock, plus the launcher or lock screen when
-shown; a theme that sets `blur = 0` skips all of those. The shadowed elements —
-windows (24), the dock (18), the launcher (30) and the lock panel (26), but not
-the top bar — each blur a scratch surface as well, at their fixed radii. That cost
-is why the blur runs at quarter resolution.
+top bar, each visible window and the taskbar, plus the launcher or lock screen
+when shown; a theme that sets `blur = 0` skips all of those. The shadowed
+elements — windows (24), the taskbar (18), the launcher (30) and the lock panel
+(26), but not the top bar — each blur a scratch surface as well, at their fixed
+radii. That cost is why the blur runs at quarter resolution.
+
+### 2.9 The text scale: one number, every metric derives from it (`src/ui.c`)
+
+`static float ui_scale` starts at 1.0 and is set by
+`ui_scale_load("/etc/mystic/ui.conf")`, which `main()` calls **before**
+`font_init()` — the scale has to be known before the first glyph is
+rasterised, or the first window would be laid out at the wrong size. The parser
+looks for the first line beginning with `scale`, takes the `atof()` of the text
+after `=`, and clamps it to 0.8 … 1.6. A missing file, or a file with no `scale`
+line, leaves 1.0. The shipped file is `scale = 1.0`.
+
+Two accessors use it:
+
+* `font_get(face, size)` multiplies the nominal size by it (§2.7), so *every*
+  string in the system — window titles, list rows, terminal cells, the lock
+  clock — grows from one place, and no caller can forget.
+* `ui_px(base)` returns `(int)(base * scale + 0.5f)`, floored at 1 so a 1 px
+  border stays a 1 px border at 0.8.
+
+`src/main.c` names the four bands it needs instead of using numbers:
+`title_h()` = `ui_px(40)`, `topbar_h()` = `ui_px(34)`, `dock_isz()` = `ui_px(40)`,
+plus `dock_gap()` = `ui_px(16)` and `dock_pad()` = `ui_px(12)` for the taskbar.
+Window open sizes (`ui_px(640) × ui_px(380)` for a terminal,
+`ui_px(520) × ui_px(360)` for an app), the launcher grid (`ui_px(128)` tiles,
+`ui_px(118)` rows, `ui_px(18)` gaps, `ui_px(52)` icons) and the lock panel
+(`ui_px(380) × ui_px(210)`) all go through `ui_px()` too. The in-desktop apps do
+the same in their own `layout_build()`-style code: `src/apps/files.c` derives its
+toolbar, breadcrumb, row and footer heights from the fonts it draws with, so the
+whole app grows with the scale rather than clipping.
+
+Not everything scales, and the code is explicit about it: the traffic-light dots
+(10 px at `+14/+32/+50`), the eye (§3.10, a 30×28 hit box), the 18 px resize
+corner, the 22 px gap between the taskbar and the screen edge, and the fixed
+offsets inside the lock panel stay put; only the bands that hold text follow
+`ui_px()`. See *Known rough edges* for the two places where that is visible.
 
 ---
 
@@ -339,13 +410,19 @@ is why the blur runs at quarter resolution.
 ### 3.1 State
 
 ```c
+enum { WIN_TERM = 0, WIN_APP, WIN_CLIENT };
+
 typedef struct {
     int   used;
-    int   kind;          /* WIN_TERM or WIN_APP */
+    int   kind;          /* WIN_TERM, WIN_APP or WIN_CLIENT */
     char  title[64];
     int   x, y, w, h;    /* screen rectangle, including the title bar */
     App  *app;           /* WIN_APP */
     Term *term;          /* WIN_TERM */
+    int   client;        /* index into clients[] when kind == WIN_CLIENT */
+    int   hidden;        /* minimised: alive, not drawn, not hit-tested */
+    int   maxed;         /* maximised by a double click */
+    int   restore_x, restore_y, restore_w, restore_h;
     int   z;             /* larger = in front */
 } Window;
 
@@ -353,6 +430,9 @@ static Window wins[MAX_WINDOWS];   /* MAX_WINDOWS == 10 */
 static int    z_top;
 static int    drag_win = -1, drag_dx, drag_dy;
 static int    resize_win = -1;
+
+static WmClient clients[WM_MAX_CLIENTS];   /* 8, from src/ipc.h */
+static WmApp   bundles[WM_MAX_APPS];       /* 32, scanned once at startup */
 ```
 
 `z` is a monotonic counter, not an index: `win_focus()` does `w->z = ++z_top`.
@@ -361,22 +441,23 @@ comparison is relative.
 
 ### 3.2 Z-order
 
-* `win_top()` — linear scan for the maximum `z`; used for the top-bar title, for
-  keyboard routing and for Esc.
+* `win_top()` — linear scan for the maximum `z` **among non-minimised windows**;
+  used for the top-bar title, for keyboard routing and for Esc.
 * Painting back-to-front is a selection loop, not a sort: `last_z` starts at −1
   and for each of up to `MAX_WINDOWS` slots the compositor picks the window with
-  the smallest `z` greater than `last_z`, draws it, and sets `last_z`. With
-  `n ≤ 10` this is cheaper than sorting and needs no scratch array.
+  the smallest `z` greater than `last_z`, draws it, and sets `last_z`. Hidden
+  windows are skipped in the same loop. With `n ≤ 10` this is cheaper than
+  sorting and needs no scratch array.
 
 ### 3.3 Open and close
 
 `win_open(kind, app_id)` takes the first `used == 0` slot:
 
-| | terminal | app |
+| | terminal | in-desktop app |
 |---|---|---|
-| size | 640 × 380 | 520 × 360 |
+| size | `ui_px(640) × ui_px(380)` | `ui_px(520) × ui_px(360)` |
 | position | `60 + (i%3)*40`, `70 + (i%3)*40` | `140 + (i%3)*40`, `110 + (i%3)*40` |
-| content | `term_create(cols, rows, "/bin/sh")` with `cols = (w-24)/7`, `rows = (h-56)/16` | `app_new(app_id, w-2, h-40-2)` |
+| content | `term_create(cols, rows, "/bin/sh")` with `cols = (w-24)/font_width(fm,"M")`, `rows = (h-56)/font_height(fm)`, `fm = font_get(FONT_MONO, 12)` | `app_new(app_id, w-2, h-40-2)` |
 | title | `"Terminal"` | `app_title(a)` |
 
 The rectangle is then clamped to stay on screen (`x = disp.w - w - 20`,
@@ -384,88 +465,115 @@ The rectangle is then clamped to stay on screen (`x = disp.w - w - 20`,
 clears the slot and returns `NULL`, so a missing app cannot leave a half-open
 window behind.
 
-`win_close()` closes the pty fd, frees the `Term`, calls `app_free()` (which runs
-`vt->free`), and `memset`s the slot. Terminals are also closed automatically when
-`term_pump()` reports the shell has gone (`term_alive()` false), which is how
-typing `exit` in a terminal closes its window. Closing through the red dot does
-not `waitpid` the shell: the pty master is closed (the shell gets SIGHUP) and the
-`Term` is freed, so only an exit that `term_pump()` observed is reaped.
+External clients do not go through `win_open()`: the frame loop binds a free
+`Window` to a `WmClient` as soon as the client has a buffer, sized
+`cl->w + 2 × cl->h + 42` (§4.5).
+
+`win_close()` calls `term_destroy()` (which closes the pty, hangs the shell up,
+reaps it and frees the grid plus the 600-line scrollback), `app_free()` (which
+runs `vt->free`), and for a client `wms_notify_close()` then
+`wms_shutdown_client()` — then `memset`s the slot. Terminals are also closed
+automatically when `term_pump()` reports the shell has gone (`term_alive()` false),
+which is how typing `exit` in a terminal closes its window. The frame loop also
+runs `waitpid(-1, NULL, WNOHANG)` until it returns 0, which reaps launched apps
+and any shell that exited while nobody was looking.
 
 ### 3.4 Hit testing
 
 `handle_click()` runs on the press edge (`input.clicked & 1`) and tests in this
 order:
 
-1. **Launcher, if it is open.** A press inside a tile opens that app and closes
-   the launcher; a press anywhere else just closes the launcher. Nothing else is
-   considered while it is open.
-2. **Window body.** The topmost window whose rectangle contains the pointer wins
-   (max `z`). It is focused first, so clicking anywhere raises.
-3. **Close dot.** Local `ly < 40` and `14 <= lx < 24` — the red circle — calls
-   `win_close()`.
-4. **Resize grip.** `lx >= w-18 && ly >= h-18` sets `resize_win` to the slot index.
-5. **Title bar.** `ly < 40` sets `drag_win` and records the grab offset
+1. **Start button.** The eye's hit box (`EYE_HIT_X/Y/W/H`, fixed at 4,3,30,28) is
+   checked before anything else: a press there starts the blink and toggles the
+   launcher, whatever is underneath.
+2. **Launcher, if it is open.** A press inside a tile opens that app (or launches
+   that bundle) and closes the launcher; a press anywhere else just closes the
+   launcher. Nothing else is considered while it is open.
+3. **Window body.** The topmost non-minimised window whose rectangle contains the
+   pointer wins (max `z`). It is focused first, so clicking anywhere raises.
+4. **Close dot.** Local `13 <= ly < 27` and `14 <= lx < 24` — the red circle —
+   calls `win_close()`. The hit box is the dot itself, not the whole title strip.
+5. **Minimise dot.** The same rows, `32 <= lx < 42` — the yellow circle — sets
+   `hidden = 1`.
+6. **Resize grip.** `lx >= w-18 && ly >= h-18` sets `resize_win` to the slot index.
+7. **Double-click on the title bar.** `ly < title_h()` and `input.clicked2`
+   toggles maximise. The press that carries `clicked2` records `restore_*` and
+   sets the window to `(0, 34, disp.w, disp.h-34-90)`; the next one restores the
+   saved rectangle. An in-desktop app gets `vt->resize()` here, so an app that
+   can reflow does; a client window is only moved and resized (no `RESIZE` is
+   sent from this path, so its buffer keeps its old size and the blit clips).
+8. **Title bar.** `ly < title_h()` sets `drag_win` and records the grab offset
    (`drag_dx`, `drag_dy`) in window-local coordinates.
-6. **Body click.** `app_click(a, lx-1, ly-tb-1, buttons)` — the same content
-   origin (`x+1, y+tb+1`) the compositor draws at, in window-local coordinates.
-7. **Dock.** If no window was hit, a pointer in the dock band over an icon calls
-   `win_open()` with `WIN_APP` and that entry's app id, or `WIN_TERM` when the id
-   is `NULL`.
+9. **Body click.** `app_click(a, lx-1, ly-tb-1, buttons)` — the same content
+   origin (`x+1, y+tb+1`) the compositor draws at, in window-local coordinates —
+   or, for a client window, `wms_notify_mouse()`.
+10. **Taskbar.** If no window was hit, a press in the taskbar band over a tile
+    restores and focuses that window if it is minimised, minimises it if it is
+    already the focused (top) window, and otherwise just focuses it.
 
 There is no separate "click-through" or "accepts input" flag; a window is a
-rectangle and the topmost one at the pointer always gets the event.
+rectangle and the topmost one at the pointer always gets the event, except that a
+minimised window is not part of the world until the taskbar brings it back.
 
-### 3.5 Drag and resize
+### 3.5 Drag, resize, snap, maximise
 
-Both are per-frame state machines while button 1 is held, not event streams:
+Drag and resize are per-frame state machines while button 1 is held, not event
+streams:
 
 * **Drag** — `nx = mouse_x - drag_dx`, `ny = mouse_y - drag_dy`, clamped so
   `x >= 0`, `y >= 34` (the top bar stays visible), `x+w <= disp.w`,
   `y+h <= disp.h`. The window is repositioned only when the result differs, so an
   immobile drag does not dirty the frame.
 * **Resize** — `nw = mouse_x - w->x + 1`, `nh = mouse_y - w->y + 1`, floor
-  280 × 160, then `vt->resize(a, w-2, h-42)` if the app implements it. Terminal
-  windows are not resized: the pty's `winsize` is set once in `term_create`, and
-  `term_draw` simply draws at most `t->cols` × `t->rows` cells inside whatever
-  rectangle it is given.
+  280 × 160, then `vt->resize(a, w-2, h-42)` for an in-desktop app or
+  `wms_notify_resize()` for a client. Terminal windows are not resized: the pty's
+  `winsize` is set once in `term_create`, and `term_draw` simply draws at most
+  `t->cols` × `t->rows` cells inside whatever rectangle it is given.
 
 Releasing button 1 clears both (`drag_win = resize_win = -1`). A release also
 snaps the dragged window when it ended near a screen edge: top edge within 6 px of
-the 34 px bar → full width (`x=0, y=bar, h=disp.h-bar-90`); `x <= 8` → left half;
-`x+w >= disp.w-8` → right half. The snap goes through `vt->resize()` like a manual
-resize, so an app that can reflow does.
+the `topbar_h()` bar → full width (`x=0, y=bar, w=disp.w, h=disp.h-bar-90`);
+`x <= 8` → left half; `x+w >= disp.w-8` → right half. The snap goes through
+`vt->resize()` like a manual resize, so an app that can reflow does.
 
-### 3.6 Keyboard
+### 3.6 Keyboard and the clock tick
 
-Only the top window receives keys. Global keys are handled before the focused
-window, every loop (and Ctrl+Alt+L before them all):
+Only the top window receives keys. Every key in `input.keys[]` is handled in
+order (handling only the last one collapsed fast bursts), and the global keys are
+handled before the focused window:
 
 | input | action |
 |---|---|
 | Ctrl+Alt+L (evdev 38) | lock the screen (§3.9) |
-| `input.text` contains `1`…`9` | `theme_index = digit-1` (theme order is filename order, `theme_load_all` sorts) |
+| Ctrl + `1`…`9` | `theme_index = digit-1` (theme order is filename order, `theme_load_all` sorts); the byte is zeroed so the app never sees it |
 | evdev 125 (Super) | `launcher_open = !launcher_open` |
+| arrows with the launcher open | move `launcher_sel` by ±1 / ±3 with wrap-around at the ends |
+| Enter (evdev 28) with the launcher open | open/launch the selected tile |
 | evdev 1 (Esc) with the launcher open | close the launcher (and nothing else) |
-| Alt+Tab | focus the window with the next-highest `z`, i.e. toggle the top two |
+| Alt+Tab (evdev 15) | focus the window with the highest `z` other than the current top |
 | evdev 59…63 (F1…F5) | open terminal, files, settings, monitor, notes |
 | evdev 1 (Esc) | `win_close(win_top())` |
 
 Terminal windows get `key_bytes()` (arrows/Home/End/PgUp/PgDn/Delete → xterm escape
 sequences), then the printable `text`; Shift+PgUp/PgDn scroll the history by 8
-lines and any typing resets it to live. App windows get the printable `text`,
-evdev 14 → `"\b"`, evdev 28 → `"\n"`. Every non-top window is deaf, and there is
+lines and any typing resets it to live. In-desktop app windows get the same
+`key_bytes()` escapes only (their printable text arrives through the once-per-frame
+`text[]` delivery); client windows get `wms_notify_key()` on press **and** on
+release, with `mods` = shift|ctrl|alt. Every non-top window is deaf, and there is
 no focus-follows-mouse.
 
-The wheel is not routed to windows at all: `main()` finds the topmost **terminal**
+The wheel is not routed to windows: `main()` finds the topmost **terminal**
 window under the pointer and calls `term_scroll(t, wheel * 3)`, so three lines per
-notch. Apps never see `input.wheel`.
+notch. Apps and clients never see `input.wheel`.
 
-The theme can also be changed from disk: once per wall-clock second `main()`
-re-reads `/etc/mystic/current-theme` and matches the first line against
-`Theme::name`, which is how the Settings app is meant to ask for a theme. Note
-that `settings.c` writes the theme *file name* (`1-obsidian.theme`) while this
-comparison uses the `name =` field inside the file (`Obsidian`), so today the
-file path does not take effect and the number keys are the working switcher.
+Once per wall-clock second the loop also re-reads two files:
+
+* `/etc/mystic/current-theme` — the first line is matched against `Theme::name`
+  (the `name =` field inside the file, not its file name) and switches the theme.
+  `src/apps/settings.c` writes exactly that name, so choosing a theme there works;
+  the write itself is lost on reboot because `/etc` is the initramfs (§5.2).
+* `/run/mystic/launch.request` — the Apps window cannot fork, so it writes a
+  bundle id there and the desktop launches it, then `remove()`s the file (§4.6).
 
 ### 3.7 Terminals (`src/term.c`)
 
@@ -477,59 +585,79 @@ ring of `HIST_ROWS` (600) rows.
 400×200), sets `winsize`, and calls `forkpty()`; the child sets
 `TERM=xterm-256color`, `PATH`, `HOME=/root`, `PS1` and `execl`s the shell with
 `-i`. The master fd is put in non-blocking mode, so the desktop never blocks on a
-shell.
+shell, and a `pidfd_open()` handle is kept when the kernel has one.
 
-`term_pump()` reads up to 2048 bytes per call and feeds them one at a time to
-`feed_byte()`, a small state machine: state 0 is text (CR, LF, BS, TAB and BEL are
-handled there), state 1 is `ESC`, state 2 accumulates CSI parameters until a final
-byte reaches `csi_dispatch()` — cursor addressing (`H`/`f`), relative moves
-(`A`–`D`), erase (`J`, `K`), and SGR (`m`: bold, the 30–37/40–47/90–97/100–107
-palettes, and 256-colour `38;5`/`48;5` folded down to the 16-colour palette) — and
-state 3 swallows OSC strings until BEL or `ESC`. `h`/`l` mode set/reset are
-ignored.
+The cell grid is sized from the font, not from a constant: the caller passes
+`cw = font_width(fm, "M")` and `ch = font_height(fm)` for
+`fm = font_get(FONT_MONO, 12)`, and both are floored at 4 and 8 px. That is why
+the terminal uses JetBrains Mono: with a proportional face the columns drift and
+`ls` output stops lining up, and at a larger text scale the drift only grows.
+
+`term_pump()` reads 2048-byte chunks up to a 64 KiB budget per call and feeds
+them one at a time to `feed_byte()`, a small state machine: state 0 is text (CR,
+LF, BS, TAB and BEL are handled there), state 1 is `ESC`, state 2 accumulates CSI
+parameters until a final byte reaches `csi_dispatch()` — cursor addressing
+(`H`/`f`), relative moves (`A`–`D`), erase (`J`, `K`), and SGR (`m`: bold, the
+30–37/40–47/90–97/100–107 palettes, and 256-colour `38;5`/`48;5` folded down to
+the 16-colour palette) — states 3/4 swallow OSC strings until BEL or `ESC`, and
+state 5 eats the one byte after `ESC (`/`ESC )`. `h`/`l` mode set/reset are
+ignored. The parameter buffer is `TERM_PARAM_BUF` (256) bytes and
+`csi_param_byte()` keeps the **newest** parameters when it fills, cutting at a
+`;` so a number is never sliced in half; a single parameter longer than the whole
+buffer abandons the sequence.
 
 Printing past the last column wraps and calls `newline()`; scrolling pushes the
 top row into the history ring before `memmove`ing the grid up. `term_draw()` fills
 the rectangle with the default background, draws history rows above the live grid
-according to the scroll offset, renders each cell with `font_draw()` at a 7×16 px
-advance, and paints the cursor as a 2 px underline. When the shell exits,
-`term_pump()` sets `alive = 0` and reaps it with `waitpid(…, WNOHANG)`, and the
-next loop closes the window.
+according to the scroll offset, renders each cell with `font_draw()` at the cell
+metrics it was handed, and paints the cursor as a 2 px underline. When the shell
+exits, `term_pump()` sets `alive = 0` and reaps it with `waitpid(…, WNOHANG)`, and
+the next loop closes the window.
 
 ### 3.8 Launcher (`src/main.c`)
 
-Super (`KEY_LEFTMETA`, evdev 125) toggles the launcher: a three-column tile panel
-centred over a full-screen dim. `LAUNCHER[]` is a list of `{ app_id, label, icon }`
-— a superset of `DOCK[]` that also exposes `sysinfo` — and `launcher_geom(i, …)`
-lays the tiles out in three columns of 128 × 118, 18 px apart, centred on the
-display.
+Super (`KEY_LEFTMETA`, evdev 125) or a press on the eye toggles the launcher: a
+three-column tile panel centred over a full-screen dim. `LAUNCHER[]` is a list of
+`{ app_id, label, icon }` — Terminal, Files, Settings, Monitor, Notes, Apps
+(`store`), Calculator (`calc`), System (`sysinfo`) — and `launcher_items()` adds
+one more tile per installed bundle, in the id order `wms_scan_apps()` sorted them
+into. `launcher_geom(i, …)` lays the tiles out in three columns of
+`ui_px(128) × ui_px(118)`, `ui_px(18)` apart, centred on the display.
 
 `draw_launcher()` first darkens the frame with
 `surf_blend(s, 0, 0, s->w, s->h, 0xAA000000u)`, then paints a rounded panel
 (`color_alpha(th->window_bg, 0.97f)`) with a shadow and, when `blur > 0`, a
-backdrop blur of radius `22*blur`, one tile per entry with hover tint, icon and
-label, and a `"Super or Esc closes"` hint underneath. A click on a tile opens the
-app and closes the launcher; a click elsewhere closes it; Esc closes it before it
-can reach the focused window.
+backdrop blur of radius `22*blur`. In-desktop tiles draw their icon; a bundle tile
+draws its manifest name's first letter in `FONT_SEMIBOLD` 26 because a bundle has
+no icon routine compiled into the desktop. The keyboard selection (`launcher_sel`)
+is drawn as an accent border, and the hint `"Super or Esc closes"` sits under the
+panel. A click on a tile opens the app (or `wms_launch()`es the bundle) and closes
+the launcher; a click elsewhere closes it; Esc closes it before it can reach the
+focused window.
 
 ### 3.9 Lock screen (`src/main.c`, `src/sha256.c`)
 
-Ctrl+Alt+L sets `locked` and clears the typed password. While `locked`, the main
-loop runs a separate branch before any global key handling: bytes with `c >= 32`
-from `text[]` are appended to `pin`, and control bytes in `text[]` (`\n` from
-Enter, `\b` from Backspace) are dropped by that loop because their actions are
-taken from the key code instead — evdev 14 removes the last character, evdev 28
-calls `try_unlock()`; any other non-printable key is ignored while locked. Every
-iteration also redraws and sleeps 16 ms, so no window, dock, launcher or app
-receives input, and the loop `continue`s instead of falling through.
+Ctrl+Alt+L sets `locked` and clears the typed password (and drops the `l` byte of
+the shortcut itself, which arrives in the same frame as a control character).
+While `locked`, the main loop runs a separate branch before any global key
+handling: bytes with `c >= 32` from `text[]` are appended to `pin`, evdev 14
+removes the last character, evdev 28 calls `try_unlock()`, and the Enter that
+unlocked is dropped from `text[]`/`keys[]` so it cannot fall through and execute
+an empty command in a terminal. No window, taskbar, launcher or app receives
+input, and the loop `continue`s instead of falling through.
+
+The lock branch redraws only when something changed — a new minute on the clock or
+input — rather than every 16 ms; the full-screen blur is the most expensive single
+frame in the system.
 
 `draw_lock_screen()` blurs the whole frame at a fixed radius of 40 when
 `th->blur > 0`. Unlike the four direct backdrop blurs (top bar 18, window 14,
-dock 20, launcher 22 — all multiplied by the theme's `blur`), this radius never
+taskbar 20, launcher 22 — all multiplied by the theme's `blur`), this radius never
 scales; the shadow blurs are fixed too, each using its own `spread`. It then dims
-the frame with `0xB0000000` and paints a 380×210 panel containing the UTC clock,
-the caption "Mystic OS is locked", a password field showing one 8 px dot per
-character (up to 24), an optional message line and "Enter to unlock".
+the frame with `0xB0000000` and paints a `ui_px(380) × ui_px(210)` panel
+containing the UTC clock, the caption "Mystic OS is locked", a password field
+showing one 8 px dot per character (up to 24), an optional message line and
+"Enter to unlock".
 
 `try_unlock()` reads the first line of `/etc/mystic/passwd` and verifies it with
 `mystic_check_password()` from `src/sha256.c`. The file format is
@@ -545,6 +673,46 @@ locks the *session*, not the machine: anyone who can read the image can also rea
 the salt and the digest. `mystic_make_password_line()` exists to produce such a
 line but has no in-tree caller yet.
 
+### 3.10 The start button (`draw_start_button`, `draw_eye`)
+
+The Mystic mark in the top-left corner is geometry, not a glyph: two circular arcs
+whose intersection is a lens (vesica), a filled iris, a smaller pupil, a
+specular highlight and a lid outline drawn only where the lens coverage is
+partial. The parameters are `EYE_CX 19`, `EYE_CY 17`, `EYE_RX 12`, `EYE_RY 7.6`.
+
+Pressing it sets `blink_t0 = now_sec()` (`CLOCK_MONOTONIC`) and toggles the
+launcher. `draw_start_button()` maps the elapsed time onto an eyelid opening:
+closed over 90 ms, open again over the next 170 ms, then `blink_t0 = -1`. While
+`blink_t0 >= 0` the frame loop forces `dirty`, so the animation is driven by the
+normal recompose path; when it finishes, the loop goes idle again. The eye is not
+scaled by `ui_px()` — it is the same 30×28 target at every text scale.
+
+### 3.11 The taskbar (formerly a fixed dock)
+
+The bar at the bottom is a list of **open windows**, not a launcher: there is one
+tile per `used` window in `wins[]`, in slot order, and no tile at all when nothing
+is open (`dock_rect()` returns 0 and the bar is not drawn). `taskbar_at(n)` maps a
+tile index to its window, and the same function is used by the painter and by the
+hit test, so a click always lands on the tile that was drawn.
+
+Geometry: width `n*dock_isz() + (n-1)*dock_gap() + 2*dock_pad()`, height
+`dock_isz() + 2*dock_pad()`, centred horizontally, `22` px above the bottom edge,
+corner radius `0.32 * height`.
+
+Magnification: when the pointer is within 110 px above (or 20 px below) the bar,
+each tile's size is `2*S` scaled by `1 + 0.45*exp(-(d/62)²/2)` where `d` is the
+horizontal distance from the pointer to that tile's centre, and the tile grows
+upwards from its baseline. The Gaussian, not a linear ramp, is what makes the
+neighbouring tiles rise a little too.
+
+Each tile draws the icon for its window's kind — `icon_for_window()` maps a
+terminal to `icon_terminal()`, an in-desktop app to its `vt->id`
+(`files`, `settings`, `monitor`, `notes`, `store`, `calc`) and a client window to
+`clients[i].id` (`clock`, `paint`, `life`, `mandel`, `sysmon`) — with a hover
+tint, the accent colour for the focused window, a 45 %-alpha foreground for a
+minimised one, a 14×3 accent pill under the focused one, and a tooltip with the
+window title over the hovered one.
+
 ---
 
 ## 4. The app contract (`src/mystic.h`, `src/apps.c`)
@@ -553,7 +721,7 @@ line but has no in-tree caller yet.
 
 ```c
 typedef struct {
-    const char *id;      /* matched against the dock / F-key id */
+    const char *id;      /* matched against the launcher / F-key id */
     const char *title;   /* window title */
     void (*init)(App *a, int w, int h);
     void (*draw)(App *a, Surface *s, int x, int y, int w, int h, const Theme *th);
@@ -582,29 +750,34 @@ released in `free`).
     &app_vt_sysinfo,     /* always built */
 ```
 
-`tools/build-desktop.sh` adds `-DWITH_FILES`, `-DWITH_SETTINGS`, `-DWITH_MONITOR`,
-`-DWITH_NOTES` for whichever `src/apps/<name>.c` files exist, and links them into
-the one binary.
+`tools/build-desktop.sh` walks `for app in files settings monitor notes store
+calc`, adds `-DWITH_<NAME>` and the source file for each one that exists, and
+links them all into the one binary. `src/mystic.h` declares the matching
+`extern const AppVT app_vt_*` behind the same macros, so a file that is present
+but not defined is simply not referenced.
 
 | call | caller | when |
 |---|---|---|
-| `vt->init(a, w, h)` | `app_new()` | window opened; `w,h` are the content size |
-| `vt->draw(a, s, x, y, w, h, th)` | `app_draw()` ← `draw_desktop()` | every composed frame, content rectangle `(x+1, y+41, w-2, h-43)` |
-| `vt->key(a, bytes, n)` | `app_key()` ← `main()` | top window only, printable bytes or `"\b"`/`"\n"` |
+| `vt->init(a, w, h)` | `app_new()` | window opened; `w,h` are `w-2, h-42` |
+| `vt->draw(a, s, x, y, w, h, th)` | `app_draw()` ← `draw_desktop()` | every composed frame, content rectangle `(x+1, y+title_h()+1, w-2, h-title_h()-2)` |
+| `vt->key(a, bytes, n)` | `app_key()` ← `main()` | top window only: escape sequences per key, then the printable `text[]` once per frame |
 | `vt->click(a, x, y, buttons)` | `app_click()` ← `handle_click()` | left press inside the body, window-local coordinates |
-| `vt->resize(a, w, h)` | `main()` drag handler | window resized by the corner grip; called with `w-2, h-42` (one pixel taller than the draw rectangle, as is the `init` size from `win_open`) |
+| `vt->resize(a, w, h)` | `main()` drag / snap / maximise handlers | called with `w-2, h-42` (the same size `init` got, which is one pixel taller than the draw rectangle when `title_h() == 40`) |
 | `vt->free(a)` | `app_free()` ← `win_close()` | window closed |
 
 `app_draw`, `app_key`, `app_click` and `app_free` are all null-safe: a missing
 handler is a no-op, `app_title` falls back to `"App"`, and an unknown id makes
-`app_new` return `NULL` (so the dock can list an app that was not compiled in and
-nothing breaks).
+`app_new` return `NULL` (so the launcher can list an app that was not compiled in
+and nothing breaks).
 
-Registered today: `files`, `settings`, `monitor`, `notes`, `sysinfo`. The dock
-shows terminal, files, settings, monitor, notes; `sysinfo` is the reference app
-that shows the smallest useful implementation of the table.
+Registered today: `files`, `settings`, `monitor`, `notes`, `store` (`"Apps"`, a
+browser for the installed bundles) and `calc` (`"Calculator"`, a recursive-descent
+expression evaluator), plus `sysinfo`, which is the reference app that shows the
+smallest useful implementation of the table. The launcher shows the first six
+individually and `sysinfo` as "System"; F1…F5 open terminal, files, settings,
+monitor and notes.
 
-### 4.3 Why an app cannot reach into the desktop
+### 4.3 Why an in-desktop app cannot reach into the desktop
 
 The contract is an API boundary, not a memory boundary:
 
@@ -619,23 +792,86 @@ The contract is an API boundary, not a memory boundary:
   is set, so pixels an app draws in the wrong place are overwritten at the next
   compose rather than accumulating.
 
-What it is **not**: process isolation, and not per-window clipping. Apps are
-functions linked into `mystic-desktop` and run in its address space; a stray
-pointer or an out-of-bounds write in an app can corrupt the compositor or kill the
-whole desktop. `Surface` clipping is only to the surface bounds — the compositor
-does not hand out a sub-surface or a clip rect — so an app that ignores its
-rectangle will paint over neighbouring windows until the next recompose. Both
-facts matter when reading the security claims in `README.md`.
+What it is **not**: process isolation, and not per-window clipping. In-desktop
+apps are functions linked into `mystic-desktop` and run in its address space; a
+stray pointer or an out-of-bounds write in an app can corrupt the compositor or
+kill the whole desktop. `Surface` clipping is only to the surface bounds — the
+compositor does not hand out a sub-surface or a clip rect — so an app that ignores
+its rectangle will paint over neighbouring windows until the next recompose. Both
+facts matter when reading the security claims in `README.md`; an app that needs a
+real boundary is written as an external app instead (§4.5).
 
 ### 4.4 Apps read real data
 
-No app invents numbers. `sysinfo` reads `/proc/meminfo`, `/proc/uptime`,
-`/proc/loadavg` and `/proc/<pid>/comm`; `monitor` walks `opendir("/proc")` and
-reads `/proc/<pid>/stat` (comm, utime/stime), `/proc/<pid>/statm` (RSS),
-`/proc/meminfo`, `/proc/loadavg` and `/proc/uptime`; `files` uses
-`opendir`/`readdir`/`stat` on a path it walks with Enter/Backspace; `notes` reads
-and writes `/root/notes.txt`; `settings` scans `/etc/mystic/themes` and writes
-`/etc/mystic/current-theme`.
+No app invents numbers:
+
+* `sysinfo` reads `/proc/meminfo`, `/proc/uptime`, `/proc/loadavg` and
+  `/proc/<pid>/comm`.
+* `monitor` walks `opendir("/proc")` and reads `/proc/<pid>/stat` (comm,
+  utime/stime), `/proc/<pid>/statm` (RSS), `/proc/meminfo`, `/proc/loadavg` and
+  `/proc/uptime`.
+* `files` is a real file manager: `opendir`/`readdir`/`lstat` for the listing,
+  `st_size`/`st_mode`/`st_mtime` for the columns, `statvfs()` for the free-space
+  figure, `stat()` to resolve a symlink that points at a directory, and
+  `strerror(errno)` when `opendir` fails. Its sort order, breadcrumbs and
+  toolbar/row geometry are all derived from the fonts it draws with.
+* `notes` reads and writes `/root/notes.txt` with `fsync` (§5.3).
+* `settings` scans `/etc/mystic/themes`, verifies each file through
+  `theme_load()`, and writes the chosen theme's `name` to
+  `/etc/mystic/current-theme`.
+* `store` reads `/usr/share/mystic/apps` with `readdir`, parses each `manifest`
+  the way `wmsrv.c` does (`name`/`desc`/`exec`, one `=` per line) and stats the
+  real payload file for the size it shows. It never forks; Enter writes the
+  bundle id to `/run/mystic/launch.request` (§4.6).
+* `calc` is pure: no file or `/proc` access at all. Its numbers come from the
+  text the user typed and from the parser's own arithmetic.
+
+### 4.5 External apps: a second kind of window (`src/ipc.h`, `src/wmsrv.c`, `src/client/`)
+
+An **external app** is its own process. It connects to a unix socket, receives a
+shared-memory pixel buffer, draws into it, and the desktop blits that buffer into
+a window. `docs/IPC.md` is the protocol reference; what matters for the
+architecture is:
+
+* `wms_start()` binds `WM_SOCKET` (`/run/mystic/wm.sock`, creating the directory)
+  once at startup; `wms_poll()` is called every frame, accepts connections
+  without blocking and reads complete `\n`-terminated lines.
+* On `HELLO <id> <w> <h> <title…>` the server creates
+  `/dev/shm/mystic-<pid>-<n>` with `ftruncate` + `mmap`, zeroes it, and answers
+  `OK <path> <stride>`; `stride == w`. `FRAME`, `TITLE <text>`, `CLOSE` and
+  `EVENT <text>` (logged only) are the other client verbs.
+* The desktop forwards input for the **focused** client window only:
+  `KEY <code> <mods> <press>` on press and release, `TEXT <utf8>` once per frame,
+  `MOUSE <x> <y> <buttons>` for clicks and motion, and `RESIZE <w> <h>` when the
+  window is resized. Coordinates are relative to the content origin, and there is
+  no partial damage: `FRAME` means "the whole window is new".
+* The window is created by the frame loop, not by `win_open()`: as soon as a
+  client has a buffer, a free `Window` is bound to it with `kind = WIN_CLIENT`,
+  `w = cl->w + 2`, `h = cl->h + 42`, a cascade position, and the client's title.
+  The blit clips to *both* the client buffer and the screen, and shifts the source
+  when the window's content origin is off-screen, because clamping only the
+  right/bottom edges wrote before the buffer for a negative origin.
+* Closing the window sends `CLOSE` to the app and then shuts the connection down;
+  a client that disconnects or exits clears its slot, and the frame loop closes
+  the window bound to that slot before the slot can be reused.
+* Apps run as root, in the same VM, with no sandbox. The isolation is address
+  space and crash containment, not privilege: a broken external app cannot corrupt
+  the compositor, but it can do anything else root can.
+
+### 4.6 Launching: one place does the `fork`
+
+`wms_scan_apps()` runs once at startup and reads `WM_APP_DIR`
+(`/usr/share/mystic/apps`): every subdirectory with a readable `manifest` becomes
+a `WmApp { id, name, desc, exe }`, sorted by id so the launcher is stable. Because
+it runs once, a bundle packaged while the desktop is running appears after the
+next boot.
+
+`wms_launch()` is the only place that starts a process for an app: `fork()`,
+`setenv("MYSTIC_SOCKET")`/`setenv("MYSTIC_APP_ID")`, `execl(WM_APP_DIR/<id>/<exe>)`.
+It is called from three places — a launcher tile, the Enter key in the launcher,
+and the `/run/mystic/launch.request` polling in §3.6 — which is how the in-desktop
+Apps window can start an external app without forking anything itself. The child
+reaps through the per-frame `waitpid(-1, …, WNOHANG)` loop.
 
 ---
 
@@ -658,22 +894,26 @@ OS formats it on the next boot.
 `setup_disk()` in `stage/init`:
 
 ```sh
-[ -b /dev/vda ] || { echo "disk: no /dev/vda"; return 0; }
-mkdir -p /root
-if mount -t ext4 /dev/vda /root 2>/dev/null; then
-    echo "disk: mounted /dev/vda (ext4) on /root"
-    return 0
-fi
-echo "disk: /dev/vda is unformatted, creating ext4 filesystem"
-if [ -x /sbin/mkfs.ext4 ]; then
-    /sbin/mkfs.ext4 -q -F /dev/vda >/dev/null 2>&1
-else
-    echo "disk: no mkfs.ext4 in the image"
-fi
-if mount -t ext4 /dev/vda /root 2>/dev/null; then
-    chmod 755 /root
-    echo "disk: formatted ext4 and mounted on /root"
-fi
+setup_disk() {
+    [ -b /dev/vda ] || { echo "disk: no /dev/vda"; return 0; }
+    mkdir -p /root
+    if mount -t ext4 /dev/vda /root 2>/dev/null; then
+        echo "disk: mounted /dev/vda (ext4) on /root"
+        return 0
+    fi
+    echo "disk: /dev/vda is unformatted, creating ext4 filesystem"
+    if [ -x /sbin/mkfs.ext4 ]; then
+        /sbin/mkfs.ext4 -q -F /dev/vda >/dev/null 2>&1
+    else
+        echo "disk: no mkfs.ext4 in the image"
+    fi
+    if mount -t ext4 /dev/vda /root 2>/dev/null; then
+        chmod 755 /root
+        echo "disk: formatted ext4 and mounted on /root"
+    else
+        echo "disk: could not mount"
+    fi
+}
 ```
 
 `mkfs.ext4` is not part of the Alpine minirootfs, so it is staged explicitly:
@@ -686,8 +926,11 @@ console: a boot without a mounted `/root` still reaches the desktop, it just has
 nowhere to persist.
 
 Because `/init` runs from the initramfs, everything outside `/root` is RAM:
-`/etc/mystic/themes/*.theme` and `/etc/mystic/passwd` are unpacked from the cpio
-at boot, and writes to `/etc` (the theme request file) disappear on reboot.
+`/etc/mystic/themes/*.theme`, `/etc/mystic/ui.conf` and `/etc/mystic/passwd` are
+unpacked from the cpio at boot, and writes to `/etc` (the theme request file)
+disappear on reboot. `/run` and `/tmp` are ordinary directories in that ramfs;
+`/dev/shm` is a tmpfs mounted by `/init`, so a client's shared pixel buffer is
+released when the machine goes down — there is nothing to clean up on the disk.
 
 ### 5.3 fsync is the difference between saving and losing
 
@@ -714,8 +957,8 @@ Persistence is observable: probe mode increments `/root/boots.txt`, creates
 
 ## 6. The build
 
-`image.sh` is the pipeline; the three tools under `tools/` do the work. Everything
-runs on the host (Windows or Linux) — nothing is built inside the guest.
+`image.sh` is the pipeline; the tools under `tools/` do the work. Everything runs
+on the host (Windows or Linux) — nothing is built inside the guest.
 
 ### 6.1 `tools/fetch-kernel.sh` — kernel + exactly the modules
 
@@ -723,7 +966,7 @@ runs on the host (Windows or Linux) — nothing is built inside the guest.
   `build/cache`, extracts it there, and copies the package's `boot/vmlinuz-virt`
   out as `build/cache/vmlinuz-virt`.
 * Takes **whole module subtrees**, not a hand-picked file list:
-  `kernel/drivers/{gpu,video,i2c,input,block}` and
+  `kernel/drivers/{gpu,video,i2c,input,block,net}`, `kernel/net/core` and
   `kernel/fs/{fat,ext4,jbd2,nls}`, decompressing every `*.ko.gz` into
   `stage/lib/modules/$(KV)/…`, plus `kernel/fs/mbcache.ko`.
 * Kernel and modules come from the same package on purpose: their versions match,
@@ -738,15 +981,24 @@ zig as a cross-compiler:
 ```
 zig cc -target x86_64-linux-musl -Os -static -fno-sanitize=all -Isrc \
        -Wall -Wextra -Wno-unused-parameter \
-       -o build/mystic-desktop <sources> -lm -lutil
+       -o build/mystic-desktop <sources> -D<app>… -lm -lutil
 ```
 
-Sources: the nine core files — `main.c`, `apps.c`, `term.c`, `sha256.c`, `gfx.c`,
-`font.c`, `fb.c`, `input.c`, `theme.c` — plus `apps/sysinfo.c`, and every optional
-app that exists, each with its `-DWITH_*` define. `-static` plus musl means the
-binary needs nothing but the kernel; `-lutil` is for `forkpty`. The result is
-copied to `stage/usr/bin/mystic-desktop` (and `chmod +x`), and the Lato `.ttf`
-files are copied to `stage/usr/share/fonts`.
+Sources: the eleven core files — `main.c`, `apps.c`, `term.c`, `sha256.c`,
+`wmsrv.c`, `ui.c`, `gfx.c`, `font.c`, `fb.c`, `input.c`, `theme.c` — plus
+`apps/sysinfo.c`, and every optional app that exists, each with its `-DWITH_*`
+define (today: files, settings, monitor, notes, store, calc). `-static` plus musl
+means the binary needs nothing but the kernel; `-lutil` is for `forkpty`. The
+result is copied to `stage/usr/bin/mystic-desktop` (and `chmod +x`), and the font
+files — the three Lato faces, `JetBrainsMono-Regular.ttf` and
+`LICENSE.txt` — are copied from `assets/fonts` to `stage/usr/share/fonts`.
+
+`image.sh` does **not** build app bundles. Each one is packaged separately with
+`./tools/mkapp.sh <id>`, which compiles `src/client/apps/<id>.c` together with
+`src/client/mystic_client.c`, `src/gfx.c`, `src/font.c` and `src/ui.c`, writes the
+binary to `stage/usr/share/mystic/apps/<id>/bin` and creates a `manifest`
+(`name`, `desc`, `exec = bin`) if none exists. Repack the initramfs afterwards for
+the bundle to appear.
 
 ### 6.3 `tools/mkimage.py` — the cpio writer, and why it exists
 
@@ -762,13 +1014,15 @@ Pipeline inside `mkimage.py`:
 
 1. Every member of the base tarballs becomes an entry
    `(mode, mtime, data | target)`; directories `S_IFDIR|0755`, symlinks and hard
-   links `S_IFLNK|0777` with the target text, regular files `S_IFREG` with their
-   mode bits and contents. Later tarballs and later entries overwrite earlier
-   ones, and `stage/` is applied last.
+   links `S_IFLNK|0777` with the target text, regular files `S_IFREG` with the
+   mode bits the tarball recorded and its contents. Later tarballs and later
+   entries overwrite earlier ones, and `stage/` is applied last.
 2. `stage/` is walked and overlaid on top. Modes are decided by path because
-   NTFS has no executable bit:
-   `init`, `bin/…`, `sbin/…`, `usr/bin/…`, `usr/sbin/…`, `usr/local/bin/…` are
-   `0755`, everything else `0644`.
+   NTFS has no executable bit: a file is `0755` when it is `init`, when it lives
+   under `bin/`, `sbin/`, `usr/bin/`, `usr/sbin/`, `usr/local/bin/`, **or when
+   its name is `bin`** — that last rule is what makes an app bundle's payload
+   (`usr/share/mystic/apps/<id>/bin`) executable. Everything else is `0644`;
+   directories from `stage/` are `0755`.
 3. Missing parent directories are synthesised, so the overlay can add
    `stage/sbin/mkfs.ext4` without listing `stage/sbin`.
 4. Entries are emitted sorted by path depth, so a directory always precedes its
@@ -792,7 +1046,7 @@ can be assembled without root.
 3. `tools/build-desktop.sh` (output suppressed).
 4. `python tools/mkimage.py --base <minirootfs> --stage stage -o build/initramfs.cpio.gz`.
 5. `dd` a 64 MB `build/disk.img` if absent.
-6. Boot with the fixed QEMU command line from §1.1, in one of four modes:
+6. Boot with the argument array from §1.1, in one of four modes:
    `run` (a window), `probe` (serial facts, then poweroff),
    `shot N` (headless, QEMU monitor `screendump` after N seconds →
    `tools/ppm2png.py` → PNG), `themes` (one boot, `sendkey 2`, `sendkey 3`,
@@ -802,33 +1056,98 @@ can be assembled without root.
 with nasm, verify it is exactly 512 bytes and ends in `0xAA55`, write it to a
 1.44 MB floppy image and boot that with no kernel. `image.sh` does not use them.
 
+### 6.5 `tools/smoke.sh` — does the image actually run?
+
+`tools/smoke.sh` is the project's test: it boots the image that was just packed,
+rather than testing functions in isolation.
+
+* Two probe boots (`image.sh probe`'s mode, but driven directly) — the second one
+  proves the ext4 `/root` survived and the boot counter moved — checking: QEMU
+  present, kernel and initramfs present, disk present, kernel reached userspace,
+  kernel version, `card0`, `/dev/fb0`, each expected module in `/proc/modules`,
+  the input nodes, the boot-time budget from the probe's own `/proc/uptime`, no
+  kernel/userspace crash in the log, and that `/dev/vda` mounted ext4.
+* One desktop boot with `DESKTOP_WAIT` seconds of runtime against the packed
+  image, checking that the desktop opened the display (the `display: … 32bpp`
+  line printed by `disp_open()`), bound a keyboard (`input: keyboard`, printed by
+  `input_open()`) and did not crash.
+* Static checks that need no QEMU (`--quick` runs only these): the text scale
+  (`stage/etc/mystic/ui.conf` exists, parses and is inside 0.8…1.6; `src/ui.c`
+  defines `ui_scale_get`/`ui_scale_load`/`ui_px`; `main.c` loads the file;
+  `font_get()` applies the scale), the monospace terminal (the `.ttf` exists and
+  starts with a real sfnt magic, it is installed into `stage`, `font.c` names it,
+  `term_draw()` is called with `FONT_MONO`), the taskbar (`taskbar_count`,
+  `taskbar_at`, `dock_rect`'s "nothing open" guard, and that `dock_rect()` is used
+  by both the painter and the hit test), and a stale-build guard: the mtime of
+  `stage/usr/bin/mystic-desktop` against every `.c` file that
+  `tools/build-desktop.sh` actually links plus the headers those files
+  `#include`. A source the desktop does not link (a client app, or a module that
+  has landed but is not wired in) is named on a `not part of the desktop build,
+  ignored:` line instead of failing the run, so a pass never hides a stale
+  binary.
+* Compile checks: every `src/*.c`, `src/apps/*.c`, `src/client/*.c` and
+  `src/client/apps/*.c` is compiled with the same `zig cc` flags and must be
+  warning-free — the client apps are built by `tools/mkapp.sh`, which `image.sh`
+  never calls, so nothing else would catch a broken one.
+
+Every check prints `PASS`/`FAIL` and the script exits non-zero if anything failed,
+so it is usable as a gate.
+
+### 6.6 What git tracks, and what it does not
+
+The repository holds sources, themes, manifests and scripts. Everything a build
+produces is ignored:
+
+```
+stage/usr/bin/mystic-desktop
+stage/usr/share/mystic/apps/*/bin
+stage/lib/modules/
+stage/usr/share/fonts/*.ttf
+stage/sbin/
+stage/usr/lib/
+build/
+```
+
+So a fresh clone has the manifests (`stage/usr/share/mystic/apps/<id>/manifest`)
+but no payloads: it needs `tools/fetch-kernel.sh` for the modules,
+`tools/build-desktop.sh` for the desktop and fonts, and one `tools/mkapp.sh <id>`
+per bundle before `image.sh` can pack an image that launches anything. `assets/`
+keeps the `.ttf` files (and their OFL licence) as the source of the copies that
+`build-desktop.sh` stages.
+
 ---
 
 ## Ours vs borrowed
 
 | piece | origin | where |
 |---|---|---|
-| Compositor, layout, dock, launcher, cursor, event loop | ours | `src/main.c` |
+| Compositor, layout, taskbar, launcher, window manager, cursor, event loop | ours | `src/main.c` |
+| Global text scale (config parser, `ui_px`) | ours | `src/ui.c` |
 | CPU renderer: SDF rounded rects, gradients, glow, blur, shadow, polygons | ours | `src/gfx.c` |
 | Framebuffer access (`/dev/fb0`, stride, mmap, present) | ours | `src/fb.c` |
 | evdev discovery, keymap, per-frame input state | ours | `src/input.c` |
 | Glyph cache, text blending, UTF-8, face/size cache | ours | `src/font.c` |
 | TrueType rasteriser | **stb_truetype.h** (public domain, Sean Barrett) | `src/stb_truetype.h` |
-| Theme file format, parser, three shipped themes | ours | `src/theme.c`, `stage/etc/mystic/themes/*.theme` |
+| Theme file format, parser, six shipped themes | ours | `src/theme.c`, `stage/etc/mystic/themes/*.theme` |
 | Terminal emulator: pty, VT parser, cell grid, palette, scrollback | ours | `src/term.c` |
 | `AppVT` contract and app registry | ours | `src/mystic.h`, `src/apps.c` |
+| Seven in-desktop apps (files, settings, monitor, notes, store, calc, sysinfo) | ours | `src/apps/*.c` |
+| Display protocol: messages, shm, fork/exec, bundle scan | ours | `src/ipc.h`, `src/wmsrv.c` |
+| Client SDK for external apps | ours | `src/client/mystic_client.c`, `src/client/mystic_client.h` |
+| External apps (clock, files, life, mandel, paint, sysmon) | ours | `src/client/apps/*.c` |
+| Procedural wallpapers (not yet wired into the desktop) | ours | `src/wallpaper.c`, `src/wallpaper.h` |
 | SHA-256, iterated salted password hash, password-file check | ours | `src/sha256.c` |
-| Five apps (files, settings, monitor, notes, sysinfo) | ours | `src/apps/*.c` |
-| PID 1: mounts, module loading, disk setup, fbcon unbind, desktop exec | ours | `stage/init` |
+| PID 1: mounts, module loading, network, disk setup, fbcon unbind, desktop exec | ours | `stage/init` |
 | initramfs builder (newc writer) | ours | `tools/mkimage.py` |
-| kernel/module fetcher, desktop build, boot harness | ours | `tools/fetch-kernel.sh`, `tools/build-desktop.sh`, `image.sh` |
+| kernel/module fetcher, desktop build, app packager, boot harness, smoke test | ours | `tools/fetch-kernel.sh`, `tools/build-desktop.sh`, `tools/mkapp.sh`, `image.sh`, `tools/smoke.sh` |
 | Screenshot converter (QEMU PPM → PNG) | ours | `tools/ppm2png.py` |
 | 512-byte boot sector (stage-1 history, unused by `image.sh`) | ours | `boot/boot.asm`, `build.sh`, `run.sh` |
 | Kernel 6.18.63-0-virt | Alpine `linux-virt` (GPL-2.0) | `build/cache/vmlinuz-virt` |
-| DRM (`bochs`, `virtio-gpu`), evdev, psmouse, virtio_blk, ext4/jbd2, vfat modules | Alpine `linux-virt` | `stage/lib/modules/6.18.63-0-virt/` |
-| Userland: `sh`/busybox (`mount`, `depmod`, `modprobe`, `awk`, `ls`, `poweroff`, …), musl libc | Alpine minirootfs 3.24.4 | inside `build/cache/minirootfs.tar.gz`, packed into the cpio |
+| DRM (`bochs`, `virtio-gpu`), evdev, psmouse, virtio_blk, virtio_net, ext4/jbd2, vfat modules | Alpine `linux-virt` | `stage/lib/modules/6.18.63-0-virt/` |
+| Userland: `sh`/busybox (`mount`, `depmod`, `modprobe`, `udhcpc`, `ip`, `awk`, `ls`, `poweroff`, …), musl libc | Alpine minirootfs 3.24.4 | inside `build/cache/minirootfs.tar.gz`, packed into the cpio |
 | `mkfs.ext4` and its shared libraries | Alpine e2fsprogs | `stage/sbin/mkfs.ext4`, `stage/usr/lib/*`, `stage/etc/mke2fs.conf` |
 | Lato Regular/Bold/Black | SIL Open Font License | `assets/fonts/*.ttf` → `stage/usr/share/fonts` |
+| JetBrains Mono Regular | SIL Open Font License | `assets/fonts/JetBrainsMono-Regular.ttf` → `stage/usr/share/fonts` |
 | QEMU (build/test tool, not part of the OS) | QEMU project (GPL-2.0) | host |
 
 ---
@@ -837,19 +1156,44 @@ with nasm, verify it is exactly 512 bytes and ends in `0xAA55`, write it to a
 
 These are behaviours of the current tree, not intentions:
 
-* The theme request file is written as a filename (`settings.c`) but matched as a
-  display name (`main.c`), so only the number keys change the theme.
-* The README's disk row still says FAT; `setup_disk()` formats and mounts ext4,
-  and the `fat`/`vfat` modules are loaded but never used.
-* Opening a terminal forces `dirty` on every loop iteration, so the desktop
-  recomposes continuously (with the blur) while any terminal window exists.
-* There is no per-window clip rectangle, so an app that draws outside its
-  rectangle overpaints its neighbours until the next compose (§4.3).
+* `title_h()` is `ui_px(40)` and the draw rectangle uses it, but `win_open()`
+  passes an app `h-42` and the drag/snap/maximise paths call `vt->resize(w-2,
+  h-42)` with a literal 40. At `scale = 1.0` that matches; at 1.2 an app is told
+  it has 8 px more height than is drawn (the last rows are clipped), and at 0.8 it
+  is told it has 8 px less (a strip is left empty).
+* The same literals show up around the top bar: the drag clamp is `y >= 34` and a
+  maximised window is placed at `y = 34`, while the bar itself is `topbar_h()`.
+  Above scale 1.0 a maximised window covers the bottom of the top bar.
+* Everything that does not hold text keeps its 1.0-scale size: the traffic-light
+  dots, the eye's 30×28 target, the 18 px resize corner and the lock panel's inner
+  offsets. At 1.6 the eye sits in the upper half of the taller bar.
+* Mouse motion is forwarded to a client window with a hardcoded 41 px offset
+  (`mouse_y - y - 41`) while the click path uses `title_h() + 1`. Above scale 1.0
+  a drag inside an external app is offset from the pixel under the pointer.
+* Alt+Tab can select a minimised window: `win_focus()` does not clear `hidden`,
+  and `win_top()` skips hidden windows, so the keystroke appears to do nothing.
+* `/run/mystic/launch.request` is only polled once per wall-clock second, so an
+  Enter in the Apps window can take up to a second to start the app.
+* `wms_scan_apps()` runs once at startup, so a bundle packaged while the desktop
+  is running needs a reboot before it shows up in the launcher.
+* `src/ipc.h`'s header comment documents `HELLO <id> <title…> <w> <h>`, but the
+  server (`wmsrv.c`) and the SDK (`mystic_client.c`) both use
+  `HELLO <id> <w> <h> <title…>`. `docs/IPC.md` has the right order.
+* `image.sh`'s boot array separates the `-drive` and `-netdev` tokens with a
+  literal `\n` (backslash + `n`), which bash turns into an extra argument `n`
+  before `-netdev`. `bash -c` on that array shows the stray element, so the boot
+  command needs that token removed before `-netdev`/`-device` mean anything.
+* `src/wallpaper.c` implements four procedural backgrounds but nothing calls
+  `wallpaper_draw()`; the desktop still paints `gfx_gradient` plus three glows.
+* The README's feature table still says the disk is FAT and that there are three
+  themes and a dock; `setup_disk()` formats and mounts ext4, six `.theme` files
+  ship, and the bottom bar is the taskbar of §3.11. The `fat`/`vfat` modules are
+  loaded but never used.
+* There is no per-window clip rectangle for in-desktop apps, so an app that draws
+  outside its rectangle overpaints its neighbours until the next compose (§4.3).
 * Resizing a terminal window does not update the pty `winsize`; the grid simply
   draws fewer cells than the window could hold.
-* A digit typed into an app also switches the theme, because the global digit
-  handler runs before the focused window sees the keystroke.
-* Closing a terminal with the red dot closes the pty but does not `waitpid` the
-  shell; the desktop is PID 1, so only exits seen by `term_pump()` are reaped.
-* Clicking a dock icon always opens a new window even when that app already has
-  one; the dot under the icon only reports that it is open.
+* With `blur = 1.0` every recompose blurs the top bar, every visible window and
+  the taskbar, plus a scratch surface per shadow, on one CPU core. Motion is what
+  triggers it, so moving the pointer across the screen is the most expensive
+  thing a user can do.

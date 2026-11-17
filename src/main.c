@@ -663,12 +663,20 @@ static const LauncherItem LAUNCHER[] = {
 static int launcher_items(void) { return LAUNCHER_N + bundle_count; }
 
 static void launcher_geom(int idx, int *tx, int *ty, int *tw, int *th) {
-    const int cols = 3, tile = ui_px(128), gap = ui_px(18), grid_h = ui_px(118);
+    const int cols = 3, tile = ui_px(128), gap = ui_px(18);
     int rows = (launcher_items() + cols - 1) / cols;
+    if (rows < 1) rows = 1;
     int gw = cols * tile + (cols - 1) * gap;
+    /* Tiles shrink so the grid fits: with 14 apps at 1.6x a fixed 118px tile
+     * put the first row's icons above the top of the screen. */
+    int avail = disp.h - ui_px(96);
+    int grid_h = (avail - (rows - 1) * gap) / rows;
+    if (grid_h > ui_px(118)) grid_h = ui_px(118);
+    if (grid_h < ui_px(56)) grid_h = ui_px(56);
     int gh = rows * grid_h + (rows - 1) * gap;
     int gx = (disp.w - gw) / 2;
     int gy = (disp.h - gh) / 2;
+    if (gy < ui_px(44)) gy = ui_px(44);
     int r = idx / cols, c = idx % cols;
     *tx = gx + c * (tile + gap);
     *ty = gy + r * (grid_h + gap);
@@ -680,9 +688,14 @@ static void draw_launcher(Surface *s, const Theme *th) {
     /* dim everything behind */
     surf_blend(s, 0, 0, s->w, s->h, 0xAA000000u);
 
-    const int cols = 3, tile = ui_px(128), gap = ui_px(18), grid_h = ui_px(118);
+    const int cols = 3, tile = ui_px(128), gap = ui_px(18);
     int rows = (launcher_items() + cols - 1) / cols;
+    if (rows < 1) rows = 1;
     int gw = cols * tile + (cols - 1) * gap;
+    int avail = s->h - ui_px(96);
+    int grid_h = (avail - (rows - 1) * gap) / rows;
+    if (grid_h > ui_px(118)) grid_h = ui_px(118);
+    if (grid_h < ui_px(56)) grid_h = ui_px(56);
     int gh = rows * grid_h + (rows - 1) * gap;
     int px = (s->w - gw) / 2 - 24;
     int py = (s->h - gh) / 2 - 24;
@@ -707,10 +720,17 @@ static void draw_launcher(Surface *s, const Theme *th) {
         gfx_rrect_aa(s, (float)tx, (float)ty, (float)tw, (float)th2, 14.0f, bg,
                      selected ? th->accent : 0, selected ? 1.5f : 0.0f);
 
-        float isz = (float)ui_px(52);
+        /* icon and label share the tile: the icon shrinks so the label always
+         * fits underneath, which is what broke at 1.6x */
+        Font *fl = font_get(FONT_MEDIUM, 12);
+        float label_h = font_height(fl) + 4.0f;
+        float isz = (float)grid_h - label_h - 12.0f;
+        if (isz > (float)ui_px(52)) isz = (float)ui_px(52);
+        if (isz < 12.0f) isz = 12.0f;
         const char *label;
         if (i < LAUNCHER_N) {
-            LAUNCHER[i].icon(s, (float)tx + (tw - isz) / 2, (float)ty + 18, isz,
+            LAUNCHER[i].icon(s, (float)tx + (tw - isz) / 2,
+                             (float)ty + 6 + (grid_h - label_h - 12.0f - isz) / 2, isz,
                              hovered ? th->accent : th->text);
             label = LAUNCHER[i].label;
         } else {
@@ -731,8 +751,9 @@ static void draw_launcher(Surface *s, const Theme *th) {
         }
 
         float lw = font_width(f12, label);
-        font_draw(s, f12, (float)tx + (tw - lw) / 2, (float)ty + th2 - 30,
-                  label, hovered ? th->text : th->text_dim);
+        font_draw(s, f12, (float)tx + (tw - lw) / 2,
+                  (float)ty + grid_h - label_h - 2, label,
+                  hovered ? th->text : th->text_dim);
     }
 
     float hw = font_width(fd, "Super or Esc closes");
@@ -800,7 +821,14 @@ static void try_unlock(void) {
         fclose(f);
     }
     pin[pin_len < (int)sizeof(pin) ? pin_len : (int)sizeof(pin) - 1] = 0;
-    if (line[0] && mystic_check_password(line, pin)) {
+    if (!line[0]) {
+        /* fail open only when there is no password file at all: deleting it
+         * used to make the lock screen unrecoverable without a reboot */
+        if (pin_len > 0) { locked = 0; pin_len = 0; pin[0] = 0; }
+        else snprintf(lock_msg, sizeof(lock_msg), "no password file - any input unlocks");
+        return;
+    }
+    if (mystic_check_password(line, pin)) {
         locked = 0;
         snprintf(lock_msg, sizeof(lock_msg), "%s", "");
     } else {
@@ -844,8 +872,31 @@ static void key_bytes_for(int code, char *out, int *n) {
     }
 }
 
+static int taskbar_click(int mx, int my) {
+    int dx, dy, dw, dh;
+    if (!dock_rect(&dx, &dy, &dw, &dh)) return 0;
+    if (my < dy || my >= dy + dh) return 0;
+    const int isz = dock_isz(), gap = dock_gap(), pad = dock_pad();
+    int n = taskbar_count();
+    for (int i = 0; i < n; i++) {
+        int bx = dx + pad + i * (isz + gap);
+        if (mx < bx || mx >= bx + isz) continue;
+        Window *w = taskbar_at(i);
+        if (!w) continue;
+        if (w->hidden) { w->hidden = 0; win_focus(w); }   /* restore */
+        else if (w == win_top()) { w->hidden = 1; }       /* put away */
+        else { win_focus(w); }                            /* focus */
+        return 1;
+    }
+    return 0;
+}
+
 static int handle_click(void) {
     int mx = input.mouse_x, my = input.mouse_y;
+
+    /* The taskbar is drawn above the windows, so it must be hit first:
+     * otherwise a window dragged over the bar swallows its clicks. */
+    if (taskbar_click(mx, my)) return 1;
 
     /* the start button is above everything else in the top bar */
     if (mx >= EYE_HIT_X && mx < EYE_HIT_X + EYE_HIT_W &&
@@ -904,8 +955,12 @@ static int handle_click(void) {
             if (!hit->maxed) {
                 hit->restore_x = hit->x; hit->restore_y = hit->y;
                 hit->restore_w = hit->w; hit->restore_h = hit->h;
-                hit->x = 0; hit->y = 34;
-                hit->w = disp.w; hit->h = disp.h - 34 - 90;
+                int top_ = topbar_h();
+                int bdx, bdy, bdw, bdh;
+                int reserved = dock_rect(&bdx, &bdy, &bdw, &bdh)
+                             ? (disp.h - bdy + ui_px(12)) : ui_px(16);
+                hit->x = 0; hit->y = top_;
+                hit->w = disp.w; hit->h = disp.h - top_ - reserved;
                 hit->maxed = 1;
             } else {
                 hit->x = hit->restore_x; hit->y = hit->restore_y;
@@ -934,24 +989,6 @@ static int handle_click(void) {
         return 1;
     }
 
-    /* taskbar */
-    {
-        int dx, dy, dw, dh;
-        if (dock_rect(&dx, &dy, &dw, &dh) && my >= dy && my < dy + dh) {
-            const int isz = dock_isz(), gap = dock_gap(), pad = dock_pad();
-            int n = taskbar_count();
-            for (int i = 0; i < n; i++) {
-                int bx = dx + pad + i * (isz + gap);
-                if (mx < bx || mx >= bx + isz) continue;
-                Window *w = taskbar_at(i);
-                if (!w) continue;
-                if (w->hidden) { w->hidden = 0; win_focus(w); }        /* restore */
-                else if (w == win_top()) { w->hidden = 1; }            /* put away */
-                else { win_focus(w); }                                 /* focus */
-                return 1;
-            }
-        }
-    }
     return 0;
 }
 
@@ -1041,6 +1078,14 @@ int main(void) {
                     disp_present(&disp, &screen);
                     dirty = 0;
                 }
+                /* the lock screen must not stall the world behind it:
+                 * clients would block on their sockets and exited children
+                 * would stay zombies for the whole lock period */
+                wms_poll(clients, WM_MAX_CLIENTS);
+                while (waitpid(-1, NULL, WNOHANG) > 0) { }
+                for (int wi = 0; wi < MAX_WINDOWS; wi++)
+                    if (wins[wi].used && wins[wi].term) term_pump(wins[wi].term);
+
                 struct pollfd lp = { 0, 0, 0 };
                 poll(&lp, 1, 16);
                 continue;
@@ -1121,11 +1166,17 @@ int main(void) {
                 if (cur) {
                     int best = -1;
                     for (int i = 0; i < MAX_WINDOWS; i++) {
-                        if (!wins[i].used || &wins[i] == cur) continue;
+                        if (!wins[i].used || wins[i].hidden || &wins[i] == cur) continue;
                         if (wins[i].z > best) { best = wins[i].z; next = &wins[i]; }
                     }
                 }
                 if (next) { win_focus(next); dirty = 1; }
+                continue;
+            }
+
+            if (launcher_open) {
+                /* modal overlay: nothing may leak to the window behind it */
+                dirty = 1;
                 continue;
             }
 
@@ -1183,7 +1234,7 @@ int main(void) {
 
         /* text is delivered once per frame, not per key */
         {
-            Window *top = win_top();
+            Window *top = launcher_open ? NULL : win_top();
             if (top && input.text_len) {
                 if (top->term) {
                     term_scroll(top->term, -(term_scroll_offset(top->term)));
@@ -1293,7 +1344,7 @@ int main(void) {
                     w->kind = WIN_CLIENT;
                     w->client = i;
                     w->w = cl->w + 2;
-                    w->h = cl->h + 42;
+                    w->h = cl->h + title_h() + 2;
                     w->x = 120 + (i % 4) * 36;
                     w->y = 90 + (i % 4) * 36;
                     if (w->x + w->w > disp.w) w->x = disp.w - w->w - 8;
@@ -1334,7 +1385,7 @@ int main(void) {
                 if (cl->used && inside &&
                     (input.buttons || (input.mouse_dx || input.mouse_dy) || input.released)) {
                     wms_notify_mouse(cl, input.mouse_x - ct->x - 1,
-                                     input.mouse_y - ct->y - 41, input.buttons);
+                                     input.mouse_y - ct->y - title_h() - 1, input.buttons);
                     dirty = 1;
                 }
             }

@@ -116,6 +116,16 @@ static void handle_line(WmClient *c, char *line) {
         if (w > 1600) w = 1600;
         if (h > 1200) h = 1200;
 
+        /* A second HELLO on the same connection replaces the window. Release
+         * the previous buffer first: make_shm overwrites shm_path/shm_fd/px,
+         * so without this the old mapping, its fd and its /dev/shm file leak
+         * for the lifetime of the server. */
+        if (c->shm_fd >= 0 || c->px || c->shm_path[0]) {
+            fprintf(stderr, "wms: %s sent HELLO twice, replacing its buffer\n",
+                    c->id[0] ? c->id : "client");
+            free_shm(c);
+        }
+
         snprintf(c->id, sizeof(c->id), "%s", id);
         snprintf(c->title, sizeof(c->title), "%s", title);
         c->w = w;
@@ -124,6 +134,10 @@ static void handle_line(WmClient *c, char *line) {
 
         if (make_shm(c) < 0) {
             sendf(c, "ERR no shm\n");
+            /* nothing to draw into: drop the connection deliberately rather
+             * than leaving a client that can never present a frame */
+            fprintf(stderr, "wms: %s could not get a buffer, disconnecting\n", c->id);
+            wms_shutdown_client(c);
             return;
         }
         sendf(c, "OK %s %d\n", c->shm_path, c->stride);
@@ -146,7 +160,28 @@ static void handle_line(WmClient *c, char *line) {
 
 static void read_client(WmClient *c) {
     for (;;) {
-        ssize_t n = read(c->fd, c->rx + c->rxlen, sizeof(c->rx) - (size_t)c->rxlen - 1);
+        size_t space = sizeof(c->rx) - (size_t)c->rxlen - 1;
+        if (space == 0) {
+            /* The buffer is full and the loop above consumed every complete
+             * line in it, so what is left is one line longer than rx[]. Never
+             * read 0 bytes here (read()==0 means EOF) and never let rxlen run
+             * past the array: reject the line explicitly and drop the client,
+             * logging why. */
+            fprintf(stderr, "wms: %s sent a line longer than %d bytes, disconnecting\n",
+                    c->id[0] ? c->id : "client", (int)sizeof(c->rx) - 1);
+            sendf(c, "ERR line too long\n");
+            /* Swallow what the app is still sending before closing: closing a
+             * socket that still has unread input makes the peer's kernel reset
+             * the connection, which would throw away the ERR we just sent. */
+            for (int i = 0; i < 16; i++) {
+                char sink[256];
+                ssize_t d = read(c->fd, sink, sizeof(sink));
+                if (d <= 0) break;
+            }
+            wms_shutdown_client(c);
+            return;
+        }
+        ssize_t n = read(c->fd, c->rx + c->rxlen, space);
         if (n > 0) {
             c->rxlen += (int)n;
             c->rx[c->rxlen] = 0;
@@ -161,9 +196,11 @@ static void read_client(WmClient *c) {
             int rest = (int)(c->rx + c->rxlen - start);
             if (rest > 0) memmove(c->rx, start, (size_t)rest);
             c->rxlen = rest;
+            c->rx[rest] = 0;          /* the tail is a partial line, keep it */
             continue;
         }
         if (n == 0) { wms_shutdown_client(c); return; }
+        if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) return;
         wms_shutdown_client(c);
         return;

@@ -1,0 +1,15 @@
+name          = Basalt
+dark          = 1
+bg_top        = #16130F
+bg_bottom     = #26211A
+accent        = #D9A15B
+glow          = #8A5A2B
+glow_strength = 0.6
+panel         = #8C221D17
+panel_border  = #2AE8D8C0
+text          = #F2E3C9
+text_dim      = #99F2E3C9
+window_bg     = #D91C1813
+window_border = #2AE8D8C0
+corner        = 16
+blur          = 1.0

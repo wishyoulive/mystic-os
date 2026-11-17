@@ -32,6 +32,12 @@
 /* An OSC string longer than this is abandoned. Title sequences are short,
  * and a stream that never sends BEL/ST must not swallow output forever. */
 #define TERM_OSC_MAX 512
+/* Raw parameter bytes kept for one CSI sequence. ECMA-48 allows 16 parameters
+ * and the longest run a real program emits is a truecolour pair (~30 bytes),
+ * so 256 bytes holds any normal SGR several times over: 32 four-character
+ * parameters (128 bytes) and more. csi_param_byte() says what happens past
+ * the end, and why it is the OLDEST parameters that are sacrificed. */
+#define TERM_PARAM_BUF 256
 
 typedef struct {
     u32 ch;
@@ -64,10 +70,11 @@ struct Term {
 
     /* parser state */
     int   state;         /* 0 normal, 1 ESC, 2 CSI, 3 OSC, 4 OSC+ESC, 5 charset */
-    char  params[64];
+    char  params[TERM_PARAM_BUF];
     int   plen;
     int   csi_priv;      /* '?', '>', '<', '=' prefix: parse, then ignore */
-    int   csi_over;      /* parameter buffer overflowed: drop the sequence */
+    int   csi_over;      /* an over-long parameter: csi_dispatch drops the
+                          * sequence instead of running a cut number */
     int   osc_len;       /* bytes seen in the current OSC string */
 
     int   alive;
@@ -392,10 +399,49 @@ again:
     else put_char(t, 0xFFFDu);   /* 0x80..0xC1 and 0xF5..0xFF are never lead bytes */
 }
 
+/* Append one parameter byte to the CSI list.
+ *
+ * Which end of the list is sacrificed when the fixed buffer fills up matters:
+ * long CSI sequences are SGR runs, and their colour codes are at the END, so
+ * the OLDEST parameter is dropped first and the newest are kept. A parameter
+ * only ever starts after a ';', so cutting at a ';' boundary means a number is
+ * never sliced in half - a half number would execute a different code, which
+ * is exactly the bug this replaces - while the codes a user actually sees (the
+ * trailing colour) survive.
+ *
+ * If a single parameter is longer than the whole buffer there is no boundary
+ * to cut at, so the sequence is abandoned (csi_over) and csi_dispatch() drops
+ * it: running a wrapped or truncated number would be worse than ignoring it.
+ * The ';' that ends that runaway number starts a fresh, usable list, so one
+ * bad parameter does not poison the rest of the stream.
+ *
+ * The one thing a trim can still distort: if the parameters dropped off the
+ * front were the head of an extended colour (38/48/58), the surviving r;g;b
+ * arguments are read as ordinary codes. That needs an SGR with more than 255
+ * bytes of parameters - 85+ of them, where ECMA-48 allows 16 and a real
+ * truecolour run is ~30 bytes - and it can only pick a different palette
+ * entry: it can never run a wrapped number or leave the grid. */
 static void csi_param_byte(Term *t, char c) {
-    if (t->plen < (int)sizeof(t->params) - 1) t->params[t->plen++] = c;
-    else t->csi_over = 1;       /* truncating mid-number would run a
-                                 * different sequence: drop it instead */
+    int cap = (int)sizeof(t->params) - 1;
+
+    if (t->csi_over) {          /* inside the abandoned over-long parameter */
+        if (c == ';') { t->plen = 0; t->params[0] = 0; t->csi_over = 0; }
+        return;
+    }
+
+    if (t->plen >= cap) {
+        int cut = -1;
+        for (int i = 0; i < t->plen; i++)
+            if (t->params[i] == ';') { cut = i; break; }
+        if (cut < 0) {          /* no boundary: this whole list is one number */
+            t->csi_over = 1;
+            if (c == ';') { t->plen = 0; t->params[0] = 0; t->csi_over = 0; }
+            return;
+        }
+        memmove(t->params, t->params + cut + 1, (size_t)(t->plen - cut - 1));
+        t->plen -= cut + 1;
+    }
+    t->params[t->plen++] = c;
 }
 
 static void feed_byte(Term *t, unsigned char b) {
