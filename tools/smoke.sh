@@ -562,15 +562,18 @@ else
         esac
 
         # A header a compiled unit #includes must have its module linked too,
-        # or the feature is declared and never built (wallpaper.h is the
-        # case that prompted this). No list is duplicated here: the walk
-        # above already found what the desktop actually includes.
+        # or the feature is declared and never built (a module that lands in
+        # src/ and is used by main.c without being added to the SRC list is
+        # exactly how the desktop grew a shadow copy of itself before).
         missing_c=""
         for inc in $reach; do
-            [ -f "src/$inc" ] || continue
-            sib="src/${inc%.h}.c"
-            [ -f "$sib" ] || continue
-            case " $built_c " in *" $sib "*) ;; *) missing_c="$missing_c $sib" ;; esac
+            base=${inc%.h}
+            for sib in "src/$base.c" "src/apps/$base.c"; do
+                [ -f "$sib" ] || continue
+                case " $built_c " in *" $sib "*) continue ;; esac
+                case " $missing_c " in *" $sib "*) continue ;; esac
+                missing_c="$missing_c $sib"
+            done
         done
         if [ -z "$missing_c" ]; then
             check "build: every included header's module is linked" 1

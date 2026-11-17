@@ -67,6 +67,8 @@ the kernel's `bochs` DRM driver binds; that is what creates `/dev/dri/card0` and
 `/dev/fb0`. `-drive …,if=virtio` is what the OS sees as `/dev/vda`. The
 `-netdev user` / `-device virtio-net-pci` pair gives the guest an `eth0` behind
 QEMU's user-mode stack, which is what `setup_net()` in `stage/init` brings up.
+The memory figure is `-m "${MYSTIC_RAM:-256}"`: 256 MB by default, overridable
+from the environment for experiments that need more.
 
 There is no bootloader in this path. QEMU's firmware loads the bzImage and the
 initrd with the Linux boot protocol and starts the kernel. `boot/boot.asm` and
@@ -143,13 +145,22 @@ Everything else is closed and logged as ignored. Both fds are opened
   one-frame `clicked`/`released` masks. A left press within 350 ms and 6 px of
   the previous one also sets `clicked2`, which is the only thing double-click
   means in this tree.
-* Other `EV_KEY` press events set `key` (raw evdev code), `key_pressed`, and the
+* Other `EV_KEY` events set `key` (raw evdev code), `key_pressed`, and the
   modifier state carried on that event (`shift`, `alt`, `ctrl`), append the code
   to `keys[]` (`nkeys`), and append a printable character to `text[]` via the
   explicit `KEYMAP` table and `key_to_char()`. Ctrl+letter is folded to a
   control byte (`Ctrl+S` → `0x13`). Releases append to `keys_up[]` (`nkeys_up`)
   so a window can see the press *and* the release, which the external app
   protocol carries as the `press` field.
+* evdev value 2 is kernel autorepeat and is accepted only for keys that
+  `key_repeats()` allows: character keys plus the editing and navigation keys.
+  Esc, Super, F1…F5 and the other one-shot shortcuts do not repeat, because
+  `main()` acts on every entry in `keys[]` — a held Esc would close every window
+  and a held F1 would open thirty terminals.
+* The per-frame queues are fixed size (`Input::keys[16]`, `text[32]`); when one
+  fills, `push_key()`/`push_char()` drop the **oldest** entry and keep the newest,
+  because the frame consumes the queue once and the newest event is the one the
+  user is reacting to.
 
 `input_frame()` clears the per-frame fields (`clicked`, `released`, `clicked2`,
 `wheel`, `key`, `nkeys`, `nkeys_up`, `mouse_dx`, `text_len`) at the top of every
@@ -231,19 +242,23 @@ and no partial redraw.
    title centred in `FONT_REGULAR` 11, and on the right `clock_text()` +
    `mem_field("MemTotal:")`/`"MemAvailable:"` from `/proc/meminfo`, formatted as
    `HH:MM      N MB used of M MB`. `clock_text()` uses `gmtime_r`, so the clock is
-   UTC.
+   UTC. Every baseline is `(bar - font_height(face)) / 2`, not a constant, so the
+   text stays centred when the scale changes the bar height; the focused title is
+   truncated with `text_fit()` to the band between the brand label and the clock
+   block (ellipsis at a UTF-8 boundary), because `font_draw()` has no clip.
 3. Windows, back to front (§3.2). Minimised windows (`hidden`) are skipped
    entirely. Each one is composed in this order:
    `gfx_shadow(x, y, w, h, corner, 24, 0.5f)` → a backdrop blur over the window
    rect (radius `14 * blur`) → the rounded body in `window_bg` with a 1 px
    `window_border` → a title strip `title_h()` = `ui_px(40)` tall, tinted with
    the panel colour at 30 % of its own alpha (`color_alpha(th->panel, 0.30f)`,
-   ≈16 % with Obsidian/Aurora) and a 1 px divider → three 10 px circles at
-   `+14/+32/+50`, y `+15` (red closes, yellow minimises, green is decoration) →
-   the title in `FONT_MEDIUM` 13 at `x+72` → three grip strokes in the
-   bottom-right corner → the content rectangle
-   `(x+1, y+title_h()+1, w-2, h-title_h()-2)` handed to `term_draw()`,
-   `app_draw()` or the client blit.
+   ≈16 % with Obsidian/Aurora) and a 1 px divider → three `DOT_SZ` (10 px)
+   circles at `+14/+32/+50` on the vertical centre `traffic_y(title_h())`
+   (red closes, yellow minimises, green is decoration) → the title in
+   `FONT_MEDIUM` 13 at `x+72`, vertically centred on the bar and truncated with
+   `text_fit()` to `w-72-12` → three grip strokes in the bottom-right corner →
+   the content rectangle `(x+1, y+title_h()+1, w-2, h-title_h()-2)` handed to
+   `term_draw()`, `app_draw()` or the client blit.
 4. Taskbar: `dock_rect()` returns 0 (and nothing is drawn) when no window is
    open; otherwise a centred bar `n*dock_isz() + (n-1)*dock_gap() + 2*dock_pad()`
    wide and `dock_isz() + 2*dock_pad()` high, 22 px above the bottom edge, with
