@@ -65,8 +65,11 @@ Everything under the desktop is Alpine's kernel and minirootfs with our
 `-display none -serial stdio`. `-vga std` is QEMU's bochs-compatible VGA, which
 the kernel's `bochs` DRM driver binds; that is what creates `/dev/dri/card0` and
 `/dev/fb0`. `-drive …,if=virtio` is what the OS sees as `/dev/vda`. The
-`-netdev user` / `-device virtio-net-pci` pair gives the guest an `eth0` behind
-QEMU's user-mode stack, which is what `setup_net()` in `stage/init` brings up.
+`-netdev user` / `-device virtio-net-pci` pair is meant to give the guest an
+`eth0` behind QEMU's user-mode stack, which is what `setup_net()` in `stage/init`
+brings up; as written the array also contains a stray `n` token that makes QEMU
+refuse to start (see *Known rough edges*), so today only a hand-built command line
+gets as far as the NIC.
 The memory figure is `-m "${MYSTIC_RAM:-256}"`: 256 MB by default, overridable
 from the environment for experiments that need more.
 
@@ -99,8 +102,8 @@ the boot, and `/root` is the only path backed by a disk (§5).
    ```
    drm drm_kms_helper ttm drm_ttm_helper drm_vram_helper drm_shmem_helper
    drm_client_lib fb_sys_fops sysimgblt sysfillrect bochs virtio-gpu evdev
-   psmouse virtio_blk virtio_net net_failover failover crc16 mbcache jbd2
-   ext4 fat vfat nls_cp437 nls_iso8859-1
+   psmouse virtio_blk virtio_net net_failover failover af_packet crc16
+   mbcache jbd2 ext4 fat vfat nls_cp437 nls_iso8859-1
    ```
 
    Alpine's `linux-virt` builds these as modules, so without this step there is no
@@ -141,7 +144,8 @@ is by capability bits (`has_bit()` wraps `EVIOCGBIT`):
 | `EV_KEY/KEY_A` or `EV_KEY/KEY_SPACE` | keyboard (first one wins) |
 
 Everything else is closed and logged as ignored. Both fds are opened
-`O_RDONLY|O_NONBLOCK`; `input_poll()` drains each with `read()` until `EAGAIN`.
+`O_RDONLY|O_NONBLOCK`; `input_poll()` drains each fd with `read()` until it stops
+returning a whole `struct input_event`.
 `handle_event()` fills the `Input` struct declared in `src/mystic.h`:
 
 * `REL_X`/`REL_Y` accumulate into `mouse_dx`/`mouse_dy` and move `mouse_x`/`mouse_y`;
@@ -1159,9 +1163,12 @@ on the host (Windows or Linux) — nothing is built inside the guest.
   `build/cache`, extracts it there, and copies the package's `boot/vmlinuz-virt`
   out as `build/cache/vmlinuz-virt`.
 * Takes **whole module subtrees**, not a hand-picked file list:
-  `kernel/drivers/{gpu,video,i2c,input,block,net}`, `kernel/net/core` and
-  `kernel/fs/{fat,ext4,jbd2,nls}`, decompressing every `*.ko.gz` into
-  `stage/lib/modules/$(KV)/…`, plus `kernel/fs/mbcache.ko`.
+  `kernel/drivers/{gpu,video,i2c,input,block,net}`, `kernel/net/{core,packet}`
+  and `kernel/fs/{fat,ext4,jbd2,nls}`, decompressing every `*.ko.gz` into
+  `stage/lib/modules/$(KV)/…`, plus `kernel/fs/mbcache.ko`. `net/packet`
+  (`af_packet`) is what `udhcpc` needs: `AF_PACKET` is a module in Alpine's
+  kernel, so without it the first DHCP client fails with "Address family not
+  supported by protocol".
 * Kernel and modules come from the same package on purpose: their versions match,
   so `modprobe` cannot fail with "invalid module format". The script prints the
   module count and total size.
@@ -1281,8 +1288,13 @@ rather than testing functions in isolation.
   landed but is not wired in) is named on a `not part of the desktop build,
   ignored:` line instead of failing the run, so a pass never hides a stale binary.
 * Build-history checks on the scripts themselves, because each of these went wrong
-  once: `stage/init` has no CRLF line endings, `tools/mkapp.sh` links the SDK
-  objects and `-lm`, and `tools/build-desktop.sh` links `-static -lm -lutil`.
+  once: `stage/init` has no CRLF line endings, `tools/mkapp.sh` still links the
+  four objects an external app cannot work without (`src/client/mystic_client.c`,
+  `src/gfx.c`, `src/font.c`, `src/ui.c` — `font.c` calls `ui_scale_get`, so
+  dropping `ui.c` links into a bundle that dies at load with an undefined symbol),
+  and `tools/build-desktop.sh` still passes `-static` — without it the binary wants
+  `ld-musl-x86_64.so.1`, which the image does not carry, and PID 1's `exec` fails
+  with no output at all.
 * Compile checks: every `src/*.c`, `src/apps/*.c`, `src/client/*.c` and
   `src/client/apps/*.c` is compiled with the same `zig cc` flags and must be
   warning-free — the client apps are built by `tools/mkapp.sh`, which `image.sh`
@@ -1378,9 +1390,11 @@ These are behaviours of the current tree, not intentions:
   server (`wmsrv.c`) and the SDK (`mystic_client.c`) both use
   `HELLO <id> <w> <h> <title…>`. `docs/IPC.md` has the right order.
 * `image.sh`'s boot array separates the `-drive` and `-netdev` tokens with a
-  literal `\n` (backslash + `n`), which bash turns into an extra argument `n`
-  before `-netdev`. `bash -c` on that array shows the stray element, so the boot
-  command needs that token removed before `-netdev`/`-device` mean anything.
+  literal `\n` (backslash + `n`), not a line continuation. Bash turns that into
+  the argument `n`, which QEMU reads as a disk-image filename and refuses:
+  `qemu-system-x86_64: n: Could not open 'n': …`. `bash -c` over the array shows
+  the stray element, so `./image.sh run|probe|shot|themes` needs that token
+  removed before any boot mode — and before `-netdev`/`-device` mean anything.
 * The README's feature table still says the disk is FAT and that there are three
   themes and a dock; `setup_disk()` formats and mounts ext4, six `.theme` files
   ship, and the bottom bar is the taskbar of §3.11. The `fat`/`vfat` modules are

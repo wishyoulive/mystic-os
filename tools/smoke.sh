@@ -671,42 +671,41 @@ else
     note "$(crlf_count "$INIT") CR byte(s): exec sees '#!/bin/sh\\r' and fails"
 fi
 
-# 2) An external app linked without the SDK objects or without -lm produced
-#    a bundle that built "successfully" and died at load with undefined
-#    symbols; the error had scrolled past because only the tail was shown.
+# 2) An external app linked without the SDK objects produced a bundle that
+#    built "successfully" and died at load with undefined symbols, and the
+#    error had scrolled past because only the tail of the log was shown.
+#    Proof: linking clock.c without src/ui.c gives
+#      ld.lld: error: undefined symbol: ui_scale_get
+#    because font.c calls it. These four files are not optional.
 MKAPP=tools/mkapp.sh
 if [ -f "$MKAPP" ]; then
     mk_missing=""
-    for need in 'src/client/mystic_client.c' 'src/gfx.c' 'src/font.c' 'src/ui.c' '-lm'; do
+    for need in 'src/client/mystic_client.c' 'src/gfx.c' 'src/font.c' 'src/ui.c'; do
         grep -qF -- "$need" "$MKAPP" || mk_missing="$mk_missing $need"
     done
     if [ -z "$mk_missing" ]; then
-        check "history: $MKAPP links the SDK objects + -lm" 1
+        check "history: $MKAPP links the SDK objects" 1
     else
-        check "history: $MKAPP links the SDK objects + -lm" 0
-        note "missing from $MKAPP:$mk_missing - the bundle links and fails at load"
+        check "history: $MKAPP links the SDK objects" 0
+        note "missing from $MKAPP:$mk_missing - the bundle builds and dies at load with undefined symbols"
     fi
 else
-    check "history: $MKAPP links the SDK objects + -lm" 0
+    check "history: $MKAPP links the SDK objects" 0
     note "no way to build an external app"
 fi
 
-# 3) The same class on the desktop side: term.c calls forkpty(), which lives
-#    in -lutil, and gfx.c/font.c/wallpaper.c need -lm. The link error only
-#    shows at the very end of a long build, which is how it was missed before.
+# 3) -static is what lets the desktop run with nothing else in the initramfs.
+#    Without it the binary wants ld-musl-x86_64.so.1, which the image does
+#    not carry, and PID 1's exec fails with no output.
 if [ -f "$DESKTOP_SH" ]; then
-    dk_missing=""
-    for need in '-lm' '-lutil' '-static'; do
-        grep -qF -- "$need" "$DESKTOP_SH" || dk_missing="$dk_missing $need"
-    done
-    if [ -z "$dk_missing" ]; then
-        check "history: $DESKTOP_SH links -static -lm -lutil" 1
+    if grep -qF -- '-static' "$DESKTOP_SH"; then
+        check "history: $DESKTOP_SH passes -static" 1
     else
-        check "history: $DESKTOP_SH links -static -lm -lutil" 0
-        note "missing from $DESKTOP_SH:$dk_missing"
+        check "history: $DESKTOP_SH passes -static" 0
+        note "the desktop would need a dynamic loader the initramfs does not have"
     fi
 else
-    skipped "history: $DESKTOP_SH linker flags (script missing)"
+    skipped "history: $DESKTOP_SH -static (script missing)"
 fi
 
 # ------------------------------------------------------------ compile checks
