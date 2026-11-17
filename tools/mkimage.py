@@ -105,7 +105,10 @@ def main():
                 # Windows has no executable bit, so decide by path:
                 # anything that lives where a program lives is 0755.
                 exec_dirs = ('bin/', 'sbin/', 'usr/bin/', 'usr/sbin/', 'usr/local/bin/')
-                is_prog = rel == 'init' or rel.startswith(exec_dirs)
+                # an app bundle's payload is called 'bin' and lives under
+                # usr/share/mystic/apps/<id>/ - it must be executable too
+                is_prog = (rel == 'init' or rel.startswith(exec_dirs)
+                           or rel.endswith('/bin'))
                 mode = 0o755 if is_prog else 0o644
                 add(rel, S_IFREG | mode, int(st.st_mtime), data=open(full, 'rb').read())
 
