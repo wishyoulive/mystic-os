@@ -200,7 +200,7 @@ typedef struct Term Term;
 Term *term_create(int cols, int rows, const char *shell);
 int   term_fd(Term *t);
 int   term_alive(Term *t);
-void  term_pump(Term *t);
+int   term_pump(Term *t);   /* bytes consumed; capped per call */
 void  term_key(Term *t, const char *bytes, int n);
 void  term_clear_screen(Term *t);
 void  term_draw(Term *t, Surface *s, int x, int y, int w, int h,

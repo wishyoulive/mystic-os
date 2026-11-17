@@ -1097,8 +1097,10 @@ int main(void) {
         /* terminals produce output asynchronously */
         for (int i = 0; i < MAX_WINDOWS; i++) {
             if (wins[i].used && wins[i].term) {
-                term_pump(wins[i].term);
-                dirty = 1;            /* keep it simple while terminals exist */
+                /* Only repaint when the shell actually produced output. Setting
+                 * dirty unconditionally meant an open terminal forced a full
+                 * 1280x800 recompose (blur included) every single frame. */
+                if (term_pump(wins[i].term) > 0) dirty = 1;
                 if (!term_alive(wins[i].term)) { win_close(&wins[i]); }
             }
         }

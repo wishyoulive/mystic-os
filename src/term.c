@@ -300,13 +300,21 @@ int term_alive(Term *t) { return t && t->alive; }
 int term_cols(Term *t) { return t ? t->cols : 0; }
 int term_rows(Term *t) { return t ? t->rows : 0; }
 
-void term_pump(Term *t) {
-    if (!t || !t->alive) return;
+/* Returns the number of bytes consumed. Reading is capped per call so a
+ * process that floods the pty (`yes`, `cat /dev/urandom`) cannot starve the
+ * compositor: at 64 KiB per frame the desktop still paints, and the rest of
+ * the output is read on the next frame. */
+int term_pump(Term *t) {
+    if (!t || !t->alive) return 0;
     char buf[2048];
-    for (;;) {
+    long budget = 65536;
+    int total = 0;
+    while (budget > 0) {
         ssize_t n = read(t->fd, buf, sizeof(buf));
         if (n > 0) {
             for (ssize_t i = 0; i < n; i++) feed_byte(t, (unsigned char)buf[i]);
+            total += (int)n;
+            budget -= n;
             continue;
         }
         if (n == 0) { t->alive = 0; break; }
@@ -318,6 +326,8 @@ void term_pump(Term *t) {
         int status;
         waitpid(t->pid, &status, WNOHANG);
     }
+    t->dirty = t->dirty || total > 0;
+    return total;
 }
 
 void term_key(Term *t, const char *bytes, int n) {
