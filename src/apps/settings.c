@@ -128,7 +128,7 @@
 /* src/main.c loads at most this many theme files
  * (theme_load_all(themes, 8, THEME_DIR), src/main.c:1367). Listing more than
  * the desktop can load would offer rows that cannot be applied. */
-#define MAX_THEMES 8
+#define MAX_THEMES 16   /* matches the desktop's array; ten themes ship */
 
 /* The five values ui_scale_load() accepts after its clamp (src/ui.c:75-77).
  * 1.0 is relative to the shipped readable size, UI_BASE = 1.4 (src/ui.c:24),
