@@ -11,6 +11,7 @@
  *          to launch an app, click a window's red dot to close it.
  * ============================================================ */
 #include "mystic.h"
+#include "ipc.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -34,7 +35,7 @@ static Theme   themes[8];
 static int     theme_count, theme_index;
 
 /* ------------------------------------------------------------ windows */
-enum { WIN_TERM = 0, WIN_APP };
+enum { WIN_TERM = 0, WIN_APP, WIN_CLIENT };
 
 typedef struct {
     int   used;
@@ -43,6 +44,7 @@ typedef struct {
     int   x, y, w, h;
     App  *app;
     Term *term;
+    int   client;        /* index into clients[] when kind == WIN_CLIENT */
     int   z;
 } Window;
 
@@ -51,6 +53,10 @@ static int    z_top;
 static int    drag_win = -1, drag_dx, drag_dy;
 static int    resize_win = -1;
 static int    launcher_open = 0;
+
+static WmClient clients[WM_MAX_CLIENTS];
+static WmApp   bundles[WM_MAX_APPS];
+static int     bundle_count = 0;
 
 /* lock screen state */
 static int    locked = 0;
@@ -138,6 +144,10 @@ static void win_close(Window *w) {
     if (!w || !w->used) return;
     if (w->term) { close(term_fd(w->term)); free(w->term); }
     if (w->app) app_free(w->app);
+    if (w->kind == WIN_CLIENT && w->client >= 0 && w->client < WM_MAX_CLIENTS) {
+        wms_notify_close(&clients[w->client]);
+        wms_shutdown_client(&clients[w->client]);
+    }
     memset(w, 0, sizeof(*w));
 }
 
@@ -285,6 +295,15 @@ static void draw_desktop(Surface *s, const Theme *th) {
             term_draw(cur->term, s, cx0, cy0, cw0, ch0, fm, 7.0f, 16.0f);
         } else if (cur->app) {
             app_draw(cur->app, s, cx0, cy0, cw0, ch0, th);
+        } else if (cur->kind == WIN_CLIENT && cur->client >= 0) {
+            WmClient *cl = &clients[cur->client];
+            if (cl->used && cl->px) {
+                int cw1 = cw0 < cl->w ? cw0 : cl->w;
+                int ch1 = ch0 < cl->h ? ch0 : cl->h;
+                for (int row = 0; row < ch1; row++)
+                    memcpy(s->px + (size_t)(cy0 + row) * s->stride + cx0,
+                           cl->px + (size_t)row * cl->stride, (size_t)cw1 * 4);
+            }
         }
     }
 
@@ -346,9 +365,11 @@ static const LauncherItem LAUNCHER[] = {
 };
 #define LAUNCHER_N ((int)(sizeof(LAUNCHER) / sizeof(LAUNCHER[0])))
 
+static int launcher_items(void) { return LAUNCHER_N + bundle_count; }
+
 static void launcher_geom(int idx, int *tx, int *ty, int *tw, int *th) {
     const int cols = 3, tile = 128, gap = 18, grid_h = 118;
-    int rows = (LAUNCHER_N + cols - 1) / cols;
+    int rows = (launcher_items() + cols - 1) / cols;
     int gw = cols * tile + (cols - 1) * gap;
     int gh = rows * grid_h + (rows - 1) * gap;
     int gx = (disp.w - gw) / 2;
@@ -365,7 +386,7 @@ static void draw_launcher(Surface *s, const Theme *th) {
     surf_blend(s, 0, 0, s->w, s->h, 0xAA000000u);
 
     const int cols = 3, tile = 128, gap = 18, grid_h = 118;
-    int rows = (LAUNCHER_N + cols - 1) / cols;
+    int rows = (launcher_items() + cols - 1) / cols;
     int gw = cols * tile + (cols - 1) * gap;
     int gh = rows * grid_h + (rows - 1) * gap;
     int px = (s->w - gw) / 2 - 24;
@@ -380,7 +401,7 @@ static void draw_launcher(Surface *s, const Theme *th) {
     Font *f12 = font_get(FONT_MEDIUM, 12);
     Font *fd = font_get(FONT_REGULAR, 10);
 
-    for (int i = 0; i < LAUNCHER_N; i++) {
+    for (int i = 0; i < launcher_items(); i++) {
         int tx, ty, tw, th2;
         launcher_geom(i, &tx, &ty, &tw, &th2);
         int hovered = (input.mouse_x >= tx && input.mouse_x < tx + tw &&
@@ -389,12 +410,22 @@ static void draw_launcher(Surface *s, const Theme *th) {
         gfx_rrect_aa(s, (float)tx, (float)ty, (float)tw, (float)th2, 14.0f, bg, 0, 0);
 
         float isz = 52;
-        LAUNCHER[i].icon(s, (float)tx + (tw - isz) / 2, (float)ty + 18, isz,
-                         hovered ? th->accent : th->text);
+        const char *label;
+        if (i < LAUNCHER_N) {
+            LAUNCHER[i].icon(s, (float)tx + (tw - isz) / 2, (float)ty + 18, isz,
+                             hovered ? th->accent : th->text);
+            label = LAUNCHER[i].label;
+        } else {
+            /* an installed bundle: a real program from /usr/share/mystic/apps */
+            int b = i - LAUNCHER_N;
+            icon_gear(s, (float)tx + (tw - isz) / 2, (float)ty + 18, isz,
+                      hovered ? th->accent : th->text);
+            label = (b >= 0 && b < bundle_count) ? bundles[b].name : "?";
+        }
 
-        float lw = font_width(f12, LAUNCHER[i].label);
+        float lw = font_width(f12, label);
         font_draw(s, f12, (float)tx + (tw - lw) / 2, (float)ty + th2 - 30,
-                  LAUNCHER[i].label, hovered ? th->text : th->text_dim);
+                  label, hovered ? th->text : th->text_dim);
     }
 
     float hw = font_width(fd, "Super or Esc closes");
@@ -510,12 +541,21 @@ static int handle_click(void) {
     int mx = input.mouse_x, my = input.mouse_y;
 
     if (launcher_open) {
-        for (int i = 0; i < LAUNCHER_N; i++) {
+        for (int i = 0; i < launcher_items(); i++) {
             int tx, ty, tw, th2;
             launcher_geom(i, &tx, &ty, &tw, &th2);
             if (mx < tx || mx >= tx + tw || my < ty || my >= ty + th2) continue;
-            if (LAUNCHER[i].app_id) win_open(WIN_APP, LAUNCHER[i].app_id);
-            else                    win_open(WIN_TERM, NULL);
+            if (i < LAUNCHER_N) {
+                if (LAUNCHER[i].app_id) win_open(WIN_APP, LAUNCHER[i].app_id);
+                else                    win_open(WIN_TERM, NULL);
+            } else {
+                int b = i - LAUNCHER_N;
+                if (b >= 0 && b < bundle_count) {
+                    int pid = wms_launch(&bundles[b], clients, b);
+                    fprintf(stderr, "wms: launched %s pid %d", bundles[b].id, pid);
+                    fprintf(stderr, "\n");
+                }
+            }
             launcher_open = 0;
             return 1;
         }
@@ -591,6 +631,10 @@ int main(void) {
     }
 
     if (input_open(&input) < 0) fprintf(stderr, "no input devices\n");
+
+    if (wms_start() < 0) fprintf(stderr, "window server failed to start\n");
+    bundle_count = wms_scan_apps(bundles, WM_MAX_APPS);
+    fprintf(stderr, "wms: %d installed app bundle(s)\n", bundle_count);
 
     int quit = 0, dirty = 1;
     long last_tick = 0;
@@ -704,6 +748,15 @@ int main(void) {
                     term_scroll(top->term, -(term_scroll_offset(top->term)));
                     term_key(top->term, input.text, input.text_len);
                 }
+            } else if (top->kind == WIN_CLIENT && top->client >= 0) {
+                WmClient *cl = &clients[top->client];
+                int mods = (input.shift ? 1 : 0) | (input.ctrl ? 2 : 0) | (input.alt ? 4 : 0);
+                if (input.key) wms_notify_key(cl, input.key, mods, 1);
+                if (input.text_len) wms_notify_text(cl, input.text);
+                char kb[64]; int kn = 0;
+                key_bytes(kb, &kn);
+                if (kn) wms_notify_text(cl, kb);
+                dirty = 1;
             } else if (top->app) {
                 if (input.text_len) app_key(top->app, input.text, input.text_len);
                 /* Arrows, Home/End, PageUp/Down and Delete must reach apps as
@@ -779,6 +832,39 @@ int main(void) {
             }
         }
         (void)mouse_prev;
+
+        /* window server: accept connections, bind windows, mark frames dirty */
+        wms_poll(clients, WM_MAX_CLIENTS);
+        for (int i = 0; i < WM_MAX_CLIENTS; i++) {
+            WmClient *cl = &clients[i];
+            if (!cl->used) continue;
+            if (cl->win < 0 && cl->px) {
+                Window *w = NULL;
+                for (int k = 0; k < MAX_WINDOWS; k++) if (!wins[k].used) { w = &wins[k]; break; }
+                if (w) {
+                    memset(w, 0, sizeof(*w));
+                    w->used = 1;
+                    w->kind = WIN_CLIENT;
+                    w->client = i;
+                    w->w = cl->w + 2;
+                    w->h = cl->h + 42;
+                    w->x = 120 + (i % 4) * 36;
+                    w->y = 90 + (i % 4) * 36;
+                    if (w->x + w->w > disp.w) w->x = disp.w - w->w - 8;
+                    if (w->y + w->h > disp.h) w->y = disp.h - w->h - 100;
+                    snprintf(w->title, sizeof(w->title), "%s", cl->title);
+                    w->z = ++z_top;
+                    cl->win = (int)(w - wins);
+                    dirty = 1;
+                }
+            } else if (cl->win >= 0) {
+                Window *w = &wins[cl->win];
+                if (w->used) {
+                    snprintf(w->title, sizeof(w->title), "%s", cl->title);
+                    if (cl->want_frame) { cl->want_frame = 0; dirty = 1; }
+                }
+            }
+        }
 
         /* terminals produce output asynchronously */
         for (int i = 0; i < MAX_WINDOWS; i++) {
