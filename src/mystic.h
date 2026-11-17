@@ -199,6 +199,7 @@ extern const AppVT app_vt_sysinfo;
  * ------------------------------------------------------------ */
 typedef struct Term Term;
 Term *term_create(int cols, int rows, const char *shell);
+void  term_destroy(Term *t);   /* close the pty, reap the shell, free the grid */
 int   term_fd(Term *t);
 int   term_alive(Term *t);
 int   term_pump(Term *t);   /* bytes consumed; capped per call */

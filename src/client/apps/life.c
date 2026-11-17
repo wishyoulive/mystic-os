@@ -228,11 +228,20 @@ static void layout_for(int vw, int vh, Layout *L, int *cols, int *rows) {
 
     int avail_w = vw - 2 * MARGIN;
     int avail_h = bot - top;
+    if (avail_w > vw) avail_w = vw;
+    if (avail_h > vh) avail_h = vh;
     if (avail_w < CELL) avail_w = CELL;
     if (avail_h < CELL) avail_h = CELL;
 
     int c = avail_w / CELL;
     int r = avail_h / CELL;
+
+    /* The band between the header and the footer can be taller than a
+     * very short window; the grid must still land inside the pixels we
+     * were actually given, so cap it by the window itself. */
+    if (c * CELL > vw && vw >= CELL) c = vw / CELL;
+    if (r * CELL > vh && vh >= CELL) r = vh / CELL;
+
     if (c > MAX_COLS) c = MAX_COLS;
     if (r > MAX_ROWS) r = MAX_ROWS;
     if (c < 1) c = 1;
@@ -242,6 +251,8 @@ static void layout_for(int vw, int vh, Layout *L, int *cols, int *rows) {
     L->gh = r * CELL;
     L->gx = (vw - L->gw) / 2;
     L->gy = top + (avail_h - L->gh) / 2;
+    if (L->gx + L->gw > vw) L->gx = vw - L->gw;
+    if (L->gy + L->gh > vh) L->gy = vh - L->gh;
     if (L->gx < 0) L->gx = 0;
     if (L->gy < 0) L->gy = 0;
 
