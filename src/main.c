@@ -222,30 +222,125 @@ static void draw_launcher(Surface *s, const Theme *th);
 static void draw_lock_screen(Surface *s, const Theme *th);
 
 /* ------------------------------------------------------------ start button
- * Our own mark: an "M" drawn as four strokes, not a font glyph, so it is
- * crisp at any size and belongs to us.
+ * The Mystic mark: an eye. Two circular arcs make the lens (vesica), the
+ * iris is a real circle, and pressing it blinks - the lid closes in 90 ms
+ * and opens in 170 ms, which is roughly how a human eye does it.
+ *
+ * Everything is drawn from geometry: no glyph, no image, crisp at any size.
  */
-#define START_X 12
-#define START_Y 6
-#define START_S 22
+#define EYE_CX   19
+#define EYE_CY   17
+#define EYE_RX   12.0f
+#define EYE_RY   7.6f
+#define EYE_HIT_X 4
+#define EYE_HIT_Y 3
+#define EYE_HIT_W 30
+#define EYE_HIT_H 28
+
+static double blink_t0 = -1.0;      /* monotonic seconds, -1 = not blinking */
+
+static double now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* coverage of a soft-edged disc at (0,0) radius r, for pixel (px,py) */
+static float disc_cov(float px, float py, float r) {
+    float d = sqrtf(px * px + py * py);
+    float cov = r - d + 0.5f;
+    if (cov < 0.0f) return 0.0f;
+    if (cov > 1.0f) return 1.0f;
+    return cov;
+}
+
+static void blend_px(Surface *s, int x, int y, u32 color, float a) {
+    if (a <= 0.004f) return;
+    if ((unsigned)x >= (unsigned)s->w || (unsigned)y >= (unsigned)s->h) return;
+    if (a > 1.0f) a = 1.0f;
+    u32 *p = &s->px[(size_t)y * s->stride + x];
+    u32 d = *p;
+    float inv = 1.0f - a;
+    *p = 0xFF000000u
+       | ((u32)(GET_R(color) * a + GET_R(d) * inv) << 16)
+       | ((u32)(GET_G(color) * a + GET_G(d) * inv) << 8)
+       |  (u32)(GET_B(color) * a + GET_B(d) * inv);
+}
+
+static void draw_eye(Surface *s, const Theme *th, float open) {
+    int hover = (input.mouse_x >= EYE_HIT_X && input.mouse_x < EYE_HIT_X + EYE_HIT_W &&
+                 input.mouse_y >= EYE_HIT_Y && input.mouse_y < EYE_HIT_Y + EYE_HIT_H);
+    int active = hover || launcher_open;
+
+    u32 ring  = active ? th->accent : color_mix(th->bg_bottom, 0xFF000000u, 0.55f);
+    u32 iris  = th->accent;
+    u32 pupil = color_mix(th->accent, 0xFF000000u, 0.82f);
+    u32 sclera = color_mix(th->text, 0xFFFFFFFFu, 0.80f);
+
+    float ry = EYE_RY * open;
+    if (ry < 0.6f) ry = 0.6f;
+
+    /* vesica: radius and centre offset that give this half-width/half-height */
+    float R = (EYE_RX * EYE_RX + ry * ry) / (2.0f * ry);
+    float d = R - ry;
+    float iris_r = EYE_RY * open * 0.86f;
+    if (iris_r > EYE_RX * 0.62f) iris_r = EYE_RX * 0.62f;
+    if (iris_r < 1.2f) iris_r = 1.2f;
+
+    int x0 = EYE_CX - (int)EYE_RX - 2, x1 = EYE_CX + (int)EYE_RX + 3;
+    int y0 = EYE_CY - (int)EYE_RY - 3,  y1 = EYE_CY + (int)EYE_RY + 4;
+
+    for (int y = y0; y < y1; y++) {
+        for (int x = x0; x < x1; x++) {
+            float px = (float)x + 0.5f - EYE_CX;
+            float py = (float)y + 0.5f - EYE_CY;
+
+            /* inside both circles -> inside the lens */
+            float d1 = sqrtf(px * px + (py - d) * (py - d));
+            float d2 = sqrtf(px * px + (py + d) * (py + d));
+            float lens = (R - d1 < R - d2 ? R - d1 : R - d2) + 0.5f;
+            if (lens <= 0.0f) continue;
+            if (lens > 1.0f) lens = 1.0f;
+
+            /* the white of the eye */
+            blend_px(s, x, y, sclera, lens * 0.97f);
+
+            /* iris, then pupil, then a highlight - all clipped by the lid */
+            float ic = disc_cov(px, py, iris_r);
+            if (ic > 0.0f) blend_px(s, x, y, iris, ic * lens);
+
+            float pc = disc_cov(px, py, iris_r * 0.58f);
+            if (pc > 0.0f) blend_px(s, x, y, pupil, pc * lens);
+
+            float hx = px + iris_r * 0.36f, hy = py + iris_r * 0.40f;
+            float hc = disc_cov(hx, hy, iris_r * 0.19f);
+            if (hc > 0.0f) blend_px(s, x, y, 0xFFFFFFFFu, hc * lens * 0.95f);
+
+            /* lid outline: only where the lens coverage is partial, i.e. the
+             * boundary. (Using 1-lens here paints the whole interior - that
+             * mistake turned the eye into a black blob.) */
+            if (lens < 0.58f)
+                blend_px(s, x, y, ring, (0.58f - lens) * 2.0f);
+        }
+    }
+}
 
 static void draw_start_button(Surface *s, const Theme *th) {
-    int hover = (input.mouse_x >= START_X && input.mouse_x < START_X + START_S &&
-                 input.mouse_y >= START_Y && input.mouse_y < START_Y + START_S);
-    u32 bg = (hover || launcher_open) ? color_alpha(th->accent, 0.28f)
-                                      : color_alpha(th->text, 0.10f);
-    u32 edge = (hover || launcher_open) ? th->accent : th->panel_border;
-    gfx_rrect_aa(s, (float)START_X, (float)START_Y, (float)START_S, (float)START_S,
-                 7.0f, bg, edge, 1.0f);
+    double t = now_sec();
+    float open = 1.0f;
 
-    u32 fg = (hover || launcher_open) ? th->accent : th->text;
-    float lx = (float)START_X + 6.0f, rx = (float)START_X + 16.0f;
-    float top = (float)START_Y + 5.5f, bot = (float)START_Y + 16.5f;
-    float mid = (float)START_Y + 11.5f;
-    gfx_line(s, lx, bot, lx, top, 1.7f, fg);
-    gfx_line(s, rx, bot, rx, top, 1.7f, fg);
-    gfx_line(s, lx, top, (lx + rx) * 0.5f, mid, 1.7f, fg);
-    gfx_line(s, rx, top, (lx + rx) * 0.5f, mid, 1.7f, fg);
+    if (blink_t0 >= 0.0) {
+        double e = t - blink_t0;
+        if (e < 0.09) {
+            open = 1.0f - (float)(e / 0.09) * 0.94f;          /* close */
+        } else if (e < 0.26) {
+            open = 0.06f + (float)((e - 0.09) / 0.17) * 0.94f;  /* open */
+        } else {
+            blink_t0 = -1.0;
+            open = 1.0f;
+        }
+    }
+    draw_eye(s, th, open);
 }
 
 /* ------------------------------------------------------------ compose */
@@ -578,8 +673,9 @@ static int handle_click(void) {
     int mx = input.mouse_x, my = input.mouse_y;
 
     /* the start button is above everything else in the top bar */
-    if (mx >= START_X && mx < START_X + START_S &&
-        my >= START_Y && my < START_Y + START_S) {
+    if (mx >= EYE_HIT_X && mx < EYE_HIT_X + EYE_HIT_W &&
+        my >= EYE_HIT_Y && my < EYE_HIT_Y + EYE_HIT_H) {
+        blink_t0 = now_sec();          /* it blinks on every press */
         launcher_open = !launcher_open;
         return 1;
     }
@@ -918,6 +1014,9 @@ int main(void) {
                 if (!term_alive(wins[i].term)) { win_close(&wins[i]); }
             }
         }
+
+        /* keep repainting while the eye is blinking */
+        if (blink_t0 >= 0.0) dirty = 1;
 
         long now = (long)time(NULL);
         if (now != last_tick) {
