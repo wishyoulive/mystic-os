@@ -25,7 +25,7 @@ echo "==> compiler: $ZIG ($("$ZIG" version))"
 SRC="src/main.c src/apps.c src/term.c src/sha256.c src/wmsrv.c src/gfx.c src/font.c src/fb.c src/input.c src/theme.c"
 SRC="$SRC src/apps/sysinfo.c"
 DEFS=""
-for app in files settings monitor notes; do
+for app in files settings monitor notes store; do
     if [ -f "src/apps/$app.c" ]; then
         SRC="$SRC src/apps/$app.c"
         DEFS="$DEFS -DWITH_$(echo $app | tr a-z A-Z)"
