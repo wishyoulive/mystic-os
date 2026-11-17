@@ -85,7 +85,12 @@ setup_disk() {
         echo "disk: mounted /dev/vda (ext4) on /root"
         return 0
     fi
-    echo "disk: /dev/vda is unformatted, creating ext4 filesystem"
+# KNOWN RISK (tracked in docs/CONTEXT-DUMP.md): this formats whenever the mount
+# fails, including failures that do not mean "the disk is empty" - a module that
+# loaded late, a busy device, a different filesystem. A safer version detected
+# ext4 by its superblock magic first, but mkfs then failed to mount on a fresh
+# disk, so it was reverted rather than left half-working.
+    echo "disk: /dev/vda did not mount, creating ext4 filesystem"
     if [ -x /sbin/mkfs.ext4 ]; then
         /sbin/mkfs.ext4 -q -F /dev/vda >/dev/null 2>&1
     else
