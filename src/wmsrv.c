@@ -99,6 +99,11 @@ int wms_start(void) {
         return -1;
     }
     listen(listen_fd, 8);
+    /* connect() needs write permission on the socket inode, and apps now run as
+     * uid 1000. This is a single-tenant system - every local process is one of
+     * our sandboxed apps - so the socket is connectable, while what is behind
+     * it (the filesystem) is not: see the jail. */
+    chmod(WM_SOCKET, 0666);
     fcntl(listen_fd, F_SETFL, fcntl(listen_fd, F_GETFL, 0) | O_NONBLOCK);
     fprintf(stderr, "wms: listening on %s\n", WM_SOCKET);
     return 0;
@@ -343,6 +348,13 @@ static void sandbox_child(const char *exe, const char *id) {
     char jail[192], path[256];
     snprintf(jail, sizeof(jail), "/run/mystic/jail/%s", id);
 
+    /* Nothing above stderr belongs to the app. Without this it inherits our
+     * root-opened /dev/fb0 (read AND write the whole screen, forge a lock
+     * screen) and the evdev keyboard (the unlock PIN in cleartext), plus the
+     * listener and every other client's socket and shm buffer. Namespaces hide
+     * paths; they do not take away file descriptors. */
+    for (int fd = 3; fd < 1024; fd++) close(fd);
+
     if (unshare(CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS) == 0) {
         mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
 
@@ -394,6 +406,14 @@ static void sandbox_child(const char *exe, const char *id) {
         mkdirp_for(jail, "/dev/shm");
         mount("/dev/shm", path, NULL, MS_BIND, NULL);
 
+        /* seeding RNG is a legitimate need (2048, paint's palette); this is
+         * read-only randomness, not a channel to anything */
+        snprintf(path, sizeof(path), "%s/dev/urandom", jail);
+        mkdirp_for(jail, "/dev");
+        int ufd = open(path, O_CREAT | O_RDWR, 0666);
+        if (ufd >= 0) close(ufd);
+        mount("/dev/urandom", path, NULL, MS_BIND | MS_RDONLY, NULL);
+
         snprintf(path, sizeof(path), "%s/proc", jail);
         mkdirp_for(jail, "/proc");
         mount("/proc", path, NULL, MS_BIND, NULL);
@@ -401,13 +421,21 @@ static void sandbox_child(const char *exe, const char *id) {
         if (chroot(jail) == 0) {
             chdir("/");
             setgroups(0, NULL);
-            if (setgid(SANDBOX_GID) != 0 || setuid(SANDBOX_UID) != 0)
-                fprintf(stderr, "wms: sandbox uid drop failed: %s\n", strerror(errno));
+            if (setgid(SANDBOX_GID) != 0 || setuid(SANDBOX_UID) != 0) {
+                fprintf(stderr, "wms: sandbox uid drop failed: %s; refusing to run\n",
+                        strerror(errno));
+                _exit(126);
+            }
         } else {
-            fprintf(stderr, "wms: chroot failed: %s\n", strerror(errno));
+            fprintf(stderr, "wms: chroot failed: %s; refusing to run\n", strerror(errno));
+            _exit(124);
         }
     } else {
-        fprintf(stderr, "wms: unshare failed (%s); running unsandboxed\n", strerror(errno));
+        /* fail closed: an app that cannot be isolated must not run at all,
+         * rather than quietly running as root with the whole filesystem */
+        fprintf(stderr, "wms: unshare failed (%s); refusing to run %s\n",
+                strerror(errno), id);
+        _exit(125);
     }
 
     setenv("MYSTIC_SOCKET", "/run/mystic/wm.sock", 1);
@@ -421,13 +449,20 @@ int wms_launch(const WmApp *app, WmClient *cl, int slot) {
     char exe[512];
     snprintf(exe, sizeof(exe), "%s/%s/%s", WM_APP_DIR, app->id, app->exe);
 
+    /* exec= comes from a manifest, which is untrusted input: a bare filename
+     * only. ".." or a slash would let a bundle point at /bin/sh, and the old
+     * unconditional host fallback would then run it as root. */
+    if (!app->exe[0] || strchr(app->exe, '/') || strstr(app->exe, "..")) {
+        fprintf(stderr, "wms: refusing bundle %s: unsafe exec=%.40s\n", app->id, app->exe);
+        return -1;
+    }
+
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
         sandbox_child(exe, app->id);
-        execl("/bin/app", "app", (char *)NULL);   /* inside the jail */
-        execl(exe, exe, (char *)NULL);            /* fallback: unsandboxed */
-        fprintf(stderr, "wms: cannot exec %s\n", exe);
+        execl("/bin/app", "app", (char *)NULL);   /* inside the jail, or not at all */
+        fprintf(stderr, "wms: cannot exec the jailed %s\n", app->id);
         _exit(127);
     }
     (void)cl;
