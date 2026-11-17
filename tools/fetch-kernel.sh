@@ -30,6 +30,8 @@ kernel/drivers/video
 kernel/drivers/i2c
 kernel/drivers/input
 kernel/drivers/block
+kernel/drivers/net
+kernel/net/core
 kernel/fs/fat
 kernel/fs/ext4
 kernel/fs/jbd2

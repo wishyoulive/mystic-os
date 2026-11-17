@@ -1,0 +1,15 @@
+name          = Sandstone
+dark          = 0
+bg_top        = #FAF3E6
+bg_bottom     = #E8D9C0
+accent        = #B44B2C
+glow          = #FFF6E4
+glow_strength = 0.8
+panel         = #C8FFFBF2
+panel_border  = #332F2013
+text          = #2E2117
+text_dim      = #A02E2117
+window_bg     = #E8FFFDF8
+window_border = #332F2013
+corner        = 14
+blur          = 1.0

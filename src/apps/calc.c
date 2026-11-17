@@ -1,5 +1,5 @@
 /* ============================================================
- *  Mystic OS - apps/calculator.c
+ *  Mystic OS - apps/calc.c
  *  "Calculator": an expression evaluator, not a keypad.
  *
  *  What you type is a string. Enter parses it with a recursive
@@ -34,7 +34,15 @@
  *  literal 'C' or '=' would only produce a garbage-character error
  *  and those are the two meanings a calculator must have.
  *
- *  The expression buffer is a fixed 64 bytes. Nothing here allocates.
+ *  Every band in this window is measured from font_height() of the font
+ *  it actually draws with, because font_get() applies the global text
+ *  scale (src/font.c): at scale 1.6 a 10-point label is 22 px tall, so a
+ *  fixed 14 px row stride would print one history row on top of the next.
+ *  Only paddings and gaps stay nominal, and those go through ui_px().
+ *
+ *  The expression buffer is a fixed 64 bytes and nothing is allocated per
+ *  frame; the single allocation is the state struct, made once in
+ *  calc_init() and released in calc_free().
  * ============================================================ */
 #include "mystic.h"
 
@@ -373,10 +381,10 @@ static int parser_eval(const char *src, double ans, int have_ans,
  *  The window
  * ------------------------------------------------------------ */
 #define HIST_MAX  5        /* last five evaluated expressions */
-#define PAD       10
-#define BTN_H     22
-#define BTN_GAP    6
-#define HIST_H    14
+#define PAD_N     10       /* nominal paddings: ui_px() applies the scale */
+#define BTN_GAP_N  6
+#define BTN_PAD_N  5       /* extra height inside a button */
+#define HINT_TEXT "Enter evaluates  -  c clears  -  'ans' is the last result"
 
 typedef struct {
     char expr[EXPR_MAX];     /* the fixed, bounded input line */
@@ -397,48 +405,120 @@ typedef struct {
     int w, h;
 } Calc;
 
+/* Real pixel measurements, all derived from the fonts that are actually
+ * drawn. layout_calc() is the only place that knows them, so the painter
+ * and the hit test can never disagree. */
 typedef struct {
-    int expr_y, res_y, rule_y, hist_label_y, hist_top;
-    int hist_lines;
-    int btn_y, btn_w, btn_n;
-    int hint_y;
-    int show_expr, show_res, show_rule, show_hist, show_hint;
+    float pad;
+    float expr_y, expr_size;      /* top of the display, its nominal size */
+    float res_y;                  /* result / error line                 */
+    float rule_y;                 /* hairline over the history           */
+    float hist_label_y;           /* the word "history"                  */
+    float hist_top, hist_h;       /* first row, and one row stride        */
+    float btn_y, btn_h, btn_w, btn_gap;
+    float hint_y;
+    int   btn_n, hist_lines;
+    int   show_expr, show_res, show_rule, show_hist, show_hint;
 } Layout;
 
 /* One geometry function for drawing *and* hit testing, so a click always
- * lands on the button that was painted. */
-static void layout_calc(int w, int h, Layout *L) {
+ * lands on the button that was painted. Returns 0 only when the fonts are
+ * not loaded, in which case nothing can be measured or drawn. */
+static int layout_calc(int w, int h, Layout *L) {
     memset(L, 0, sizeof *L);
 
-    L->expr_y       = 6;
-    L->res_y        = 40;
-    L->rule_y       = 62;
-    L->hist_label_y = 68;
-    L->hist_top     = 84;
-    L->hint_y       = h - 15;
+    Font *fres = font_get(FONT_MEDIUM, 14);
+    Font *frow = font_get(FONT_REGULAR, 11);
+    Font *fsm  = font_get(FONT_REGULAR, 10);
+    Font *fbtn = font_get(FONT_MEDIUM, 11);
+    if (!fres || !frow || !fsm || !fbtn) return 0;
 
-    L->show_expr = (w >= 40 && h >= L->expr_y + 30);
-    L->show_res  = (h >= L->res_y + 20);
-    L->show_rule = (h >= L->rule_y + 6);
-    L->show_hist = (h >= L->hist_top + HIST_H);
+    float frh   = font_height(fres);   /* one result line  */
+    float frowh = font_height(frow);   /* one history row  */
+    float fsmh  = font_height(fsm);    /* label and hint   */
+    float fbth  = font_height(fbtn);   /* button label     */
 
-    /* five buttons above the hint line, never on top of the history */
-    int by = h - 15 - 6 - BTN_H;
-    int bw = (w - 2 * PAD - 4 * BTN_GAP) / 5;
-    if (bw >= 24 && by >= L->hist_top && w >= 5 * 24 + 4 * BTN_GAP + 2 * PAD) {
-        L->btn_y = by;
-        L->btn_w = bw;
-        L->btn_n = 5;
+    float pad = (float)ui_px(PAD_N);
+    float g2  = (float)ui_px(2);
+    float g4  = (float)ui_px(4);
+    float top = (float)ui_px(6);
+    L->pad = pad;
+
+    /* The display is the one line that can shrink and still say
+     * everything, so its budget is what is left after the result, one
+     * button row and the gaps; clamped to a readable 11..20 points. */
+    float scale = ui_scale_get();
+    if (scale < 0.1f) scale = 1.0f;
+    L->btn_h = fbth + (float)ui_px(BTN_PAD_N);
+    float budget = (float)h - top - frh - L->btn_h - 2.0f * g4 - g2;
+    int nominal = (int)(budget / (1.4f * scale));
+    if (nominal < 11) nominal = 11;
+    if (nominal > 20) nominal = 20;
+    L->expr_size = (float)nominal;
+
+    Font *fbig = font_get(FONT_SEMIBOLD, L->expr_size);
+    if (!fbig) return 0;
+    float fe = font_height(fbig);
+
+    L->expr_y = top;
+    L->res_y  = top + fe + g2;
+    float after_res = L->res_y + frh;
+
+    L->show_expr = (w >= ui_px(40) && (float)h >= top + fe);
+    L->show_res  = ((float)h >= after_res);
+
+    /* The five buttons are the only mouse control the app has, so they are
+     * reserved before the history. First try hint + buttons, then buttons
+     * alone; the history only gets what is still free, and the buttons
+     * themselves go only when even the smallest display plus the result
+     * line cannot share the height with them. */
+    L->btn_gap = (float)ui_px(BTN_GAP_N);
+    L->btn_w   = ((float)w - 2.0f * pad - 4.0f * L->btn_gap) / 5.0f;
+
+    float label_min = font_width(fbtn, "(") + (float)ui_px(8);
+    if (label_min < (float)ui_px(24)) label_min = (float)ui_px(24);
+
+    for (int pass = 0; pass < 2 && L->btn_n == 0; pass++) {
+        int want_hint = (pass == 0);
+        float bottom = (float)h - g2;
+
+        if (want_hint) {
+            float hy = bottom - fsmh;
+            if (font_width(fsm, HINT_TEXT) > (float)w - 2.0f * pad) continue;
+            if (hy < after_res + g4) continue;
+            bottom = hy - g2;
+        }
+        float by = bottom - L->btn_h;
+        if (L->btn_w >= label_min && by >= after_res + g4) {
+            L->btn_n = 5;
+            L->btn_y = by;
+            if (want_hint) {
+                L->show_hint = 1;
+                L->hint_y    = (float)h - g2 - fsmh;
+            }
+        }
     }
 
-    int bottom = L->btn_n ? L->btn_y - 8 : (h - 15 - 4);
-    int n = (bottom - L->hist_top) / HIST_H;
-    if (n < 0) n = 0;
-    if (n > HIST_MAX) n = HIST_MAX;
-    if (!L->show_hist) n = 0;
-    L->hist_lines = n;
+    /* History gets whatever is left between the result and the buttons. */
+    L->rule_y = after_res + g4;
+    float rows_top = L->rule_y + g2 + fsmh + g2;
+    float rows_bottom = L->btn_n ? L->btn_y - g2
+                      : (L->show_hint ? L->hint_y - g2 : (float)h - g2);
 
-    L->show_hint = (L->hint_y > L->rule_y + 8 && w >= 200);
+    int n = 0;
+    if (rows_bottom > rows_top)
+        n = (int)((rows_bottom - rows_top) / (frowh + 1.0f));
+    if (n > HIST_MAX) n = HIST_MAX;
+
+    if (n > 0) {
+        L->show_hist    = 1;
+        L->show_rule    = 1;
+        L->hist_label_y = L->rule_y + g2;
+        L->hist_top     = rows_top;
+        L->hist_h       = frowh + 1.0f;
+        L->hist_lines   = n;
+    }
+    return 1;
 }
 
 /* Text inside maxw pixels, cut with ".." when it has to be. */
@@ -628,13 +708,13 @@ static void calc_click(App *a, int x, int y, int buttons) {
     if (x < 0 || y < 0 || x >= c->w || y >= c->h) return;
 
     Layout L;
-    layout_calc(c->w, c->h, &L);
+    if (!layout_calc(c->w, c->h, &L)) return;
     if (L.btn_n == 0) return;
-    if (y < L.btn_y || y >= L.btn_y + BTN_H) return;
+    if ((float)y < L.btn_y || (float)y >= L.btn_y + L.btn_h) return;
 
     for (int i = 0; i < L.btn_n; i++) {
-        int bx = PAD + i * (L.btn_w + BTN_GAP);
-        if (x < bx || x >= bx + L.btn_w) continue;
+        float bx = L.pad + (float)i * (L.btn_w + L.btn_gap);
+        if ((float)x < bx || (float)x >= bx + L.btn_w) continue;
 
         switch (i) {
             case 0: calc_clear(c); break;                    /* C  */
@@ -658,114 +738,142 @@ static void calc_draw(App *a, Surface *s, int x, int y, int w, int h,
     c->h = h;
 
     Layout L;
-    layout_calc(w, h, &L);
-    if (!L.show_expr) return;
+    if (!layout_calc(w, h, &L) || !L.show_expr) return;
 
-    Font *fbig = font_get(FONT_SEMIBOLD, 20);
+    Font *fbig = font_get(FONT_SEMIBOLD, L.expr_size);
     Font *fres = font_get(FONT_MEDIUM, 14);
     Font *frow = font_get(FONT_REGULAR, 11);
     Font *fsm  = font_get(FONT_REGULAR, 10);
     Font *fbtn = font_get(FONT_MEDIUM, 11);
     if (!fbig || !fres || !frow || !fsm || !fbtn) return;
 
-    float left  = (float)x + (float)PAD;
-    float right = (float)(x + w) - (float)PAD;
+    float left  = (float)x + L.pad;
+    float right = (float)(x + w) - L.pad;
     float maxw  = right - left;
+    float fe    = font_height(fbig);
+    float fres_h = font_height(fres);
+    float fsm_h  = font_height(fsm);
 
-    /* ---- the expression, big, right aligned like a calculator display ---- */
+    /* ---- the display: right aligned, caret at the right edge ---- */
+    float caret_w = (float)ui_px(2);
+    float text_right = right - caret_w - (float)ui_px(3);
+    if (text_right < left + 1.0f) text_right = right;
+
     if (c->len == 0) {
-        draw_tail(s, fbig, right, (float)(y + L.expr_y), maxw, "0",
+        draw_tail(s, fbig, text_right, (float)y + L.expr_y, text_right - left, "0",
                   color_alpha(th->text, 0.28f));
     } else {
-        float endx = draw_tail(s, fbig, right, (float)(y + L.expr_y), maxw,
-                               c->expr, th->text);
-        /* a caret, so the line visibly ends where typing continues */
-        if (endx + 5.0f < right)
-            surf_blend(s, (int)(endx + 2.0f), y + L.expr_y + 3, 2, 20,
-                       color_alpha(th->accent, 0.75f));
+        draw_tail(s, fbig, text_right, (float)y + L.expr_y, text_right - left,
+                  c->expr, th->text);
+    }
+    /* The caret has its own column at the right edge: the text is aligned
+     * just left of it, so it is always painted where typing continues. */
+    if (right - caret_w > left) {
+        float cy  = (float)y + L.expr_y + fe * 0.14f;
+        float chh = fe * 0.72f;
+        if (chh < 3.0f) chh = 3.0f;
+        surf_blend(s, (int)(right - caret_w), (int)cy, (int)caret_w, (int)chh,
+                   color_alpha(th->accent, 0.75f));
     }
 
     /* ---- result, or the reason there is none ---- */
     if (L.show_res) {
-        float ry = (float)(y + L.res_y);
+        float ry = (float)y + L.res_y;
+
+        /* The ans badge is an extra. It never takes width from an error
+         * message - the named error is required output - and it is only
+         * drawn when a useful amount of room is left for the message. */
+        const char *badge = NULL;
+        char ansbuf[RESULT_MAX + 8], val[RESULT_MAX];
+        float bw = 0.0f;
+        if (c->have_ans) {
+            fmt_number(c->last, val, sizeof val);
+            snprintf(ansbuf, sizeof ansbuf, "ans %s", val);
+            bw = font_width(fsm, ansbuf);
+            /* Only the room that is actually left decides: at 350 px the
+             * badge fits at every scale, and the gate is the message width,
+             * not a second fixed window width. */
+            if (!c->err[0] &&
+                bw + (float)ui_px(90) <= maxw)
+                badge = ansbuf;
+        }
+        float msgw = badge ? maxw - bw - (float)ui_px(8) : maxw;
+
         if (c->err[0]) {
-            draw_clipped(s, fres, left, ry, maxw, c->err, th->accent);
+            draw_clipped(s, fres, left, ry, msgw, c->err, th->accent);
         } else if (c->have_value) {
             char line[RESULT_MAX + 4];
             snprintf(line, sizeof line, "= %s", c->result);
-            draw_clipped(s, fres, left, ry, maxw, line, th->accent);
+            draw_clipped(s, fres, left, ry, msgw, line, th->accent);
         } else if (c->notice) {
-            draw_clipped(s, fsm, left, ry + 3.0f, maxw,
+            draw_clipped(s, fsm, left, ry + (fres_h - fsm_h) * 0.5f, msgw,
                          "the line is full - 63 characters", th->text_dim);
         }
 
-        /* what 'ans' currently stands for */
-        if (c->have_ans && w >= 240) {
-            char ansbuf[RESULT_MAX + 8], val[RESULT_MAX];
-            fmt_number(c->last, val, sizeof val);
-            snprintf(ansbuf, sizeof ansbuf, "ans %s", val);
-            float aw = font_width(fsm, ansbuf);
-            if (aw + 80.0f < maxw)
-                font_draw(s, fsm, right - aw, ry + 3.0f, ansbuf,
-                          color_alpha(th->text, 0.40f));
-        }
+        if (badge)
+            font_draw(s, fsm, right - bw, ry + (fres_h - fsm_h) * 0.5f, badge,
+                      color_alpha(th->text, 0.40f));
     }
 
     if (L.show_rule)
-        surf_blend(s, x + PAD, y + L.rule_y, w - 2 * PAD, 1, th->panel_border);
+        surf_blend(s, (int)left, (int)((float)y + L.rule_y), (int)maxw, 1,
+                   th->panel_border);
 
     /* ---- history: last five, most recent first ---- */
-    if (L.hist_lines > 0) {
-        font_draw(s, fsm, left, (float)(y + L.hist_label_y), "history",
+    if (L.show_hist) {
+        font_draw(s, fsm, left, (float)y + L.hist_label_y, "history",
                   color_alpha(th->text, 0.40f));
 
         int lines = c->nhist < L.hist_lines ? c->nhist : L.hist_lines;
         if (lines == 0)
-            draw_clipped(s, frow, left, (float)(y + L.hist_top), maxw,
+            draw_clipped(s, frow, left, (float)y + L.hist_top, maxw,
                          "no results yet", color_alpha(th->text, 0.30f));
         for (int i = 0; i < lines; i++) {
-            float hy = (float)(y + L.hist_top) + (float)i * (float)HIST_H;
+            float hy = (float)y + L.hist_top + (float)i * L.hist_h;
             char vb[RESULT_MAX + 4];
             snprintf(vb, sizeof vb, "= %s", c->hist[i].value);
             float vw = font_width(frow, vb);
-            if (vw + 40.0f > maxw) {
+            float room = maxw - vw - (float)ui_px(10);
+            if (room < (float)ui_px(40)) {
                 draw_clipped(s, frow, left, hy, maxw, c->hist[i].expr,
                              color_alpha(th->text, 0.55f));
                 continue;
             }
             font_draw(s, frow, right - vw, hy, vb,
                       color_alpha(th->accent, 0.80f));
-            draw_clipped(s, frow, left, hy, (right - vw - 10.0f) - left,
-                         c->hist[i].expr, color_alpha(th->text, 0.55f));
+            draw_clipped(s, frow, left, hy, room, c->hist[i].expr,
+                         color_alpha(th->text, 0.55f));
         }
     }
 
     /* ---- the five buttons ---- */
     if (L.btn_n > 0) {
         static const char *LABEL[5] = { "C", "(", ")", "/", "=" };
+        float fbth = font_height(fbtn);
         for (int i = 0; i < L.btn_n; i++) {
-            float bx = (float)(x + PAD + i * (L.btn_w + BTN_GAP));
-            float by = (float)(y + L.btn_y);
+            float bx = (float)x + L.pad + (float)i * (L.btn_w + L.btn_gap);
+            float by = (float)y + L.btn_y;
             int accent = (i == 4);
 
-            gfx_rrect_aa(s, bx, by, (float)L.btn_w, (float)BTN_H, 6.0f,
+            gfx_rrect_aa(s, bx, by, L.btn_w, L.btn_h, (float)ui_px(6),
                          accent ? color_alpha(th->accent, 0.22f)
                                 : color_alpha(th->text, 0.07f),
                          accent ? th->accent : th->panel_border,
                          accent ? 1.4f : 1.0f);
 
             float lw = font_width(fbtn, LABEL[i]);
-            font_draw(s, fbtn, bx + ((float)L.btn_w - lw) * 0.5f, by + 5.0f,
-                      LABEL[i], accent ? th->accent : th->text);
+            font_draw(s, fbtn, bx + (L.btn_w - lw) * 0.5f,
+                      by + (L.btn_h - fbth) * 0.5f, LABEL[i],
+                      accent ? th->accent : th->text);
         }
     }
 
     if (L.show_hint) {
-        const char *hint = "Enter evaluates  -  c clears  -  'ans' is the last result";
-        float hw = font_width(fsm, hint);
-        if (hw < (float)w - 8.0f)
+        float hw = font_width(fsm, HINT_TEXT);
+        if (hw <= (float)w - 2.0f * L.pad)
             font_draw(s, fsm, (float)x + ((float)w - hw) * 0.5f,
-                      (float)(y + L.hint_y), hint, color_alpha(th->text, 0.34f));
+                      (float)y + L.hint_y, HINT_TEXT,
+                      color_alpha(th->text, 0.34f));
     }
 }
 

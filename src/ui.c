@@ -9,6 +9,7 @@
 #include "mystic.h"
 
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -25,6 +26,9 @@ void ui_scale_load(const char *path) {
         char *eq = strchr(line, '=');
         if (!eq) continue;
         float v = (float)atof(eq + 1);
+        /* NaN passes both comparisons, which would make every metric 1px
+         * and every font 5px: reject it explicitly. */
+        if (!isfinite(v)) continue;
         if (v < 0.8f) v = 0.8f;
         if (v > 1.6f) v = 1.6f;
         ui_scale = v;

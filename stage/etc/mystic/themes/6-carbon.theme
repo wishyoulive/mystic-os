@@ -1,0 +1,15 @@
+name          = Carbon
+dark          = 1
+bg_top        = #05070A
+bg_bottom     = #0B0F14
+accent        = #FFD400
+glow          = #6B5A00
+glow_strength = 0.6
+panel         = #F00C1016
+panel_border  = #66FFFFFF
+text          = #FFFFFF
+text_dim      = #CCFFFFFF
+window_bg     = #F5090C10
+window_border = #80FFFFFF
+corner        = 10
+blur          = 1.0

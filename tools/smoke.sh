@@ -9,8 +9,15 @@
 #    ./tools/smoke.sh             full run: two probe boots (the
 #                                 second proves the ext4 counter
 #                                 moves), one desktop boot, then
-#                                 the compile checks
-#    ./tools/smoke.sh --quick     compile checks only, no QEMU
+#                                 the static and compile checks
+#    ./tools/smoke.sh --quick     static + compile checks only, no QEMU
+#
+#  The static checks need no QEMU. They parse the tree that actually
+#  ships (src/, stage/, assets/) and assert the things that have gone
+#  silently wrong in this project before: a text scale that font_get()
+#  never applied, a terminal drawn in a proportional face, a taskbar
+#  that drew itself with nothing open, and a stale binary sitting inside
+#  a freshly packed image.
 #
 #  Every check prints PASS or FAIL, and the script exits non-zero
 #  if any check failed.
@@ -281,6 +288,272 @@ else
     skipped "qemu boot checks (qemu or image unavailable)"
 fi
 
+# ------------------------------------------------------------ static checks
+# No QEMU here: these read the tree that gets packed. They run under
+# --quick too, because each one is a regression this project shipped.
+echo
+echo "== static checks =="
+
+mtime() {                        # mtime <file> -> readable timestamp
+    stat -c '%y' "$1" 2>/dev/null || date -r "$1" '+%Y-%m-%d %H:%M:%S'
+}
+
+# ---- text scale: one number in /etc/mystic/ui.conf must reach font_get()
+UI_CONF=stage/etc/mystic/ui.conf
+UI_C=src/ui.c
+if [ ! -f "$UI_CONF" ]; then
+    check "text scale: $UI_CONF present" 0
+    note "ui_scale_load() would fall back to 1.0 - the shipped scale is never exercised"
+else
+    check "text scale: $UI_CONF present" 1
+    # Same reading the C does: first line whose first five characters are
+    # "scale" (strncmp in ui_scale_load), value after '=' eaten by atof().
+    ui_val=$(awk '
+        /^scale/ {
+            i = index($0, "=")
+            if (i > 0) {
+                v = substr($0, i + 1)
+                gsub(/^[ \t]+|[ \t\r]+$/, "", v)
+                print v
+                exit
+            }
+        }' "$UI_CONF")
+    if [ -z "$ui_val" ]; then
+        check "text scale: $UI_CONF has a 'scale = <number>' line" 0
+        note "no line starts with 'scale' and holds '=' - ui_scale_load() ignores the file"
+    elif ! printf '%s\n' "$ui_val" | grep -qE '^[0-9]+([.][0-9]+)?$'; then
+        check "text scale: $UI_CONF has a 'scale = <number>' line" 0
+        note "'$ui_val' is not a decimal number - atof() gives 0, which clamps to 0.8"
+    elif printf '%s\n' "$ui_val" | awk -v v="$ui_val" 'BEGIN { exit !(v + 0 >= 0.8 && v + 0 <= 1.6) }'; then
+        check "text scale: scale = $ui_val (inside 0.8..1.6)" 1
+    else
+        check "text scale: scale = $ui_val (inside 0.8..1.6)" 0
+        note "ui_scale_load() silently clamps to 0.8..1.6 - file and clamp disagree"
+    fi
+fi
+
+# Each function the rest of the desktop calls. A rename here compiles into
+# a link error only when someone remembers to rebuild.
+ui_fn() {                        # ui_fn <name> <grep -E pattern>
+    if grep -qE -- "$2" "$UI_C" 2>/dev/null; then
+        check "text scale: src/ui.c defines $1" 1
+    else
+        check "text scale: src/ui.c defines $1" 0
+        note "no /$2/ in $UI_C"
+    fi
+}
+ui_fn 'ui_scale_get(void)'     'float[[:space:]]+ui_scale_get\(void\)'
+ui_fn 'ui_scale_load(const char *)' 'void[[:space:]]+ui_scale_load\(const char'
+ui_fn 'ui_px(int)'             'int[[:space:]]+ui_px\(int'
+
+if grep -qF 'ui_scale_load("/etc/mystic/ui.conf")' src/main.c 2>/dev/null; then
+    check "text scale: main.c loads /etc/mystic/ui.conf" 1
+else
+    check "text scale: main.c loads /etc/mystic/ui.conf" 0
+    note "the file is packed at $UI_CONF but nothing reads it"
+fi
+
+# The scale has to be applied inside font_get(), not at a call site: that
+# is what makes it impossible for a layout to forget it.
+font_get_body=$(awk '/^Font \*font_get\(/ { inside = 1 } inside { print } inside && /^}/ { exit }' src/font.c)
+if [ -z "$font_get_body" ]; then
+    check "text scale: font_get() applies ui_scale_get()" 0
+    note "font_get() not found in src/font.c"
+elif printf '%s\n' "$font_get_body" | grep -q 'ui_scale_get('; then
+    check "text scale: font_get() applies ui_scale_get()" 1
+else
+    check "text scale: font_get() applies ui_scale_get()" 0
+    note "font sizes would ignore the scale - every scaled metric drifts from the text"
+fi
+
+# ---- monospace terminal: a proportional face makes columns drift
+MONO_TTF=assets/fonts/JetBrainsMono-Regular.ttf
+STAGED_MONO=stage/usr/share/fonts/JetBrainsMono-Regular.ttf
+if [ -s "$MONO_TTF" ]; then
+    check "monospace: $MONO_TTF present" 1
+    # A 404 page saved with a .ttf name has the same byte count as nothing
+    # useful; the sfnt magic is what stb_truetype actually needs.
+    mono_magic=$(od -An -tx1 -N4 "$MONO_TTF" 2>/dev/null | tr -d ' \n')
+    case "$mono_magic" in
+        00010000|74727565|4f54544f|74746366)
+            check "monospace: $MONO_TTF is a real sfnt (magic $mono_magic)" 1 ;;
+        *)
+            check "monospace: $MONO_TTF is a real sfnt (magic $mono_magic)" 0
+            note "stb_truetype cannot parse this - the terminal loses its face" ;;
+    esac
+else
+    check "monospace: $MONO_TTF present" 0
+    note "font_get(FONT_MONO, ...) would return NULL and the terminal cannot draw"
+    skipped "monospace: sfnt magic (no file)"
+fi
+if [ -s "$STAGED_MONO" ]; then
+    check "monospace: font installed at $STAGED_MONO" 1
+else
+    check "monospace: font installed at $STAGED_MONO" 0
+    note "tools/build-desktop.sh copies assets/fonts/*.ttf there - run it"
+fi
+if grep -q 'JetBrainsMono-Regular.ttf' src/font.c 2>/dev/null; then
+    check "monospace: font.c names the JetBrains Mono file" 1
+else
+    check "monospace: font.c names the JetBrains Mono file" 0
+    note "FONT_FILES[FONT_MONO] must match the file that ships"
+fi
+# FONT_MONO must be the face handed to the terminal's draw call, not just
+# present somewhere in the file.
+mono_draw=$(awk '/font_get\(FONT_MONO/ { last = NR }
+                  /term_draw\(/ { if (last > 0 && NR - last <= 20) { print NR; exit } }' src/main.c)
+if [ -n "$mono_draw" ]; then
+    check "monospace: term_draw() uses FONT_MONO (src/main.c:$mono_draw)" 1
+else
+    check "monospace: term_draw() uses FONT_MONO" 0
+    note "no font_get(FONT_MONO, ...) within 20 lines of the term_draw() call"
+fi
+
+# ---- taskbar: the bar is a list of open windows, and nothing else
+tb_count=$(grep -cE 'static int taskbar_count\(void\)' src/main.c 2>/dev/null)
+tb_at=$(grep -cE 'static Window \*taskbar_at\(int' src/main.c 2>/dev/null)
+[ "${tb_count:-0}" -gt 0 ] && check "taskbar: taskbar_count() defined in src/main.c" 1 \
+                          || check "taskbar: taskbar_count() defined in src/main.c" 0
+[ "${tb_at:-0}" -gt 0 ] && check "taskbar: taskbar_at() defined in src/main.c" 1 \
+                       || check "taskbar: taskbar_at() defined in src/main.c" 0
+
+dock_body=$(awk '/^static int dock_rect\(/ { inside = 1 } inside { print } inside && /^}/ { exit }' src/main.c)
+if [ -z "$dock_body" ]; then
+    check "taskbar: dock_rect() returns 0 when nothing is open ('n <= 0' guard)" 0
+    note "dock_rect() not found in src/main.c"
+elif printf '%s\n' "$dock_body" | grep -q 'n <= 0' \
+     && printf '%s\n' "$dock_body" | grep -q 'return 0'; then
+    check "taskbar: dock_rect() returns 0 when nothing is open ('n <= 0' guard)" 1
+else
+    check "taskbar: dock_rect() returns 0 when nothing is open ('n <= 0' guard)" 0
+    note "with zero windows the bar would draw an empty pill and swallow clicks"
+fi
+
+# A bar that is never asked for its geometry is dead code; the draw loop and
+# the click handler must both consult it (one definition, two call sites).
+dock_uses=$(grep -c 'dock_rect(' src/main.c 2>/dev/null)
+if [ "${dock_uses:-0}" -ge 3 ]; then
+    check "taskbar: dock_rect() used by draw and hit-test ($dock_uses references)" 1
+else
+    check "taskbar: dock_rect() used by draw and hit-test ($dock_uses references)" 0
+    note "expected the definition plus a call in the draw path and in the click path"
+fi
+
+# ---- stale build guard: a fresh image around an old binary has bitten us.
+# The check is against the sources mystic-desktop is actually built from:
+# the .c files build-desktop.sh links, plus the headers those reach through
+# #include. A file in src/ that none of them touches cannot make the binary
+# stale, so it is listed as ignored instead of failing the run.
+BIN=stage/usr/bin/mystic-desktop
+DESKTOP_SH=tools/build-desktop.sh
+if [ ! -f "$BIN" ] || [ ! -f "$DESKTOP_SH" ]; then
+    if [ -f "$BIN" ]; then
+        check "build: $BIN present" 1
+    else
+        check "build: $BIN present" 0
+        note "the image would boot without a desktop - run ./tools/build-desktop.sh"
+    fi
+    if [ -f "$DESKTOP_SH" ]; then
+        check "build: $DESKTOP_SH present" 1
+    else
+        check "build: $DESKTOP_SH present" 0
+        note "without it there is no way to know what the binary was built from"
+    fi
+    skipped "build: stale check (needs both files)"
+else
+    check "build: $BIN present" 1
+    check "build: $DESKTOP_SH present" 1
+    desktop_apps=$(sed -n 's/^for app in \(.*\); do[[:space:]]*$/\1/p' "$DESKTOP_SH" 2>/dev/null | head -1)
+
+    # Which .c files does build-desktop.sh actually link? It names src/*.c
+    # literally and builds src/apps/<app>.c from a list, so both forms are
+    # read back out of the script rather than duplicated here.
+    built_c=""
+    for f in src/*.c src/apps/*.c; do
+        [ -f "$f" ] || continue
+        in_build=0
+        grep -qF -- "$f" "$DESKTOP_SH" 2>/dev/null && in_build=1
+        case "$f" in
+            src/apps/*.c)
+                app=${f#src/apps/}; app=${app%.c}
+                if [ -z "$desktop_apps" ]; then
+                    in_build=1            # unreadable list: be conservative
+                else
+                    case " $desktop_apps " in
+                        *" $app "*) in_build=1 ;;
+                    esac
+                fi ;;
+        esac
+        [ "$in_build" -eq 1 ] && built_c="$built_c $f"
+    done
+
+    if [ -z "$built_c" ]; then
+        # With no source list every comparison would be vacuous and pass,
+        # which is the silent-failure shape this project keeps hitting.
+        check "build: $BIN newer than every source it is built from" 0
+        note "no source is named in $DESKTOP_SH - the stale guard cannot work"
+    else
+        # A header only matters if something the desktop compiles #includes
+        # it, so walk the includes from the real sources. This is what keeps
+        # a module that has landed in src/ but is not wired into the desktop
+        # yet from being reported as a stale build.
+        reach=""
+        frontier="$built_c"
+        while [ -n "$frontier" ]; do
+            nxt=""
+            for f in $frontier; do
+                for inc in $(sed -n 's/^[[:space:]]*#[[:space:]]*include[[:space:]]*"\([^"]*\)".*/\1/p' "$f"); do
+                    case " $reach " in *" $inc "*) continue ;; esac
+                    reach="$reach $inc"
+                    for p in "src/$inc" "src/apps/$inc"; do
+                        [ -f "$p" ] && nxt="$nxt $p"
+                    done
+                done
+            done
+            frontier="$nxt"
+        done
+
+        newest_src=""
+        newer_count=0
+        ignored_src=""
+
+        # Sources the desktop does not link cannot make its binary stale: an
+        # app built by tools/mkapp.sh, or a module not wired in yet. Name
+        # them so the decision to ignore them is visible, not silent.
+        for f in src/*.c src/apps/*.c; do
+            [ -f "$f" ] || continue
+            case " $built_c " in *" $f "*) continue ;; esac
+            [ "$f" -nt "$BIN" ] && ignored_src="$ignored_src $f"
+        done
+
+        for f in $built_c src/*.h src/apps/*.h; do
+            [ -f "$f" ] || continue
+            case "$f" in
+                *.h)
+                    base=${f##*/}
+                    case " $reach " in
+                        *" $base "*) ;;              # reaches a compiled unit
+                        *)
+                            [ "$f" -nt "$BIN" ] && ignored_src="$ignored_src $f"
+                            continue ;;
+                    esac ;;
+            esac
+            [ "$f" -nt "$BIN" ] || continue
+            newer_count=$((newer_count + 1))
+            if [ -z "$newest_src" ] || [ "$f" -nt "$newest_src" ]; then newest_src=$f; fi
+        done
+        if [ -z "$newest_src" ]; then
+            check "build: $BIN newer than every source it is built from" 1
+        else
+            check "build: $BIN newer than every source it is built from" 0
+            note "binary: $(mtime "$BIN")   $BIN"
+            note "newest: $(mtime "$newest_src")   $newest_src  ($newer_count source file(s) newer)"
+            note "the packed image would run the old desktop - run ./tools/build-desktop.sh"
+        fi
+        [ -n "$ignored_src" ] && note "not part of the desktop build, ignored:$ignored_src"
+    fi
+fi
+
 # ------------------------------------------------------------ compile checks
 echo
 echo "== compile checks =="
@@ -288,8 +561,22 @@ ZIG=$(command -v zig 2>/dev/null)
 [ -n "$ZIG" ] || ZIG=$(ls -d /c/Users/saket/AppData/Local/Microsoft/WinGet/Packages/zig.zig_*/zig-x86_64-windows-*/zig.exe 2>/dev/null | head -1)
 if [ -n "$ZIG" ]; then
     for f in src/*.c src/apps/*.c; do
+        [ -f "$f" ] || continue
         if "$ZIG" cc -target x86_64-linux-musl -Os -static -Wall -Wextra -Wno-unused-parameter \
              -c "$f" -Isrc -o /tmp/smoke.o 2>/tmp/smoke.err; then
+            check "compiles clean: $f" 1
+        else
+            check "compiles clean: $f" 0
+            head -3 /tmp/smoke.err | sed 's/^/        /'
+        fi
+    done
+    # The external apps are separate processes built by tools/mkapp.sh, which
+    # image.sh never calls: nothing else in the project compiles them, so a
+    # broken client app ships unnoticed unless this loop covers it.
+    for f in src/client/*.c src/client/apps/*.c; do
+        [ -f "$f" ] || continue
+        if "$ZIG" cc -target x86_64-linux-musl -Os -static -Wall -Wextra -Wno-unused-parameter \
+             -c "$f" -Isrc -Isrc/client -o /tmp/smoke.o 2>/tmp/smoke.err; then
             check "compiles clean: $f" 1
         else
             check "compiles clean: $f" 0

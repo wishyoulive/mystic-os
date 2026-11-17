@@ -1,0 +1,3 @@
+name = 2048
+desc = A real 2048 game, its own process
+exec = bin
