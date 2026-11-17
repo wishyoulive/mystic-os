@@ -385,7 +385,12 @@ def main(argv):
         return 2
     if getattr(args, "sig", "x") is None:
         args.sig = args.input + ".sig"
-    return args.func(args)
+    try:
+        return args.func(args)
+    except OSError as e:
+        name = getattr(e, "filename", None) or args.cmd
+        print("%s: %s: %s" % (ap.prog, name, e.strerror or e), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

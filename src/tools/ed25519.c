@@ -225,7 +225,7 @@ static void gf_carry(gf o)
         o[i] += (i64)1 << 16;
         c = o[i] >> 16;
         o[(i + 1) * (i < 15)] += c - 1 + 37 * (c - 1) * (i == 15);
-        o[i] -= c << 16;
+        o[i] -= c * 65536;   /* c * 2^16: no signed left shift */
     }
 }
 
@@ -462,7 +462,7 @@ static void scalar_reduce(u8 *r)
         for (j = i - 32; j < i - 12; ++j) {
             x[j] += carry - 16 * x[i] * (i64)ED_L[j - (i - 32)];
             carry = (x[j] + 128) >> 8;
-            x[j] -= carry << 8;
+            x[j] -= carry * 256;
         }
         x[j] += carry;
         x[i] = 0;

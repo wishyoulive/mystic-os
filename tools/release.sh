@@ -277,7 +277,9 @@ WHAT DOES NOT WORK YET - HONESTLY
     The kernel's drm modules are display drivers, not video decoding.
   - The browser is plain HTTP only. No JavaScript, no CSS, no images,
     no HTTPS, no video.
-  - Packages are checksum-verified (sha256) but not signed yet.
+  - Packages are signed: the repository index is Ed25519-signed and checked
+    against the key in the image, and every tarball is checked against the
+    sha256 recorded in that signed index.
   - This is a QEMU bundle, not an ISO. There is no bare-metal installer.
   - The desktop is drawn by the CPU. There is no GPU acceleration, so
     animations and full-screen scrolling cost CPU.

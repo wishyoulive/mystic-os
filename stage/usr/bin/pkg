@@ -12,6 +12,7 @@
 #      pkg remove <name>         delete it
 #      pkg update                refresh the cached index
 #      pkg repo                  which repository is in use
+#      pkg key                   which public key this image trusts
 #
 #  Repository layout - identical for a static host, a directory
 #  listing and GitHub release assets. The index is signed; an index
@@ -311,7 +312,7 @@ fetch_index() {
         rm -f "$INDEX" "$INDEX_SIG"
         die "the index changed while it was being installed - removed"
     fi
-    _n=$(awk -F'\t' 'NF >= 2 && $1 != "" { n++ } END { print n + 0 }' "$INDEX")
+    _n=$(awk -F'\t' '/^[[:space:]]*#/ { next } NF >= 2 && $1 != "" { n++ } END { print n + 0 }' "$INDEX")
     say "$_n packages (signature ok, key sha256 $(key_fingerprint "$PUBKEY"))"
     # The Store app lists "Available" from this file, so keep its copy in step
     # whenever pkg refreshes the index.
@@ -365,7 +366,7 @@ cmd_list() {
             printf "%-22s %-10s %-9s %s\n", $1, ($2 == "" ? "-" : $2), s, $6
         }
     ' "$INDEX"
-    _n=$(awk -F'\t' 'NF >= 2 && $1 != "" { n++ } END { print n + 0 }' "$INDEX")
+    _n=$(awk -F'\t' '/^[[:space:]]*#/ { next } NF >= 2 && $1 != "" { n++ } END { print n + 0 }' "$INDEX")
     if [ "$_n" -eq 0 ]; then
         say "(the repository index is empty - nothing to install yet)"
     fi
@@ -530,9 +531,9 @@ cmd_repo() {
     else
         say "  key:   MISSING ($PUBKEY) - nothing can be installed"
     fi
-    say "  verifier: ${_ver:-MISSING (ed25519-verify)} - indexes are unsigned, so refused"
+    say "  verifier: ${_ver:-MISSING (ed25519-verify)} - an index that does not verify is refused"
     if [ -f "$INDEX" ]; then
-        _n=$(awk -F'\t' 'NF >= 2 && $1 != "" { n++ } END { print n + 0 }' "$INDEX")
+        _n=$(awk -F'\t' '/^[[:space:]]*#/ { next } NF >= 2 && $1 != "" { n++ } END { print n + 0 }' "$INDEX")
         if verify_index "$INDEX" "$INDEX_SIG" 2>/dev/null; then
             say "  index: $_n packages cached in $INDEX (signature ok)"
         else

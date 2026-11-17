@@ -44,6 +44,26 @@ done
 pack_one "browser" "build/browser-root" "Chromium headless engine (installs to /root/apps)"
 
 mv "$REPO/index.tsv.new" "$REPO/index.tsv"
+
+# --- sign it ---------------------------------------------------------
+# pkg refuses an index whose Ed25519 signature does not verify, so an
+# unsigned development mirror would be useless. The signing key is the
+# publisher's and is deliberately not in the repository: build/ is ignored.
+KEY=${REPO_KEY:-build/sign/repo.key}
+PUB=${REPO_PUB:-stage/etc/mystic/repo.pub}
+if [ -f "$KEY" ]; then
+    if [ -f "$PUB" ]; then
+        python tools/sign-index.py sign --seed "$KEY" --in "$REPO/index.tsv" --pub "$PUB"
+        cp "$PUB" "$REPO/index.pub"
+    else
+        python tools/sign-index.py sign --seed "$KEY" --in "$REPO/index.tsv"
+    fi
+else
+    echo "WARNING: no signing key at $KEY - this index is UNSIGNED and pkg will refuse it." >&2
+    echo "         create one once: python tools/sign-index.py keygen --seed $KEY --pub $PUB" >&2
+    echo "         (then rebuild the image so $PUB is the key it trusts)" >&2
+fi
+
 echo "repository: $REPO  ($(wc -l < "$REPO/index.tsv") packages, $(du -sh "$REPO" | cut -f1))"
 
 if [ "${1:-}" != "--index" ]; then

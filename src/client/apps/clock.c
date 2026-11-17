@@ -189,28 +189,11 @@ static void fmt_until(char *out, size_t n, long sec) {
     else            snprintf(out, n, "in %lds", s);
 }
 
-/* ---- end of the pure arithmetic ------------------------------------ */
-
-#ifndef CLOCK_HOST_TEST
-
-/* ------------------------------------------------------------ colour */
-
-#define COL_BG_TOP RGB(0x0D, 0x13, 0x1F)
-#define COL_BG_BOT RGB(0x15, 0x1E, 0x2D)
-#define COL_TEXT   RGB(0xE8, 0xEC, 0xF6)
-#define COL_DIM    RGB(0x8A, 0x93, 0xA6)
-#define COL_FAINT  RGB(0x5E, 0x6B, 0x82)
-#define COL_ACCENT RGB(0x4F, 0xD1, 0xC5)
-#define COL_BLUE   RGB(0x7A, 0xA2, 0xF7)
-#define COL_WARN   RGB(0xF5, 0xC5, 0x42)
-#define COL_HOT    RGB(0xFF, 0x6B, 0x5B)
-#define COL_HOT_TX RGB(0xFF, 0xC9, 0xB8)
-#define COL_PANEL  RGB(0x16, 0x1E, 0x2B)
-#define COL_SUNK   RGB(0x10, 0x17, 0x23)
-#define COL_EDGE   RGB(0x27, 0x32, 0x45)
-#define COL_EDGE2  RGB(0x38, 0x46, 0x5E)
-
-/* ------------------------------------------------------------ state */
+/* ------------------------------------------------------------ state
+ * The state and every transition it can make are pure: they take the
+ * monotonic reading as an argument and touch no pixel, so the host
+ * harness drives the real state machine, not a copy of it.
+ */
 
 /* The four tabs. The index is stored, not a name or a position. */
 enum { TAB_CLOCK, TAB_TIMER, TAB_STOPWATCH, TAB_ALARM };
@@ -244,309 +227,6 @@ typedef struct {
     long a_prev_sec;          /* last seconds-of-day we saw, -1 = none */
     u64  a_flash_until;
 } ClockState;
-
-/* ------------------------------------------------------------ geometry */
-
-typedef struct { int x, y, w, h; } Rect;
-
-static int rect_has(Rect r) { return r.w > 0 && r.h > 0; }
-
-static int rect_hit(Rect r, int x, int y) {
-    return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
-}
-
-/* The grid: one cell is one row of small text plus its leading, and it is
- * measured from the font that is really loaded (which already has the
- * desktop's text scale applied). Every band below is a whole number of
- * cells, so the layout is the same lattice at 0.8 and at 1.6. */
-typedef struct {
-    Font *small;     /* hints, dates, lap rows */
-    int   cell_h;
-    int   cell_w;
-} Chrome;
-
-typedef struct {
-    Rect tabs, content, hint;
-    int  tabw;       /* one tab cell */
-    int  gap;
-} Layout;
-
-/* Everything a tab's drawing and its hit test need, computed once from the
- * content rectangle so the two can never disagree. */
-typedef struct {
-    Rect field[2];       /* the two setter boxes */
-    Rect minus[2], plus[2];
-    Rect big;            /* the counter / the digital time */
-    Rect line2;          /* date, or the alarm status line */
-    Rect btn[3];
-    int  btn_n;
-    Rect list;           /* lap list */
-    int  rows;           /* lap rows that fit */
-} TabUI;
-
-static const char *TAB_NAME[TAB_COUNT] = { "Clock", "Timer", "Stopwatch", "Alarm" };
-
-static void chrome_init(Chrome *C) {
-    C->small = font_get(FONT_REGULAR, 10);
-    C->cell_h = C->small ? (int)(font_height(C->small) + 3.0f) : 14;
-    if (C->cell_h < 11) C->cell_h = 11;
-    C->cell_w = C->small ? (int)(font_width(C->small, "0") + 0.5f) : 6;
-    if (C->cell_w < 4) C->cell_w = 4;
-}
-
-/* The largest of these nominal sizes whose measured text fits the box.
- * font_get() applies the text scale, so the table is a set of candidates in
- * nominal points and the chosen one is whatever the scale made of them.
- * Iterating a fixed table (instead of computing a size from the box) keeps
- * the number of fonts the app ever asks for bounded. NULL means even the
- * smallest spills, and the caller then does not draw rather than overlap. */
-static Font *fit_font_box(int face, const char *txt, float max_w, float max_h) {
-    static const int sizes[9] = { 46, 40, 34, 28, 22, 17, 13, 10, 8 };
-    if (!txt || !*txt || max_w < 2.0f || max_h < 2.0f) return NULL;
-    for (int i = 0; i < 9; i++) {
-        Font *f = font_get(face, (float)sizes[i]);
-        if (!f) continue;
-        if (font_width(f, txt) <= max_w && font_height(f) <= max_h) return f;
-    }
-    return NULL;
-}
-
-/* Draw a string centred in a box, at the largest size that fits. */
-static void text_box(Surface *s, int face, Rect r, const char *txt, u32 col) {
-    Font *f = fit_font_box(face, txt, (float)r.w, (float)r.h);
-    if (!f) return;
-    float w = font_width(f, txt);
-    float x = (float)r.x + ((float)r.w - w) * 0.5f;
-    float y = (float)r.y + ((float)r.h - font_height(f)) * 0.5f;
-    font_draw(s, f, x, y, txt, col);
-}
-
-/* A specific font, centred / left / right in a box. */
-static void font_box(Surface *s, Font *f, Rect r, const char *txt, u32 col, int align) {
-    if (!f || !txt) return;
-    float w = font_width(f, txt);
-    float x = (float)r.x;
-    if (align == 1) x = (float)r.x + ((float)r.w - w) * 0.5f;
-    if (align == 2) x = (float)r.x + (float)r.w - w;
-    float y = (float)r.y + ((float)r.h - font_height(f)) * 0.5f;
-    font_draw(s, f, x, y, txt, col);
-}
-
-/* Tab labels are pills: the same cell width each, with the label sized to
- * the longest one so "Stopwatch" never pushes into "Alarm" at any scale. */
-static Font *choose_tab_font(int tabw) {
-    static const int sizes[7] = { 13, 12, 11, 10, 9, 8, 7 };
-    for (int i = 0; i < 7; i++) {
-        Font *f = font_get(FONT_SEMIBOLD, (float)sizes[i]);
-        if (!f) continue;
-        float need = 0.0f;
-        for (int k = 0; k < TAB_COUNT; k++) {
-            float w = font_width(f, TAB_NAME[k]);
-            if (w > need) need = w;
-        }
-        if (need <= (float)tabw - 8.0f) return f;
-    }
-    return font_get(FONT_SEMIBOLD, 7.0f);
-}
-
-static void layout_window(int vw, int vh, const Chrome *C, Layout *L) {
-    int pad = C->cell_h / 2;
-    if (pad < 4) pad = 4;
-    int gap = C->cell_h / 3;
-    if (gap < 3) gap = 3;
-
-    L->gap = gap;
-    L->tabs.x = pad;
-    L->tabs.y = pad;
-    L->tabs.w = vw - 2 * pad;
-    L->tabs.h = C->cell_h + C->cell_h / 2;
-    if (L->tabs.w < 4) L->tabs.w = 4;
-    if (L->tabs.h < 4) L->tabs.h = 4;
-
-    L->tabw = (L->tabs.w - (TAB_COUNT - 1) * gap) / TAB_COUNT;
-    if (L->tabw < 8) L->tabw = 8;
-
-    L->hint.x = pad;
-    L->hint.y = vh - pad - C->cell_h;
-    L->hint.w = vw - 2 * pad;
-    L->hint.h = C->cell_h;
-    if (L->hint.w < 0) L->hint.w = 0;
-
-    L->content.x = pad;
-    L->content.y = L->tabs.y + L->tabs.h + gap;
-    L->content.w = vw - 2 * pad;
-    L->content.h = L->hint.y - gap - L->content.y;
-    if (L->content.w < 0) L->content.w = 0;
-    if (L->content.h < 0) L->content.h = 0;
-}
-
-static Rect tab_rect(const Layout *L, int i) {
-    Rect r;
-    r.x = L->tabs.x + i * (L->tabw + L->gap);
-    r.y = L->tabs.y;
-    r.w = L->tabw;
-    r.h = L->tabs.h;
-    return r;
-}
-
-/* Two setter boxes with a [-] and a [+] under each. Returns the height
- * used, so the caller can give the rest to the counter. */
-static int geo_fields(Rect c, const Chrome *C, TabUI *u) {
-    int gap = C->cell_h / 3;
-    if (gap < 3) gap = 3;
-    int bw = (c.w - gap) / 2;
-    if (bw < 8) bw = 8;
-    int fh = 2 * C->cell_h;
-    if (fh > c.h / 2) fh = c.h / 2;
-    if (fh < C->cell_h) fh = c.h < C->cell_h ? c.h : C->cell_h;
-
-    for (int i = 0; i < 2; i++) {
-        u->field[i].x = c.x + i * (bw + gap);
-        u->field[i].y = c.y;
-        u->field[i].w = bw;
-        u->field[i].h = fh;
-
-        int hw = (bw - gap) / 2;
-        if (hw < 6) hw = 6;
-        u->minus[i].x = u->field[i].x;
-        u->minus[i].y = c.y + fh + gap;
-        u->minus[i].w = hw;
-        u->minus[i].h = C->cell_h;
-        u->plus[i].x = u->field[i].x + hw + gap;
-        u->plus[i].y = u->minus[i].y;
-        u->plus[i].w = hw;
-        u->plus[i].h = C->cell_h;
-    }
-    return fh + gap + C->cell_h;
-}
-
-static void geo_timer(Rect c, const Chrome *C, TabUI *u) {
-    int gap = C->cell_h / 3;
-    if (gap < 3) gap = 3;
-    int used = geo_fields(c, C, u);
-
-    int bh = C->cell_h + C->cell_h / 2;
-    int bw = (c.w - gap) / 2;
-    if (bw < 8) bw = 8;
-    u->btn_n = 2;
-    for (int i = 0; i < 2; i++) {
-        u->btn[i].x = c.x + i * (bw + gap);
-        u->btn[i].y = c.y + c.h - bh;
-        u->btn[i].w = bw;
-        u->btn[i].h = bh;
-    }
-
-    int by = c.y + used + gap;
-    int bh2 = (c.y + c.h - bh - gap) - by;
-    if (bh2 < 0) bh2 = 0;
-    u->big.x = c.x;
-    u->big.y = by;
-    u->big.w = c.w;
-    u->big.h = bh2;
-}
-
-static void geo_stopwatch(Rect c, const Chrome *C, TabUI *u) {
-    int gap = C->cell_h / 3;
-    if (gap < 3) gap = 3;
-
-    int bh = C->cell_h + C->cell_h / 2;
-    int bw = (c.w - 2 * gap) / 3;
-    if (bw < 8) bw = 8;
-    u->btn_n = 3;
-    for (int i = 0; i < 3; i++) {
-        u->btn[i].x = c.x + i * (bw + gap);
-        u->btn[i].y = c.y + c.h - bh;
-        u->btn[i].w = bw;
-        u->btn[i].h = bh;
-    }
-
-    int cy = c.y;
-    int ch = 3 * C->cell_h;
-    if (ch > c.h) ch = c.h;
-    u->big.x = c.x;
-    u->big.y = cy;
-    u->big.w = c.w;
-    u->big.h = ch;
-
-    int ly = cy + ch + gap;
-    int lh = (c.y + c.h - bh - gap) - ly;
-    if (lh < 0) lh = 0;
-    u->list.x = c.x;
-    u->list.y = ly;
-    u->list.w = c.w;
-    u->list.h = lh;
-    u->rows = lh / C->cell_h;
-    if (u->rows > LAP_MAX) u->rows = LAP_MAX;
-}
-
-static void geo_alarm(Rect c, const Chrome *C, TabUI *u) {
-    int gap = C->cell_h / 3;
-    if (gap < 3) gap = 3;
-    int used = geo_fields(c, C, u);
-
-    int bh = C->cell_h + C->cell_h / 2;
-    int bw = (c.w - gap) / 2;
-    if (bw < 8) bw = 8;
-    u->btn_n = 2;
-    for (int i = 0; i < 2; i++) {
-        u->btn[i].x = c.x + i * (bw + gap);
-        u->btn[i].y = c.y + used + gap;
-        u->btn[i].w = bw;
-        u->btn[i].h = bh;
-    }
-
-    int sy = u->btn[0].y + bh + gap;
-    int sh = (c.y + c.h) - sy;
-    if (sh < 0) sh = 0;
-    u->big.x = c.x;              /* the status text lives here */
-    u->big.y = sy;
-    u->big.w = c.w;
-    u->big.h = sh;
-    u->line2 = u->big;
-}
-
-static void geo_clock(Rect c, const Chrome *C, TabUI *u) {
-    int gap = C->cell_h / 3;
-    if (gap < 3) gap = 3;
-
-    int dateh = C->cell_h;
-    int digith = 2 * C->cell_h + gap;
-    int side = c.w < c.h - dateh - digith - 2 * gap
-             ? c.w : c.h - dateh - digith - 2 * gap;
-    if (side > 300) side = 300;
-
-    u->big.x = c.x;
-    u->big.y = c.y + c.h - dateh - digith;
-    u->big.w = c.w;
-    u->big.h = digith;
-    u->line2.x = c.x;
-    u->line2.y = c.y + c.h - dateh;
-    u->line2.w = c.w;
-    u->line2.h = dateh;
-
-    if (side >= 56) {
-        u->field[0].x = c.x + (c.w - side) / 2;
-        u->field[0].y = c.y;
-        u->field[0].w = side;
-        u->field[0].h = side;
-    } else {
-        u->field[0].x = c.x;
-        u->field[0].y = c.y;
-        u->field[0].w = 0;
-        u->field[0].h = 0;
-    }
-}
-
-static void tab_geometry(int tab, Rect c, const Chrome *C, TabUI *u) {
-    memset(u, 0, sizeof(*u));
-    if (!rect_has(c)) return;
-    switch (tab) {
-    case TAB_CLOCK:     geo_clock(c, C, u); break;
-    case TAB_TIMER:     geo_timer(c, C, u); break;
-    case TAB_STOPWATCH: geo_stopwatch(c, C, u); break;
-    default:            geo_alarm(c, C, u); break;
-    }
-}
 
 /* ------------------------------------------------------------ actions */
 
@@ -647,6 +327,391 @@ static void tick(ClockState *K, u64 now, long sec_of_day) {
     K->a_prev_sec = sec_of_day;
 }
 
+/* ---- end of the pure arithmetic ------------------------------------ */
+
+#if !defined(CLOCK_HOST_TEST)
+
+/* ------------------------------------------------------------ colour */
+
+#define COL_BG_TOP RGB(0x0D, 0x13, 0x1F)
+#define COL_BG_BOT RGB(0x15, 0x1E, 0x2D)
+#define COL_TEXT   RGB(0xE8, 0xEC, 0xF6)
+#define COL_DIM    RGB(0x8A, 0x93, 0xA6)
+#define COL_FAINT  RGB(0x5E, 0x6B, 0x82)
+#define COL_ACCENT RGB(0x4F, 0xD1, 0xC5)
+#define COL_BLUE   RGB(0x7A, 0xA2, 0xF7)
+#define COL_WARN   RGB(0xF5, 0xC5, 0x42)
+#define COL_HOT    RGB(0xFF, 0x6B, 0x5B)
+#define COL_HOT_TX RGB(0xFF, 0xC9, 0xB8)
+#define COL_PANEL  RGB(0x16, 0x1E, 0x2B)
+#define COL_SUNK   RGB(0x10, 0x17, 0x23)
+#define COL_EDGE   RGB(0x27, 0x32, 0x45)
+#define COL_EDGE2  RGB(0x38, 0x46, 0x5E)
+
+/* ------------------------------------------------------------ geometry */
+
+typedef struct { int x, y, w, h; } Rect;
+
+static int rect_has(Rect r) { return r.w > 0 && r.h > 0; }
+
+static int rect_hit(Rect r, int x, int y) {
+    return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+}
+
+/* The grid: one cell is one row of small text plus its leading, and it is
+ * measured from the font that is really loaded (which already has the
+ * desktop's text scale applied). Every band below is a whole number of
+ * cells, so the layout is the same lattice at 0.8 and at 1.6. */
+typedef struct {
+    Font *small;     /* hints, dates, lap rows */
+    int   cell_h;
+    int   cell_w;
+} Chrome;
+
+typedef struct {
+    Rect tabs, content, hint;
+    int  gap;
+    /* Tab cells are handed out in proportion to their measured labels, so
+     * "Stopwatch" gets the room it needs and no cell can be too narrow for
+     * the word inside it. */
+    Font *tabfont;
+    int  tab_x[TAB_COUNT];
+    int  tab_w[TAB_COUNT];
+    int  tabw;       /* the first cell, for the geometry checks */
+} Layout;
+
+/* Everything a tab's drawing and its hit test need, computed once from the
+ * content rectangle so the two can never disagree. */
+typedef struct {
+    Rect field[2];       /* the two setter boxes */
+    Rect minus[2], plus[2];
+    Rect big;            /* the counter / the digital time */
+    Rect line2;          /* date, or the alarm status line */
+    Rect btn[3];
+    int  btn_n;
+    Rect list;           /* lap list */
+    int  rows;           /* lap rows that fit */
+} TabUI;
+
+static const char *TAB_NAME[TAB_COUNT] = { "Clock", "Timer", "Stopwatch", "Alarm" };
+
+static void chrome_init(Chrome *C) {
+    C->small = font_get(FONT_REGULAR, 10);
+    C->cell_h = C->small ? (int)(font_height(C->small) + 3.0f) : 14;
+    if (C->cell_h < 11) C->cell_h = 11;
+    C->cell_w = C->small ? (int)(font_width(C->small, "0") + 0.5f) : 6;
+    if (C->cell_w < 4) C->cell_w = 4;
+}
+
+/* The largest of these nominal sizes whose measured text fits the box.
+ * font_get() applies the text scale, so the table is a set of candidates in
+ * nominal points and the chosen one is whatever the scale made of them.
+ * Iterating a fixed table (instead of computing a size from the box) keeps
+ * the number of fonts the app ever asks for bounded. NULL means even the
+ * smallest spills, and the caller then does not draw rather than overlap. */
+static Font *fit_font_box(int face, const char *txt, float max_w, float max_h) {
+    static const int sizes[9] = { 46, 40, 34, 28, 22, 17, 13, 10, 8 };
+    if (!txt || !*txt || max_w < 2.0f || max_h < 2.0f) return NULL;
+    for (int i = 0; i < 9; i++) {
+        Font *f = font_get(face, (float)sizes[i]);
+        if (!f) continue;
+        if (font_width(f, txt) <= max_w && font_height(f) <= max_h) return f;
+    }
+    return NULL;
+}
+
+/* Draw a string centred in a box, at the largest size that fits. */
+static void text_box(Surface *s, int face, Rect r, const char *txt, u32 col) {
+    if (!rect_has(r)) return;          /* a collapsed band is not drawn at all */
+    Font *f = fit_font_box(face, txt, (float)r.w, (float)r.h);
+    if (!f) return;
+    float w = font_width(f, txt);
+    float x = (float)r.x + ((float)r.w - w) * 0.5f;
+    float y = (float)r.y + ((float)r.h - font_height(f)) * 0.5f;
+    font_draw(s, f, x, y, txt, col);
+}
+
+/* A specific font, centred / left / right in a box. */
+static void font_box(Surface *s, Font *f, Rect r, const char *txt, u32 col, int align) {
+    if (!f || !txt || !rect_has(r)) return;
+    float w = font_width(f, txt);
+    float x = (float)r.x;
+    if (align == 1) x = (float)r.x + ((float)r.w - w) * 0.5f;
+    if (align == 2) x = (float)r.x + (float)r.w - w;
+    float y = (float)r.y + ((float)r.h - font_height(f)) * 0.5f;
+    font_draw(s, f, x, y, txt, col);
+}
+
+/* The gap between bands: a third of a cell, never less than 3px. */
+static int gap_of(const Chrome *C) {
+    int g = C->cell_h / 3;
+    return g < 3 ? 3 : g;
+}
+
+/* Side padding inside a tab pill: two digits of the small face. */
+static int tab_pad(const Chrome *C) {
+    int p = 2 * C->cell_w;
+    return p < 12 ? 12 : p;
+}
+
+/* The largest label face for which all four labels, their padding and the
+ * gaps between the cells fit the strip. At 220px wide and text scale 1.6
+ * this is the difference between four legible tabs and four overlapping
+ * ones, so it is measured, not assumed. */
+static Font *choose_tab_font(const Chrome *C, int strip_w) {
+    static const int sizes[7] = { 13, 12, 11, 10, 9, 8, 7 };
+    int pad = tab_pad(C), gap = gap_of(C);
+    for (int i = 0; i < 7; i++) {
+        Font *f = font_get(FONT_SEMIBOLD, (float)sizes[i]);
+        if (!f) continue;
+        float total = (float)((TAB_COUNT - 1) * gap + TAB_COUNT * pad);
+        for (int k = 0; k < TAB_COUNT; k++) total += font_width(f, TAB_NAME[k]);
+        if (total <= (float)strip_w) return f;
+    }
+    return font_get(FONT_SEMIBOLD, 7.0f);
+}
+
+static void layout_window(int vw, int vh, const Chrome *C, Layout *L) {
+    int pad = C->cell_h / 2;
+    if (pad < 4) pad = 4;
+    int gap = C->cell_h / 3;
+    if (gap < 3) gap = 3;
+
+    L->gap = gap;
+    L->tabs.x = pad;
+    L->tabs.y = pad;
+    L->tabs.w = vw - 2 * pad;
+    L->tabs.h = C->cell_h + C->cell_h / 2;
+    if (L->tabs.w < 4) L->tabs.w = 4;
+    if (L->tabs.h < 4) L->tabs.h = 4;
+
+    L->tabfont = choose_tab_font(C, L->tabs.w);
+
+    /* Hand the strip out in proportion to the measured labels, then give any
+     * leftover to every cell equally. When even the smallest face does not
+     * fit, scale proportionally and let the last cells be clipped rather
+     * than drawn on top of each other. */
+    int cellpad = tab_pad(C);
+    int need[TAB_COUNT], total = (TAB_COUNT - 1) * gap;
+    for (int k = 0; k < TAB_COUNT; k++) {
+        need[k] = (int)font_width(L->tabfont, TAB_NAME[k]) + cellpad;
+        if (need[k] < 10) need[k] = 10;
+        total += need[k];
+    }
+    int x = L->tabs.x, end = L->tabs.x + L->tabs.w;
+    for (int k = 0; k < TAB_COUNT; k++) {
+        int w;
+        if (total <= L->tabs.w) {
+            int extra = L->tabs.w - total;
+            w = need[k] + extra / TAB_COUNT + (k < extra % TAB_COUNT ? 1 : 0);
+        } else {
+            w = (int)((long)need[k] * (long)L->tabs.w / (long)total);
+        }
+        int room = end - x - (TAB_COUNT - 1 - k) * gap;   /* leave the rest a cell */
+        if (room < 0) room = 0;
+        if (w > room) w = room;
+        if (w < 0) w = 0;
+        L->tab_x[k] = x;
+        L->tab_w[k] = w;
+        x += w + gap;
+    }
+    L->tabw = L->tab_w[0];
+
+    L->hint.x = pad;
+    L->hint.y = vh - pad - C->cell_h;
+    L->hint.w = vw - 2 * pad;
+    L->hint.h = C->cell_h;
+    if (L->hint.w < 0) L->hint.w = 0;
+
+    L->content.x = pad;
+    L->content.y = L->tabs.y + L->tabs.h + gap;
+    L->content.w = vw - 2 * pad;
+    L->content.h = L->hint.y - gap - L->content.y;
+    if (L->content.w < 0) L->content.w = 0;
+    if (L->content.h < 0) L->content.h = 0;
+}
+
+static Rect tab_rect(const Layout *L, int i) {
+    Rect r;
+    r.x = L->tab_x[i];
+    r.y = L->tabs.y;
+    r.w = L->tab_w[i];
+    r.h = L->tabs.h;
+    return r;
+}
+
+/* Two setter boxes with a [-] and a [+] under each. `reserve` is the height
+ * the caller still needs below this group, so the group shrinks to fit
+ * instead of pushing the rest out of the window: a 220x170 window at text
+ * scale 1.6 gets shorter boxes, never overlapping ones. Returns the height
+ * the group actually used. */
+static int geo_fields(Rect c, const Chrome *C, TabUI *u, int reserve) {
+    int gap = gap_of(C);
+    int avail = c.h - reserve;
+    if (avail < 0) avail = 0;
+
+    int fh = 2 * C->cell_h;
+    int row = C->cell_h;
+    if (fh + gap + row > avail) {
+        int space = avail - gap;
+        if (space < 0) space = 0;
+        row = C->cell_h;
+        if (row > space / 2) row = space / 2;
+        fh = space - row;
+        if (fh > 2 * C->cell_h) fh = 2 * C->cell_h;
+        if (fh < 0) fh = 0;
+        if (row < 0) row = 0;
+    }
+
+    int bw = (c.w - gap) / 2;
+    if (bw < 8) bw = 8;
+    int hw = (bw - gap) / 2;
+    if (hw < 6) hw = 6;
+
+    for (int i = 0; i < 2; i++) {
+        u->field[i].x = c.x + i * (bw + gap);
+        u->field[i].y = c.y;
+        u->field[i].w = bw;
+        u->field[i].h = fh;
+
+        u->minus[i].x = u->field[i].x;
+        u->minus[i].y = c.y + fh + gap;
+        u->minus[i].w = hw;
+        u->minus[i].h = row;
+        u->plus[i].x = u->field[i].x + hw + gap;
+        u->plus[i].y = u->minus[i].y;
+        u->plus[i].w = hw;
+        u->plus[i].h = row;
+    }
+    return fh + gap + row;
+}
+
+/* A row of equal buttons along the bottom of the content box. */
+static void geo_buttons(Rect c, const Chrome *C, TabUI *u, int n) {
+    int gap = gap_of(C);
+    int bh = C->cell_h + C->cell_h / 2;
+    int bw = (c.w - (n - 1) * gap) / n;
+    if (bw < 8) bw = 8;
+    u->btn_n = n;
+    for (int i = 0; i < n; i++) {
+        u->btn[i].x = c.x + i * (bw + gap);
+        u->btn[i].y = c.y + c.h - bh;
+        u->btn[i].w = bw;
+        u->btn[i].h = bh;
+    }
+}
+
+static void geo_timer(Rect c, const Chrome *C, TabUI *u) {
+    int gap = gap_of(C);
+    int bh = C->cell_h + C->cell_h / 2;
+    /* the counter keeps at least two cells: the fields give way first */
+    int used = geo_fields(c, C, u, bh + gap + 2 * C->cell_h + gap);
+    geo_buttons(c, C, u, 2);
+
+    int by = c.y + used + gap;
+    int bh2 = (u->btn[0].y - gap) - by;
+    if (bh2 < 0) bh2 = 0;
+    if (by < c.y) by = c.y;
+    u->big.x = c.x;
+    u->big.y = by;
+    u->big.w = c.w;
+    u->big.h = bh2;
+}
+
+static void geo_stopwatch(Rect c, const Chrome *C, TabUI *u) {
+    int gap = gap_of(C);
+    int bh = C->cell_h + C->cell_h / 2;
+    geo_buttons(c, C, u, 3);
+
+    int ch = 3 * C->cell_h;
+    int room = c.h - bh - 2 * gap;
+    if (ch > room) ch = room;
+    if (ch < 0) ch = 0;
+    u->big.x = c.x;
+    u->big.y = c.y;
+    u->big.w = c.w;
+    u->big.h = ch;
+
+    int ly = c.y + ch + gap;
+    int lh = (u->btn[0].y - gap) - ly;
+    if (lh < 0) lh = 0;
+    u->list.x = c.x;
+    u->list.y = ly;
+    u->list.w = c.w;
+    u->list.h = lh;
+    u->rows = C->cell_h > 0 ? lh / C->cell_h : 0;
+    if (u->rows > LAP_MAX) u->rows = LAP_MAX;
+}
+
+static void geo_alarm(Rect c, const Chrome *C, TabUI *u) {
+    int gap = gap_of(C);
+    int bh = C->cell_h + C->cell_h / 2;
+    /* the buttons and one status line are fixed; the fields shrink */
+    int used = geo_fields(c, C, u, bh + gap + C->cell_h + gap);
+    geo_buttons(c, C, u, 2);
+
+    int sy = c.y + used + gap;
+    int sh = (c.y + c.h) - sy;
+    if (sh < 0) sh = 0;
+    if (sh > 2 * C->cell_h) sh = 2 * C->cell_h;
+    u->big.x = c.x;              /* the status text lives here */
+    u->big.y = sy;
+    u->big.w = c.w;
+    u->big.h = sh;
+    u->line2 = u->big;
+}
+
+static void geo_clock(Rect c, const Chrome *C, TabUI *u) {
+    int gap = gap_of(C);
+
+    /* bottom up: one cell for the date, two for the digital time; if the
+     * window is too short the digital band shrinks and then the date goes */
+    int dateh = C->cell_h;
+    int digith = 2 * C->cell_h + gap;
+    if (dateh + digith > c.h) {
+        digith = c.h - dateh;
+        if (digith < C->cell_h) {
+            digith = c.h;
+            dateh = 0;
+        }
+    }
+    if (digith < 0) digith = 0;
+    if (dateh < 0) dateh = 0;
+
+    u->big.x = c.x;
+    u->big.y = c.y + c.h - dateh - digith;
+    u->big.w = c.w;
+    u->big.h = digith;
+    u->line2.x = c.x;
+    u->line2.y = c.y + c.h - dateh;
+    u->line2.w = c.w;
+    u->line2.h = dateh;
+
+    int room = c.h - dateh - digith - 2 * gap;
+    int side = room;
+    if (side > c.w) side = c.w;
+    if (side > 300) side = 300;
+    if (side >= 56) {
+        /* centred in the space above the digital line, so a maximised
+         * window does not leave the dial stranded at the top */
+        u->field[0].x = c.x + (c.w - side) / 2;
+        u->field[0].y = c.y + (room - side) / 2;
+        u->field[0].w = side;
+        u->field[0].h = side;
+    }
+}
+
+static void tab_geometry(int tab, Rect c, const Chrome *C, TabUI *u) {
+    memset(u, 0, sizeof(*u));
+    if (!rect_has(c)) return;
+    switch (tab) {
+    case TAB_CLOCK:     geo_clock(c, C, u); break;
+    case TAB_TIMER:     geo_timer(c, C, u); break;
+    case TAB_STOPWATCH: geo_stopwatch(c, C, u); break;
+    default:            geo_alarm(c, C, u); break;
+    }
+}
+
 /* The 4 Hz flash phase, 1 while a banner should be lit. */
 static int flash_on(u64 now, u64 until) {
     if (!until || now >= until) return 0;
@@ -689,7 +754,7 @@ static void draw_box(Surface *s, Rect r, int on, int hot) {
 }
 
 static void draw_tabs(DC *d) {
-    Font *tf = choose_tab_font(d->L->tabw);
+    Font *tf = d->L->tabfont;
     for (int i = 0; i < TAB_COUNT; i++) {
         Rect r = tab_rect(d->L, i);
         int on = (i == d->K->tab);
@@ -703,7 +768,10 @@ static void draw_tabs(DC *d) {
             event = flash_on(d->now, d->K->a_flash_until);
         draw_pill(d->s, r, on, hot, event ? COL_HOT : COL_ACCENT);
         u32 col = on ? COL_TEXT : (event ? COL_HOT_TX : COL_DIM);
-        font_box(d->s, tf, r, TAB_NAME[i], col, 1);
+        /* In a window too narrow for the word, the pill stays and the label
+         * goes: half a word in the next cell over is worse than none. */
+        if (tf && font_width(tf, TAB_NAME[i]) <= (float)r.w - 4.0f)
+            font_box(d->s, tf, r, TAB_NAME[i], col, 1);
     }
 }
 
@@ -804,7 +872,7 @@ static void draw_timer_tab(DC *d) {
     long mins = K->t_dur_ms / 60000;
     long secs = (K->t_dur_ms / 1000) % 60;
     for (int i = 0; i < 2; i++) {
-        draw_box(s, d->u->field[i], K->t_field == i && !K->t_run,
+        draw_box(s, d->u->field[i], K->t_field == i,
                  rect_hit(d->u->field[i], d->mx, d->my));
         snprintf(buf, sizeof(buf), "%02ld", i == 0 ? mins : secs);
         text_box(s, FONT_MONO, d->u->field[i], buf,
@@ -972,17 +1040,30 @@ static void draw_hint(DC *d) {
     font_box(d->s, f, d->L->hint, hint, COL_FAINT, 0);
 
     if (K->tab == TAB_STOPWATCH && K->w_laps) {
+        /* the lap count keeps to the right third of the hint band, and is
+         * only drawn if it fits there, so it can never run into the keys */
         char n[24];
-        snprintf(n, sizeof(n), "laps %d", K->w_laps);
-        font_box(d->s, f, d->L->hint, n,
-                 K->w_laps >= LAP_MAX ? COL_WARN : COL_DIM, 2);
+        snprintf(n, sizeof(n), "laps %d/%d", K->w_laps, LAP_MAX);
+        Rect rr = d->L->hint;
+        int third = rr.w / 3;
+        rr.x = rr.x + rr.w - third;
+        rr.w = third;
+        text_box(d->s, FONT_REGULAR, rr, n,
+                 K->w_laps >= LAP_MAX ? COL_WARN : COL_DIM);
     }
 }
 
 static void draw_all(MClient *c, int vw, int vh, ClockState *K, const Chrome *C,
                      const Wall *w, u64 now) {
-    Surface s = { c->px, vw, vh, c->stride };
     if (vw <= 0 || vh <= 0) return;
+    /* The buffer is the whole screen; this Surface is the window, and its
+     * clip rectangle says so, so nothing here can touch a neighbouring
+     * window even if a rectangle were miscalculated. */
+    Surface s;
+    s.px = c->px;
+    s.w = vw; s.h = vh;
+    s.stride = c->stride;
+    s.cx0 = 0; s.cy0 = 0; s.cx1 = vw; s.cy1 = vh;
 
     int lit = flash_on(now, K->t_flash_until) || flash_on(now, K->a_flash_until);
     u32 top = lit ? color_mix(COL_BG_TOP, COL_HOT, 0.18f) : COL_BG_TOP;
@@ -1052,6 +1133,8 @@ static void alarm_click(ClockState *K, const TabUI *u, int x, int y, long now_se
 }
 
 /* ------------------------------------------------------------ main */
+
+#ifndef CLOCK_LAYOUT_TEST
 
 static u64 now_ns_monotonic(void) {
     struct timespec ts;
@@ -1234,9 +1317,9 @@ int main(void) {
                 if ((ev.buttons & 1) && !was_down) {
                     Layout L;
                     layout_window(vw, vh, &C, &L);
+                    tab_click(&K, &L, ev.x, ev.y);   /* the strip is above the body */
                     TabUI u;
                     tab_geometry(K.tab, L.content, &C, &u);
-                    tab_click(&K, &L, ev.x, ev.y);
                     if (K.tab == TAB_TIMER) timer_click(&K, &u, ev.x, ev.y, now);
                     if (K.tab == TAB_STOPWATCH) sw_click(&K, &u, ev.x, ev.y, now);
                     if (K.tab == TAB_ALARM) alarm_click(&K, &u, ev.x, ev.y, w.sec_of_day);
@@ -1265,5 +1348,7 @@ int main(void) {
     mc_close(&c);
     return 0;
 }
+
+#endif /* !CLOCK_LAYOUT_TEST */
 
 #endif /* !CLOCK_HOST_TEST */
