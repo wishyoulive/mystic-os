@@ -12,6 +12,7 @@
  * ============================================================ */
 #include "mystic.h"
 #include "ipc.h"
+#include "wallpaper.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -65,6 +66,9 @@ static int    z_top;
 static int    drag_win = -1, drag_dx, drag_dy;
 static int    resize_win = -1;
 static int    launcher_open = 0;
+static int    wall_index = 0;
+static double wall_t0 = 0.0;
+static double wall_last = 0.0;
 static int    launcher_sel = 0;
 
 static WmClient clients[WM_MAX_CLIENTS];
@@ -448,12 +452,12 @@ static void draw_start_button(Surface *s, const Theme *th) {
 
 /* ------------------------------------------------------------ compose */
 static void draw_desktop(Surface *s, const Theme *th) {
-    int W = s->w, H = s->h;
+    int W = s->w;
+    (void)(s->h);
 
-    gfx_gradient(s, 0, 0, W, H, th->bg_top, th->bg_bottom);
-    gfx_glow(s, W * 0.22f, H * 0.18f, W * 0.42f, th->glow, th->glow_strength * 0.85f);
-    gfx_glow(s, W * 0.86f, H * 0.72f, W * 0.38f, th->accent, th->glow_strength * 0.45f);
-    gfx_glow(s, W * 0.55f, H * 1.02f, W * 0.50f, th->glow, th->glow_strength * 0.55f);
+    /* the background is a wallpaper: a pure function of theme + index + time,
+     * so the animated ones move and the static ones cost nothing */
+    wallpaper_draw(s, th, wall_index, now_sec() - wall_t0);
 
     /* ---------------- top bar ---------------- */
     const int bar = topbar_h();
@@ -997,6 +1001,20 @@ int main(void) {
     if (disp_open(&disp, "/dev/fb0") < 0) return 1;
     /* the text scale must be known before the first font is requested */
     ui_scale_load("/etc/mystic/ui.conf");
+    {
+        FILE *wf = fopen("/etc/mystic/wallpaper", "r");
+        if (wf) {
+            char name[64] = {0};
+            if (fgets(name, sizeof(name), wf)) {
+                char *nl = strchr(name, 10);
+                if (nl) *nl = 0;
+                int idx = wallpaper_from_name(name);
+                if (idx >= 0) wall_index = idx;
+            }
+            fclose(wf);
+        }
+        wall_t0 = now_sec();
+    }
     font_init(FONT_DIR);
     fprintf(stderr, "ui: scale %.2f", ui_scale_get());
     fputc(10, stderr);
@@ -1394,10 +1412,37 @@ int main(void) {
         /* keep repainting while the eye is blinking */
         if (blink_t0 >= 0.0) dirty = 1;
 
+        /* animated wallpapers need repaints; a static one must never force
+         * them or the CPU would never idle */
+        if (wallpaper_animated(wall_index)) {
+            double nowt = now_sec();
+            if (nowt - wall_last > 0.08) { wall_last = nowt; dirty = 1; }
+        }
+
         long now = (long)time(NULL);
         if (now != last_tick) {
             last_tick = now;
             dirty = 1;
+            /* Settings can change these at runtime: re-read both files once a
+             * second (a whole-file read of two small files is cheap). */
+            {
+                float before = ui_scale_get();
+                ui_scale_load("/etc/mystic/ui.conf");
+                if (ui_scale_get() != before) dirty = 1;
+
+                FILE *wf = fopen("/etc/mystic/wallpaper", "r");
+                if (wf) {
+                    char wn[64] = {0};
+                    if (fgets(wn, sizeof(wn), wf)) {
+                        char *nl = strchr(wn, 10);
+                        if (nl) *nl = 0;
+                        int idx = wallpaper_from_name(wn);
+                        if (idx >= 0 && idx != wall_index) { wall_index = idx; dirty = 1; }
+                    }
+                    fclose(wf);
+                }
+            }
+
             /* another app can ask for a theme by writing this file */
             FILE *tf = fopen("/etc/mystic/current-theme", "r");            if (tf) {
                 char want[64] = {0};

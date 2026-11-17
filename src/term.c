@@ -10,6 +10,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,6 +39,13 @@
  * parameters (128 bytes) and more. csi_param_byte() says what happens past
  * the end, and why it is the OLDEST parameters that are sacrificed. */
 #define TERM_PARAM_BUF 256
+
+/* One key event must never wedge the compositor, but a pty input queue that is
+ * momentarily full (a foreground job that has stopped reading) is normal. So
+ * term_key() waits for room in bounded steps: at most TERM_KEY_WAITS polls of
+ * TERM_KEY_POLL_MS each - 100 ms - and then gives up rather than spin. */
+#define TERM_KEY_POLL_MS 5
+#define TERM_KEY_WAITS   20
 
 typedef struct {
     u32 ch;
@@ -619,10 +627,167 @@ int term_pump(Term *t) {
     return total;
 }
 
+/* Resize the screen: a new grid and a new scrollback ring of the new width,
+ * then tell the shell. The grid is cols wide everywhere in this file (cell_at,
+ * hist_push and the scrollback ring all stride by t->cols), so changing cols
+ * without rebuilding *both* buffers would make every later row read the wrong
+ * cells - that is why the scrollback is reallocated here too.
+ *
+ * Content is preserved from the top-left: row y, column x of the old screen
+ * becomes row y, column x of the new one, and every cell past the old extent
+ * is blanked. Shrinking therefore keeps what was at the top (the prompt and
+ * the first lines of output) and drops the tail; growing keeps everything and
+ * fills the new area with background. The cursor is clamped into the new grid
+ * and any pending wrap is cancelled, so the cursor can never point outside the
+ * cells that are drawn.
+ *
+ * Failure is safe: if either buffer cannot be allocated nothing is changed and
+ * the old (consistent) screen stays, which draws clipped rather than corrupt.
+ *
+ * ioctl(TIOCSWINSZ) is the whole point: the kernel turns it into SIGWINCH for
+ * the pty's foreground process group, and programs read the new size back with
+ * TIOCGWINSZ. Without it the shell keeps formatting for the old width - 'ls'
+ * still wraps at the old column count while the window shows the new one. */
+void term_resize(Term *t, int cols, int rows) {
+    if (!t) return;
+    if (cols < 10) cols = 10;
+    if (rows < 4) rows = 4;
+    if (cols > TERM_MAX_COLS) cols = TERM_MAX_COLS;
+    if (rows > TERM_MAX_ROWS) rows = TERM_MAX_ROWS;
+    if (cols == t->cols && rows == t->rows) return;
+
+    Cell *grid = calloc((size_t)cols * rows, sizeof(Cell));
+    Cell *hist = t->hist ? calloc((size_t)cols * HIST_ROWS, sizeof(Cell)) : NULL;
+    if (!grid || (t->hist && !hist)) { free(grid); free(hist); return; }
+
+    int cc = cols < t->cols ? cols : t->cols;   /* columns that survive */
+    int cr = rows < t->rows ? rows : t->rows;   /* rows that survive */
+
+    for (int y = 0; y < cr; y++)
+        memcpy(grid + (size_t)y * cols, t->grid + (size_t)y * t->cols,
+               (size_t)cc * sizeof(Cell));
+    for (int y = 0; y < rows; y++) {
+        for (int x = (y < cr ? cc : 0); x < cols; x++) {
+            Cell *c = &grid[(size_t)y * cols + x];
+            c->ch = ' ';
+            c->fg = t->fg;
+            c->bg = t->bg;
+            c->bold = 0;
+        }
+    }
+
+    if (hist) {
+        /* The ring is rebuilt in age order (oldest first) at width cols, so
+         * the oldest line lands in slot 0 and hist_head = hist_count % HIST_ROWS
+         * keeps it consistent with what term_draw() expects. */
+        for (int i = 0; i < t->hist_count; i++) {
+            int src = (t->hist_head - t->hist_count + i + HIST_ROWS * 2) % HIST_ROWS;
+            memcpy(hist + (size_t)i * cols, t->hist + (size_t)src * t->cols,
+                   (size_t)cc * sizeof(Cell));
+            for (int x = cc; x < cols; x++) {
+                Cell *c = &hist[(size_t)i * cols + x];
+                c->ch = ' ';
+                c->fg = t->fg;
+                c->bg = t->bg;
+                c->bold = 0;
+            }
+        }
+        t->hist_head = t->hist_count % HIST_ROWS;
+    }
+
+    free(t->grid);
+    free(t->hist);
+    t->grid = grid;
+    t->hist = hist;
+    t->cols = cols;
+    t->rows = rows;
+
+    if (t->cx < 0) t->cx = 0;
+    if (t->cx >= cols) t->cx = cols - 1;
+    if (t->cy < 0) t->cy = 0;
+    if (t->cy >= rows) t->cy = rows - 1;
+    t->wrap = 0;
+    t->scroll = 0;          /* the live screen is what the user wants to see */
+
+    if (t->fd >= 0) {
+        struct winsize ws;
+        memset(&ws, 0, sizeof(ws));
+        ws.ws_col = (unsigned short)cols;
+        ws.ws_row = (unsigned short)rows;
+        /* Best effort: the grid is already the right size, so a pty that has
+         * gone away must not turn a resize into a failure. */
+        (void)ioctl(t->fd, TIOCSWINSZ, &ws);
+    }
+    t->dirty = 1;
+}
+
+/* The same thing in pixels, with the cell metrics term_draw() uses, so a
+ * caller only has to hand over the rectangle it is about to draw the terminal
+ * into. Kept next to term_resize() so the two can never disagree about how a
+ * window rectangle becomes a column count. */
+void term_resize_px(Term *t, int w, int h) {
+    if (!t) return;
+    Font *fm = font_get(FONT_MONO, 12);
+    float cw = font_width(fm, "M");
+    float ch = font_height(fm);
+    if (cw < 4.0f) cw = 4.0f;
+    if (ch < 8.0f) ch = 8.0f;
+    term_resize(t, (int)(w / cw), (int)(h / ch));
+}
+
+/* Wait briefly for the pty to accept more input. Returns 0 to retry the write,
+ * -1 to give up (out of budget, or the fd is not writable any more).
+ * *waits is the retry counter shared by the whole term_key() call, so one
+ * stalled frame spends at most TERM_KEY_WAITS * TERM_KEY_POLL_MS. */
+static int wait_for_room(Term *t, int *waits) {
+    if (++*waits > TERM_KEY_WAITS) return -1;
+    struct pollfd pfd;
+    pfd.fd = t->fd;
+    pfd.events = POLLOUT;
+    pfd.revents = 0;
+    int pr = poll(&pfd, 1, TERM_KEY_POLL_MS);
+    if (pr < 0) return errno == EINTR ? 0 : -1;
+    if (pr > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return -1;
+    return 0;   /* writable, or timeout: the caller retries and counts it */
+}
+
+/* Send bytes to the shell.
+ *
+ * The master side is O_NONBLOCK (the compositor reads it every frame and must
+ * never stall on it), so one write(2) is not enough: when the pty input queue
+ * is full a single write returns EAGAIN and the whole chunk would be lost, and
+ * a short write returns a count below n and the tail would be lost. Either way
+ * the user's keystrokes vanish while the shell catches up, which is exactly
+ * what a long paste or a burst of autorepeat does.
+ *
+ * So: loop until every byte is accepted, resuming from the count the kernel
+ * returned (the bytes it took are already in the queue and must not be sent
+ * twice), retry on EINTR, and on EAGAIN wait for POLLOUT with a short timeout
+ * instead of spinning. The wait is bounded by TERM_KEY_WAITS polls so a reader
+ * that has stopped for good (SIGSTOPped job holding the pty) costs the frame
+ * ~100 ms and then the rest of the chunk is dropped rather than hanging the
+ * desktop. Only a genuinely dead pty ends the loop early. */
 void term_key(Term *t, const char *bytes, int n) {
-    if (!t || !t->alive || n <= 0) return;
-    ssize_t r = write(t->fd, bytes, (size_t)n);
-    (void)r;
+    if (!t || !t->alive || !bytes || n <= 0 || t->fd < 0) return;
+
+    int sent = 0;
+    int waits = 0;
+    while (sent < n) {
+        ssize_t r = write(t->fd, bytes + sent, (size_t)(n - sent));
+        if (r > 0) { sent += (int)r; continue; }
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (wait_for_room(t, &waits) < 0) break;
+            continue;
+        }
+        if (r == 0) {               /* no bytes accepted and no error */
+            if (wait_for_room(t, &waits) < 0) break;
+            continue;
+        }
+        /* EBADF/EPIPE/EIO: the slave side is gone and the shell with it. */
+        t->alive = 0;
+        break;
+    }
 }
 
 void term_scroll(Term *t, int lines) {
@@ -720,6 +885,13 @@ void term_draw(Term *t, Surface *s, int x, int y, int w, int h,
     if (!t) return;
     int cols = (int)(w / cw);
     int rows = (int)(h / ch);
+    /* The window this terminal lives in can be dragged, resized or maximised
+     * by code that never thinks about terminals. The grid is exactly the
+     * cells that fit in the rectangle we are about to fill, so reconcile here:
+     * resizing the pty to the drawn size is the one place that cannot be
+     * forgotten, and every path that changes a window ends up drawing it.
+     * term_resize() only does work when the size really changed. */
+    if (cols > 0 && rows > 0) term_resize(t, cols, rows);
     if (cols > t->cols) cols = t->cols;
     if (rows > t->rows) rows = t->rows;
 

@@ -212,6 +212,11 @@ void  ui_scale_load(const char *path);
 int   ui_px(int base);            /* a size scaled by ui_scale, min 1 */   /* close the pty, reap the shell, free the grid */
 int   term_fd(Term *t);
 int   term_alive(Term *t);
+/* Rebuild the grid and scrollback at a new size, keeping the top-left content,
+ * and ioctl(TIOCSWINSZ) the pty so the shell reflows (SIGWINCH). */
+void  term_resize(Term *t, int cols, int rows);
+/* The same, from the pixel rectangle the terminal is drawn into. */
+void  term_resize_px(Term *t, int w, int h);
 int   term_pump(Term *t);   /* bytes consumed; capped per call */
 void  term_key(Term *t, const char *bytes, int n);
 void  term_clear_screen(Term *t);

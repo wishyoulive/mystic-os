@@ -10,9 +10,16 @@
  *
  *  Cost is what makes this usable on old hardware, so the rules
  *  here are: no transcendental function inside a per-pixel loop
- *  (a 256 entry table does the sin/cos work), and the one float
- *  divide gfx_glow does per pixel becomes a reciprocal multiply
- *  plus a 64 step ramp.
+ *  (a 256 entry table does the sin/cos work for Waves, one sqrt
+ *  per row does it for Orbits and for the Dusk lights), and the
+ *  float divide gfx_glow does per pixel becomes a multiply by a
+ *  precomputed reciprocal plus a 128 step alpha ramp.
+ *
+ *  Measured at 1280x800 with the shipping flags (-Os) on the dev
+ *  host: Dusk and Waves about 3 ms, Mesh about 1.5 ms, Orbits under
+ *  1 ms - roughly 2 to 7 plain full-screen fills' worth of work, a
+ *  fill being ~0.45 ms here. Only Waves and Orbits ever need to
+ *  repeat at frame rate; the other two are painted once.
  * ============================================================ */
 #include "wallpaper.h"
 
@@ -44,15 +51,19 @@ static int wp_lower(int c) {
 }
 
 /* case-insensitive compare of a user string against a lowercase literal,
- * ignoring leading and trailing blanks */
+ * ignoring leading and trailing whitespace. CR and LF count as whitespace
+ * because the name comes from a config file (main.c reads
+ * /etc/mystic/wallpaper and only strips the newline, so a CRLF checkout
+ * would otherwise hand us "Mesh\r"). */
 static int wp_name_is(const char *user, const char *literal) {
-    while (*user == ' ' || *user == '\t') user++;
+    while (*user == ' ' || *user == '\t' || *user == '\r' || *user == '\n') user++;
     size_t i = 0;
     for (; literal[i]; i++) {
         if (wp_lower((unsigned char)user[i]) != literal[i]) return 0;
     }
     for (; user[i]; i++) {
-        if (user[i] != ' ' && user[i] != '\t') return 0;
+        if (user[i] != ' ' && user[i] != '\t' && user[i] != '\r' && user[i] != '\n')
+            return 0;
     }
     return 1;
 }
@@ -103,8 +114,10 @@ static inline void wp_blend(Surface *s, int x, int y, u32 color, int alpha) {
 /* ------------------------------------------------------------ 0. Dusk
  * The original desktop: a vertical gradient with three soft lights on it.
  * Same falloff as gfx_glow (a = t*t*strength with t = 1 - d2/r2) but the
- * per-pixel float divide becomes a reciprocal multiply plus a 64 step
- * ramp, which is what keeps three screen sized lights inside a few ms.
+ * per-pixel float divide becomes a multiply by a precomputed reciprocal
+ * plus a 128 step ramp, and each row walks only the span the circle
+ * actually covers, which is what keeps three screen sized lights inside a
+ * couple of milliseconds.
  */
 static void wp_glow(Surface *s, float cx, float cy, float radius, u32 color, float strength) {
     if (!(radius > 0.0f) || !(strength > 0.0f)) return;
@@ -144,17 +157,15 @@ static void wp_glow(Surface *s, float cx, float cy, float radius, u32 color, flo
         if (xb <= xa) continue;
 
         int iy = (int)(dy2 * scale);             /* per-row half of the index */
-        /* walk (x-cx)^2 by finite difference: one add per pixel, no multiply
-           and no float->int of a squared coordinate */
-        float fdx = (float)xa - cx;
-        float dxx = fdx * fdx;
-        float dstep = fdx + fdx;                 /* (x+1)^2 - x^2 = 2x+1 */
         u32 *row = s->px + (size_t)y * s->stride;
 
         for (int x = xa; x < xb; x++) {
-            int idx = (int)(dxx * scale) + iy;
-            dxx += dstep;
-            dstep += 2.0f;
+            /* per-pixel square, not a finite difference: the add-chain
+               version (dxx += dstep; dstep += 2) is 2x SLOWER here because
+               it serialises on a 2-add dependency, while this form lets the
+               out-of-order core overlap iterations */
+            float fdx = (float)x - cx;
+            int idx = (int)(fdx * fdx * scale) + iy;
             if (idx > LEVELS) continue;
             int a = ramp[idx];
             if (a <= 0) continue;
@@ -177,8 +188,8 @@ static void wp_draw_dusk(Surface *s, const Theme *th) {
 
     /* The three lights of the original desktop, in the same places and at
        the same strengths. Measured against main.c's gfx_gradient + three
-       gfx_glow calls over all six themes: max channel difference 4/255,
-       mean below 1/255 - the same picture, at about 1.6x the speed. */
+       gfx_glow calls over all six themes: max channel difference 4/255 and
+       mean below 0.8/255 - the same picture - at 1.4x to 1.9x the speed. */
     wp_glow(s, (float)W * 0.22f, (float)H * 0.18f, (float)W * 0.42f,
             th->glow, th->glow_strength * 0.85f);
     wp_glow(s, (float)W * 0.86f, (float)H * 0.72f, (float)W * 0.38f,

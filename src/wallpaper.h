@@ -25,7 +25,9 @@
 const char *wallpaper_name(int index);
 
 /* 0..WALLPAPER_COUNT-1, or -1 when the name is unknown.
- * Matching is case-insensitive and ignores surrounding spaces. */
+ * Matching is case-insensitive and ignores surrounding whitespace
+ * (spaces, tabs, CR, LF), so a name read straight out of a config file
+ * works without trimming. */
 int wallpaper_from_name(const char *name);
 
 /* 1 when the wallpaper uses `seconds` (so the caller should keep

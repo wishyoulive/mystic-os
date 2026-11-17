@@ -166,8 +166,9 @@ because a relative device has no absolute position to report until it moves.
 `bits_per_pixel`) and `FBIOGET_FSCREENINFO` (`line_length`), then
 
 ```c
-d->stride = fi.line_length / (vi.bits_per_pixel / 8);   /* pixels per row */
-d->mem = mmap(NULL, fi.line_length * vi.yres, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+d->stride = fi.line_length / (vi.bits_per_pixel / 8);
+size_t bytes = (size_t)fi.line_length * (size_t)vi.yres;
+d->mem = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, d->fd, 0);
 ```
 
 `disp_present()` copies row by row, `min(surface width, display width)` pixels per
@@ -191,7 +192,9 @@ clipped is the external client's buffer into its window (§4.5).
 `main()` allocates two surfaces at display size:
 
 ```c
-screen.px = calloc(w*h, 4);   scene = screen;   scene.px = calloc(w*h, 4);
+screen.px = calloc((size_t)screen.w * screen.h, 4);
+scene = screen;
+scene.px = calloc((size_t)screen.w * screen.h, 4);
 ```
 
 * `scene` is the compose target: `draw_desktop(&scene, &themes[theme_index])`.
@@ -204,22 +207,20 @@ never has to be erased. At 1280×800 the pair costs 2 × 4.096 MB.
 ### 2.4 Full recompose on change
 
 There is no damage tracking. Every loop sets `dirty` for any of: a click that a
-window, the eye or the launcher handled, mouse motion (`mouse_dx || mouse_dy`),
-a key that opens or closes a window, moves the launcher selection or changes the
-theme, a changed wall-clock second, terminal output (`term_pump()` returning a
-positive byte count), a resize or a snap, a click on a window title that
-maximises it, a client that sent `FRAME` (`want_frame`), and — while it lasts —
-the eye blink. When `dirty` is set, the entire frame is rebuilt and presented,
-then `dirty = 0`. The loop ends with `poll(…, 16)` ms, which is the only pacing —
-there is no vsync and no partial redraw.
+window, the taskbar, the eye or the launcher handled, mouse motion
+(`mouse_dx || mouse_dy`), a key that opens or closes a window, moves the launcher
+selection or changes the theme, a changed wall-clock second, terminal output
+(`term_pump()` returning a positive byte count), a resize or a snap, a click on a
+window title that maximises it, a client that sent `FRAME` (`want_frame`), an
+animated wallpaper (every ≥ 0.08 s — §2.10), and — while it lasts — the eye blink.
+When `dirty` is set, the entire frame is rebuilt and presented, then `dirty = 0`.
+The loop ends with `poll(…, 16)` ms, which is the only pacing — there is no vsync
+and no partial redraw.
 
 `draw_desktop()` composes in this order:
 
-1. Background: `gfx_gradient` from `bg_top` to `bg_bottom`, then three
-   `gfx_glow` calls (top-left, right, bottom) using the theme's `glow`/`accent`
-   and `glow_strength`. (`src/wallpaper.c` holds four procedural wallpapers that
-   also paint a background from the `Theme`; nothing calls it yet — see
-   *Known rough edges*.)
+1. Background: `wallpaper_draw(s, th, wall_index, now_sec() - wall_t0)` (§2.10),
+   which repaints the whole surface from the theme.
 2. Top bar, `topbar_h()` = `ui_px(34)`: `gfx_blur_region` over the bar (radius
    `18 * blur`), then `surf_blend(…, color_alpha(th->panel, 0.55f))` — the panel
    colour at 55 % of *its own* alpha, which works out at ≈30 % opacity with
@@ -401,7 +402,40 @@ Not everything scales, and the code is explicit about it: the traffic-light dots
 (10 px at `+14/+32/+50`), the eye (§3.10, a 30×28 hit box), the 18 px resize
 corner, the 22 px gap between the taskbar and the screen edge, and the fixed
 offsets inside the lock panel stay put; only the bands that hold text follow
-`ui_px()`. See *Known rough edges* for the two places where that is visible.
+`ui_px()`. See *Known rough edges* for the places where that is visible.
+
+### 2.10 Wallpapers (`src/wallpaper.c`, `src/wallpaper.h`)
+
+`draw_desktop()` starts every frame with
+`wallpaper_draw(s, th, wall_index, now_sec() - wall_t0)`. A wallpaper is a pure
+function of the `Theme`, an index and (for the animated ones) a time in seconds;
+nothing in `wallpaper.c` touches the filesystem or `/proc`. That is what lets a
+static wallpaper cost exactly one paint and an animated one cost a paint per
+frame, with no state to keep.
+
+| index | name | animated | what it paints |
+|---|---|---|---|
+| 0 | Dusk | no | `bg_top` → `bg_bottom` gradient plus the three soft glows the desktop used to draw itself |
+| 1 | Mesh | no | four corner colours (each a mix of the theme background with one of its light sources) bilinearly blended, plus a soft oval vignette |
+| 2 | Waves | yes | layered sine bands drifting sideways |
+| 3 | Orbits | yes | rings and discs orbiting the centre |
+
+Every colour is derived from `th` — `bg_top`, `bg_bottom`, `glow`, `accent`,
+`text`, `panel` and `glow_strength` — so any wallpaper works with any theme
+instead of assuming one palette. Dusk is deliberately the original background:
+same three lights, same positions, same strengths.
+
+The index comes from `/etc/mystic/wallpaper` at startup: `main()` reads the first
+line, `wallpaper_from_name()` matches it case-insensitively (ignoring spaces and a
+stray `\r`), and an unknown name leaves the default of 0. `wall_index`, `wall_t0`
+and `wall_last` are statics in `main.c`; `wallpaper_animated()` decides whether
+the loop forces a repaint, and it does so at most every 0.08 s so a still
+wallpaper never keeps the CPU awake. `wallpaper_draw()` clamps an out-of-range
+index to 0 and fills black if the theme is missing, so the screen can never be
+left unpainted.
+
+The shipped `stage/etc/mystic/wallpaper` says `Orbits`, so the desktop animates
+out of the box.
 
 ---
 
@@ -409,37 +443,45 @@ offsets inside the lock panel stay put; only the bands that hold text follow
 
 ### 3.1 State
 
+Abridged from `src/main.c` (the launcher and lock-screen statics are omitted):
+
 ```c
+/* ------------------------------------------------------------ windows */
 enum { WIN_TERM = 0, WIN_APP, WIN_CLIENT };
 
 typedef struct {
     int   used;
-    int   kind;          /* WIN_TERM, WIN_APP or WIN_CLIENT */
+    int   kind;
     char  title[64];
-    int   x, y, w, h;    /* screen rectangle, including the title bar */
-    App  *app;           /* WIN_APP */
-    Term *term;          /* WIN_TERM */
+    int   x, y, w, h;
+    App  *app;
+    Term *term;
     int   client;        /* index into clients[] when kind == WIN_CLIENT */
-    int   hidden;        /* minimised: alive, not drawn, not hit-tested */
-    int   maxed;         /* maximised by a double click */
+    int   hidden;        /* minimised: still alive, not drawn, not hit-tested */
+    int   maxed;         /* maximised by double-click */
     int   restore_x, restore_y, restore_w, restore_h;
-    int   z;             /* larger = in front */
+    int   z;
 } Window;
 
-static Window wins[MAX_WINDOWS];   /* MAX_WINDOWS == 10 */
+static Window wins[MAX_WINDOWS];
 static int    z_top;
 static int    drag_win = -1, drag_dx, drag_dy;
 static int    resize_win = -1;
 
-static WmClient clients[WM_MAX_CLIENTS];   /* 8, from src/ipc.h */
-static WmApp   bundles[WM_MAX_APPS];       /* 32, scanned once at startup */
+static WmClient clients[WM_MAX_CLIENTS];
+static WmApp   bundles[WM_MAX_APPS];
 ```
+
+`MAX_WINDOWS` is 10, `WM_MAX_CLIENTS` 8 and `WM_MAX_APPS` 32; the last two come
+from `src/ipc.h`. The launcher (`launcher_open`, `launcher_sel`), the starting
+cursor position for the pointer (`mouse_prev`) and the wallpaper state
+(`wall_index`, `wall_t0`, `wall_last`) are further file statics.
+
+### 3.2 Z-order
 
 `z` is a monotonic counter, not an index: `win_focus()` does `w->z = ++z_top`.
 No list is renumbered, and closing a window needs no fix-up because every
 comparison is relative.
-
-### 3.2 Z-order
 
 * `win_top()` — linear scan for the maximum `z` **among non-minimised windows**;
   used for the top-bar title, for keyboard routing and for Esc.
@@ -467,7 +509,8 @@ window behind.
 
 External clients do not go through `win_open()`: the frame loop binds a free
 `Window` to a `WmClient` as soon as the client has a buffer, sized
-`cl->w + 2 × cl->h + 42` (§4.5).
+`cl->w + 2 × (cl->h + title_h() + 2)` (§4.5), so the client's pixels get exactly
+the content rectangle the compositor will hand them at any text scale.
 
 `win_close()` calls `term_destroy()` (which closes the pty, hangs the shell up,
 reaps it and frees the grid plus the 600-line scrollback), `app_free()` (which
@@ -483,33 +526,37 @@ and any shell that exited while nobody was looking.
 `handle_click()` runs on the press edge (`input.clicked & 1`) and tests in this
 order:
 
-1. **Start button.** The eye's hit box (`EYE_HIT_X/Y/W/H`, fixed at 4,3,30,28) is
-   checked before anything else: a press there starts the blink and toggles the
-   launcher, whatever is underneath.
-2. **Launcher, if it is open.** A press inside a tile opens that app (or launches
+1. **Taskbar.** `taskbar_click()` runs first, because the taskbar is drawn above
+the windows: a press in the bar over a tile restores and focuses that window if
+it is minimised, minimises it if it is already the focused (top) window, and
+otherwise just focuses it. Without this order a window dragged over the bar
+swallowed its clicks.
+2. **Start button.** The eye's hit box (`EYE_HIT_X/Y/W/H`, fixed at 4,3,30,28) is
+   checked next: a press there starts the blink and toggles the launcher,
+   whatever is underneath.
+3. **Launcher, if it is open.** A press inside a tile opens that app (or launches
    that bundle) and closes the launcher; a press anywhere else just closes the
    launcher. Nothing else is considered while it is open.
-3. **Window body.** The topmost non-minimised window whose rectangle contains the
+4. **Window body.** The topmost non-minimised window whose rectangle contains the
    pointer wins (max `z`). It is focused first, so clicking anywhere raises.
-4. **Close dot.** Local `13 <= ly < 27` and `14 <= lx < 24` — the red circle —
+5. **Close dot.** Local `13 <= ly < 27` and `14 <= lx < 24` — the red circle —
    calls `win_close()`. The hit box is the dot itself, not the whole title strip.
-5. **Minimise dot.** The same rows, `32 <= lx < 42` — the yellow circle — sets
+6. **Minimise dot.** The same rows, `32 <= lx < 42` — the yellow circle — sets
    `hidden = 1`.
-6. **Resize grip.** `lx >= w-18 && ly >= h-18` sets `resize_win` to the slot index.
-7. **Double-click on the title bar.** `ly < title_h()` and `input.clicked2`
+7. **Resize grip.** `lx >= w-18 && ly >= h-18` sets `resize_win` to the slot index.
+8. **Double-click on the title bar.** `ly < title_h()` and `input.clicked2`
    toggles maximise. The press that carries `clicked2` records `restore_*` and
-   sets the window to `(0, 34, disp.w, disp.h-34-90)`; the next one restores the
-   saved rectangle. An in-desktop app gets `vt->resize()` here, so an app that
-   can reflow does; a client window is only moved and resized (no `RESIZE` is
-   sent from this path, so its buffer keeps its old size and the blit clips).
-8. **Title bar.** `ly < title_h()` sets `drag_win` and records the grab offset
+   sets the window to `(0, topbar_h(), disp.w, disp.h - topbar_h() - reserved)`,
+   where `reserved` is the taskbar band plus `ui_px(12)` when the bar is showing
+   and `ui_px(16)` when it is not; the next double click restores the saved
+   rectangle. An in-desktop app gets `vt->resize()` here, so an app that can
+   reflow does; a client window is only moved and resized (no `RESIZE` is sent
+   from this path, so its buffer keeps its size and the blit clips).
+9. **Title bar.** `ly < title_h()` sets `drag_win` and records the grab offset
    (`drag_dx`, `drag_dy`) in window-local coordinates.
-9. **Body click.** `app_click(a, lx-1, ly-tb-1, buttons)` — the same content
-   origin (`x+1, y+tb+1`) the compositor draws at, in window-local coordinates —
-   or, for a client window, `wms_notify_mouse()`.
-10. **Taskbar.** If no window was hit, a press in the taskbar band over a tile
-    restores and focuses that window if it is minimised, minimises it if it is
-    already the focused (top) window, and otherwise just focuses it.
+10. **Body click.** `app_click(a, lx-1, ly-tb-1, buttons)` — the same content
+    origin (`x+1, y+tb+1`) the compositor draws at, in window-local coordinates —
+    or, for a client window, `wms_notify_mouse()`.
 
 There is no separate "click-through" or "accepts input" flag; a window is a
 rectangle and the topmost one at the pointer always gets the event, except that a
@@ -526,15 +573,18 @@ streams:
   immobile drag does not dirty the frame.
 * **Resize** — `nw = mouse_x - w->x + 1`, `nh = mouse_y - w->y + 1`, floor
   280 × 160, then `vt->resize(a, w-2, h-42)` for an in-desktop app or
-  `wms_notify_resize()` for a client. Terminal windows are not resized: the pty's
-  `winsize` is set once in `term_create`, and `term_draw` simply draws at most
-  `t->cols` × `t->rows` cells inside whatever rectangle it is given.
+  `wms_notify_resize()` for a client. `term.c` does have `term_resize()` /
+  `term_resize_px()`, which rebuild the grid and scrollback at a new size and
+  `ioctl(TIOCSWINSZ)` the pty, but the window manager does not call them yet, so
+  a terminal keeps the column count it was opened with.
 
 Releasing button 1 clears both (`drag_win = resize_win = -1`). A release also
 snaps the dragged window when it ended near a screen edge: top edge within 6 px of
 the `topbar_h()` bar → full width (`x=0, y=bar, w=disp.w, h=disp.h-bar-90`);
-`x <= 8` → left half; `x+w >= disp.w-8` → right half. The snap goes through
-`vt->resize()` like a manual resize, so an app that can reflow does.
+`x <= 8` → left half; `x+w >= disp.w-8` → right half. The snap calls
+`vt->resize()` for an in-desktop app, so an app that can reflow does; a client
+window is only moved and given a new rectangle here (only the corner grip sends
+`RESIZE`), so its buffer keeps the size it asked for and the blit clips.
 
 ### 3.6 Keyboard and the clock tick
 
@@ -550,9 +600,14 @@ handled before the focused window:
 | arrows with the launcher open | move `launcher_sel` by ±1 / ±3 with wrap-around at the ends |
 | Enter (evdev 28) with the launcher open | open/launch the selected tile |
 | evdev 1 (Esc) with the launcher open | close the launcher (and nothing else) |
-| Alt+Tab (evdev 15) | focus the window with the highest `z` other than the current top |
+| Alt+Tab (evdev 15) | focus the window with the highest `z` other than the current top, skipping minimised ones |
 | evdev 59…63 (F1…F5) | open terminal, files, settings, monitor, notes |
 | evdev 1 (Esc) | `win_close(win_top())` |
+
+While the launcher is open it is modal: after Super/Esc/arrows/Enter are handled,
+any other key is swallowed (`dirty = 1; continue;`) instead of falling through to
+the window behind, and printable text is delivered to nobody, because the
+delivery step starts from `launcher_open ? NULL : win_top()`.
 
 Terminal windows get `key_bytes()` (arrows/Home/End/PgUp/PgDn/Delete → xterm escape
 sequences), then the printable `text`; Shift+PgUp/PgDn scroll the history by 8
@@ -700,17 +755,19 @@ Geometry: width `n*dock_isz() + (n-1)*dock_gap() + 2*dock_pad()`, height
 corner radius `0.32 * height`.
 
 Magnification: when the pointer is within 110 px above (or 20 px below) the bar,
-each tile's size is `2*S` scaled by `1 + 0.45*exp(-(d/62)²/2)` where `d` is the
-horizontal distance from the pointer to that tile's centre, and the tile grows
-upwards from its baseline. The Gaussian, not a linear ramp, is what makes the
-neighbouring tiles rise a little too.
+each tile is drawn at `dock_isz() * scale` with
+`scale = 1 + 0.45*exp(-(d/62)²/2)`, where `d` is the horizontal distance from
+the pointer to that tile's centre, and the grown tile is anchored towards the
+top of the bar. The Gaussian, not a linear ramp, is what makes the neighbouring
+tiles rise a little too.
 
 Each tile draws the icon for its window's kind — `icon_for_window()` maps a
 terminal to `icon_terminal()`, an in-desktop app to its `vt->id`
 (`files`, `settings`, `monitor`, `notes`, `store`, `calc`) and a client window to
-`clients[i].id` (`clock`, `paint`, `life`, `mandel`, `sysmon`) — with a hover
-tint, the accent colour for the focused window, a 45 %-alpha foreground for a
-minimised one, a 14×3 accent pill under the focused one, and a tooltip with the
+`clients[i].id`; `icon_for_id()` has a drawing for `clock`, `paint`, `life`,
+`mandel` and `sysmon`, and falls back to `icon_gear()` for anything else — with a
+hover tint, the accent colour for the focused window, a 45 %-alpha foreground for
+a minimised one, a 14×3 accent pill under the focused one, and a tooltip with the
 window title over the hovered one.
 
 ---
@@ -721,8 +778,8 @@ window title over the hovered one.
 
 ```c
 typedef struct {
-    const char *id;      /* matched against the launcher / F-key id */
-    const char *title;   /* window title */
+    const char *id;
+    const char *title;
     void (*init)(App *a, int w, int h);
     void (*draw)(App *a, Surface *s, int x, int y, int w, int h, const Theme *th);
     void (*key)(App *a, const char *bytes, int n);
@@ -731,8 +788,14 @@ typedef struct {
     void (*free)(App *a);
 } AppVT;
 
-struct App { const AppVT *vt; void *state; };
+struct App {
+    const AppVT *vt;
+    void *state;      /* app private data */
+};
 ```
+
+`id` is what the launcher and the F-keys name and what `app_new()` looks up;
+`title` is the window title. The rest are the callbacks listed in §4.2.
 
 An app file exports exactly one symbol, e.g. `const AppVT app_vt_files`
 (`.id = "files"`), and keeps all of its data in `a->state` (allocated in `init`,
@@ -747,8 +810,11 @@ released in `free`).
     &app_vt_files,
 #endif
     …
-    &app_vt_sysinfo,     /* always built */
+    &app_vt_sysinfo,
 ```
+
+`sysinfo` has no `#ifdef`: it is always built, and it is the reference
+implementation of the table.
 
 `tools/build-desktop.sh` walks `for app in files settings monitor notes store
 calc`, adds `-DWITH_<NAME>` and the source file for each one that exists, and
@@ -773,9 +839,8 @@ and nothing breaks).
 Registered today: `files`, `settings`, `monitor`, `notes`, `store` (`"Apps"`, a
 browser for the installed bundles) and `calc` (`"Calculator"`, a recursive-descent
 expression evaluator), plus `sysinfo`, which is the reference app that shows the
-smallest useful implementation of the table. The launcher shows the first six
-individually and `sysinfo` as "System"; F1…F5 open terminal, files, settings,
-monitor and notes.
+smallest useful implementation of the table. The launcher lists all seven plus one
+tile per installed bundle; F1…F5 open terminal, files, settings, monitor and notes.
 
 ### 4.3 Why an in-desktop app cannot reach into the desktop
 
@@ -816,9 +881,9 @@ No app invents numbers:
   `strerror(errno)` when `opendir` fails. Its sort order, breadcrumbs and
   toolbar/row geometry are all derived from the fonts it draws with.
 * `notes` reads and writes `/root/notes.txt` with `fsync` (§5.3).
-* `settings` scans `/etc/mystic/themes`, verifies each file through
-  `theme_load()`, and writes the chosen theme's `name` to
-  `/etc/mystic/current-theme`.
+* `settings` scans `/etc/mystic/themes` with `readdir`/`fopen`, reads the
+  `name =` line of each `.theme` file (falling back to the file name when the
+  line is missing) and writes the chosen `name` to `/etc/mystic/current-theme`.
 * `store` reads `/usr/share/mystic/apps` with `readdir`, parses each `manifest`
   the way `wmsrv.c` does (`name`/`desc`/`exec`, one `=` per line) and stats the
   real payload file for the size it shows. It never forks; Enter writes the
@@ -866,7 +931,7 @@ a `WmApp { id, name, desc, exe }`, sorted by id so the launcher is stable. Becau
 it runs once, a bundle packaged while the desktop is running appears after the
 next boot.
 
-`wms_launch()` is the only place that starts a process for an app: `fork()`,
+`wms_launch()` is the only place that starts an **external app**: `fork()`,
 `setenv("MYSTIC_SOCKET")`/`setenv("MYSTIC_APP_ID")`, `execl(WM_APP_DIR/<id>/<exe>)`.
 It is called from three places — a launcher tile, the Enter key in the launcher,
 and the `/run/mystic/launch.request` polling in §3.6 — which is how the in-desktop
@@ -934,20 +999,24 @@ released when the machine goes down — there is nothing to clean up on the disk
 
 ### 5.3 fsync is the difference between saving and losing
 
-`save()` in `src/apps/notes.c`:
+`save()` in `src/apps/notes.c` never writes the target in place. It creates
+`/root/notes.txt.tmp` in the same directory
+(`open(O_WRONLY | O_CREAT | O_TRUNC, 0600)`), writes the whole buffer in a loop
+that handles short writes and `EINTR`, then `fsync(fd)` (a failure aborts the
+save, unlinks the temp and reports the real errno), then `close(fd)` — which is
+also where a deferred write error surfaces — and finally
+`rename(tmp, NOTES_PATH)`.
 
-```c
-FILE *f = fopen("/root/notes.txt", "w");
-fwrite(n->buf, 1, n->len, f);
-fflush(f);
-fsync(fileno(f));     /* without this the bytes sit in the page cache */
-fclose(f);
-```
+`write()` only reaches the kernel's page cache; with `-no-reboot` and a VM that is
+killed rather than shut down, unsynced bytes are simply gone. `fsync` is what
+forces ext4 to hand them to the virtio device. `rename()` inside one directory is
+atomic, so a failure at any step leaves the previous `notes.txt` intact instead of
+a half-written file, and the buffer stays dirty with the real `errno` in `err[]`.
+The same reasoning is why probe mode runs `sync` before `poweroff -f`.
 
-`fwrite` only reaches the kernel, and `fflush` only reaches the kernel's page
-cache; with `-no-reboot` and a VM that is killed rather than shut down, unsynced
-bytes are simply gone. `fsync` is what forces ext4 to hand them to the virtio
-device. The same reasoning is why probe mode runs `sync` before `poweroff -f`.
+The buffer holds at most `NOTES_MAX - 1` (65535) bytes. If the file on disk is
+larger than what was loaded, writing the buffer back would truncate it, so the app
+states the two real sizes and asks for a second Ctrl+S before it overwrites.
 
 Persistence is observable: probe mode increments `/root/boots.txt`, creates
 `/root/permtest` with mode 600 and ownership 1000:1000 and prints what
@@ -981,7 +1050,7 @@ zig as a cross-compiler:
 ```
 zig cc -target x86_64-linux-musl -Os -static -fno-sanitize=all -Isrc \
        -Wall -Wextra -Wno-unused-parameter \
-       -o build/mystic-desktop <sources> -D<app>… -lm -lutil
+       -o build/mystic-desktop $SRC $DEFS -lm -lutil
 ```
 
 Sources: the eleven core files — `main.c`, `apps.c`, `term.c`, `sha256.c`,
@@ -1134,7 +1203,7 @@ keeps the `.ttf` files (and their OFL licence) as the source of the copies that
 | Seven in-desktop apps (files, settings, monitor, notes, store, calc, sysinfo) | ours | `src/apps/*.c` |
 | Display protocol: messages, shm, fork/exec, bundle scan | ours | `src/ipc.h`, `src/wmsrv.c` |
 | Client SDK for external apps | ours | `src/client/mystic_client.c`, `src/client/mystic_client.h` |
-| External apps (clock, files, life, mandel, paint, sysmon) | ours | `src/client/apps/*.c` |
+| External apps, one process each | ours | `src/client/apps/*.c` |
 | Procedural wallpapers (not yet wired into the desktop) | ours | `src/wallpaper.c`, `src/wallpaper.h` |
 | SHA-256, iterated salted password hash, password-file check | ours | `src/sha256.c` |
 | PID 1: mounts, module loading, network, disk setup, fbcon unbind, desktop exec | ours | `stage/init` |
@@ -1157,10 +1226,10 @@ keeps the `.ttf` files (and their OFL licence) as the source of the copies that
 These are behaviours of the current tree, not intentions:
 
 * `title_h()` is `ui_px(40)` and the draw rectangle uses it, but `win_open()`
-  passes an app `h-42` and the drag/snap/maximise paths call `vt->resize(w-2,
-  h-42)` with a literal 40. At `scale = 1.0` that matches; at 1.2 an app is told
-  it has 8 px more height than is drawn (the last rows are clipped), and at 0.8 it
-  is told it has 8 px less (a strip is left empty).
+  passes an app `h-42`, and the drag/snap/maximise paths call
+  `vt->resize(w-2, h-42)` — which is `title_h() + 2` only at scale 1.0. At 1.2 an
+  app is told it has 8 px more height than is drawn (its last rows are clipped);
+  at 0.8 it is told it has 8 px less (a strip is left empty).
 * The same literals show up around the top bar: the drag clamp is `y >= 34` and a
   maximised window is placed at `y = 34`, while the bar itself is `topbar_h()`.
   Above scale 1.0 a maximised window covers the bottom of the top bar.

@@ -9,6 +9,7 @@
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +24,7 @@ typedef struct {
     float advance;
     u8   *bitmap;
     int   used;
+    unsigned last_use;   /* Font.use_clock value of the last hit: the LRU key */
 } Glyph;
 
 struct Font {
@@ -33,6 +35,7 @@ struct Font {
     float          scale;
     float          ascent, descent;
     Glyph          cache[MAX_GLYPHS];
+    unsigned       use_clock;   /* monotonic per face: bumped on every access */
     struct Font   *next;
 };
 
@@ -140,18 +143,52 @@ Font *font_get(int face, float size) {
     return f;
 }
 
+/* One monotonic counter per face, bumped on every cache access. It only ever
+ * orders glyphs against each other, so on the 4-billionth access - where an
+ * unsigned would wrap and the ordering would collapse - halving every stored
+ * stamp keeps the relative order and buys another 4 billion. */
+static unsigned next_use(Font *f) {
+    if (f->use_clock >= UINT_MAX - 1) {
+        for (int i = 0; i < MAX_GLYPHS; i++) f->cache[i].last_use >>= 1;
+        f->use_clock = UINT_MAX / 2;
+    }
+    return ++f->use_clock;
+}
+
 static Glyph *glyph_get(Font *f, int cp) {
-    int slot = cp % MAX_GLYPHS;
-    for (int i = 0; i < MAX_GLYPHS; i++) {
-        Glyph *g = &f->cache[(slot + i) % MAX_GLYPHS];
-        if (g->used) {
-            if (g->cp == cp) return g;
+    const unsigned start = (unsigned)cp % MAX_GLYPHS;
+    Glyph *empty = NULL;
+
+    /* The table is open-addressed, but eviction can free a slot in the middle
+     * of another codepoint's probe run, so a lookup must never stop at the
+     * first empty slot: it walks the table and compares codepoints, which is
+     * always correct wherever the entry ended up. A hit stops at the match,
+     * so the common path stays short; only a miss pays for the full walk. */
+    for (unsigned i = 0; i < MAX_GLYPHS; i++) {
+        Glyph *g = &f->cache[(start + i) % MAX_GLYPHS];
+        if (!g->used) {
+            if (!empty) empty = g;
             continue;
         }
-        glyph_rasterise(f, g, cp);
-        return g;
+        if (g->cp == cp) { g->last_use = next_use(f); return g; }
     }
-    return NULL;
+
+    Glyph *slot = empty;
+    if (!slot) {
+        /* Full: evict the least recently used glyph and hand its slot to the
+         * new one. Without this the 2048 entries were permanent, so every
+         * codepoint first seen after the table filled stayed invisible. */
+        slot = &f->cache[0];
+        for (int i = 1; i < MAX_GLYPHS; i++)
+            if (f->cache[i].last_use < slot->last_use) slot = &f->cache[i];
+        free(slot->bitmap);      /* the evicted bitmap must not leak */
+        slot->bitmap = NULL;
+        slot->used = 0;
+    }
+
+    glyph_rasterise(f, slot, cp);
+    slot->last_use = next_use(f);
+    return slot;
 }
 
 static int utf8_next(const unsigned char *p, int *len) {
