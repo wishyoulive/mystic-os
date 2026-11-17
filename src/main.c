@@ -46,6 +46,8 @@ typedef struct {
     Term *term;
     int   client;        /* index into clients[] when kind == WIN_CLIENT */
     int   hidden;        /* minimised: still alive, not drawn, not hit-tested */
+    int   maxed;         /* maximised by double-click */
+    int   restore_x, restore_y, restore_w, restore_h;
     int   z;
 } Window;
 
@@ -753,6 +755,24 @@ static int handle_click(void) {
             resize_win = (int)(hit - wins);
             return 1;
         }
+        /* double-click on the title bar toggles maximise */
+        if (ly < tb && input.clicked2) {
+            if (!hit->maxed) {
+                hit->restore_x = hit->x; hit->restore_y = hit->y;
+                hit->restore_w = hit->w; hit->restore_h = hit->h;
+                hit->x = 0; hit->y = 34;
+                hit->w = disp.w; hit->h = disp.h - 34 - 90;
+                hit->maxed = 1;
+            } else {
+                hit->x = hit->restore_x; hit->y = hit->restore_y;
+                hit->w = hit->restore_w; hit->h = hit->restore_h;
+                hit->maxed = 0;
+            }
+            if (hit->app && hit->app->vt && hit->app->vt->resize)
+                hit->app->vt->resize(hit->app, hit->w - 2, hit->h - 42);
+            return 1;
+        }
+
         /* title bar = drag */
         if (ly < tb) {
             drag_win = (int)(hit - wins);
@@ -860,6 +880,14 @@ int main(void) {
             }
             if (input.key == 14 && pin_len > 0) pin[--pin_len] = 0;   /* Backspace */
             if (input.key == 28) try_unlock();                        /* Enter */
+            if (!locked) {
+                /* The Enter that unlocked must not reach whatever window is
+                 * focused: previously it fell through and executed an empty
+                 * command in the terminal / inserted a newline in Notes. */
+                input.text_len = 0;
+                input.key = 0;
+                input.nkeys = 0;
+            }
 
             /* Redraw only when something changed. The lock screen is a
              * full-screen blur (~7 ms measured), and it used to run at 60 Hz

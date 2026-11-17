@@ -80,14 +80,19 @@ static int index_of(Files *f, const char *name) {
     return -1;
 }
 
-/* Keep the same entry selected across a reload or a re-sort. */
+/* Keep the same entry selected across a reload or a re-sort.
+ *
+ * The match is by name, never by the numeric index: after activate()
+ * changes directory the old index points at an unrelated entry in the
+ * new listing, so reusing it left the selection mid-list. When the name
+ * is not in the new listing (a real descend, or the selected dotfile
+ * being hidden) start again at row 0. */
 static void restore_selection(Files *f, const char *keep) {
     if (keep && keep[0]) {
         int i = index_of(f, keep);
         if (i >= 0) { f->sel = i; return; }
     }
-    if (f->sel < 0) f->sel = 0;
-    if (f->sel >= f->count) f->sel = f->count > 0 ? f->count - 1 : 0;
+    f->sel = 0;
 }
 
 /* ------------------------------------------------------------
@@ -445,8 +450,22 @@ static void files_click(App *a, int x, int y, int buttons) {
     int rows = row_count(f);
     if (rows < 1) return;
 
-    int row = (int)(((float)y - (float)HEAD_H) / ROW_H);
-    if (row < 0 || row >= rows) return;
+    /* Only the row band owns rows. A click above the first row - the path
+     * in the header, or the blank space under it before the rule - and a
+     * click in the footer belong to no row and must do nothing. This used
+     * to be `(int)(((float)y - HEAD_H) / ROW_H)`: C truncates a negative
+     * float toward zero, so y in [HEAD_H - ROW_H + 1, HEAD_H - 1] (here
+     * 16..29) became row 0 and the `row < 0` guard could never fire - a
+     * click on the header was treated as a click on the already-selected
+     * row 0, so `idx == f->sel` ran activate() and the browser descended
+     * into that directory. Reject the bands first, then divide a value
+     * that is known to be >= 0, so truncation and floor agree and no
+     * negative or out-of-range index can be produced. */
+    if (y < HEAD_H) return;                     /* header band */
+    if (y >= f->h - FOOT_H) return;             /* footer band */
+
+    int row = (y - HEAD_H) / (int)ROW_H;        /* y >= HEAD_H: exact */
+    if (row < 0 || row >= rows) return;         /* past the list */
     int idx = f->scroll + row;
     if (idx < 0 || idx >= f->count) return;
     if (idx == f->sel) activate(f);

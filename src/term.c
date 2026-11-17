@@ -17,11 +17,20 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 #include <pty.h>
 
 #define TERM_MAX_COLS 400
 #define TERM_MAX_ROWS 200
+
+/* No CSI parameter may exceed this. Every cursor coordinate is clamped to
+ * the screen, so a larger number can never mean anything, and capping it
+ * here keeps (cursor + delta) well inside int - no sequence can wrap. */
+#define TERM_PARAM_MAX 1000000
+/* An OSC string longer than this is abandoned. Title sequences are short,
+ * and a stream that never sends BEL/ST must not swallow output forever. */
+#define TERM_OSC_MAX 512
 
 typedef struct {
     u32 ch;
@@ -40,13 +49,23 @@ struct Term {
     int   hist_head;     /* next slot to write in hist */
     int   hist_count;    /* valid lines in hist */
     int   scroll;        /* lines scrolled back from the live screen */
-    int   cx, cy;        /* cursor */
+    int   cx, cy;        /* cursor; always inside the grid */
+    int   wrap;          /* last column printed: wrap before the next glyph */
     u8    fg, bg, bold;
 
+    /* UTF-8 decoder: bytes of a multi-byte character are accumulated here
+     * and become one cell when the sequence completes (or U+FFFD). */
+    u32   u8_cp;
+    int   u8_need;       /* continuation bytes still expected, 0 = idle */
+    u32   u8_min;        /* smallest legal codepoint for this length */
+
     /* parser state */
-    int   state;         /* 0 normal, 1 ESC, 2 CSI, 3 OSC */
+    int   state;         /* 0 normal, 1 ESC, 2 CSI, 3 OSC, 4 OSC+ESC, 5 charset */
     char  params[64];
     int   plen;
+    int   csi_priv;      /* '?', '>', '<', '=' prefix: parse, then ignore */
+    int   csi_over;      /* parameter buffer overflowed: drop the sequence */
+    int   osc_len;       /* bytes seen in the current OSC string */
 
     int   alive;
     int   dirty;
@@ -104,12 +123,40 @@ static void scroll_up(Term *t) {
 }
 
 static void newline(Term *t) {
+    t->wrap = 0;
     t->cy++;
     if (t->cy >= t->rows) { t->cy = t->rows - 1; scroll_up(t); }
 }
 
+/* The cursor is only ever moved through these two functions, so it cannot
+ * leave [0,cols) x [0,rows) no matter what a program prints. The long
+ * arithmetic and the clamp together make every move saturating. */
+static void cursor_set(Term *t, int col, int row) {
+    if (col < 0) col = 0;
+    if (col >= t->cols) col = t->cols - 1;
+    if (row < 0) row = 0;
+    if (row >= t->rows) row = t->rows - 1;
+    t->cx = col;
+    t->cy = row;
+    t->wrap = 0;
+}
+
+static void cursor_move(Term *t, int dx, int dy) {
+    long nx = (long)t->cx + (long)dx;
+    long ny = (long)t->cy + (long)dy;
+    if (nx < 0) nx = 0;
+    else if (nx >= t->cols) nx = t->cols - 1;
+    if (ny < 0) ny = 0;
+    else if (ny >= t->rows) ny = t->rows - 1;
+    t->cx = (int)nx;
+    t->cy = (int)ny;
+    t->wrap = 0;
+}
+
 static void put_char(Term *t, u32 ch) {
-    if (t->cx >= t->cols) { t->cx = 0; newline(t); }
+    /* A glyph written into the last column parks the cursor there and wraps
+     * on the next glyph rather than running past the end of the row. */
+    if (t->wrap) { t->cx = 0; newline(t); }
     Cell *c = cell_at(t, t->cx, t->cy);
     if (c) {
         c->ch = ch;
@@ -117,7 +164,26 @@ static void put_char(Term *t, u32 ch) {
         c->bg = t->bg;
         c->bold = t->bold;
     }
-    t->cx++;
+    if (t->cx + 1 < t->cols) t->cx++;
+    else                     t->wrap = 1;
+    t->dirty = 1;
+}
+
+/* RIS (ESC c) and the public term_clear_screen(): blank the screen, home the
+ * cursor, drop attributes and any half-received UTF-8 character. */
+static void screen_reset(Term *t) {
+    t->fg = 7;
+    t->bg = 0;
+    t->bold = 0;
+    t->cx = 0;
+    t->cy = 0;
+    t->wrap = 0;
+    t->u8_cp = 0;
+    t->u8_need = 0;
+    t->u8_min = 0;
+    t->scroll = 0;
+    t->wrap = 0;
+    clear_cells(t, 0, 0, t->cols - 1, t->rows - 1);
     t->dirty = 1;
 }
 

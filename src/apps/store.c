@@ -591,8 +591,22 @@ static void store_click(App *a, int x, int y, int buttons) {
     layout_of(s->h, &rows, &band, &nlines);
     if (rows < 1) return;
 
-    int row = (int)(((float)y - (float)HEAD_H) / ROW_H);
-    if (row < 0 || row >= rows) return;
+    /* Only the row band owns rows. A click above the first row - the
+     * "Apps" title, the "N bundles" count, or the rule under them - and a
+     * click in the footer or the desc band below the list belong to no row
+     * and must do nothing. This used to be `(int)(((float)y - HEAD_H) /
+     * ROW_H)`: C truncates a negative float toward zero, so y in
+     * [HEAD_H - ROW_H + 1, HEAD_H - 1] (here 11..25) became row 0 and the
+     * `row < 0` guard could never fire - one click on the word "Apps"
+     * selected the top bundle and wrote /run/mystic/launch.request, which
+     * the desktop then fork/exec'd. Reject the bands first, then divide a
+     * value that is known to be >= 0, so truncation and floor agree and no
+     * negative or out-of-range index can be produced. */
+    if (y < HEAD_H) return;                     /* header band */
+    if (y >= s->h - FOOT_H) return;             /* footer band */
+
+    int row = (y - HEAD_H) / (int)ROW_H;        /* y >= HEAD_H: exact */
+    if (row < 0 || row >= rows) return;         /* past the list / desc band */
     int idx = s->scroll + row;
     if (idx < 0 || idx >= s->count) return;
 
