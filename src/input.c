@@ -114,6 +114,26 @@ static int key_char(int code, int shift, int ctrl) {
     return ch;
 }
 
+/* Which keys may repeat. The desktop's global shortcuts (Esc closes the top
+ * window, Super toggles the launcher, F1..F5 open windows) are one-shot
+ * actions in main.c that run for every entry in keys[], so letting those
+ * repeat would close every window or open thirty terminals while a key is
+ * held - real desktops suppress autorepeat for keybindings for exactly that
+ * reason. The keys a person holds on purpose are the ones that repeat: the
+ * character keys (include space, Enter and Backspace) and the editing and
+ * navigation keys. */
+static int key_repeats(int code) {
+    if (key_to_char(code, 0) || key_to_char(code, 1)) return 1;
+    switch (code) {
+        case KEY_LEFT: case KEY_RIGHT: case KEY_UP: case KEY_DOWN:
+        case KEY_HOME: case KEY_END: case KEY_PAGEUP: case KEY_PAGEDOWN:
+        case KEY_INSERT: case KEY_DELETE:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 /* Per-frame event queues are deliberately small; app code walks them every
  * frame. A burst larger than the buffer is therefore possible (a key held
  * down, a chord of arrows, a pasted-on-the-keyboard run of digits), and when
@@ -187,6 +207,7 @@ static void handle_event(Input *in, struct input_event *ev, int *shift, int *ctr
             } else {
                 /* evdev values: 1 press, 2 kernel autorepeat (already
                  * rate-limited by the input device), 0 release. */
+                if (ev->value == 2 && !key_repeats(ev->code)) break;
                 if (ev->value == 1 || ev->value == 2) {
                     in->key = ev->code;
                     push_key(in->keys, &in->nkeys,

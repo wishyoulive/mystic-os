@@ -12,7 +12,7 @@
  *
  *  Every band is derived from the font that draws in it (see
  *  layout_build()), so the global text scale - applied inside
- *  font_get(), src/font.c:125 - grows the toolbar, the breadcrumb
+ *  font_get() in src/font.c - grows the toolbar, the breadcrumb
  *  line, the rows and the footer together. layout_build() is the one
  *  and only source of those numbers: files_draw() paints with it and
  *  files_click() hit-tests with it, so a click always lands on the row
@@ -20,16 +20,17 @@
  *
  *  ICONS are drawn geometry, in the same style as the desktop
  *  launcher's icon_folder()/icon_pencil() in src/main.c - no images:
- *  a folder with a tab, a page with a folded corner, and a mark on the
- *  page for the kind of file (a dot for .theme, text rules for .conf,
- *  a play triangle for an executable, a mountain and a sun for an
- *  image). The kind is decided from the real name and st_mode.
+ *  a 20x20 (at 100% scale, ui_px() grows it) folder with a tab, a page
+ *  with a folded corner, and a mark on the page for the kind of file
+ *  (a dot for .theme, text rules for .conf, a play triangle for an
+ *  executable, a mountain and a sun for an image). The kind is decided
+ *  from the real name and st_mode.
  *
- *  The listing is opendir()/readdir()/lstat(), the byte and inode
- *  counts are the real st_size/st_mtime, the free-space figure is
- *  statvfs() on the directory being shown, and a symlink that points
- *  at a directory resolves through stat() so it opens like one. If
- *  opendir() fails the real strerror(errno) is drawn instead of rows.
+ *  The listing is opendir()/readdir()/lstat(), the size and stamp are
+ *  the real st_size/st_mtime, the free-space figure is statvfs() on the
+ *  directory being shown, and a symlink that points at a directory
+ *  resolves through stat() so it opens like one. If opendir() fails the
+ *  real strerror(errno) is drawn instead of rows.
  *
  *  KEYS   j/k, Up/Down   move          Enter      open (dir descends,
  *         Home/End       first/last               a file says so)
@@ -202,7 +203,11 @@ static void fmt_mtime(long long mtime, char *out, size_t n) {
         snprintf(out, n, "--");
 }
 
-/* draw inside maxw pixels, ending in ".." when it has to be cut */
+/* draw inside maxw pixels, ending in ".." when it has to be cut.
+ * The half-pixel tolerance matters: a column width is computed as
+ * (x0 + width) - x0, which in floating point can come out a few
+ * thousandths of a pixel smaller than the width it started from - enough
+ * to chop the last letter off a label that fits perfectly. */
 static void draw_clipped(Surface *s, Font *f, float x, float y, float maxw,
                          const char *text, u32 color) {
     if (!f || !text || !text[0] || maxw < 4.0f) return;
@@ -211,7 +216,7 @@ static void draw_clipped(Surface *s, Font *f, float x, float y, float maxw,
     if (len >= sizeof(buf) - 3) len = sizeof(buf) - 3;
     memcpy(buf, text, len);
     buf[len] = 0;
-    if (font_width(f, buf) <= maxw) { font_draw(s, f, x, y, buf, color); return; }
+    if (font_width(f, buf) <= maxw + 0.5f) { font_draw(s, f, x, y, buf, color); return; }
     float budget = maxw - font_width(f, "..");
     size_t cut = len;
     while (cut > 0 && font_width(f, buf) > budget) buf[--cut] = 0;
@@ -827,10 +832,15 @@ static void draw_crumbs(Files *f, Surface *s, int x, int y, int w,
         if (room > cr[i].x1 - cr[i].x0) room = cr[i].x1 - cr[i].x0;
         draw_clipped(s, L->fc, (float)x + cr[i].x0, ty, room, text, col);
 
-        if (i + 1 < n)
-            draw_chevron(s, (float)x + cr[i].x1 + (float)ui_px(2),
-                         (float)cy + ((float)L->crumb_h - (float)ui_px(9)) * 0.5f,
-                         (float)ui_px(9), color_alpha(th->text, 0.30f));
+        if (i + 1 < n) {
+            /* the arrow lives inside the gap reserved for it (ui_px(9)),
+             * with a pixel of air on either side so it never touches the
+             * segment that follows */
+            float sz = (float)(ui_px(9) - 3);
+            draw_chevron(s, (float)x + cr[i].x1 + (float)ui_px(1),
+                         (float)cy + ((float)L->crumb_h - sz) * 0.5f, sz,
+                         color_alpha(th->text, 0.30f));
+        }
     }
     if (L->crumb_h > 0)
         surf_blend(s, x + L->pad, cy + L->crumb_h - 1, w - 2 * L->pad, 1,
@@ -948,11 +958,11 @@ static void draw_footer(Files *f, Surface *s, int x, int y, int w,
     } else if (f->sel >= 0 && f->sel < f->count) {
         Entry *e = &f->ent[f->sel];
         if (e->is_dir)
-            snprintf(info, sizeof(info), "%s/  folder", e->name);
+            snprintf(info, sizeof(info), "%s/  folder%s", e->name, e->is_link ? " link" : "");
         else {
             char sz[24];
             human_size(e->size, sz, sizeof(sz));
-            snprintf(info, sizeof(info), "%s  %s", e->name, sz);
+            snprintf(info, sizeof(info), "%s%s  %s", e->name, e->is_link ? " -> link" : "", sz);
         }
     } else {
         info[0] = 0;

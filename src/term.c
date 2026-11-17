@@ -701,6 +701,7 @@ void term_resize(Term *t, int cols, int rows) {
     t->hist = hist;
     t->cols = cols;
     t->rows = rows;
+    if (!t->hist) t->hist_count = 0;   /* no ring: nothing may index it */
 
     if (t->cx < 0) t->cx = 0;
     if (t->cx >= cols) t->cx = cols - 1;

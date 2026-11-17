@@ -17,12 +17,15 @@
 
 #define MAX_GLYPHS 2048
 
+/* 40 bytes exactly: the pointer first so the ints after it pack without
+ * padding. 2048 of these are walked on every cache probe, so the layout is
+ * worth this much. */
 typedef struct {
+    u8   *bitmap;
     int   cp;
     int   w, h;
     int   xoff, yoff;
     float advance;
-    u8   *bitmap;
     int   used;
     unsigned last_use;   /* Font.use_clock value of the last hit: the LRU key */
 } Glyph;
