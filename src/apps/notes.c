@@ -7,7 +7,9 @@
  *  The buffer is a fixed 64 KB block: no allocation ever grows
  *  with the file. On top of that buffer:
  *
- *    - a line-number gutter, numbered by counting '\n';
+ *    - a line-number gutter, numbered by counting '\n', right-aligned in a
+ *      column whose width is the real width of the digits at the current
+ *      text scale, sharing the text's baseline;
  *    - a scroll window (first visible line, plus the first visible
  *      wrapped row inside that line) that keeps the caret on screen;
  *    - arrow / PageUp / PageDown / Home / End editing, driven either
@@ -15,6 +17,16 @@
  *      forward text, by the Ctrl chords;
  *    - a footer that reports the real st_size of the file next to the
  *      buffer length and says "unsaved" when the two disagree.
+ *
+ *  Every position in this file comes from grid_of(), which measures the two
+ *  fonts and ui_px() once per frame: one page margin, one gutter, one gap and
+ *  one row height, shared by the painter, the click handler, the scroll
+ *  window and the footer. A character's ink is centred in its row band. The
+ *  caret is a bar exactly one ink box tall, drawn after every glyph and in the
+ *  gap that ends where the next glyph's pen starts, so it is neither under a
+ *  letter nor on top of one - it sits between two characters at any text
+ *  scale. The wheel scrolls the view three lines a notch without moving the
+ *  caret.
  *
  *  Ctrl+S writes the whole 64 KB buffer into /root/notes.txt.tmp,
  *  fsyncs that file, closes it and rename()s it over /root/notes.txt.
@@ -40,26 +52,14 @@
 #include <sys/stat.h>
 
 #define NOTES_MAX   65536
-#define TOP_PAD     6      /* space above the first text row        */
-#define TEXT_GAP    8      /* gap between gutter rule and glyphs    */
-#define GUTTER_PAD  6      /* gutter's own left inset               */
 #define ERR_COLOR   0xFFFF7B72u  /* footer text when a save failed   */
 
 /* ------------------------------------------------------------
- *  Vertical metrics, derived from the fonts at draw time.
- *
- *  LINE_H and FOOT_H used to be fixed here. font_get() is where the
- *  global text scale is applied (src/font.c:125), so a fixed row
- *  stride would print each line of the file on top of the last one and
- *  a fixed footer would cut the status line. Instead one text row is
- *  one font line box plus 2 px of leading, and the footer band is its
- *  own line box plus the rule and the small gap above the bottom edge.
- *  notes_draw(), notes_click(), ensure_visible() and caret_page() all
- *  go through line_h_of()/visible_rows(), so a click lands on the row
- *  the painter drew and the caret scrolls against the same budget.
+ *  Every distance in this file comes from the Grid further down:
+ *  grid_of() measures the two fonts and ui_px() once per frame, and the
+ *  painter, the click handler, the scroll window and the footer all read
+ *  that one struct. There is no fixed row height, inset or gap here.
  * ------------------------------------------------------------ */
-static float line_h_of(Font *fr) { return font_height(fr) + 2.0f; }   /* one text row  */
-static float foot_h_of(Font *fd) { return font_height(fd) + 8.0f; }   /* rule + one line */
 
 typedef struct {
     char  *buf;
@@ -157,22 +157,89 @@ static int rows_of_line(const Notes *n, Font *fr, int start, int end, float avai
     return rows;
 }
 
-/* Width of the number gutter. Fixed while the line count keeps the
- * same number of digits. */
-static float gutter_width_px(const Notes *n, Font *fd) {
+/* ------------------------------------------------------------
+ *  One grid, derived from the fonts and ui_px() at draw time.
+ *
+ *  font_draw() takes y as the ascender line and puts the baseline
+ *  font_ascent() below it (src/font.c:229); stbtt_ScaleForPixelHeight()
+ *  makes ascent + descent exactly the nominal size (src/font.c:119) while
+ *  font_height() is size * 1.4, so one line of glyphs covers font_height/1.4
+ *  from y. Centring that ink box is what puts a character in the middle of
+ *  its row at every text scale, and it is the box the caret is drawn over.
+ *
+ *  The text inset used to be GUTTER_PAD + digits + 2*TEXT_GAP, because
+ *  gutter_width_px() already contained one gap and text_avail_px() added it
+ *  again. There is now exactly one inset, one gutter width and one gap, all
+ *  in this struct, and the painter, the click handler, the scroll window and
+ *  the footer read the same numbers - they cannot drift apart again.
+ * ------------------------------------------------------------ */
+static float ink_h(Font *f) { return font_height(f) / 1.4f; }
+
+/* Baseline of one row of glyphs centred in a band, and the y font_draw() needs
+ * to put a line on that baseline. */
+static float base_y(Font *f, float top, float band_h) {
+    return top + (band_h - ink_h(f)) * 0.5f + font_ascent(f);
+}
+static float top_y(Font *f, float base) { return base - font_ascent(f); }
+
+typedef struct {
+    float m;        /* page margin: the footer and the gutter inset      */
+    float pad_t;    /* space above the first text row                     */
+    float num_w;    /* width of the line-number column                    */
+    float gap;      /* gutter rule .. first glyph                         */
+    float text_x;   /* app-local x of the first character                 */
+    float text_r;   /* app-local x glyphs may not pass                    */
+    float avail;    /* text_r - text_x, never less than one short word    */
+    float lh;       /* one text row                                       */
+    float foot_h;   /* footer band                                        */
+    int   vis;      /* rows that fit between pad_t and the footer         */
+} Grid;
+
+static Grid grid_of(const Notes *n, Font *fr, Font *fd) {
+    Grid g;
     int lines = line_count(n);
     int digits = 1;
     while (lines >= 10) { lines /= 10; digits++; }
     if (digits < 2) digits = 2;
-    return (float)GUTTER_PAD + (float)digits * font_width(fd, "0") + (float)TEXT_GAP;
+
+    g.m      = (float)ui_px(10);
+    g.pad_t  = (float)ui_px(8);
+    g.gap    = (float)ui_px(8);
+    g.lh     = font_height(fr) + (float)ui_px(4);
+    g.foot_h = font_height(fd) + (float)ui_px(8);
+    g.num_w  = (float)digits * font_width(fd, "0");
+    g.text_x = g.m + g.num_w + g.gap;
+    g.text_r = (float)n->w - g.m;
+    g.avail  = g.text_r - g.text_x;
+    if (g.avail < (float)ui_px(24)) g.avail = (float)ui_px(24);
+    g.vis    = (int)(((float)n->h - g.pad_t - g.foot_h) / g.lh);
+    if (g.vis < 1) g.vis = 1;
+    return g;
 }
 
-/* Width available to text after the gutter. */
-static float text_avail_px(const Notes *n, Font *fd) {
-    float avail = (float)n->w - gutter_width_px(n, fd) - (float)TEXT_GAP;
-    return avail < 24.0f ? 24.0f : avail;
-}
+/* Row of the caret measured from the top of the visible band, or -1 if the
+ * caret sits above it. *rows_top_line gets the height of the top line, so the
+ * caller can normalise top_row. */
+static int caret_row_from_top(Notes *n, Font *fr, const Grid *g, int *rows_top_line) {
+    int caret_line = line_index_at(n, n->cur);
+    if (caret_line < n->top) return -1;
 
+    int pos = line_start_of_index(n, n->top);
+    int end = line_end_at(n, pos);
+    int top_rows = rows_of_line(n, fr, pos, end, g->avail);
+    if (rows_top_line) *rows_top_line = top_rows;
+
+    int rows = 0;
+    int line = n->top;
+    while (line < caret_line) {
+        rows += rows_of_line(n, fr, pos, end, g->avail);
+        pos = end < n->len ? end + 1 : end;
+        end = line_end_at(n, pos);
+        line++;
+    }
+    rows += rows_of_line(n, fr, pos, n->cur, g->avail) - 1;
+    return rows - n->top_row;
+}
 /* Shorten s in place, with a trailing "..", until it fits maxw. A
  * strerror() message can be long and the window can be narrow: text
  * must never spill out of the app's rect. */
@@ -191,35 +258,6 @@ static void fit_footer(char *s, size_t cap, Font *fd, float maxw) {
     s[0] = 0;
 }
 
-/* Rows of text that fit between the top padding and the footer. */
-static int visible_rows(const Notes *n, Font *fr, Font *fd) {
-    int rows = (int)(((float)n->h - foot_h_of(fd)) / line_h_of(fr));
-    return rows < 1 ? 1 : rows;
-}
-
-/* Row of the caret measured from the top of the visible band, or -1
- * if the caret sits above it. *rows_top_line gets the height of the
- * top line, so the caller can normalise top_row. */
-static int caret_row_from_top(Notes *n, Font *fr, float avail, int *rows_top_line) {
-    int caret_line = line_index_at(n, n->cur);
-    if (caret_line < n->top) return -1;
-
-    int pos = line_start_of_index(n, n->top);
-    int end = line_end_at(n, pos);
-    int top_rows = rows_of_line(n, fr, pos, end, avail);
-    if (rows_top_line) *rows_top_line = top_rows;
-
-    int rows = 0;
-    int line = n->top;
-    while (line < caret_line) {
-        rows += rows_of_line(n, fr, pos, end, avail);
-        pos = end < n->len ? end + 1 : end;
-        end = line_end_at(n, pos);
-        line++;
-    }
-    rows += rows_of_line(n, fr, pos, n->cur, avail) - 1;
-    return rows - n->top_row;
-}
 
 /* ------------------------------------------------------------
  *  Caret movement
@@ -282,9 +320,9 @@ static void ensure_visible(Notes *n, Font *fr, Font *fd) {
     if (n->top < 0) { n->top = 0; n->top_row = 0; }
     if (n->top_row < 0) n->top_row = 0;
 
-    float avail = text_avail_px(n, fd);
-    int   vis = visible_rows(n, fr, fd);
-    int   caret_line = line_index_at(n, n->cur);
+    Grid g = grid_of(n, fr, fd);
+    int vis = g.vis;
+    int caret_line = line_index_at(n, n->cur);
 
     if (caret_line < n->top) {         /* caret above: pull the window up */
         n->top = caret_line;
@@ -292,12 +330,12 @@ static void ensure_visible(Notes *n, Font *fr, Font *fd) {
     }
 
     int top_rows = 1;
-    int row = caret_row_from_top(n, fr, avail, &top_rows);
+    int row = caret_row_from_top(n, fr, &g, &top_rows);
 
     if (row < 0) {                     /* caret row scrolled above the band */
         n->top_row += row;
         if (n->top_row < 0) n->top_row = 0;
-        row = caret_row_from_top(n, fr, avail, &top_rows);
+        row = caret_row_from_top(n, fr, &g, &top_rows);
         if (row < 0) row = 0;
     }
     if (row >= vis)                    /* caret row below the band */
@@ -309,7 +347,7 @@ static void ensure_visible(Notes *n, Font *fr, Font *fd) {
         n->top_row -= top_rows;
         n->top++;
         int s = line_start_of_index(n, n->top);
-        top_rows = rows_of_line(n, fr, s, line_end_at(n, s), avail);
+        top_rows = rows_of_line(n, fr, s, line_end_at(n, s), g.avail);
         if (++guard > 100000) break;
     }
     if (n->top_row >= top_rows) n->top_row = top_rows - 1;
@@ -319,8 +357,9 @@ static void ensure_visible(Notes *n, Font *fr, Font *fd) {
 /* PageUp (dir < 0) / PageDown: move the window a screenful of lines
  * and take the caret with it, so the two never disagree. */
 static void caret_page(Notes *n, Font *fr, Font *fd, int dir) {
+    Grid g = grid_of(n, fr, fd);
     int lines = line_count(n);
-    int vis = visible_rows(n, fr, fd);
+    int vis = g.vis;
     int line = line_index_at(n, n->cur);
     int target = line + dir * vis;
     if (target < 0) target = 0;
@@ -680,84 +719,114 @@ static void notes_draw(App *a, Surface *s, int x, int y, int w, int h, const The
         n->fitted_h = h;
     }
 
+    Grid g = grid_of(n, fr, fd);
     int   lines = line_count(n);
-    float gutter = gutter_width_px(n, fd);
-    float avail = text_avail_px(n, fd);
-    int   vis = visible_rows(n, fr, fd);
-    /* one text row, from the font that is about to draw the file */
-    float lh = line_h_of(fr);
-    float foot_h = foot_h_of(fd);
-    int   body_h = (float)h - foot_h > 0.0f ? (int)((float)h - foot_h) : 0;
+    int   body_h = (int)((float)h - g.foot_h);
+    if (body_h < 0) body_h = 0;
+    float ink = ink_h(fr);                /* the box the glyphs fill */
+    int   caret_w = ui_px(1);
 
     if (n->top > lines - 1) { n->top = lines - 1; n->top_row = 0; }
     if (n->top < 0) { n->top = 0; n->top_row = 0; }
     if (n->top_row < 0) n->top_row = 0;
 
-    /* Gutter tint and its rule, so the numbers read as a margin. */
-    surf_blend(s, x, y, (int)gutter, body_h, color_alpha(th->panel_border, 0.10f));
-    surf_blend(s, x + (int)gutter - 1, y, 1, body_h, color_alpha(th->panel_border, 0.55f));
+    /* The gutter is a full-bleed band whose rule sits exactly one half-gap
+     * before the first glyph, so the rule, the numbers and the text share one
+     * inset instead of the old GUTTER_PAD + 2*TEXT_GAP stack. */
+    float rule_x = (float)x + g.text_x - g.gap * 0.5f;
+    surf_blend(s, x, y, (int)(rule_x - (float)x), body_h,
+               color_alpha(th->panel_border, 0.10f));
+    surf_blend(s, (int)rule_x, y, 1, body_h, color_alpha(th->panel_border, 0.55f));
 
+    float text_x = (float)x + g.text_x;
+    float text_r = (float)x + g.text_r;
     int   caret_line = line_index_at(n, n->cur);
     int   pos = line_start_of_index(n, n->top);
     int   line = n->top;
     int   row = 0;
-    int   base = n->top_row;
-    int   last_row = base + vis;
-    float left = (float)x + gutter + (float)TEXT_GAP;
-    float px = left;
+    int   base_row = n->top_row;
+    int   last_row = base_row + g.vis;
+    float px = text_x;
     char  one[2] = { 0, 0 };
+
+    /* Where the caret goes, decided while the text is laid out. It is painted
+     * after every glyph (below) so a character can never be drawn on top of
+     * it, and it sits in the gap the next glyph's pen starts from - see the
+     * caret block after the loop. */
+    int   caret_painted = 0;
+    float caret_x = 0.0f, caret_top = 0.0f;
 
     while (line < lines && row < last_row) {
         int end = line_end_at(n, pos);
 
-        /* The line number rides the first visible row of the line: if
-         * the line started above the band, that is the band's top row. */
-        int num_row = row < base ? base : row;
+        /* The line number rides the first visible row of the line: if the
+         * line started above the band, that is the band's top row. It is
+         * right-aligned in the number column and sits on the text's own
+         * baseline, so a 10 px digit lines up with a 12 px character. */
+        int num_row = row < base_row ? base_row : row;
         if (num_row < last_row) {
             char num[16];
             snprintf(num, sizeof(num), "%d", line + 1);
-            float num_x = (float)x + gutter - (float)TEXT_GAP - font_width(fd, num);
-            float num_y = (float)y + (float)TOP_PAD + (float)(num_row - base) * lh
-                        + (lh - font_height(fd)) * 0.5f;
+            float band = (float)y + g.pad_t + (float)(num_row - base_row) * g.lh;
+            float nb = base_y(fr, band, g.lh);
+            float num_r = (float)x + g.m + g.num_w;
             u32 num_col = (line == caret_line) ? color_alpha(th->text, 0.95f)
                                                : color_alpha(th->text, 0.38f);
-            font_draw(s, fd, num_x, num_y, num, num_col);
+            font_draw(s, fd, num_r - font_width(fd, num), top_y(fd, nb), num, num_col);
         }
 
         for (int i = pos; i < end && row < last_row; i++) {
-            int at_caret = (i == n->cur);
             one[0] = n->buf[i];
             float cw = font_width(fr, one);
-            if (px + cw > left + avail && px > left) {
-                px = left;
+            if (px + cw > text_r && px > text_x) {
+                px = text_x;
                 row++;
                 if (row >= last_row) break;
             }
-            float py = (float)y + (float)TOP_PAD + (float)(row - base) * lh;
-            if (row >= base) {
-                if (at_caret) surf_blend(s, (int)px, (int)py, 1, (int)lh, th->accent);
-                font_draw(s, fr, px, py, one, th->text);
+            float band = (float)y + g.pad_t + (float)(row - base_row) * g.lh;
+            if (row >= base_row) {
+                if (i == n->cur) {
+                    /* px is the pen the glyph below starts from, so the bar
+                     * goes in the gap just before it and never covers it. At
+                     * the very start of a row there is no gap to use, so it
+                     * starts exactly on the text inset instead. */
+                    caret_x = (px > text_x) ? px - (float)caret_w : text_x;
+                    caret_top = band + (g.lh - ink) * 0.5f;
+                    caret_painted = 1;
+                }
+                font_draw(s, fr, px, top_y(fr, base_y(fr, band, g.lh)), one, th->text);
             }
             px += cw;
         }
 
-        /* Caret parked just before the newline, or at the end of the buffer. */
-        if (n->cur == end && row >= base && row < last_row) {
-            float py = (float)y + (float)TOP_PAD + (float)(row - base) * lh;
-            surf_blend(s, (int)px, (int)py, 1, (int)lh, th->accent);
+        /* Caret parked just before the newline, or at the end of the buffer:
+         * same gap rule, one bar-width to the left of the pen. */
+        if (n->cur == end && row >= base_row && row < last_row) {
+            float band = (float)y + g.pad_t + (float)(row - base_row) * g.lh;
+            caret_x = (px > text_x) ? px - (float)caret_w : text_x;
+            caret_top = band + (g.lh - ink) * 0.5f;
+            caret_painted = 1;
         }
 
         pos = end < n->len ? end + 1 : end;
         line++;
         if (pos >= n->len && line >= lines) break;
-        px = left;
+        px = text_x;
         row++;
     }
 
-    /* Footer: rule, then buffer length against the size on disk. Both sit
-     * in the band foot_h_of() reserves, so a scaled-up line cannot spill. */
-    float foot_y = (float)(y + h) - font_height(fd) - 4.0f;
-    surf_blend(s, x + 4, (int)(foot_y - 4.0f), w - 8, 1, th->panel_border);
+    /* The caret, last: one ink box tall, fully visible, in the gap between the
+     * character before it and the character it points at. Nothing was drawn
+     * after the text loop, so no glyph can split the bar at any scale. */
+    if (caret_painted)
+        surf_blend(s, (int)(caret_x + 0.5f), (int)(caret_top + 0.5f),
+                   caret_w, (int)(ink + 0.5f), th->accent);
+
+    /* Footer: a rule on the page margins, then the buffer length against the
+     * size on disk, centred in the band foot_h reserves. */
+    float foot_top = (float)(y + h) - g.foot_h;
+    surf_blend(s, x + (int)g.m, (int)(foot_top + 0.5f), w - 2 * (int)g.m, 1,
+               th->panel_border);
 
     char foot[192];
     int unsaved = n->dirty || (n->disk_len >= 0 && n->disk_len != (long)n->len);
@@ -784,15 +853,17 @@ static void notes_draw(App *a, Surface *s, int x, int y, int w, int h, const The
                      n->len, n->disk_len, ago < 0 ? 0L : ago);
         }
     }
-    if (!n->err[0] && font_width(fd, foot) > (float)(w - 16)) {   /* narrow window: shorten */
+    float foot_maxw = (float)w - 2.0f * g.m;
+    if (foot_maxw < 1.0f) foot_maxw = 1.0f;
+    if (!n->err[0] && font_width(fd, foot) > foot_maxw) {   /* narrow window: shorten */
         if (n->disk_len < 0)
             snprintf(foot, sizeof(foot), "%d b buf  -  no disk file", n->len);
         else
             snprintf(foot, sizeof(foot), "%d b buf  -  %ld b disk%s",
                      n->len, n->disk_len, unsaved ? "  -  unsaved" : "");
     }
-    fit_footer(foot, sizeof(foot), fd, (float)(w - 16));
-    font_draw(s, fd, (float)x + 8, foot_y, foot,
+    fit_footer(foot, sizeof(foot), fd, foot_maxw);
+    font_draw(s, fd, (float)x + g.m, top_y(fd, base_y(fd, foot_top, g.foot_h)), foot,
               n->err[0] ? ERR_COLOR : color_alpha(th->text, 0.55f));
 }
 
@@ -859,11 +930,11 @@ static void notes_click(App *a, int x, int y, int buttons) {
     Font *fd = font_get(FONT_REGULAR, 10);
     if (!fr || !fd) return;
 
-    int band = (int)(((float)y - (float)TOP_PAD) / line_h_of(fr));
-    if (band < 0 || band >= visible_rows(n, fr, fd)) return;   /* outside the text */
+    Grid  g = grid_of(n, fr, fd);
+    int   band = (int)(((float)y - g.pad_t) / g.lh);
+    if (band < 0 || band >= g.vis) return;      /* outside the text */
 
-    float avail = text_avail_px(n, fd);
-    float left = gutter_width_px(n, fd) + (float)TEXT_GAP;
+    float left = g.text_x;             /* the same inset the painter used */
     int   lines = line_count(n);
     int   want = n->top_row + band;    /* row measured from the top line */
 
@@ -882,7 +953,7 @@ static void notes_click(App *a, int x, int y, int buttons) {
             }
             char one[2] = { n->buf[i], 0 };
             float cw = font_width(fr, one);
-            if (px + cw > left + avail && px > left) {
+            if (px + cw > left + g.avail && px > left) {
                 if (r == want) { best = i; break; }     /* row ends at a wrap */
                 px = left;
                 r++;
@@ -917,6 +988,28 @@ static void notes_resize(App *a, int w, int h) {
     n->fitted_h = h;
 }
 
+/* The wheel scrolls the view three lines a notch (positive = up) without
+ * moving the caret, which is what a text view does; the next keystroke pulls
+ * the caret back through ensure_visible(). The window never leaves the last
+ * full page, so the bottom of the band is never past the end of the file. */
+static void notes_wheel(App *a, int notches) {
+    Notes *n = a->state;
+    if (!n || !notches) return;
+    Font *fr = font_get(FONT_REGULAR, 12);
+    Font *fd = font_get(FONT_REGULAR, 10);
+    if (!fr || !fd) return;
+
+    Grid g = grid_of(n, fr, fd);
+    int lines = line_count(n);
+    int max_top = lines - g.vis;
+    if (max_top < 0) max_top = 0;
+    int top = n->top - notches * 3;
+    if (top > max_top) top = max_top;
+    if (top < 0) top = 0;
+    n->top = top;
+    n->top_row = 0;
+}
+
 const AppVT app_vt_notes = {
     .id = "notes",
     .title = "Notes",
@@ -925,5 +1018,6 @@ const AppVT app_vt_notes = {
     .key = notes_key,
     .click = notes_click,
     .resize = notes_resize,
+    .wheel = notes_wheel,
     .free = notes_free,
 };

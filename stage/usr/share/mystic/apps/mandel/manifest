@@ -1,0 +1,3 @@
+name = Mandel
+desc = Mystic OS application
+exec = bin

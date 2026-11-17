@@ -47,6 +47,14 @@
 #define TERM_KEY_POLL_MS 5
 #define TERM_KEY_WAITS   20
 
+/* The nominal mono size the desktop draws a terminal with (src/main.c:801 calls
+ * font_get(FONT_MONO, 12)). font_get() multiplies by the global text scale, so
+ * this is a size SETTING, not a pixel height: the cell is always re-measured.
+ * term_resize_px() prefers the metrics the window manager actually passed to
+ * term_draw(), so this fallback only runs before the first paint and right
+ * after a text-scale change. */
+#define TERM_FONT_SIZE 12.0f
+
 typedef struct {
     u32 ch;
     u8  fg, bg, bold;
@@ -87,7 +95,17 @@ struct Term {
 
     int   alive;
     int   dirty;
-    int   scroll_off;    /* reserved for scrollback */
+
+    /* The cell the window manager last drew this terminal with, recorded by
+     * term_draw() from the metrics it was handed. A terminal's pty grid has to
+     * be measured with exactly that cell, otherwise term_resize_px() would be
+     * guessing a font size while the paint uses another and the shell would
+     * wrap at a column count nobody sees. Per terminal, refreshed on every
+     * paint (never a static), and cell_scale records the text scale that
+     * produced it: after ui.conf changes the stored cell no longer describes
+     * what will be drawn, so term_resize_px() re-measures from the font. */
+    float cell_cw, cell_ch;
+    float cell_scale;
 };
 
 /* ---------------------------------------------------------- palette */
@@ -105,6 +123,16 @@ static u32 cell_fg(const Cell *c) {
 static u32 cell_bg(const Cell *c) {
     if (c->bg < 16) return PALETTE[c->bg];
     return 0xFF10131Au;
+}
+
+/* A cell can never be zero wide or tall: the division that turns a window
+ * rectangle into a column count would be 0 or inf and the cast below would be
+ * undefined. These are the same floors the desktop applies to the metrics it
+ * passes (src/main.c:804-805), so flooring here cannot make the two disagree.
+ * The comparison also rejects NaN, which fails it and takes the floor. */
+static void cell_floor(float *cw, float *ch) {
+    *cw = (*cw > 4.0f) ? *cw : 4.0f;
+    *ch = (*ch > 8.0f) ? *ch : 8.0f;
 }
 
 /* ---------------------------------------------------------- screen */
@@ -708,7 +736,17 @@ void term_resize(Term *t, int cols, int rows) {
     if (t->cy < 0) t->cy = 0;
     if (t->cy >= rows) t->cy = rows - 1;
     t->wrap = 0;
-    t->scroll = 0;          /* the live screen is what the user wants to see */
+    /* A resize must not throw away where the user is reading. The rebuild above
+     * copies line y to line y, so the scrollback keeps both its line count and
+     * the identity of every line: the same offset still names the same
+     * historical line whether only the height changed (the case a dragged edge
+     * hits, where the view has to stay put) or the width did. So keep the
+     * offset and clamp it to the ring that now exists; zeroing it here - as
+     * this did - snapped every resize, including the one term_draw() performs
+     * when the cell metrics change with the text scale, back to the live screen
+     * and lost the reader's place. */
+    if (t->scroll > t->hist_count) t->scroll = t->hist_count;
+    if (t->scroll < 0) t->scroll = 0;
 
     if (t->fd >= 0) {
         struct winsize ws;
@@ -722,18 +760,34 @@ void term_resize(Term *t, int cols, int rows) {
     t->dirty = 1;
 }
 
-/* The same thing in pixels, with the cell metrics term_draw() uses, so a
- * caller only has to hand over the rectangle it is about to draw the terminal
- * into. Kept next to term_resize() so the two can never disagree about how a
- * window rectangle becomes a column count. */
+/* The same thing in pixels, so a caller only has to hand over the rectangle it
+ * is about to draw the terminal into.
+ *
+ * The cell used here must be the one the paint will use, or the pty and the
+ * screen disagree about how many columns there are: the shell wraps at one
+ * count while the window shows another, and the text looks like it ignored the
+ * text-size setting. So the metrics term_draw() was given are the first choice
+ * - they come from the window manager, which measured the very font it draws
+ * with - and they are only reused while cell_scale still equals the current
+ * text scale. Before the first paint, or on the first resize after ui.conf
+ * changed, the cell is re-measured from the mono font the desktop uses, at
+ * whatever size font_get() now returns. */
 void term_resize_px(Term *t, int w, int h) {
     if (!t) return;
-    Font *fm = font_get(FONT_MONO, 12);
-    float cw = font_width(fm, "M");
-    float ch = font_height(fm);
-    if (cw < 4.0f) cw = 4.0f;
-    if (ch < 8.0f) ch = 8.0f;
-    term_resize(t, (int)(w / cw), (int)(h / ch));
+    float cw, ch;
+    float scale = ui_scale_get();
+    if (t->cell_cw > 0.0f && t->cell_scale == scale) {
+        cw = t->cell_cw;
+        ch = t->cell_ch;
+    } else {
+        Font *fm = font_get(FONT_MONO, TERM_FONT_SIZE);
+        cw = font_width(fm, "M");
+        ch = font_height(fm);
+        cell_floor(&cw, &ch);
+    }
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    term_resize(t, (int)((float)w / cw), (int)((float)h / ch));
 }
 
 /* Wait briefly for the pty to accept more input. Returns 0 to retry the write,
@@ -884,8 +938,16 @@ void term_destroy(Term *t) {
 void term_draw(Term *t, Surface *s, int x, int y, int w, int h,
                Font *fr, float cw, float ch) {
     if (!t) return;
-    int cols = (int)(w / cw);
-    int rows = (int)(h / ch);
+    /* The cell is whatever the caller measured from the font it is drawing
+     * with - it is not a number this file gets to choose. Record it (after the
+     * same floor the desktop applies) so term_resize_px() measures the pty with
+     * exactly this cell instead of a second, possibly different one. */
+    cell_floor(&cw, &ch);
+    t->cell_cw = cw;
+    t->cell_ch = ch;
+    t->cell_scale = ui_scale_get();
+    int cols = (int)((float)w / cw);
+    int rows = (int)((float)h / ch);
     /* The window this terminal lives in can be dragged, resized or maximised
      * by code that never thinks about terminals. The grid is exactly the
      * cells that fit in the rectangle we are about to fill, so reconcile here:
@@ -948,12 +1010,27 @@ void term_draw(Term *t, Surface *s, int x, int y, int w, int h,
     }
 
     if (t->scroll > 0) {
+        /* The "scrolled back" pill is text, so everything about it comes from
+         * the font that draws it: its height is one ink box plus ui_px() air,
+         * its width is the measured string, its corner is half its height and
+         * its inset is scaled too. The old numbers (a 16 px pill at y+h-20, the
+         * label at y+h-17) were pixels, so at a large text scale the label was
+         * taller than its own pill and hung past the bottom of the window -
+         * exactly the kind of thing that makes the terminal look like it
+         * ignored the text-size setting. */
         char ind[48];
         snprintf(ind, sizeof(ind), "  scrolled back %d lines  ", t->scroll);
-        float iw = font_width(fr, ind);
-        gfx_rrect_aa(s, (float)x + (w - iw) / 2 - 8, (float)(y + h) - 20, iw + 16, 16, 8,
-                     0xCC000000u, 0, 0);
-        font_draw(s, fr, (float)x + (w - iw) / 2, (float)(y + h) - 17, ind, 0xFFCCCCCCu);
+        float ink = font_height(fr) / 1.4f;
+        float ih = ink + (float)ui_px(6);
+        float iw = font_width(fr, ind) + (float)ui_px(12);
+        float limit = (float)w - 2.0f * (float)ui_px(4);
+        if (iw > limit) iw = limit;
+        if (ih > (float)h) ih = (float)h;
+        float ix = (float)x + ((float)w - iw) * 0.5f;
+        float iy = (float)(y + h) - ih - (float)ui_px(4);
+        if (ih > 1.0f)
+            gfx_rrect_aa(s, ix, iy, iw, ih, ih * 0.5f, 0xCC000000u, 0, 0);
+        font_draw(s, fr, ix + (float)ui_px(6), iy + (ih - ink) * 0.5f, ind, 0xFFCCCCCCu);
     }
 
     /* cursor */

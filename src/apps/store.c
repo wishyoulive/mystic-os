@@ -44,16 +44,30 @@
  *  compositor surface and paints at origin + local, while click()
  *  gets APP-LOCAL coordinates (src/main.c: app_draw(cur->app, s,
  *  cx0, cy0, ...) vs app_click(hit->app, lx - 1, ly - tb - 1, ...)).
- *  Every rectangle in here - btn_rect(), the row band - is app-local,
- *  so the painter adds the origin and the hit-test never does. That
- *  is the rule src/apps/files.c spells out; mixing the two only looks
- *  right while the window happens to sit at (0,0).
+ *  Every rectangle in here - the Refresh button, the row band, each
+ *  column edge - is app-local, so the painter adds the origin and the
+ *  hit-test never does. That is the rule src/apps/files.c spells out;
+ *  mixing the two only looks right while the window sits at (0,0).
+ *
+ *  Geometry comes from one layout_store() Layout: the gutter, the
+ *  icon box, the row height and every column edge are measured from
+ *  the real fonts and ui_px(), and the lines are centred with the
+ *  face's own ascent (line_top()). draw(), key(), click() and the wheel
+ *  all read that one Layout, so they cannot disagree about where a row
+ *  is - and nothing is a hand-tuned padding constant.
+ *
+ *  Rows carry a drawn mark: a parcel for a package that can be
+ *  installed, a tick for one already on the disk (sections carry the
+ *  same marks so the list explains itself). Both are geometry built
+ *  from the theme's accent - no images.
  *
  *  Keys:  j/k or Up/Down  move        Enter  launch / install
  *         Home/End/g/G    first/last  PgUp/PgDn  by a screen
  *         r               refresh the repo index
  *  Mouse: click the Refresh button, click a row to select it, click
- *         the selected row again to activate it.
+ *         the selected row again to activate it. The wheel scrolls the
+ *         list by WHEEL_ROWS rows a notch and keeps the selection inside
+ *         the window (positive = up).
  * ============================================================ */
 #include "mystic.h"
 #include "ipc.h"
@@ -89,8 +103,7 @@
 
 /* how long an install may run before the window stops claiming it is
  * running (pkg's own wget timeout is 300 s; a local repo answers in
- * seconds, so a minute and a half of silence means it did not happen) */
-#ifndef STORE_INSTALL_TIMEOUT_SEC
+ * seconds, so a minute and a half of silence means it did not happen) */#ifndef STORE_INSTALL_TIMEOUT_SEC
 /* pkg allows 300 s per network read (stage/usr/bin/pkg) and the
  * browser package is 573 MB, so a shorter deadline would declare a
  * healthy download dead and offer the row again mid-transfer. */
@@ -103,6 +116,10 @@
 #define PKG_MAX 64              /* repo rows we hold; the index is small */
 #define INST_MAX (2 * WM_MAX_APPS)   /* both bundle roots together */
 #define DISP_MAX (INST_MAX + PKG_MAX + 6)
+
+/* Rows the wheel moves per notch. A count, not a pixel size: it moves
+ * whole entries, so it follows the text scale for free. */
+#define WHEEL_ROWS 3
 
 typedef struct {
     char id[32];
@@ -125,11 +142,16 @@ typedef struct {
 /* one painted line of the window: a section title, a real row, or a note */
 enum { D_SECT = 1, D_APP, D_PKG, D_MSG };
 
+/* the mark painted in a row's icon column: a parcel for an installable
+ * package, a tick for anything already on the disk */
+enum { MARK_NONE = 0, MARK_PKG, MARK_CHECK };
+
 typedef struct {
     int         kind;
     int         idx;    /* D_APP: inst[] index, D_PKG: avail[] index,
                            D_SECT: how many rows the section holds */
     const char *msg;    /* D_SECT label / D_MSG text (static or Store-owned) */
+    unsigned char mark; /* MARK_*: the icon a section title carries */
 } Disp;
 
 typedef struct {
@@ -272,6 +294,7 @@ static void disp_push(Store *s, int kind, int idx, const char *msg) {
     d->kind = kind;
     d->idx = idx;
     d->msg = msg;
+    d->mark = MARK_NONE;
 }
 
 static void build_disp(Store *s) {
@@ -291,6 +314,7 @@ static void build_disp(Store *s) {
     s->sel = -1;
 
     disp_push(s, D_SECT, s->ninst, "Installed");
+    if (s->ndisp > 0) s->disp[s->ndisp - 1].mark = MARK_CHECK;
     if (s->ninst == 0)
         disp_push(s, D_MSG, 0, "no app bundles installed");
     else
@@ -298,6 +322,7 @@ static void build_disp(Store *s) {
             disp_push(s, D_APP, i, NULL);
 
     disp_push(s, D_SECT, s->navail, "Available");
+    if (s->ndisp > 0) s->disp[s->ndisp - 1].mark = MARK_PKG;
     if (s->index_state == 0)
         disp_push(s, D_MSG, 0, "no index - press r to fetch it");
     else if (s->index_state < 0)
@@ -580,78 +605,233 @@ static void poll_install(Store *s) {
 }
 
 /* ------------------------------------------------------------
- * Geometry. draw(), key() and click() must agree on where the rows
- * are, so they all derive the vertical metrics from the fonts and
- * share one layout function.
+ * Geometry: one Layout, one grid, four callers
  *
- * There is no ROW_H/HEAD_H/FOOT_H/LINE_H constant. Every vertical
- * size is the height of the font that draws in it plus a fixed
- * amount of leading, which is what "leading" means: the space
- * between baselines. font_get() is where the global text scale is
- * applied (src/font.c:125), so a scale change moves every one of
- * these numbers together with the glyphs: rows cannot overlap, the
- * bands cannot cut the text, and because click() runs the very same
- * geo_of()/layout_of() pair a click still lands on the row that was
- * painted. Horizontal paddings stay fixed on purpose.
+ * draw(), key(), click() and the wheel all call layout_store(), so the
+ * rows they act on are the rows that were painted. There is no ROW_H or
+ * PAD constant: the gutter is ui_px(), a row is the row font's
+ * font_height() plus leading, the icon is a square inside that row, and
+ * every text line is centred in its band from font_ascent() (line_top()),
+ * never from a guessed +2. A change of text scale moves all of it at
+ * once, because font_get() applies the scale before these numbers are
+ * measured.
+ *
+ * The horizontal grid, left to right:
+ *
+ *   pad_x | ICON | icon_gap | NAME (name_w, measured from the widest
+ *         real name) | gap | DESCRIPTION (flexible) | gap | SIZE
+ *         (right-aligned in size_col) | gap | TAG (right-aligned in
+ *         tag_col) | pad_x
+ *
+ * Columns are dropped from the right when the window cannot hold them
+ * (tag first, then size, then the description), so the name keeps its
+ * measured width and two columns can never overlap.
  * ------------------------------------------------------------ */
 typedef struct {
-    int row_h;      /* one row                (font of the row + 4) */
-    int head_h;     /* title band + its rule  (font of the title + 12) */
-    int foot_h;     /* status line at the bottom (font of the line + 6) */
-    int line_h;     /* one wrapped description line (font + 2) */
-} Geo;
+    Font *fp;          /* title + section labels: medium 12 */
+    Font *fr;          /* list rows:              regular 11 */
+    Font *fd;          /* size/tag/hint:          regular 10 */
 
-static Geo geo_of(Font *fp, Font *fr) {
-    Geo g;
-    int fph = (int)(font_height(fp) + 0.5f);
-    int frh = (int)(font_height(fr) + 0.5f);
-    g.row_h  = frh + 4;
-    g.head_h = fph + 12;
-    g.foot_h = frh + 6;
-    g.line_h = frh + 2;
-    return g;
+    int pad_x, gap, icon_gap, icon_sz, icon_x, radius;
+    int row_xpad, row_ypad;
+
+    int row_h, line_h, head_h, foot_h, band_h, band_pad, nlines, rows;
+    int hint_h, rule;          /* rule: hairline thickness, ui_px(1) */
+    int list_y, list_bot, band_top, err_y;
+
+    /* the column grid */
+    int name_x, name_w, desc_x, desc_w;
+    int size_right, size_col, tag_right, tag_col;
+    int show_size, show_tag, show_desc;
+
+    /* text tops, from the face that draws each line */
+    int title_dy, row_dy, small_row_dy, hint_dy, desc_dy, foot_dy, btn_text_dy;
+
+    /* the Refresh button in the header: the icon->label gap and the
+     * label's own offset are fields, so the painter never re-derives them */
+    int btn_x, btn_y, btn_w, btn_h, btn_icon, btn_pad, btn_gap, btn_label_dx;
+
+    /* this window's own mark, at the head of the title */
+    int title_icon, title_x;
+} Layout;
+
+static int iround(float v) { return (int)(v < 0.0f ? v - 0.5f : v + 0.5f); }
+static int iceil(float v) {
+    int i = (int)v;
+    return (v > (float)i) ? i + 1 : i;
 }
 
-/* The fonts the two bodies of text in this window use, exactly as
- * store_draw() asks for them, so every caller gets the same metrics. */
-static int geo_now(Geo *g) {
-    Font *fp = font_get(FONT_MEDIUM, 12);
-    Font *fr = font_get(FONT_REGULAR, 11);
-    if (!fp || !fr) return 0;
-    *g = geo_of(fp, fr);
-    return 1;
+/* y for font_draw() that centres one line of `f` in a band `band` px
+ * tall. The ink of a line is `ascent` above the baseline and `descent`
+ * below it; stbtt's ScaleForPixelHeight makes those sum to the nominal
+ * size, which is font_height()/1.4 (src/font.c draws in a 1.4*size
+ * line box). So centring the ink box is (band - font_height/1.4)/2, and
+ * font_draw()'s baseline then lands font_ascent() below that top:
+ * caps and descenders sit equally inside the row. The other apps use
+ * the same rule, so "centred" means the same thing everywhere. */
+static int line_top(Font *f, int band) {
+    int ink;
+    if (!f || band <= 0) return 0;
+    ink = iround(font_height(f) / 1.4f);
+    if (ink >= band) return 0;
+    return (band - ink) / 2;
 }
 
-/* The nl thresholds only decide how many description lines are shown at
- * all (3 on a tall window, 1 or none on a short one); they are not text
- * positions. The band and the rows above it are computed from the metrics. */
-static void layout_of(int h, const Geo *g, int *rows, int *band, int *nlines) {
-    int nl = h >= 210 ? DESC_MAXLINES : h >= 172 ? 2 : h >= 134 ? 1 : 0;
-    for (;;) {
-        int b = nl > 0 ? nl * g->line_h + g->line_h + 8
-                       : (h >= 96 ? g->line_h + 8 : 0);
-        int r = (h - g->head_h - g->foot_h - b) / g->row_h;
-        if (r >= 1 || nl == 0) {
-            *rows = r < 0 ? 0 : r;
-            *band = b;
-            *nlines = nl;
-            return;
-        }
-        nl--;
+/* The description band gives up lines before it gives up rows: it shows
+ * as many of DESC_MAXLINES as still leave two whole rows (or all it can
+ * on a window too short for that). The hint line always has its slot -
+ * it is what tells the owner that Enter writes a request. */
+static int layout_store(Layout *L, const Store *st, int w, int h) {
+    memset(L, 0, sizeof(*L));
+    if (w < 1 || h < 1) return 0;
+
+    L->fp = font_get(FONT_MEDIUM, 12);
+    L->fr = font_get(FONT_REGULAR, 11);
+    L->fd = font_get(FONT_REGULAR, 10);
+    if (!L->fp || !L->fr || !L->fd) return 0;
+
+    int fh_p = iround(font_height(L->fp));
+    int fh_r = iround(font_height(L->fr));
+    int fh_d = iround(font_height(L->fd));
+
+    L->pad_x     = ui_px(10);
+    L->gap       = ui_px(8);
+    L->icon_gap  = ui_px(6);
+    L->radius    = ui_px(5);
+    L->row_xpad  = L->pad_x / 2;
+    L->row_ypad  = ui_px(1);
+    L->rule      = ui_px(1);
+    L->band_pad  = ui_px(4);
+    L->btn_pad   = ui_px(6);
+    L->btn_icon  = ui_px(12);
+
+    L->row_h  = fh_r + 2 * ui_px(4);
+    L->line_h = fh_r + ui_px(5);
+    L->hint_h = fh_d + 2 * ui_px(3);
+    L->head_h = fh_p + 2 * ui_px(6);
+    L->foot_h = fh_r + 2 * ui_px(5);
+
+    L->title_dy     = line_top(L->fp, L->head_h);
+    L->row_dy       = line_top(L->fr, L->row_h);
+    L->small_row_dy = line_top(L->fd, L->row_h);
+    L->hint_dy      = line_top(L->fd, L->hint_h);
+    L->desc_dy      = line_top(L->fr, L->line_h);
+    L->foot_dy      = line_top(L->fr, L->foot_h);
+
+    /* the icon is a square that fits the row with air above and below */
+    L->icon_sz = ui_px(16);
+    if (L->icon_sz > L->row_h - 2 * ui_px(3)) L->icon_sz = L->row_h - 2 * ui_px(3);
+    if (L->icon_sz < ui_px(10)) L->icon_sz = ui_px(10);
+    L->icon_x = L->pad_x;
+    L->name_x = L->icon_x + L->icon_sz + L->icon_gap;
+
+    /* Refresh: icon + label, both inside a box one small-font line tall
+     * plus padding, centred in the header band and right-aligned on the
+     * same gutter as everything else. */
+    L->btn_gap = ui_px(5);
+    L->btn_label_dx = L->btn_pad + L->btn_icon + L->btn_gap;
+    L->btn_w = L->btn_label_dx + iceil(font_width(L->fd, "Refresh")) + L->btn_pad;
+    L->btn_h = fh_d + 2 * ui_px(4);
+    if (L->btn_h > L->head_h - 2 * ui_px(2)) L->btn_h = L->head_h - 2 * ui_px(2);
+    if (L->btn_h < ui_px(12)) L->btn_h = ui_px(12);
+    L->btn_y = (L->head_h - L->btn_h) / 2;
+    L->btn_text_dy = line_top(L->fd, L->btn_h);
+
+    L->title_icon = L->icon_sz;
+    L->title_x = L->pad_x + L->title_icon + L->icon_gap;
+    L->btn_x = w - L->pad_x - L->btn_w;
+    /* the title and the button must not collide; the button gives way */
+    if (L->btn_x < L->title_x + iceil(font_width(L->fp, "Apps")) + L->gap)
+        L->btn_w = 0;
+
+    /* ---- the column grid ---------------------------------- */
+    int content_right = w - L->pad_x;
+    int nmax = 0;
+    for (int i = 0; i < st->ninst; i++) {
+        int nw = iceil(font_width(L->fr, st->inst[i].name));
+        if (nw > nmax) nmax = nw;
     }
-}
+    for (int i = 0; i < st->navail; i++) {
+        int nw = iceil(font_width(L->fr, st->avail[i].name));
+        if (nw > nmax) nmax = nw;
+    }
+    if (nmax < ui_px(44)) nmax = ui_px(44);
 
-/* When the bundle directory cannot be read, its error line gets the first
- * row slot instead of replacing the list - the Available section stays
- * usable. The painter, the pager and the click hit-test shift by the same
- * derived amount, so a click still lands on the row that was painted. */
-static int list_offset(const Store *s, const Geo *g) {
-    return s->error[0] ? g->row_h : 0;
-}
+    L->tag_col  = iceil(font_width(L->fd, "installed"));
+    L->size_col = iceil(font_width(L->fd, "0000.0 MB"));
+    int desc_min = ui_px(70);
 
-static int list_rows(const Store *s, int rows) {
-    if (s->error[0] && rows > 0) rows--;
-    return rows > 0 ? rows : 0;
+    L->show_tag = L->show_size = L->show_desc = 1;
+    int right = content_right;
+    L->tag_right = right;
+    right -= L->tag_col + L->gap;
+    L->size_right = right;
+    right -= L->size_col + L->gap;
+
+    L->desc_x = L->name_x + nmax + L->gap;
+    L->desc_w = right - L->desc_x;
+
+    if (L->desc_w < desc_min) {                 /* drop the tag column */
+        L->show_tag = 0;
+        right = content_right;
+        L->size_right = right;
+        right -= L->size_col + L->gap;
+        L->desc_w = right - L->desc_x;
+    }
+    if (L->desc_w < desc_min) {                 /* then the size column */
+        L->show_size = 0;
+        right = content_right;
+        L->desc_w = right - L->desc_x;
+    }
+    if (L->desc_w < desc_min) {                 /* names only */
+        L->show_desc = 0;
+        L->desc_w = 0;
+        int cap = (right > L->name_x) ? right - L->gap - L->name_x : 0;
+        if (cap > 0 && nmax > cap) nmax = cap;
+    }
+    if (nmax < ui_px(24)) nmax = ui_px(24);
+    L->name_w = nmax;
+
+    /* ---- vertical bands ----------------------------------- */
+    int err_line = st->error[0] ? L->row_h : 0;
+    int usable = h - L->head_h - L->foot_h - err_line;
+    int hint_slot = L->hint_h;
+
+    L->nlines = 0;
+    L->band_h = 0;
+    for (int nl = DESC_MAXLINES; nl >= 0; nl--) {
+        /* a band with no description is just the hint: it may sit closer
+         * to the rule than a band of text does */
+        int pad = nl > 0 ? ui_px(4) : ui_px(2);
+        int band = nl * L->line_h + hint_slot + 2 * pad + L->rule;
+        int rows = (usable - band) / L->row_h;
+        if (rows >= 2 || nl == 0) {
+            L->nlines = nl;
+            L->band_h = band;
+            L->band_pad = pad;
+            break;
+        }
+    }
+    if (L->band_h > usable - L->row_h) {        /* no room for a band at all */
+        L->band_h = 0;
+        L->nlines = 0;
+    }
+    /* A one-row window is worth less than the band: give the band up rather
+     * than leave the list showing a single section title. Below two rows
+     * there is nothing left to give, so the band comes back. */
+    if (L->band_h > 0 && (usable - L->band_h) / L->row_h < 2) {
+        L->band_h = 0;
+        L->nlines = 0;
+    }
+
+    L->err_y    = L->head_h;
+    L->list_y   = L->head_h + err_line;
+    L->band_top = h - L->foot_h - L->band_h;
+    L->list_bot = L->band_top;
+    if (L->list_bot < L->list_y) L->list_bot = L->list_y;
+    L->rows = (L->list_bot - L->list_y) / L->row_h;
+    if (L->rows < 0) L->rows = 0;
+    return 1;
 }
 
 /* ------------------------------------------------------------
@@ -770,8 +950,8 @@ static int wrap_desc(Font *fr, const char *text, float maxw,
 /* The cache is keyed on the selected row's name, not on its row number, and
  * every list rebuild clears it - so a rescan can never leave another
  * package's text in the band, whether rows appeared, vanished, or a desc
- * column was edited. */
-static void refresh_wrap(Store *s, Font *fr, int w) {
+ * column was edited. `maxw` is the real text width the band offers. */
+static void refresh_wrap(Store *s, Font *fr, int maxw) {
     char key[64];
     key[0] = 0;
     const char *text = "";
@@ -787,12 +967,12 @@ static void refresh_wrap(Store *s, Font *fr, int w) {
         }
     }
 
-    if (s->wrap_w == w && !strcmp(s->wrap_id, key)) return;
+    if (s->wrap_w == maxw && !strcmp(s->wrap_id, key)) return;
     snprintf(s->wrap_id, sizeof(s->wrap_id), "%s", key);
-    s->wrap_w = w;
+    s->wrap_w = maxw;
     s->dn = 0;
     if (!key[0]) return;
-    s->dn = wrap_desc(fr, text, (float)w - 12.0f, s->dlines, DESC_MAXLINES);
+    s->dn = wrap_desc(fr, text, (float)maxw, s->dlines, DESC_MAXLINES);
 }
 
 /* ------------------------------------------------------------
@@ -902,102 +1082,164 @@ static void activate(Store *s) {
  * Drawing
  * ------------------------------------------------------------ */
 
-/* The Refresh button, APP-LOCAL. draw() adds the window origin to paint
- * it, store_click() compares the app-local pointer against it directly -
- * one rectangle, one owner, so the two can never drift apart (the
- * coordinate-space rule src/apps/files.c documents). Returns 0 when the
- * button does not fit: a button that is not painted is not clickable. */
-static int btn_rect(const Geo *g, int w, int *bx, int *by, int *bw, int *bh) {
-    Font *fd = font_get(FONT_REGULAR, 10);
-    if (!fd || w < 120) return 0;
+/* ------------------------------------------------------------
+ *  The two row marks. Both are geometry - the same rounded-rect and
+ *  line primitives the launcher's icons are made of - so they need no
+ *  asset and scale with the row. Theme colours only.
+ *
+ *  parcel: a lid, a body and the tape down the middle. It means "this
+ *          is something you can install". `dim` fades the whole mark.
+ *  tick:   a disc with a tick. It means "this is already on the disk".
+ * ------------------------------------------------------------ */
+static void draw_pkg_icon(Surface *s, float x, float y, float sz,
+                          u32 accent, float dim) {
+    u32 edge = color_alpha(accent, 0.90f * dim);
+    u32 body = color_alpha(accent, 0.30f * dim);
+    u32 lid  = color_alpha(accent, 0.78f * dim);
+    u32 tape = color_alpha(accent, 0.85f * dim);
 
-    int tw = (int)(font_width(fd, "Refresh") + 0.5f);
-    int bwi = tw + 18;
-    int bhi = g->head_h - 10;
-    if (bhi < 12) bhi = 12;
+    float w = sz * 0.92f;
+    float bx = x + (sz - w) * 0.5f;
+    float top = y + sz * 0.12f;
+    float lid_h = sz * 0.20f;
+    float body_top = top + lid_h + sz * 0.02f;
+    float body_h = sz * 0.60f;
 
-    int x = w - bwi - 6;
-    if (x < 48) return 0;                  /* no room right of the title */
-    *bx = x;
-    *by = 5;
-    *bw = bwi;
-    *bh = bhi;
-    return 1;
+    /* the body, inset from the lid */
+    gfx_rrect_aa(s, bx + sz * 0.06f, body_top, w - sz * 0.12f, body_h,
+                 sz * 0.07f, body, edge, 1.0f);
+    /* the lid, a solid band a little wider than the body */
+    gfx_rrect(s, bx, top, w, lid_h, sz * 0.05f, lid);
+    /* the tape, wrapped over the lid and down the body */
+    gfx_rrect(s, x + sz * 0.44f, top, sz * 0.12f,
+              lid_h + sz * 0.02f + body_h, sz * 0.03f, tape);
 }
 
-static void paint_row(Surface *s, Font *fr, Font *fd, const Theme *th,
-                      int x, int ry, int w, int row_h, Store *st, int idx) {
-    Disp *d = &st->disp[idx];
+static void draw_check_icon(Surface *s, float x, float y, float sz,
+                            u32 accent, float dim) {
+    u32 ring = color_alpha(accent, 0.70f * dim);
+    u32 fill = color_alpha(accent, 0.14f * dim);
+    u32 tick = color_alpha(accent, 0.95f * dim);
+    float d = sz * 0.84f;
+    float ox = x + (sz - d) * 0.5f, oy = y + (sz - d) * 0.5f;
+
+    gfx_rrect_aa(s, ox, oy, d, d, d * 0.5f, fill, ring, 1.0f);
+    gfx_line(s, ox + d * 0.24f, oy + d * 0.52f,
+                ox + d * 0.43f, oy + d * 0.71f, sz * 0.11f, tick);
+    gfx_line(s, ox + d * 0.43f, oy + d * 0.71f,
+                ox + d * 0.78f, oy + d * 0.30f, sz * 0.11f, tick);
+}
+
+/* the Refresh mark, the same circular arrow Files' toolbar uses */
+static void draw_refresh_icon(Surface *s, float x, float y, float sz, u32 c) {
+    float cx = x + sz * 0.5f, cy = y + sz * 0.5f, r = sz * 0.30f;
+    gfx_rrect_aa(s, cx - r, cy - r, r * 2.0f, r * 2.0f, r, 0, c, sz * 0.12f);
+    float head[6] = { cx + r * 0.10f, cy - r * 1.35f,
+                      cx + r * 1.35f, cy - r * 0.50f,
+                      cx + r * 0.10f, cy - r * 0.18f };
+    gfx_polygon(s, head, 3, c);
+}
+
+/* One painted line. `x` is the window's origin (the painter is the only
+ * side that adds it); `ry` is the row's top in the compositor's surface.
+ * Every number comes from the Layout the hit-test also uses, so the row a
+ * click lands on is this row - and each text line is centred in the row
+ * with the face's own ascent (line_top()), not with a +1 or +2 fudge. */
+static void paint_row(Surface *s, const Layout *L, const Theme *th,
+                      const Store *st, int x, int w, int ry, int idx) {
+    const Disp *d = &st->disp[idx];
     int selected = (idx == st->sel);
     float fx = (float)x;
-    float fy = (float)ry;
+    int iy = ry + (L->row_h - L->icon_sz) / 2;
 
     if (selected && disp_selectable(d))
-        gfx_rrect_aa(s, fx + 3.0f, fy - 1.0f, (float)w - 6.0f, (float)row_h,
-                     4.0f, color_alpha(th->accent, 0.20f), 0, 0);
+        gfx_rrect_aa(s, fx + (float)L->row_xpad, (float)ry + (float)L->row_ypad,
+                     (float)(w - 2 * L->row_xpad),
+                     (float)(L->row_h - 2 * L->row_ypad), (float)L->radius,
+                     color_alpha(th->accent, 0.20f), 0, 0);
 
     if (d->kind == D_SECT) {
+        /* The title sits on the name column and carries the same mark its
+         * rows do, so the list explains its own icon vocabulary. */
+        if (d->mark == MARK_CHECK)
+            draw_check_icon(s, fx + (float)L->icon_x, (float)iy,
+                            (float)L->icon_sz, th->accent, 0.85f);
+        else
+            draw_pkg_icon(s, fx + (float)L->icon_x, (float)iy,
+                          (float)L->icon_sz, th->accent, 0.85f);
+
         char label[64];
         snprintf(label, sizeof(label), "%s (%d)", d->msg, d->idx);
-        float lw = font_width(fd, label);
-        font_draw(s, fd, fx + 8.0f, fy + 2.0f, label, color_alpha(th->accent, 0.75f));
-        float rx = fx + 8.0f + lw + 8.0f;
-        float re = fx + (float)w - 8.0f;
+        float lx = fx + (float)L->name_x;
+        float lw = font_width(L->fd, label);
+        font_draw(s, L->fd, lx, (float)ry + (float)L->small_row_dy, label,
+                  color_alpha(th->accent, 0.75f));
+
+        float rx = lx + lw + (float)L->gap;
+        float re = fx + (float)w - (float)L->pad_x;
         if (re > rx)
-            surf_blend(s, (int)rx, ry + row_h / 2, (int)(re - rx), 1, th->panel_border);
+            surf_blend(s, (int)rx, ry + L->row_h / 2, (int)(re - rx), 1,
+                       th->panel_border);
         return;
     }
 
     if (d->kind == D_MSG) {
-        draw_clipped(s, fd, fx + 14.0f, fy + 2.0f, (float)w - 22.0f, d->msg,
+        draw_clipped(s, L->fd, fx + (float)L->name_x,
+                     (float)ry + (float)L->small_row_dy,
+                     (float)w - (float)L->pad_x - (float)L->name_x, d->msg,
                      color_alpha(th->text, 0.45f));
         return;
     }
 
-    float right = fx + (float)w - 6.0f;
+    float name_y  = (float)ry + (float)L->row_dy;
+    float small_y = (float)ry + (float)L->small_row_dy;
+    float name_x  = fx + (float)L->name_x;
+    float name_w  = (float)L->name_w;
 
     if (d->kind == D_APP) {
-        StoreApp *e = &st->inst[d->idx];
+        const StoreApp *e = &st->inst[d->idx];
+
+        /* an installed bundle is a tick; a bundle whose payload we cannot
+         * stat is dimmed: it is listed, but it is not launchable */
+        draw_check_icon(s, fx + (float)L->icon_x, (float)iy,
+                        (float)L->icon_sz, th->accent,
+                        e->have_size ? 0.90f : 0.55f);
 
         char sz[32];
         if (e->have_size)
             snprintf(sz, sizeof(sz), "%.1f KB", (double)e->size / 1024.0);
         else
             snprintf(sz, sizeof(sz), "no payload");
-        float sw = font_width(fr, sz);
-        if (sw + 90.0f < (float)w) {
-            font_draw(s, fr, right - sw, fy, sz,
+        if (L->show_size) {
+            float sw = font_width(L->fd, sz);
+            font_draw(s, L->fd, fx + (float)L->size_right - sw, small_y, sz,
                       color_alpha(th->text, e->have_size ? 0.55f : 0.35f));
-            right -= sw + 10.0f;
         }
 
-        if (w >= 320) {
-            float ew = font_width(fd, e->exe);
-            if (right - ew > fx + 140.0f) {
-                font_draw(s, fd, right - ew, fy + 1.0f, e->exe,
-                          color_alpha(th->text, 0.35f));
-                right -= ew + 10.0f;
-            }
+        if (L->show_tag && e->from_root) {         /* installed by pkg */
+            const char *tag = "pkg";
+            float tw = font_width(L->fd, tag);
+            font_draw(s, L->fd, fx + (float)L->tag_right - tw, small_y, tag,
+                      color_alpha(th->accent, 0.55f));
         }
 
-        if (e->from_root) {     /* came from the repo, not the image */
-            float mw = font_width(fd, "pkg");
-            if (right - mw > fx + 140.0f) {
-                font_draw(s, fd, right - mw, fy + 1.0f, "pkg",
-                          color_alpha(th->accent, 0.55f));
-                right -= mw + 10.0f;
-            }
-        }
-
-        float name_x = fx + 8.0f;
-        draw_clipped(s, fr, name_x, fy, right - name_x, e->name,
+        if (!L->show_desc)
+            name_w = fx + (float)w - (float)L->pad_x - name_x;
+        draw_clipped(s, L->fr, name_x, name_y, name_w, e->name,
                      selected ? th->text : th->text_dim);
         return;
     }
 
-    /* D_PKG: name, the index's size, and its description */
-    Pkg *k = &st->avail[d->idx];
+    /* D_PKG: what the index offers */
+    const Pkg *k = &st->avail[d->idx];
     int ins = is_installed(st, k->name);
+
+    if (ins)
+        draw_check_icon(s, fx + (float)L->icon_x, (float)iy,
+                        (float)L->icon_sz, th->accent, 0.60f);
+    else
+        draw_pkg_icon(s, fx + (float)L->icon_x, (float)iy,
+                      (float)L->icon_sz, th->accent, selected ? 1.0f : 0.85f);
 
     char sz[32];
     if (!k->have_size)
@@ -1006,133 +1248,126 @@ static void paint_row(Surface *s, Font *fr, Font *fd, const Theme *th,
         snprintf(sz, sizeof(sz), "%.1f MB", (double)k->size / 1048576.0);
     else
         snprintf(sz, sizeof(sz), "%ld KB", (k->size + 1023) / 1024);
-    {
-        float sw = font_width(fd, sz);
-        if (sw + 70.0f < (float)w) {
-            font_draw(s, fd, right - sw, fy + 1.0f, sz,
-                      color_alpha(th->text, k->have_size ? 0.55f : 0.35f));
-            right -= sw + 10.0f;
-        }
+    if (L->show_size) {
+        float sw = font_width(L->fd, sz);
+        font_draw(s, L->fd, fx + (float)L->size_right - sw, small_y, sz,
+                  color_alpha(th->text, k->have_size ? 0.55f : 0.35f));
     }
 
-    if (ins) {
-        float iw = font_width(fd, "installed");
-        if (right - iw > fx + 150.0f) {
-            font_draw(s, fd, right - iw, fy + 1.0f, "installed",
-                      color_alpha(th->accent, 0.70f));
-            right -= iw + 10.0f;
-        }
+    if (L->show_tag && ins) {
+        const char *tag = "installed";
+        float tw = font_width(L->fd, tag);
+        font_draw(s, L->fd, fx + (float)L->tag_right - tw, small_y, tag,
+                  color_alpha(th->accent, 0.70f));
     }
 
-    float name_x = fx + 8.0f;
-    float name_w = (float)w * 0.34f;
-    if (name_w > 170.0f) name_w = 170.0f;
-    if (name_w < 64.0f) name_w = 64.0f;
-
-    float desc_x = name_x + name_w + 6.0f;
-    float desc_w = right - 8.0f - desc_x;
-    if (desc_w > 20.0f)
-        draw_clipped(s, fd, desc_x, fy + 1.0f, desc_w, k->desc,
+    if (L->show_desc)
+        draw_clipped(s, L->fd, fx + (float)L->desc_x, small_y,
+                     (float)L->desc_w, k->desc,
                      color_alpha(th->text, ins ? 0.30f : 0.50f));
+    else
+        name_w = fx + (float)w - (float)L->pad_x - name_x;
 
-    draw_clipped(s, fr, name_x, fy, name_w, k->name,
+    draw_clipped(s, L->fr, name_x, name_y, name_w, k->name,
                  ins ? color_alpha(th->text, 0.55f)
                      : (selected ? th->text : th->text_dim));
 }
 
 static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const Theme *th) {
     Store *st = a->state;
-    if (!st) return;
+    if (!st || !th) return;
     st->w = w;
     st->h = h;
     if (w < 40 || h < 40) return;
 
-    Font *fp = font_get(FONT_MEDIUM, 12);
-    Font *fr = font_get(FONT_REGULAR, 11);
-    Font *fd = font_get(FONT_REGULAR, 10);
-    if (!fp || !fr || !fd) return;
-
-    /* bring the two sources up to date before painting them */
+    /* bring the two sources up to date before laying them out */
     poll_install(st);
     sync_index(st);
 
-    Geo g = geo_of(fp, fr);
+    Layout L;
+    if (!layout_store(&L, st, w, h)) return;
 
-    /* header: what this window is, and the Refresh action */
-    font_draw(s, fp, (float)x + 6.0f, (float)y + 5.0f, "Apps", th->text);
-    {
-        int bx, by, bw, bh;
-        if (btn_rect(&g, w, &bx, &by, &bw, &bh)) {
-            /* the rect is app-local; the painter is the one that adds (x,y) */
-            float px = (float)(x + bx);
-            float py = (float)(y + by);
+    /* ---- header: this window's own mark, its name, the Refresh action */
+    surf_blend(s, x, y, w, L.head_h, th->panel);
+    draw_pkg_icon(s, (float)(x + L.icon_x),
+                  (float)y + (float)((L.head_h - L.title_icon) / 2),
+                  (float)L.title_icon, th->accent, 1.0f);
+    font_draw(s, L.fp, (float)(x + L.title_x), (float)y + (float)L.title_dy,
+              "Apps", th->text);
 
-            gfx_rrect_aa(s, px, py, (float)bw, (float)bh, 4.0f,
-                         color_alpha(th->accent, 0.18f),
-                         color_alpha(th->accent, 0.55f), 1.0f);
-            float ty = py + ((float)bh - font_height(fd)) * 0.5f;
-            if (ty < py) ty = py;
-            font_draw(s, fd, px + 9.0f, ty, "Refresh", th->text);
-        }
+    if (L.btn_w > 0) {
+        float bx = (float)(x + L.btn_x), by = (float)(y + L.btn_y);
+        gfx_rrect_aa(s, bx, by, (float)L.btn_w, (float)L.btn_h, (float)L.radius,
+                     color_alpha(th->accent, 0.18f),
+                     color_alpha(th->accent, 0.55f), 1.0f);
+        draw_refresh_icon(s, bx + (float)L.btn_pad,
+                          by + ((float)L.btn_h - (float)L.btn_icon) * 0.5f,
+                          (float)L.btn_icon, color_alpha(th->text, 0.90f));
+        font_draw(s, L.fd, bx + (float)L.btn_label_dx,
+                  by + (float)L.btn_text_dy, "Refresh", th->text);
     }
-    surf_blend(s, x + 4, y + g.head_h - 6, w - 8, 1, th->panel_border);
+    surf_blend(s, x + L.pad_x, y + L.head_h - L.rule, w - 2 * L.pad_x,
+               L.rule, th->panel_border);
 
-    int rows = 0, band = 0, nlines = 0;
-    layout_of(h, &g, &rows, &band, &nlines);
-
+    /* ---- the error line, when the bundle root could not be read */
     if (st->error[0])
-        draw_clipped(s, fr, (float)x + 6.0f, (float)y + (float)g.head_h,
-                     (float)w - 12.0f, st->error, th->accent);
+        draw_clipped(s, L.fr, (float)(x + L.pad_x),
+                     (float)(y + L.err_y + L.row_dy),
+                     (float)(w - 2 * L.pad_x), st->error, th->accent);
 
-    int nrows = list_rows(st, rows);
-    int top = y + g.head_h + list_offset(st, &g);
-
-    if (nrows > 0) {
-        /* keep the selected row inside the scroll window */
+    /* ---- rows; the selection is kept inside the scroll window */
+    if (L.rows > 0) {
         if (st->sel >= 0) {
             if (st->sel < st->scroll) st->scroll = st->sel;
-            if (st->sel >= st->scroll + nrows) st->scroll = st->sel - nrows + 1;
+            if (st->sel >= st->scroll + L.rows) st->scroll = st->sel - L.rows + 1;
         }
-        int max_scroll = st->ndisp - nrows;
+        int max_scroll = st->ndisp - L.rows;
         if (max_scroll < 0) max_scroll = 0;
         if (st->scroll > max_scroll) st->scroll = max_scroll;
         if (st->scroll < 0) st->scroll = 0;
 
-        for (int i = 0; i < nrows; i++) {
+        for (int i = 0; i < L.rows; i++) {
             int idx = st->scroll + i;
             if (idx >= st->ndisp) break;
-            int ry = top + i * g.row_h;
-            paint_row(s, fr, fd, th, x, ry, w, g.row_h, st, idx);
+            paint_row(s, &L, th, st, x, w, y + L.list_y + i * L.row_h, idx);
         }
     }
 
-    /* description band: the selected row's own text, wrapped */
-    if (band > 0) {
-        float by = (float)(y + h) - (float)g.foot_h - (float)band;
-        surf_blend(s, x + 4, (int)by, w - 8, 1, th->panel_border);
-        refresh_wrap(st, fr, w);
+    /* ---- description band: the selected row's own text, wrapped */
+    if (L.band_h > 0) {
+        int by = y + L.band_top;
+        int text_w = w - 2 * L.pad_x;
+        surf_blend(s, x + L.pad_x, by, text_w, L.rule, th->panel_border);
+        refresh_wrap(st, L.fr, text_w);
 
+        int content_y = by + L.rule + L.band_pad;
         int sel = st->sel;
+
         if (sel >= 0 && sel < st->ndisp && disp_selectable(&st->disp[sel])) {
             int shown = st->dn;
-            if (shown > nlines) shown = nlines;
-            if (shown == 0 && nlines > 0)
-                draw_clipped(s, fr, (float)x + 6.0f, by + 5.0f, (float)w - 12.0f,
+            if (shown > L.nlines) shown = L.nlines;
+            /* a message takes the first description line's slot - and only
+             * exists when the band has room for a line at all (a hint-only
+             * band at the smallest size has not) */
+            if (shown == 0 && L.nlines > 0)
+                draw_clipped(s, L.fr, (float)(x + L.pad_x),
+                             (float)(content_y + L.desc_dy),
+                             (float)text_w,
                              st->disp[sel].kind == D_PKG
                                  ? "no description in the index"
                                  : "this manifest has no desc = line",
                              th->text_dim);
             for (int i = 0; i < shown; i++)
-                draw_clipped(s, fr, (float)x + 6.0f,
-                             by + 5.0f + (float)i * (float)g.line_h,
-                             (float)w - 12.0f, st->dlines[i],
+                draw_clipped(s, L.fr, (float)(x + L.pad_x),
+                             (float)(content_y + i * L.line_h + L.desc_dy),
+                             (float)text_w, st->dlines[i],
                              color_alpha(th->text, 0.85f));
 
-            /* the hint: what Enter will ask for, and nothing else */
+            /* the hint: what Enter will ask the desktop to do */
             char hint[128];
-            float hy = (float)(y + h) - (float)g.foot_h - (float)g.line_h - 3.0f;
+            int hy = content_y + L.nlines * L.line_h + L.hint_dy;
             if (st->disp[sel].kind == D_PKG) {
-                Pkg *k = &st->avail[st->disp[sel].idx];
+                const Pkg *k = &st->avail[st->disp[sel].idx];
                 if (is_installed(st, k->name))
                     snprintf(hint, sizeof(hint), "%s is installed - Enter does nothing",
                              k->name);
@@ -1142,7 +1377,7 @@ static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const The
                 else
                     snprintf(hint, sizeof(hint), "Enter: pkg install %s", k->name);
             } else {
-                StoreApp *e = &st->inst[st->disp[sel].idx];
+                const StoreApp *e = &st->inst[st->disp[sel].idx];
                 if (e->from_root)
                     snprintf(hint, sizeof(hint),
                              "%s is in %s - the launcher reads %s",
@@ -1151,37 +1386,47 @@ static void store_draw(App *a, Surface *s, int x, int y, int w, int h, const The
                     snprintf(hint, sizeof(hint),
                              "Enter: ask the desktop to launch %s", e->id);
             }
-            draw_clipped(s, fd, (float)x + 6.0f, hy, (float)w - 12.0f, hint,
-                         color_alpha(th->text, 0.40f));
+            draw_clipped(s, L.fd, (float)(x + L.pad_x), (float)hy,
+                         (float)text_w, hint, color_alpha(th->text, 0.40f));
         } else {
-            float hy = (float)(y + h) - (float)g.foot_h - (float)g.line_h - 3.0f;
-            draw_clipped(s, fd, (float)x + 6.0f, hy, (float)w - 12.0f,
-                         "r: fetch the package index", color_alpha(th->text, 0.40f));
+            int hy = content_y + L.hint_dy;
+            draw_clipped(s, L.fd, (float)(x + L.pad_x), (float)hy,
+                         (float)text_w, "r: fetch the package index",
+                         color_alpha(th->text, 0.40f));
         }
     }
 
-    /* footer: how much is installed and offered, plus the last outcome.
+    /* ---- footer: how much is installed and offered, plus the outcome.
      * A status that does not fit beside the counts gets the whole line - a
      * failure message that is never painted would be worse than a lost
      * count. */
     {
-        float fy = (float)(y + h) - font_height(fr) - 3.0f;
+        int fy = y + h - L.foot_h;
+        surf_blend(s, x, fy, w, L.foot_h, th->panel);
+        surf_blend(s, x + L.pad_x, fy, w - 2 * L.pad_x, L.rule,
+                   th->panel_border);
+
+        float ty = (float)fy + (float)L.foot_dy;
         char foot[96];
         snprintf(foot, sizeof(foot), "%d installed - %d available%s",
                  st->ninst, st->navail,
                  st->index_state == 0 ? " - no index" : "");
 
-        float tw = st->status[0] ? font_width(fr, st->status) : 0.0f;
-        if (st->status[0] && tw + font_width(fr, foot) + 18.0f < (float)w) {
-            font_draw(s, fr, (float)(x + w) - tw - 6.0f, fy, st->status,
+        float tw = st->status[0] ? font_width(L.fr, st->status) : 0.0f;
+        if (st->status[0] &&
+            tw + font_width(L.fr, foot) + (float)(2 * L.gap) < (float)w) {
+            font_draw(s, L.fr, (float)(x + w - L.pad_x) - tw, ty, st->status,
                       color_alpha(th->accent, 0.55f));
-            draw_clipped(s, fr, (float)x + 6.0f, fy, (float)w - tw - 12.0f, foot,
+            draw_clipped(s, L.fr, (float)(x + L.pad_x), ty,
+                         (float)w - tw - (float)(L.pad_x + L.gap), foot,
                          color_alpha(th->text, 0.45f));
         } else if (st->status[0]) {
-            draw_clipped(s, fr, (float)x + 6.0f, fy, (float)w - 12.0f, st->status,
+            draw_clipped(s, L.fr, (float)(x + L.pad_x), ty,
+                         (float)(w - 2 * L.pad_x), st->status,
                          color_alpha(th->accent, 0.55f));
         } else {
-            draw_clipped(s, fr, (float)x + 6.0f, fy, (float)w - 12.0f, foot,
+            draw_clipped(s, L.fr, (float)(x + L.pad_x), ty,
+                         (float)(w - 2 * L.pad_x), foot,
                          color_alpha(th->text, 0.45f));
         }
     }
@@ -1221,11 +1466,9 @@ static void store_key(App *a, const char *bytes, int n) {
     Store *s = a->state;
     if (!s) return;
 
-    Geo g;
-    int rows = 1, band = 0, nlines = 0;
-    if (geo_now(&g)) layout_of(s->h, &g, &rows, &band, &nlines);
-    rows = list_rows(s, rows);
-    if (rows < 1) rows = 1;
+    Layout L;
+    int rows = 1;
+    if (layout_store(&L, s, s->w, s->h) && L.rows > 0) rows = L.rows;
 
     for (int i = 0; i < n; i++) {
         unsigned char c = (unsigned char)bytes[i];
@@ -1267,42 +1510,79 @@ static void store_key(App *a, const char *bytes, int n) {
     }
 }
 
+/* The window's wheel hook (AppVT.wheel). Positive notches scroll up, as
+ * the desktop delivers them. The view moves under the pointer by whole
+ * rows, and the selection is pulled to the nearest selectable row when
+ * the view passes it, so it can never be scrolled out of sight. */
+static void store_wheel(App *a, int notches) {
+    Store *s = a->state;
+    if (!s || notches == 0) return;
+
+    Layout L;
+    if (!layout_store(&L, s, s->w, s->h) || L.rows <= 0) return;
+
+    int maxs = s->ndisp - L.rows;
+    if (maxs < 0) maxs = 0;
+    int old = s->scroll;
+    int want = s->scroll - notches * WHEEL_ROWS;
+    if (want < 0) want = 0;
+    if (want > maxs) want = maxs;
+    if (want == s->scroll) return;
+
+    s->scroll = want;
+
+    /* The view may only come to rest somewhere a row can actually be
+     * selected: when the window would hold nothing but a section title (a
+     * one-row window at the smallest size), the move is refused instead of
+     * parking the selection off-screen. */
+    int lo = s->scroll;
+    int hi = s->scroll + L.rows - 1;
+    if (hi >= s->ndisp) hi = s->ndisp - 1;
+    int any = 0;
+    for (int i = lo; i <= hi && !any; i++)
+        if (disp_selectable(&s->disp[i])) any = 1;
+    if (!any) { s->scroll = old; return; }
+
+    /* Keep the selection exactly where it is while it is still in view.
+     * When the view has passed it, take the nearest selectable row at the
+     * edge the view came towards - the top for a downward scroll, the
+     * bottom for an upward one - so one notch never throws the highlight
+     * across the whole window. */
+    if (s->sel < lo) {
+        for (int i = lo; i <= hi; i++)
+            if (disp_selectable(&s->disp[i])) { s->sel = i; break; }
+    } else if (s->sel > hi) {
+        for (int i = hi; i >= lo; i--)
+            if (disp_selectable(&s->disp[i])) { s->sel = i; break; }
+    }
+}
+
 static void store_click(App *a, int x, int y, int buttons) {
     Store *s = a->state;
     if (!s) return;
     if (buttons && !(buttons & 1)) return;      /* left button only */
 
-    /* The Refresh button. btn_rect() is app-local and so is (x,y): the draw
-     * origin must not appear in this comparison. */
-    Geo g;
-    if (!geo_now(&g)) return;
+    Layout L;
+    if (!layout_store(&L, s, s->w, s->h)) return;
 
-    int bx = 0, by = 0, bw = 0, bh = 0;
-    if (btn_rect(&g, s->w, &bx, &by, &bw, &bh) &&
-        x >= bx && x < bx + bw && y >= by && y < by + bh) {
+    /* The Refresh button: its rectangle and the pointer are both app-local,
+     * so the draw origin must not appear in this comparison. */
+    if (L.btn_w > 0 && x >= L.btn_x && x < L.btn_x + L.btn_w &&
+        y >= L.btn_y && y < L.btn_y + L.btn_h) {
         request_refresh(s);
         return;
     }
 
-    int rows = 0, band = 0, nlines = 0;
-    if (!geo_now(&g)) return;
-    layout_of(s->h, &g, &rows, &band, &nlines);
-    rows = list_rows(s, rows);
-    int top = g.head_h + list_offset(s, &g);
-    if (rows < 1) return;
+    if (L.rows < 1) return;
 
-    /* Only the row band owns rows. A click above the first row - the
-     * "Apps" title, the Refresh button, the rule under them, or the error
-     * line when the bundle directory is unreadable - and a click in the
-     * description band or the footer belong to no row and must do nothing.
-     * Reject the bands first, then divide a value that is known to be >= 0,
-     * so truncation and floor agree and no negative or out-of-range index
-     * can be produced. */
-    if (y < top) return;                        /* header band */
-    if (y >= s->h - g.foot_h) return;           /* footer band */
+    /* Only the row band owns rows. A click in the header, the error line,
+     * the description band or the footer belongs to no row and must do
+     * nothing. Reject those bands first, then divide a value known to be
+     * >= 0, so truncation and floor agree. */
+    if (y < L.list_y || y >= L.list_bot) return;
 
-    int row = (y - top) / g.row_h;              /* y >= top: exact */
-    if (row < 0 || row >= rows) return;         /* past the list */
+    int row = (y - L.list_y) / L.row_h;         /* y >= list_y: exact */
+    if (row < 0 || row >= L.rows) return;
     int idx = s->scroll + row;
     if (idx < 0 || idx >= s->ndisp) return;
     if (!disp_selectable(&s->disp[idx])) return;  /* titles and notes */
@@ -1348,5 +1628,6 @@ const AppVT app_vt_store = {
     .key = store_key,
     .click = store_click,
     .resize = store_resize,
+    .wheel = store_wheel,
     .free = store_free,
 };

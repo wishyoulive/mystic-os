@@ -14,9 +14,14 @@
  *  layout_build()), so the global text scale - applied inside
  *  font_get() in src/font.c - grows the toolbar, the breadcrumb
  *  line, the rows and the footer together. layout_build() is the one
- *  and only source of those numbers: files_draw() paints with it and
- *  files_click() hit-tests with it, so a click always lands on the row
- *  that was painted. Nothing here is a fixed 15 px.
+ *  and only source of those numbers: one Layout holds the outer
+ *  padding, every inter-column gap, the row height, the icon size,
+ *  the corner radius and the right edge of each column. files_draw()
+ *  paints from it and files_click()/files_wheel() hit-test and scroll
+ *  with it, so a click always lands on the row that was painted and
+ *  the wheel moves the list the pointer is over. Nothing here is a
+ *  fixed 15 px, and no text is placed with a guessed +2: each line is
+ *  centred in its band from font_ascent() (see line_top()).
  *
  *  ICONS are drawn geometry, in the same style as the desktop
  *  launcher's icon_folder()/icon_pencil() in src/main.c - no images.
@@ -45,6 +50,10 @@
  *  of staying lit. The breadcrumb line is clickable per segment and the
  *  status line carries the item count, the selected entry's name, its
  *  real size and the free space statvfs() reports for the directory.
+ *  Each breadcrumb segment's hover pill and click span come from one
+ *  function, crumb_pill(), which clips the span to the padded band - so a
+ *  folder name wider than the band is cut at the padding, never painted
+ *  over the desktop, and its chevron cannot cross the edge either.
  *
  *  The listing is opendir()/readdir()/lstat(), the size and stamp are the
  *  real st_size/st_mtime, the free-space figure is statvfs() on the
@@ -67,6 +76,10 @@
  *  MOUSE  a click selects a row; a second click on the same row within
  *         450 ms (measured with CLOCK_MONOTONIC) opens it; the toolbar
  *         buttons and every breadcrumb segment are clickable.
+ *  WHEEL  the window's wheel hook scrolls the list by WHEEL_ROWS rows a
+ *         notch (positive = up, toward the first entry). The highlighted
+ *         row is pulled to the nearest edge when the view moves past it,
+ *         so the selection can never be scrolled out of sight.
  *
  *  COLUMNS the modified-time column is dropped under 380 px of window (the
  *         brief's literal number) and, regardless of width, whenever the
@@ -116,6 +129,10 @@ enum { IC_FOLDER, IC_FILE, IC_EXEC, IC_IMAGE, IC_CONF, IC_ARCHIVE, IC_TEXT, IC_L
 /* how long a toolbar button stays visibly pressed after a real click */
 #define PRESS_S 0.14
 
+/* Rows the wheel moves per notch. A count, not a pixel size: the wheel
+ * moves whole entries, so it follows the text scale for free. */
+#define WHEEL_ROWS 3
+
 typedef struct {
     char          name[NAME_LEN];
     char          target[LINK_LEN];  /* readlink() of a symlink, empty otherwise */
@@ -146,17 +163,40 @@ typedef struct {
     Font *ft;          /* toolbar            */
 
     int pad, gap, icw, btn;
+    int content_l, content_r;   /* the padded band every band is clipped to */
+    int rule;                   /* hairline thickness, ui_px(1) */
     int toolbar_h, crumb_h, footer_h;
-    int row_h, icon_sz, rows, text_off;
+    int row_h, icon_sz, rows;
     int list_y, list_bot;
     int btn_x[TB_COUNT], btn_w[TB_COUNT];
     int tb_labels;      /* the four navigation buttons carry their names */
     int tb_sort_label;  /* the sort button carries the current mode */
 
+    /* insets and corner radii, all ui_px(): the row highlight is inset
+     * from the list edges by row_xpad/row_ypad, buttons and highlights
+     * share `radius`, and the scrollbar lives in the right padding. */
+    int radius, row_xpad, row_ypad, press_dy;
+    int bar_w, bar_pad, thumb_min;
+
+    /* the breadcrumb band: the app's folder mark, the chevron cell between
+     * two segments, and the hover pill's air around a segment. */
+    int crumb_icon, crumb_chev, crumb_hpad, crumb_vpad, chev_sz, chev_pad,
+        crumb_igap;
+
+    /* text tops inside their own band, from line_top(): the row, the
+     * breadcrumb, the footer and the toolbar labels. */
+    int row_text_dy, crumb_text_dy, footer_text_dy, tb_text_dy, tb_icon_dy;
+
+    /* one column grid: name on the left, size and stamp right-aligned on
+     * the same two edges in every row. */
     int name_x, name_w;
-    int size_x, size_col;
-    int time_x, time_col;
+    int size_right, size_col;
+    int time_right, time_col;
     int show_time, show_size;
+
+    /* footer: the gap after the item count, before the free-space figure
+     * and the smallest middle column worth drawing. */
+    int foot_gap, foot_colgap, foot_mininfo;
 } Layout;
 
 typedef struct {
@@ -186,6 +226,33 @@ static int iround(float v) { return (int)(v < 0.0f ? v - 0.5f : v + 0.5f); }
 static int iceil(float v) {
     int i = (int)v;
     return (v > (float)i) ? i + 1 : i;
+}
+
+/* ------------------------------------------------------------
+ *  Vertical centring that is not a guess
+ *
+ *  font_draw() takes the TOP of a line and puts the baseline exactly
+ *  font_ascent() below it. The ink of that line runs from `ascent`
+ *  above the baseline to `descent` below it, and stbtt's
+ *  ScaleForPixelHeight makes ascent + descent equal the nominal size
+ *  - which is font_height()/1.4, because src/font.c draws in a 1.4*size
+ *  line box (src/font.c:60,119). So the ink box is exactly
+ *  font_height()/1.4 tall and centring it in a band of `band` pixels is
+ *
+ *      y = (band - font_height(f)/1.4) / 2
+ *
+ *  measured from the band's top. Caps and descenders are then equally
+ *  inside the row; the old (band - font_height())/2 guess sat about a
+ *  tenth of a line high because it centred the leading too. The other
+ *  apps in this tree use the same rule, so no two windows disagree
+ *  about what "centred" means. Every band here uses this function.
+ * ------------------------------------------------------------ */
+static int line_top(Font *f, int band) {
+    int ink;
+    if (!f || band <= 0) return 0;
+    ink = iround(font_height(f) / 1.4f);
+    if (ink >= band) return 0;
+    return (band - ink) / 2;
 }
 
 static double mono_now(void) {
@@ -313,6 +380,27 @@ static int layout_build(Layout *L, int w, int h) {
 
     L->pad = ui_px(6);
     L->gap = ui_px(4);
+    L->content_l = L->pad;
+    L->content_r = w - L->pad;
+    if (L->content_r < L->content_l) L->content_r = L->content_l;
+    L->rule = ui_px(1);
+    L->radius = ui_px(5);
+    L->row_xpad = L->pad / 2;
+    L->row_ypad = ui_px(1);
+    L->press_dy = ui_px(1);
+    L->bar_w = ui_px(3);
+    L->bar_pad = ui_px(2);
+    L->thumb_min = ui_px(10);
+    L->crumb_chev = ui_px(12);
+    L->chev_sz = ui_px(7);
+    L->chev_pad = ui_px(2);
+    L->crumb_hpad = ui_px(3);
+    L->crumb_vpad = ui_px(2);
+    L->crumb_icon = ui_px(14);
+    L->crumb_igap = ui_px(4);
+    L->foot_gap = ui_px(14);
+    L->foot_colgap = ui_px(8);
+    L->foot_mininfo = ui_px(20);
 
     /* An icon button is one glyph line plus padding on every side. */
     L->icw = fh_t + ui_px(2);
@@ -330,8 +418,12 @@ static int layout_build(Layout *L, int w, int h) {
     L->icon_sz = ui_px(20);
     if (L->icon_sz > L->row_h - ui_px(4)) L->icon_sz = L->row_h - ui_px(4);
     if (L->icon_sz < ui_px(12)) L->icon_sz = ui_px(12);
-    L->text_off = (L->row_h - fh_l) / 2;
-    if (L->text_off < 0) L->text_off = 0;
+
+    /* Every line's top inside its own band, from the face that draws it. */
+    L->row_text_dy = line_top(L->fl, L->row_h);
+    L->tb_text_dy = line_top(L->ft, L->btn);
+    L->tb_icon_dy = (L->btn - L->icw) / 2;
+    if (L->tb_icon_dy < 0) L->tb_icon_dy = 0;
 
     /* Vertical bands. A band is only kept if it and one whole row still fit
      * in the window: the status line goes first, then the breadcrumbs, so a
@@ -343,6 +435,9 @@ static int layout_build(Layout *L, int w, int h) {
     if (L->toolbar_h + L->crumb_h + L->footer_h + L->row_h > h) L->footer_h = 0;
     if (L->toolbar_h + L->crumb_h + L->row_h > h) L->crumb_h = 0;
     if (L->toolbar_h + L->row_h > h) L->toolbar_h = h;
+
+    L->crumb_text_dy = line_top(L->fc, L->crumb_h);
+    L->footer_text_dy = line_top(L->ff, L->footer_h);
 
     L->list_y = L->toolbar_h + L->crumb_h + L->pad / 2;
     L->list_bot = h - L->footer_h;
@@ -407,8 +502,8 @@ static int layout_build(Layout *L, int w, int h) {
         L->size_col = iceil(font_width(L->fl, "0000.0 MB"));
         L->time_col = iceil(font_width(L->fl, "0000-00-00 00:00"));
         L->name_x = L->pad + L->icon_sz + L->pad;
-        L->size_x = right - L->size_col;
-        L->time_x = right - L->time_col;
+        L->size_right = right;
+        L->time_right = right;
 
         /* The brief's rule: no modified-time column under 380 px of window.
          * 380 is a literal window width - the columns it holds are already
@@ -417,16 +512,20 @@ static int layout_build(Layout *L, int w, int h) {
          * name column against ui_px(90); that test is the real guard, and it
          * keeps the dates in a 480 px window at 1.4x where they still fit. */
         L->show_time = (w >= 380);
-        if (L->show_time) L->size_x = L->time_x - L->pad - L->size_col;
-        L->name_w = L->size_x - L->gap - L->name_x;
+        if (L->show_time)
+            L->size_right = L->time_right - L->time_col - L->pad;
+        L->name_w = L->size_right - L->size_col - L->gap - L->name_x;
         if (L->show_time && L->name_w < ui_px(90)) {
             L->show_time = 0;
-            L->size_x = right - L->size_col;
-            L->name_w = L->size_x - L->gap - L->name_x;
+            L->size_right = right;
+            L->name_w = L->size_right - L->size_col - L->gap - L->name_x;
         }
         /* in a window too narrow for a size column the names take it all */
         L->show_size = (L->name_w >= ui_px(90));
-        if (!L->show_size) L->name_w = right - L->name_x;
+        if (!L->show_size) {
+            L->size_right = right;
+            L->name_w = right - L->name_x;
+        }
         if (L->name_w < ui_px(16)) L->name_w = ui_px(16);
     }
     return 1;
@@ -516,7 +615,7 @@ static int tb_enabled(const Files *f, int i) {
 /* ------------------------------------------------------------
  *  Breadcrumbs: built from the real path, laid out to fit w
  * ------------------------------------------------------------ */
-static int crumb_build(const Files *f, const Layout *L, int w, Crumb *out, int *dots) {
+static int crumb_build(const Files *f, const Layout *L, Crumb *out, int *dots) {
     Crumb all[MAX_CRUMBS];
     int n = 0;
 
@@ -544,7 +643,7 @@ static int crumb_build(const Files *f, const Layout *L, int w, Crumb *out, int *
         if (f->path[i] == '/') i++;
     }
 
-    float chev = (float)ui_px(9);
+    float chev = (float)L->crumb_chev;
     float wid[MAX_CRUMBS];
     float total = 0.0f;
     for (int k = 0; k < n; k++) {
@@ -558,7 +657,11 @@ static int crumb_build(const Files *f, const Layout *L, int w, Crumb *out, int *
         if (k) total += chev;
     }
 
-    float avail = (float)(w - 2 * L->pad);
+    /* The app's own folder mark owns the first crumb_icon pixels of the
+     * band; the path starts after it (and after the ellipsis when leading
+     * segments had to go). Everything is measured inside the padded band
+     * (content_l .. content_r), so nothing can leave the window. */
+    float avail = (float)(L->content_r - L->content_l - L->crumb_icon - L->crumb_igap);
     int first = 0;
     float dots_w = font_width(L->fc, "...") + (float)L->gap;
     /* Drop whole leading segments until the line fits *with* the ellipsis
@@ -573,19 +676,45 @@ static int crumb_build(const Files *f, const Layout *L, int w, Crumb *out, int *
         *dots = 1;
     }
 
-    float x = (float)L->pad + (*dots ? dots_w : 0.0f);
+    float x = (float)L->content_l + (float)L->crumb_icon + (float)L->crumb_igap
+            + (*dots ? dots_w : 0.0f);
     int m = 0;
     for (int k = first; k < n; k++) {
+        float x1 = x + wid[k];
+        /* A single component wider than the whole band is clipped here, not
+         * just in the painter: the span the click test and the hover pill
+         * use must stop at the padded edge as well, or a long folder name
+         * would paint its pill over the desktop. */
+        if (x > (float)L->content_r) x = (float)L->content_r;
+        if (x1 > (float)L->content_r) x1 = (float)L->content_r;
         out[m].x0 = x;
-        out[m].x1 = x + wid[k];
+        out[m].x1 = x1;
         out[m].target = all[k].target;
         out[m].ls = all[k].ls;
         out[m].ll = all[k].ll;
-        x += wid[k];
+        x = x1;
         if (k + 1 < n) x += chev;
         m++;
     }
     return m;
+}
+
+/* ------------------------------------------------------------
+ *  One crumb's hover pill and click span, clipped to the padded band.
+ *  The painter fills exactly this rectangle (draw_crumbs()) and the
+ *  hit-test compares the pointer with exactly this rectangle
+ *  (files_click()), so a path component wider than the breadcrumb band
+ *  can neither paint nor capture a single pixel outside the window - and
+ *  the two sides cannot drift apart, because there is only one copy.
+ * ------------------------------------------------------------ */
+static void crumb_pill(const Layout *L, const Crumb *c, float *px, float *pw) {
+    float x0 = c->x0 - (float)L->crumb_hpad;
+    float x1 = c->x1 + (float)L->crumb_hpad;
+    if (x0 < (float)L->content_l) x0 = (float)L->content_l;
+    if (x1 > (float)L->content_r) x1 = (float)L->content_r;
+    if (x1 < x0) x1 = x0;
+    *px = x0;
+    *pw = x1 - x0;
 }
 
 /* ------------------------------------------------------------
@@ -908,6 +1037,16 @@ static void mark_arrow(Surface *s, float x, float y, float w, float h, u32 c) {
     gfx_polygon(s, head, 3, c);
 }
 
+/* The folder mark, in the launcher's geometric style: a tab body plus the
+ * body itself. Used for every directory row and as this window's own mark
+ * at the head of the breadcrumb band. */
+static void draw_folder(Surface *s, float x, float y, float sz, u32 fg) {
+    float w = sz * 0.90f, h = sz * 0.60f;
+    float bx = x + (sz - w) * 0.5f, by = y + (sz - h) * 0.5f + sz * 0.07f;
+    gfx_rrect(s, bx, by - sz * 0.15f, w * 0.46f, sz * 0.18f, sz * 0.04f, fg);
+    gfx_rrect_aa(s, bx, by, w, h, sz * 0.10f, fg, 0, 0);
+}
+
 static void draw_entry_icon(Surface *s, const Entry *e, float x, float y, float sz,
                             int sel, const Theme *th) {
     if (sz < 6.0f) return;
@@ -916,11 +1055,7 @@ static void draw_entry_icon(Surface *s, const Entry *e, float x, float y, float 
     int broken = (e->kind == IC_LINK) && !e->link_ok;
 
     if (e->kind == IC_FOLDER) {
-        u32 fg = color_alpha(th->accent, sel ? 0.98f : 0.80f);
-        float w = sz * 0.90f, h = sz * 0.60f;
-        float bx = x + (sz - w) * 0.5f, by = y + (sz - h) * 0.5f + sz * 0.07f;
-        gfx_rrect(s, bx, by - sz * 0.15f, w * 0.46f, sz * 0.18f, sz * 0.04f, fg);
-        gfx_rrect_aa(s, bx, by, w, h, sz * 0.10f, fg, 0, 0);
+        draw_folder(s, x, y, sz, color_alpha(th->accent, sel ? 0.98f : 0.80f));
         return;
     }
 
@@ -1005,7 +1140,8 @@ static void draw_toolbar(Files *f, Surface *s, int x, int y, int w,
     if (w <= 0 || L->toolbar_h <= 0) return;
 
     surf_blend(s, x, y, w, L->toolbar_h, th->panel);
-    if (L->toolbar_h > 1) surf_blend(s, x, y + L->toolbar_h - 1, w, 1, th->panel_border);
+    if (L->toolbar_h > L->rule)
+        surf_blend(s, x, y + L->toolbar_h - L->rule, w, L->rule, th->panel_border);
 
     double now = mono_now();
 
@@ -1035,7 +1171,7 @@ static void draw_toolbar(Files *f, Surface *s, int x, int y, int w,
         }
 
         gfx_rrect_aa(s, (float)(x + bx), (float)(y + by), (float)bw, (float)bh,
-                     (float)ui_px(5), fill, border, 1.0f);
+                     (float)L->radius, fill, border, 1.0f);
 
         u32 fg = !enabled ? color_alpha(th->text, 0.25f)
                : down    ? th->text
@@ -1044,15 +1180,14 @@ static void draw_toolbar(Files *f, Surface *s, int x, int y, int w,
 
         /* pressed: the icon and the word sit one pixel lower, inside the
          * same button - the pixel the finger would have pushed */
-        int dy = down ? 1 : 0;
+        int dy = down ? L->press_dy : 0;
         float ix = (float)(x + bx) + (float)L->pad;
-        float iy = (float)(y + by) + (float)(bh - L->icw) * 0.5f + (float)dy;
+        float iy = (float)(y + by) + (float)L->tb_icon_dy + (float)dy;
         tb_icon(s, i, ix, iy, (float)L->icw, fg);
 
         if (i == TB_SORT ? L->tb_sort_label : L->tb_labels) {
             const char *lab = (i == TB_SORT) ? sort_label(f->sort) : TB_LABEL[i];
-            float ly = (float)(y + by) + ((float)bh - font_height(L->ft)) * 0.5f
-                     + (float)dy;
+            float ly = (float)(y + by) + (float)L->tb_text_dy + (float)dy;
             float lx = ix + (float)L->icw + (float)L->pad;
             float maxw = (float)(x + bx + bw) - lx - (float)L->pad;
             draw_clipped(s, L->ft, lx, ly, maxw, lab, fg);
@@ -1066,14 +1201,22 @@ static void draw_crumbs(Files *f, Surface *s, int x, int y, int w,
     int cy = y + L->toolbar_h;
     Crumb cr[MAX_CRUMBS];
     int dots = 0;
-    int n = crumb_build(f, L, w, cr, &dots);
+    int n = crumb_build(f, L, cr, &dots);
 
-    float ty = (float)cy + ((float)L->crumb_h - font_height(L->fc)) * 0.5f;
-    if (ty < (float)cy) ty = (float)cy;
+    float ty = (float)cy + (float)L->crumb_text_dy;
+
+    /* the window's own mark: a folder at the head of the path */
+    draw_folder(s, (float)(x + L->pad),
+                (float)cy + ((float)L->crumb_h - (float)L->crumb_icon) * 0.5f,
+                (float)L->crumb_icon, color_alpha(th->accent, 0.70f));
 
     if (dots)
-        draw_clipped(s, L->fc, (float)(x + L->pad), ty,
-                     (float)(w - 2 * L->pad), "...", color_alpha(th->text, 0.45f));
+        draw_clipped(s, L->fc,
+                     (float)(x + L->content_l + L->crumb_icon + L->crumb_igap),
+                     ty,
+                     (float)(L->content_r - L->content_l - L->crumb_icon -
+                             L->crumb_igap),
+                     "...", color_alpha(th->text, 0.45f));
 
     for (int i = 0; i < n; i++) {
         char lab[NAME_LEN];
@@ -1083,35 +1226,44 @@ static void draw_crumbs(Files *f, Surface *s, int x, int y, int w,
         lab[len] = 0;
         const char *text = len ? lab : "/";
 
-        /* local pointer vs local span - see the coordinate-space note
-         * above layout_build(); the draw origin stays out of this */
+        /* local pointer vs the pill crumb_pill() computes - see the
+         * coordinate-space note above layout_build(); the draw origin stays
+         * out of this. The pill is clipped to the padded band, so hovering
+         * a path component wider than the band cannot paint outside the
+         * window. */
+        float pill_x, pill_w;
+        crumb_pill(L, &cr[i], &pill_x, &pill_w);
         int hov = f->py >= L->toolbar_h && f->py < L->toolbar_h + L->crumb_h &&
-                  (float)f->px >= cr[i].x0 - 2.0f && (float)f->px < cr[i].x1 + 2.0f;
+                  pill_w > 0.0f &&
+                  (float)f->px >= pill_x && (float)f->px < pill_x + pill_w;
         int last = (i == n - 1);
 
         if (hov)
-            gfx_rrect(s, (float)x + cr[i].x0 - 3.0f, (float)cy + 2.0f,
-                      (cr[i].x1 - cr[i].x0) + 6.0f, (float)L->crumb_h - 4.0f,
-                      (float)ui_px(4), color_alpha(th->accent, 0.18f));
+            gfx_rrect(s, (float)x + pill_x,
+                      (float)cy + (float)L->crumb_vpad,
+                      pill_w, (float)(L->crumb_h - 2 * L->crumb_vpad),
+                      (float)L->radius, color_alpha(th->accent, 0.18f));
 
         u32 col = last ? th->text : (hov ? th->text : color_alpha(th->text, 0.62f));
-        /* never paint past the right padding, whatever the path is */
-        float room = (float)(x + w - L->pad) - ((float)x + cr[i].x0);
-        if (room > cr[i].x1 - cr[i].x0) room = cr[i].x1 - cr[i].x0;
-        draw_clipped(s, L->fc, (float)x + cr[i].x0, ty, room, text, col);
+        draw_clipped(s, L->fc, (float)x + cr[i].x0, ty,
+                     cr[i].x1 - cr[i].x0, text, col);
 
         if (i + 1 < n) {
-            /* the arrow lives inside the gap reserved for it (ui_px(9)),
-             * with a pixel of air on either side so it never touches the
-             * segment that follows */
-            float sz = (float)(ui_px(9) - 3);
-            draw_chevron(s, (float)x + cr[i].x1 + (float)ui_px(1),
+            /* the arrow lives inside the cell crumb_chev reserved for it,
+             * with a pixel of air so it never touches a segment. It cannot
+             * cross the right edge: a clipped last span leaves its chevron
+             * at the band edge, inside the padded band. */
+            float sz = (float)L->chev_sz;
+            float cxp = (float)x + cr[i].x1 + (float)L->chev_pad;
+            if (cxp + sz > (float)x + L->content_r) cxp = (float)x + L->content_r - sz;
+            draw_chevron(s, cxp,
                          (float)cy + ((float)L->crumb_h - sz) * 0.5f, sz,
                          color_alpha(th->text, 0.30f));
         }
     }
-    if (L->crumb_h > 0)
-        surf_blend(s, x + L->pad, cy + L->crumb_h - 1, w - 2 * L->pad, 1,
+    if (L->crumb_h > L->rule)
+        surf_blend(s, x + L->content_l, cy + L->crumb_h - L->rule,
+                   L->content_r - L->content_l, L->rule,
                    color_alpha(th->panel_border, 0.6f));
 }
 
@@ -1120,12 +1272,12 @@ static void draw_list(Files *f, Surface *s, int x, int y, int w,
     int top = y + L->list_y;
 
     if (f->error[0]) {
-        draw_clipped(s, L->fl, (float)(x + L->pad), (float)(top + L->text_off),
+        draw_clipped(s, L->fl, (float)(x + L->pad), (float)(top + L->row_text_dy),
                      (float)(w - 2 * L->pad), f->error, th->accent);
         return;
     }
     if (f->count == 0) {
-        draw_clipped(s, L->fl, (float)(x + L->pad), (float)(top + L->text_off),
+        draw_clipped(s, L->fl, (float)(x + L->pad), (float)(top + L->row_text_dy),
                      (float)(w - 2 * L->pad), "this folder is empty", th->text_dim);
         return;
     }
@@ -1155,9 +1307,9 @@ static void draw_list(Files *f, Surface *s, int x, int y, int w,
         int sel = (idx == f->sel);
 
         if (sel) {
-            gfx_rrect_aa(s, (float)x + (float)(L->pad / 2), ry + 1.0f,
-                         (float)(w - L->pad), (float)(rh - 2),
-                         (float)ui_px(4),
+            gfx_rrect_aa(s, (float)x + (float)L->row_xpad, ry + (float)L->row_ypad,
+                         (float)(w - 2 * L->row_xpad),
+                         (float)(rh - 2 * L->row_ypad), (float)L->radius,
                          color_alpha(th->accent, 0.20f), 0, 0);
         } else {
             /* hover: the last pointer position the desktop reported sits on
@@ -1165,13 +1317,14 @@ static void draw_list(Files *f, Surface *s, int x, int y, int w,
              * f->px/f->py and row_rect() are both app-local. */
             int hov = f->px >= 0 && f->px < w && f->py >= ryt && f->py < ryt + rh;
             if (hov)
-                gfx_rrect_aa(s, (float)x + (float)(L->pad / 2), ry + 1.0f,
-                             (float)(w - L->pad), (float)(rh - 2),
-                             (float)ui_px(4),
+                gfx_rrect_aa(s, (float)x + (float)L->row_xpad,
+                             ry + (float)L->row_ypad,
+                             (float)(w - 2 * L->row_xpad),
+                             (float)(rh - 2 * L->row_ypad), (float)L->radius,
                              color_alpha(th->text, 0.05f), 0, 0);
         }
 
-        float ty = ry + (float)L->text_off;
+        float ty = ry + (float)L->row_text_dy;
         draw_entry_icon(s, e, (float)(x + L->pad),
                         ry + (float)(rh - L->icon_sz) * 0.5f,
                         (float)L->icon_sz, sel, th);
@@ -1187,8 +1340,7 @@ static void draw_list(Files *f, Surface *s, int x, int y, int w,
             char sz[24];
             human_size(e->size, sz, sizeof(sz));
             float sw = font_width(L->fl, sz);
-            font_draw(s, L->fl,
-                      (float)(x + L->size_x) + (float)L->size_col - sw, ty, sz,
+            font_draw(s, L->fl, (float)(x + L->size_right) - sw, ty, sz,
                       color_alpha(th->text, sel ? 0.85f : 0.50f));
         }
 
@@ -1196,8 +1348,7 @@ static void draw_list(Files *f, Surface *s, int x, int y, int w,
             char ts[32];
             fmt_mtime(e->mtime, ts, sizeof(ts));
             float tw = font_width(L->fl, ts);
-            font_draw(s, L->fl,
-                      (float)(x + L->time_x) + (float)L->time_col - tw, ty, ts,
+            font_draw(s, L->fl, (float)(x + L->time_right) - tw, ty, ts,
                       color_alpha(th->text, sel ? 0.62f : 0.36f));
         }
     }
@@ -1206,12 +1357,12 @@ static void draw_list(Files *f, Surface *s, int x, int y, int w,
      * rows/scroll/count, so it is a map of the list, not decoration. It
      * lives in the right padding so it can never cross a column. */
     if (L->rows > 0 && f->count > L->rows) {
-        int bar_w = ui_px(3);
+        int bar_w = L->bar_w;
         int band = L->list_bot - L->list_y;
-        int bx = x + w - bar_w - ui_px(2);
+        int bx = x + w - bar_w - L->bar_pad;
         if (bx > x) {
             int thumb = band * L->rows / f->count;
-            if (thumb < ui_px(10)) thumb = ui_px(10);
+            if (thumb < L->thumb_min) thumb = L->thumb_min;
             if (thumb > band) thumb = band;
             int span = band - thumb;
             int maxs = f->count - L->rows;
@@ -1260,9 +1411,10 @@ static void draw_footer(Files *f, Surface *s, int x, int y, int w,
     if (L->footer_h <= 0) return;
     int fy = y + L->list_bot;
     surf_blend(s, x, fy, w, L->footer_h, th->panel);
-    if (L->footer_h > 1) surf_blend(s, x, fy, w, 1, th->panel_border);
+    if (L->footer_h > L->rule)
+        surf_blend(s, x, fy, w, L->rule, th->panel_border);
 
-    float ty = (float)fy + ((float)L->footer_h - font_height(L->ff)) * 0.5f;
+    float ty = (float)fy + (float)L->footer_text_dy;
 
     char left[48];
     snprintf(left, sizeof(left), "%d%s item%s", f->count, f->truncated ? "+" : "",
@@ -1280,9 +1432,9 @@ static void draw_footer(Files *f, Surface *s, int x, int y, int w,
                   color_alpha(th->text, 0.50f));
     }
 
-    float minfo = (float)(x + L->pad) + lw + (float)ui_px(14);
-    float maxw = (float)(x + w - L->pad) - rw - (float)ui_px(8) - minfo;
-    if (maxw < (float)ui_px(20)) return;
+    float minfo = (float)(x + L->pad) + lw + (float)L->foot_gap;
+    float maxw = (float)(x + w - L->pad) - rw - (float)L->foot_colgap - minfo;
+    if (maxw < (float)L->foot_mininfo) return;
 
     char info[NAME_LEN + LINK_LEN + 64];
     footer_info(f, info, sizeof(info));
@@ -1346,9 +1498,14 @@ static void files_click(App *a, int cx, int cy, int buttons) {
     if (cy >= cy0 && cy < cy0 + L.crumb_h) {
         Crumb cr[MAX_CRUMBS];
         int dots = 0;
-        int n = crumb_build(f, &L, f->w, cr, &dots);
+        int n = crumb_build(f, &L, cr, &dots);
         for (int i = 0; i < n; i++) {
-            if ((float)cx < cr[i].x0 - 2.0f || (float)cx >= cr[i].x1 + 2.0f) continue;
+            float pill_x, pill_w;
+            crumb_pill(&L, &cr[i], &pill_x, &pill_w);
+            /* the same clamped span the painter filled - a click in the
+             * right gutter is not this crumb */
+            if (pill_w <= 0.0f || (float)cx < pill_x ||
+                (float)cx >= pill_x + pill_w) continue;
             char target[PATH_LEN];
             int t = cr[i].target;
             if (t < 1) t = 1;
@@ -1447,6 +1604,31 @@ static void files_key(App *a, const char *bytes, int n) {
     }
 }
 
+/* The window's wheel hook (AppVT.wheel). Positive notches scroll up, as
+ * the desktop delivers them. The view moves under the pointer by whole
+ * rows; the highlighted row is pulled to the nearest edge when the view
+ * passes it, so the selection is always on screen. Like an arrow key,
+ * the wheel only moves - it never opens the row it lands on. */
+static void files_wheel(App *a, int notches) {
+    Files *f = a->state;
+    if (!f || notches == 0 || f->count <= 0) return;
+
+    Layout L;
+    if (!layout_build(&L, f->w, f->h) || L.rows <= 0) return;
+
+    int maxs = f->count - L.rows;
+    if (maxs < 0) maxs = 0;
+    int want = f->scroll - notches * WHEEL_ROWS;
+    if (want < 0) want = 0;
+    if (want > maxs) want = maxs;
+    if (want == f->scroll) return;
+
+    f->scroll = want;
+    if (f->sel < f->scroll) f->sel = f->scroll;
+    if (f->sel >= f->scroll + L.rows) f->sel = f->scroll + L.rows - 1;
+    f->status[0] = 0;
+}
+
 static void files_resize(App *a, int w, int h) {
     Files *f = a->state;
     if (!f) return;
@@ -1483,5 +1665,6 @@ static void files_free(App *a) {
 const AppVT app_vt_files = {
     .id = "files", .title = "Files",
     .init = files_init, .draw = files_draw, .key = files_key,
-    .click = files_click, .resize = files_resize, .free = files_free,
+    .click = files_click, .resize = files_resize,
+    .wheel = files_wheel, .free = files_free,
 };
