@@ -104,9 +104,16 @@
  *  names - each handler below is the one that does it. A menu is measured
  *  from the fonts before it is placed, then clamped to the window rect
  *  (menu_measure/menu_place), so it can never paint on the desktop
- *  outside the window; Up/Down/Home/End move the highlight, Right/Left
- *  open and close a submenu, Enter activates, Esc and a click elsewhere
- *  dismiss.
+ *  outside the window; if the window is too short for every row the box is
+ *  capped and the bands that do not fit are cut (zero height, unreachable),
+ *  so the painted menu, the hit test and the keyboard walk the same set of
+ *  items. Up/Down/Home/End move the highlight, Right/Left open and close a
+ *  submenu, Enter activates, Esc and a click elsewhere dismiss. A click on
+ *  the menu's own padding or on the rule between two items is swallowed:
+ *  it dismisses nothing and activates nothing, the way a real menu behaves.
+ *  A press outside the rect the app was given (the desktop forwards a right
+ *  press on a title bar as a negative y) belongs to the desktop and is
+ *  ignored, so the list never opens a menu above its own window.
  *
  *  The menu has no hover highlight from the mouse: the AppVT only reports
  *  the pointer together with a press, so the item under the opening click
@@ -174,10 +181,23 @@
 #define COPY_BUF    32768
 #define DEPTH_MAX   24     /* recursion cap for copy/remove (real dirs are shallow) */
 
+/* Where a delete puts things. Overridable so a host harness can point it at
+ * a scratch tree instead of the real /root; the OS build uses this path. */
+#ifndef TRASH_DIR
 #define TRASH_DIR    "/root/.local/share/mystic/trash"
+#endif
+
+/* Where app bundles and the launch request live. Guarded the same way as
+ * TRASH_DIR so a host harness can point them at a scratch tree. */
+#ifndef APP_DIR_ONE
 #define APP_DIR_ONE  "/usr/share/mystic/apps"
+#endif
+#ifndef APP_DIR_TWO
 #define APP_DIR_TWO  "/root/apps"
+#endif
+#ifndef LAUNCH_REQ
 #define LAUNCH_REQ   "/run/mystic/launch.request"
+#endif
 
 /* the buttons mask, as src/input.c builds it, plus the modifier bits a
  * window server that knew about modifiers would OR in. The app accepts
@@ -2071,6 +2091,27 @@ static int menu_measure(Menu *m, int win_w, int win_h) {
     }
     m->w = w;
     m->h = yy + vpad;
+
+    /* A window that is too short for the whole list cannot hold the menu
+     * either. The row height shrinks first (above), but the glyphs need
+     * their line box, so the box may still be taller than the window allows:
+     * cap it here and cut the bands that would fall outside. A cut item keeps
+     * a zero-height band, which menu_hit(), menu_focus_move() and the painter
+     * all skip - so what is painted, what the keyboard can reach and what a
+     * click can land on stay the same set. */
+    if (m->h > maxh) {
+        m->h = maxh;
+        int bottom = m->h - vpad;
+        for (int i = 0; i < m->n; i++) {
+            MenuItem *it = &m->item[i];
+            if (it->y0 >= bottom) {
+                it->y0 = it->y1 = 0;
+                it->enabled = 0;        /* unreachable: not drawn, not hit */
+                continue;
+            }
+            if (it->y1 > bottom) it->y1 = bottom;
+        }
+    }
     return 1;
 }
 
@@ -2094,6 +2135,7 @@ static int menu_hit(const Menu *m, int cx, int cy) {
     for (int i = 0; i < m->n; i++) {
         int y0 = m->y + m->item[i].y0;
         int y1 = m->y + m->item[i].y1;
+        if (y1 <= y0) continue;          /* cut by menu_measure(): no band */
         if (cy >= y0 && cy < y1) return i;
     }
     return -1;
@@ -2608,6 +2650,7 @@ static void draw_menu(Surface *s, int x, int y, const Menu *m, const Theme *th) 
         const MenuItem *it = &m->item[i];
         int iy = my + it->y0;
         int ih = it->y1 - it->y0;
+        if (ih <= 0) continue;             /* cut by menu_measure(): no band */
         if (it->sep_before && i > 0) {
             int sy = iy - m->sep_h / 2;
             surf_blend(s, mx + m->pad / 2, sy, m->w - m->pad, ui_px(1),
@@ -3296,6 +3339,12 @@ static void toolbar_action(Files *f, int which) {
 static void files_click(App *a, int cx, int cy, int buttons) {
     Files *f = a->state;
     if (!f) return;
+    /* A press outside the rect the app was given is not ours: the desktop
+     * forwards a right press on the title bar as a negative y (ly - tb - 1)
+     * because it has no window menu of its own. Opening the list's menu up
+     * there would be a menu for the folder under the title of another
+     * window. */
+    if (cx < 0 || cy < 0 || (f->w > 0 && cx >= f->w) || (f->h > 0 && cy >= f->h)) return;
     f->px = cx;
     f->py = cy;
 
@@ -3333,6 +3382,10 @@ static void files_click(App *a, int cx, int cy, int buttons) {
     if (f->sub.open) {
         int hit = menu_hit(&f->sub, cx, cy);
         if (hit >= 0) { menu_activate(f, &f->sub, hit); return; }
+        /* Inside the sub's own box but not on an item (its padding or the
+         * rule between two items): that is a click on the menu, not on the
+         * list behind it, so it is swallowed and the menu stays up. */
+        if (menu_inside(&f->sub, cx, cy)) return;
         if (menu_inside(&f->menu, cx, cy)) { f->sub.open = 0; return; }
         f->sub.open = 0;
         f->menu.open = 0;
@@ -3340,6 +3393,7 @@ static void files_click(App *a, int cx, int cy, int buttons) {
     } else if (f->menu.open) {
         int hit = menu_hit(&f->menu, cx, cy);
         if (hit >= 0) { menu_activate(f, &f->menu, hit); return; }
+        if (menu_inside(&f->menu, cx, cy)) return;   /* separator / padding */
         f->menu.open = 0;
         if (!right) return;
     }
@@ -3386,6 +3440,10 @@ static void files_click(App *a, int cx, int cy, int buttons) {
     if (idx >= f->count) idx = -1;
 
     if (right) {
+        /* a right press is not half of a double click on the row it lands
+         * on, so it ends the double-click window the next left click would
+         * otherwise be measured against */
+        f->last_click_idx = -1;
         if (idx >= 0) {
             f->sel = idx;
             /* A right click on a row outside the marked set acts on that
@@ -3639,7 +3697,7 @@ static void files_init(App *a, int w, int h) {
     snprintf(f->path, sizeof(f->path), "/");
     scan(f);
     if (f->count > 0) { f->sel = 0; mark_set(f, 0, 1); f->anchor = 0; }
-    statusf(f, "right-click a row for actions - Ctrl+A selects all");
+    statusf(f, "right-click for actions - Space marks, v ranges, Ctrl+A all");
     a->state = f;
 }
 

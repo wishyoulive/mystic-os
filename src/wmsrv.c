@@ -306,7 +306,7 @@ static int cmp_app(const void *a, const void *b) {
  * installed from the Store could never be launched. */
 static const char *const APP_ROOTS[] = { WM_APP_DIR, "/root/apps" };
 
-static int scan_root(WmApp *out, int n, int max, const char *root) {
+static int scan_root(WmApp *out, int n, int max, const char *root, int from_image) {
     DIR *d = opendir(root);
     if (!d) return n;
     struct dirent *e;
@@ -319,6 +319,7 @@ static int scan_root(WmApp *out, int n, int max, const char *root) {
 
         WmApp *a = &out[n];
         memset(a, 0, sizeof(*a));
+        a->from_image = from_image;
         snprintf(a->id, sizeof(a->id), "%s", e->d_name);
 
         char line[256];
@@ -350,13 +351,26 @@ static int scan_root(WmApp *out, int n, int max, const char *root) {
 int wms_scan_apps(WmApp *out, int max) {
     int n = 0;
     for (unsigned i = 0; i < sizeof(APP_ROOTS) / sizeof(APP_ROOTS[0]); i++)
-        n = scan_root(out, n, max, APP_ROOTS[i]);
-    /* readdir order is arbitrary; sort so the launcher is stable. Two roots
-     * can hold the same id: the image's copy wins, so drop the later one. */
+        n = scan_root(out, n, max, APP_ROOTS[i], i == 0);
+    /* readdir order is arbitrary; sort so the launcher is stable. */
     qsort(out, (size_t)n, sizeof(WmApp), cmp_app);
+    /* Two roots can hold the same id - the image's bundle and a copy that pkg
+     * unpacked into /root/apps. The image must win, deterministically: the
+     * previous version kept "the first one" after qsort, which is not stable,
+     * so a stale /root/apps copy could shadow a freshly built bundle and the
+     * desktop would run last month's binary with no way to tell. */
     int keep = 0;
     for (int i = 0; i < n; i++) {
-        if (keep > 0 && !strcmp(out[keep - 1].id, out[i].id)) continue;
+        int dup = 0;
+        for (int j = 0; j < keep; j++)
+            if (!strcmp(out[j].id, out[i].id)) { dup = 1; break; }
+        if (dup) {
+            if (out[i].from_image) {          /* image copy replaces the other */
+                for (int j = 0; j < keep; j++)
+                    if (!strcmp(out[j].id, out[i].id)) { out[j] = out[i]; break; }
+            }
+            continue;
+        }
         if (keep != i) out[keep] = out[i];
         keep++;
     }
@@ -438,14 +452,35 @@ static void sandbox_child(const char *exe, const char *id, int net) {
         if (net) {
             /* getaddrinfo needs these two; ro, and only when asked for */
             snprintf(path, sizeof(path), "%s/etc", jail);   mkdir(path, 0755);
-            const char *cf[] = { "/etc/resolv.conf", "/etc/hosts" };
-            for (int ci = 0; ci < 2; ci++) {
+            /* the CA bundle lives two levels down; mkdir(2) makes one level */
+            snprintf(path, sizeof(path), "%s/etc/ssl", jail);       mkdir(path, 0755);
+            snprintf(path, sizeof(path), "%s/etc/ssl/certs", jail); mkdir(path, 0755);
+            const char *cf[] = { "/etc/resolv.conf", "/etc/hosts",
+                                 "/etc/ssl/certs/ca-bundle.crt" };
+            for (int ci = 0; ci < (int)(sizeof(cf) / sizeof(cf[0])); ci++) {
                 snprintf(path, sizeof(path), "%s%s", jail, cf[ci]);
                 fd = open(path, O_CREAT | O_RDWR, 0644);
                 if (fd >= 0) close(fd);
                 if (mount(cf[ci], path, NULL, MS_BIND | MS_RDONLY, NULL) < 0)
                     fprintf(stderr, "wms: sandbox bind %s failed: %s\n", cf[ci], strerror(errno));
             }
+        }
+
+        /* Each app gets its OWN writable /root. Without this a jailed app
+         * cannot save anything: /root is not in the jail and the jail root is
+         * root-owned, so Paint could not write /root/Pictures and 2048 could
+         * not keep its best score. Mounted as the app's /root, it is still
+         * isolated from every other app and from the real one. */
+        {
+            char home[256];
+            mkdir("/root/appdata", 0755);
+            snprintf(home, sizeof(home), "/root/appdata/%s", id);
+            mkdir(home, 0755);
+            if (chown(home, 1000, 1000) != 0)
+                fprintf(stderr, "wms: appdata chown %s failed: %s\n", home, strerror(errno));
+            snprintf(path, sizeof(path), "%s/root", jail); mkdir(path, 0755);
+            if (mount(home, path, NULL, MS_BIND, NULL) < 0)
+                fprintf(stderr, "wms: appdata bind %s failed: %s\n", home, strerror(errno));
         }
 
         snprintf(path, sizeof(path), "%s/dev/null", jail);

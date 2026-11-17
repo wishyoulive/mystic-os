@@ -145,6 +145,29 @@ How the four differ is a design decision, not a hue rotation:
   colour left on the screen is the three window buttons, which `src/main.c:793-797`
   paints at fixed RGB instead of taking them from the theme.
 
+### The two space themes, measured
+
+Both are built for the two space wallpapers (`Black Hole` and `Nebula` in
+`src/wallpaper.c`), which take their colours from the theme: the accretion disk
+runs hot-white at the ISCO through `accent` to `glow` at the rim, and the
+nebula's two cloud hues are `accent` and `glow` again. Neither theme needs a
+different key set — they are ordinary `.theme` files.
+
+| Theme | `text` on `window_bg` | `text` on `panel` (bar / in window) | `text_dim` on `window_bg` | `text_dim` on `panel` (bar / in window) | `accent` on `window_bg` | `accent` on `panel` |
+|---|---|---|---|---|---|---|
+| **Nebula** | 16.27 : 1 | 16.67 / 16.44 | 6.57 : 1 | 6.74 / 6.64 | 9.04 : 1 | 9.27 / 9.14 |
+| **Eclipse** | 18.63 : 1 | 18.74 / 18.52 | 6.29 : 1 | 6.32 / 6.25 | 11.31 : 1 | 11.37 / 11.24 |
+
+* **Nebula** — violet and indigo: `bg_top #0A0618` is almost black with a blue
+  cast, `bg_bottom #170D33` is the nebula's own light, the accent is a pale
+  lavender (`#B9A6FF`) and the glow an indigo (`#6B3FD4`) at
+  `glow_strength 0.65`. 16 px corners; the softest theme that is still dark.
+* **Eclipse** — near-black with a single warm light: `bg_top #070404`,
+  `bg_bottom #170C05` (the corona's afterglow), accent amber `#FFB454`, glow a
+  burnt ember `#8A3E0C` at `0.7`. 12 px corners. The accent is the only
+  saturated colour on the screen, which is what makes the black hole's beamed
+  side read as a highlight rather than as decoration.
+
 ### The six older themes, measured
 
 Same formula, same method, for the record:

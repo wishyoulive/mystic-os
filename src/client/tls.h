@@ -5,6 +5,11 @@
  *  TLS 1.2 session. The caller owns the socket and supplies the two
  *  byte-moving callbacks; the TLS code never opens a socket itself.
  *
+ *  TLS 1.2 only: the engine's version range is pinned to 1.2 on both
+ *  ends, so a server that speaks nothing but 1.3 (or 1.1 and below)
+ *  fails the handshake instead of silently falling back. TLS 1.3 is
+ *  not implemented here.
+ *
  *  On success it returns a connection whose certificate chain has
  *  already been validated against the bundled Mozilla roots, whose
  *  host name has been matched and whose dates have been checked.
@@ -40,7 +45,12 @@ typedef struct {
 TlsConn *tls_connect(void *ioctx, TlsReadFn rd, TlsWriteFn wr,
                      const char *hostname, char *err, size_t esz);
 
-/* Application data. Return >0 bytes, 0 on orderly close, -1 on error. */
+/* Application data. Return >0 bytes, 0 on orderly close, -1 on error.
+ * A peer that closes the TCP connection without sending close_notify is
+ * reported as 0: everything BearSSL delivered was authenticated first, so
+ * the bytes are genuine, and the protocol above (HTTP) decides from its
+ * own framing whether the message was complete. A transport failure on a
+ * socket that is still open stays -1. */
 long tls_read(TlsConn *t, void *buf, size_t len, char *err, size_t esz);
 int  tls_write(TlsConn *t, const void *buf, size_t len, char *err, size_t esz);
 

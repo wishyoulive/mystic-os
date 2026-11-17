@@ -19,41 +19,57 @@
  *                that hit the cap.
  *    create      open(path, O_WRONLY|O_CREAT|O_EXCL, 0600).
  *    delete      unlink(path), after an explicit in-app confirmation.
- *    rename      rename(old, new), after saving unsaved edits.
+ *    rename      rename(old, new), after saving unsaved edits, and only
+ *                when lstat() says the target name is free - rename(2)
+ *                would otherwise replace another note silently.
  *    save        open(path.tmp, O_WRONLY|O_CREAT|O_TRUNC), write(),
  *                fsync(), close(), rename() over path - and fsync of
  *                the directory so the rename is durable. A failure at
  *                any step leaves the previous file intact and the
  *                buffer dirty, with the kernel's strerror(errno) on
  *                screen.
- *    autosave    the same save, four seconds after the last edit, run
- *                from draw() (main.c repaints at least once a second
- *                for the taskbar clock). After a save the footer says
- *                "saved HH:MM:SS" from localtime_r(time(NULL)).
+ *    autosave    the same save, four seconds after the buffer first
+ *                became dirty, run from draw() (main.c repaints at
+ *                least once a second for the taskbar clock). After a
+ *                save the footer shows "saved HH:MM:SS" from
+ *                localtime_r(time(NULL)).
  *    search      opendir()/readdir() again, then open()+read() each
  *                note into a second fixed buffer and a case-folding
- *                substring scan. The filter box highlights the match
- *                inside each result, and the same needle is painted
- *                behind the matching bytes in the editor.
+ *                substring scan. The note being edited is scanned from
+ *                the live buffer, so unsaved text is searched too. The
+ *                filter box highlights the match inside each result,
+ *                and the same needle is painted behind the matching
+ *                bytes in the editor.
  *    find/repl   a scan of the in-memory buffer; the replacement is a
  *                memmove inside the same 64 KB block, never a new
  *                allocation. Ctrl+R replaces every occurrence it can
  *                fit and reports the real count.
  *    counts      words/chars/lines computed from the buffer on every
- *                frame (chars counts UTF-8 lead bytes, not
- *                continuation bytes).
+ *                frame (chars counts UTF-8 code points, not continuation
+ *                bytes). The painter decodes the same sequences, so a
+ *                multi-byte glyph is drawn, measured and wrapped as one
+ *                glyph; the caret itself stays byte-addressed.
  *    preview     Ctrl+T renders the buffer as markdown-ish text:
  *                headings, bullets, numbered lists, quotes, fences,
  *                **bold**, `code` and [links](...) are parsed out of
  *                the real bytes; nothing is a canned stub.
  *
  *  The editor keeps the caret behaviour that was verified: the caret
- *  is painted after every glyph, one ink-box tall, in the gap where
- *  the next glyph's pen starts. All geometry - margin, gutter, gap,
- *  row height, sidebar, buttons, footer - is derived from the fonts
- *  and ui_px() once per frame in layout_build()/grid_of(), so the
- *  whole app grows and shrinks with the global text scale and the
- *  click handler, the painter and the scroll window cannot drift.
+ *  is painted after every glyph, one ink-box tall, on the glyph pen -
+ *  the x the next glyph is drawn from, not over its ink. All geometry -
+ *  margin, gutter, gap, row height, sidebar, buttons, footer - is
+ *  derived from the fonts and ui_px() once per frame in
+ *  layout_build()/grid_of(), so the whole app grows and shrinks with the
+ *  global text scale and the click handler, the painter and the scroll
+ *  window cannot drift.
+ *  The wheel scrolls the list when the pointer is over the sidebar (the
+ *  last pointer position the desktop reported) and the text otherwise;
+ *  the list view keeps its selection on screen instead of running off.
+ *
+ *  The surface the desktop hands an app is the whole screen, with the
+ *  window clip in screen coordinates. draw() rebases both into window
+ *  space before painting: copying the surface alone would clip the
+ *  top-left of every window that is not at 0,0.
  *
  *  There is no unbounded allocation: the two 64 KB blocks are fixed,
  *  the document table is capped at MAX_DOCS and the result table at
@@ -166,6 +182,11 @@ typedef struct {
     int    status_err;
 
     int    esc, esc_param, esc_digits, esc_mod;
+
+    /* Last pointer position the desktop reported with a click. The AppVT
+     * wheel event carries no position, so this is the only honest way to
+     * know which pane the wheel is over. */
+    int    ptr_x, ptr_y, ptr_valid;
 } Notes;
 
 /* ------------------------------------------------------------
@@ -289,16 +310,41 @@ static int line_start_of_index(const Notes *n, int line) {
     return pos;
 }
 
+/* Copy one UTF-8 code point starting at i into out and return its byte
+ * length (1 for a byte that is not part of a valid sequence, so bad bytes
+ * still show up as themselves instead of vanishing). Drawing, measuring
+ * and hit-testing all go through this, so a two-byte accent is one glyph
+ * wide everywhere and wraps at the same place it is painted. */
+static int utf8_seq(const Notes *n, int i, int end, char *out) {
+    int need = 0;
+    if (i < 0 || i >= n->len) { out[0] = 0; return 0; }
+    unsigned char b = (unsigned char)n->buf[i];
+    if (b >= 0xC2 && b <= 0xDF) need = 1;
+    else if (b >= 0xE0 && b <= 0xEF) need = 2;
+    else if (b >= 0xF0 && b <= 0xF4) need = 3;
+    if (need > 0 && i + need < end) {
+        for (int k = 1; k <= need; k++)
+            if (((unsigned char)n->buf[i + k] & 0xC0) != 0x80) { need = 0; break; }
+    } else {
+        need = 0;
+    }
+    int len = need + 1;
+    memcpy(out, n->buf + i, (size_t)len);
+    out[len] = 0;
+    return len;
+}
+
 static int rows_of_line(const Notes *n, Font *fr, int start, int end, float avail) {
     float px = 0.0f;
     int   rows = 1;
-    char  one[2] = { 0, 0 };
+    char  one[8];
     if (end > n->len) end = n->len;
     for (int i = start; i < end; i++) {
-        one[0] = n->buf[i];
+        int gl = utf8_seq(n, i, end, one);
         float cw = font_width(fr, one);
         if (px + cw > avail && px > 0.0f) { px = 0.0f; rows++; }
         px += cw;
+        i += gl - 1;
     }
     return rows;
 }
@@ -927,7 +973,12 @@ static void doc_stash_view(Notes *n) {
  * current buffer and the switch does not happen. */
 static int doc_open(Notes *n, int idx) {
     if (idx < 0 || idx >= n->ndocs) return 0;
-    if (idx == n->cur_doc) { n->dsel = idx; return 1; }
+    if (idx == n->cur_doc) {
+        n->dsel = idx;
+        n->focus = FOCUS_EDIT;
+        n->view_preview = 0;
+        return 1;
+    }
 
     if (n->cur_doc >= 0) {
         doc_stash_view(n);
@@ -943,6 +994,7 @@ static int doc_open(Notes *n, int idx) {
     n->cur_doc = idx;
     n->dsel = idx;
     n->focus = FOCUS_EDIT;
+    n->view_preview = 0;
     ensure_visible(n, font_get(FONT_REGULAR, 12), font_get(FONT_REGULAR, 10));
     return 1;
 }
@@ -1252,6 +1304,32 @@ static void add_hit(Notes *n, const char *file, long off, int line,
     }
 }
 
+/* Scan one block of bytes for the filter. It is used both for the disk
+ * copy of a note and for the live buffer of the note being edited, so a
+ * search always sees exactly what is on screen - unsaved text included. */
+static void scan_block(Notes *n, const char *name, const char *data, int len) {
+    int line = 1;
+    int line_start = 0;
+    for (int i = 0; i < len; ) {
+        if (data[i] == '\n') {
+            line++;
+            i++;
+            line_start = i;
+            continue;
+        }
+        if (ci_match(data, len, i, n->filter, n->filter_len)) {
+            int le = i;
+            while (le < len && data[le] != '\n') le++;
+            add_hit(n, name, (long)i, line, data + line_start, le - line_start,
+                    i - line_start);
+            i += n->filter_len;
+            if (n->nhits >= MAX_HITS) { n->hits_more = 1; return; }
+        } else {
+            i++;
+        }
+    }
+}
+
 static void search_all(Notes *n) {
     n->nhits = 0;
     n->hits_more = 0;
@@ -1260,6 +1338,11 @@ static void search_all(Notes *n) {
     if (n->filter_len <= 0) return;
 
     for (int di = 0; di < n->ndocs && n->nhits < MAX_HITS; di++) {
+        if (di == n->cur_doc && n->dirty) {
+            scan_block(n, n->docs[di].name, n->buf, n->len);
+            continue;
+        }
+
         char path[PATH_LEN];
         if (!doc_path(n, n->docs[di].name, path, sizeof(path))) continue;
 
@@ -1267,27 +1350,7 @@ static void search_all(Notes *n) {
         long size = -1;
         int got = read_file(path, n->scan, NOTES_MAX - 1, &size, &e);
         if (got < 0) continue;         /* vanished between scan and open */
-
-        int line = 1;
-        int line_start = 0;
-        for (int i = 0; i < got; ) {
-            if (n->scan[i] == '\n') {
-                line++;
-                i++;
-                line_start = i;
-                continue;
-            }
-            if (ci_match(n->scan, got, i, n->filter, n->filter_len)) {
-                int le = i;
-                while (le < got && n->scan[le] != '\n') le++;
-                add_hit(n, n->docs[di].name, (long)i, line,
-                        n->scan + line_start, le - line_start, i - line_start);
-                i += n->filter_len;
-                if (n->nhits >= MAX_HITS) { n->hits_more = 1; break; }
-            } else {
-                i++;
-            }
-        }
+        scan_block(n, n->docs[di].name, n->scan, got);
     }
 }
 
@@ -1314,6 +1377,13 @@ static void open_hit(Notes *n, int idx) {
     n->view_preview = 0;        /* a hit is opened to be edited */
     n->cur = clampi((int)off, 0, n->len);
     n->pcol = n->cur - line_start_at(n, n->cur);
+    /* The disk may have changed since the scan, or the hit may have come
+     * from the live buffer: put the caret on a real match rather than on
+     * a byte offset that no longer points at one. */
+    if (n->filter_len > 0 &&
+        !ci_match(n->buf, n->len, n->cur, n->filter, n->filter_len)) {
+        if (!find_next_in(n, n->cur)) find_next_in(n, 0);
+    }
     n->focus = FOCUS_EDIT;
     n->find_open = 0;
     ensure_visible(n, font_get(FONT_REGULAR, 12), font_get(FONT_REGULAR, 10));
@@ -1450,6 +1520,14 @@ static int doc_rename(Notes *n, int idx, const char *newname) {
     if (!doc_path(n, oldname, oldpath, sizeof(oldpath)) ||
         !doc_path(n, newname, newpath, sizeof(newpath))) {
         set_status(n, 1, "rename: path too long");
+        return 0;
+    }
+    /* rename(2) replaces the target silently. In a notes directory that is
+     * a lost note, so refuse instead: the real lstat() decides, and the
+     * message names the collision. */
+    struct stat clash;
+    if (lstat(newpath, &clash) == 0) {
+        set_status(n, 1, "rename: a note with that name already exists");
         return 0;
     }
     if (rename(oldpath, newpath) != 0) {
@@ -2328,7 +2406,6 @@ static void draw_editor(Notes *n, Surface *s, const Layout *L,
     int base_row = n->top_row;
     int last_row = base_row + g->vis;
     float px = g->text_x;
-    char one[2] = { 0, 0 };
     int caret_painted = 0;
     float caret_x = 0.0f, caret_top = 0.0f;
 
@@ -2354,8 +2431,9 @@ static void draw_editor(Notes *n, Surface *s, const Layout *L,
         }
 
         for (int i = pos; i < end && row < last_row; i++) {
-            one[0] = n->buf[i];
-            float cw = font_width(fr, one);
+            char glyph[8];
+            int gl = utf8_seq(n, i, end, glyph);
+            float cw = font_width(fr, glyph);
             if (px + cw > g->text_r && px > g->text_x) {
                 px = g->text_x;
                 row++;
@@ -2363,8 +2441,10 @@ static void draw_editor(Notes *n, Surface *s, const Layout *L,
             }
             float band = g->oy + g->pad_t + (float)(row - base_row) * g->lh;
             if (row >= base_row) {
-                if (i == n->cur) {
-                    caret_x = (px > g->text_x) ? px - (float)caret_w : g->text_x;
+                /* The caret is byte-addressed; a position inside a multi-byte
+                 * glyph belongs to the glyph it is part of. */
+                if (n->cur >= i && n->cur < i + gl) {
+                    caret_x = px;
                     caret_top = band + (g->lh - ink) * 0.5f;
                     caret_painted = 1;
                 }
@@ -2387,14 +2467,15 @@ static void draw_editor(Notes *n, Surface *s, const Layout *L,
                     }
                 }
 
-                font_draw(s, fr, px, ink_y(fr, band, g->lh), one, th->text);
+                font_draw(s, fr, px, ink_y(fr, band, g->lh), glyph, th->text);
             }
             px += cw;
+            i += gl - 1;
         }
 
         if (n->cur == end && row >= base_row && row < last_row) {
             float band = g->oy + g->pad_t + (float)(row - base_row) * g->lh;
-            caret_x = (px > g->text_x) ? px - (float)caret_w : g->text_x;
+            caret_x = px;
             caret_top = band + (g->lh - ink) * 0.5f;
             caret_painted = 1;
         }
@@ -2406,8 +2487,9 @@ static void draw_editor(Notes *n, Surface *s, const Layout *L,
         row++;
     }
 
-    /* The caret, last, one ink box tall, in the gap before the glyph
-     * the caret points at - not under it and not over it. */
+    /* The caret, last, one ink box tall, on the glyph pen: the x the
+     * next glyph would be drawn from. Painting it after every glyph is
+     * what keeps a glyph from covering it when it sits mid-word. */
     if (caret_painted)
         surf_blend(s, (int)(caret_x + 0.5f), (int)(caret_top + 0.5f),
                    caret_w, (int)(ink + 0.5f), th->accent);
@@ -2810,10 +2892,13 @@ static void notes_key(App *a, const char *bytes, int count) {
             if (n->filter_len) search_all(n);
             continue;
         }
-        if (c == 0x06 && n->focus == FOCUS_EDIT) {  /* Ctrl+F: find bar */
+        /* Ctrl+F opens the find bar from any pane: a user who just
+         * searched the directory should not have to click the text first. */
+        if (c == 0x06) {
             n->find_open = 1;
             n->find_field = 0;
             n->view_preview = 0;
+            n->focus = FOCUS_EDIT;
             ensure_visible(n, fr, fd);
             continue;
         }
@@ -2866,13 +2951,14 @@ static void click_text(Notes *n, const Layout *L, Font *fr, Font *fd,
 
     while (line < lines && r <= want) {
         int end = line_end_at(n, pos);
-        for (int i = pos; i <= end; i++) {
+        for (int i = pos; i <= end; ) {
             if (i == end) {
                 if (r == want) best = end;
                 break;
             }
-            char one[2] = { n->buf[i], 0 };
-            float cw = font_width(fr, one);
+            char glyph[8];
+            int gl = utf8_seq(n, i, end, glyph);
+            float cw = font_width(fr, glyph);
             if (px + cw > g->text_x + g->avail && px > g->text_x) {
                 if (r == want) { best = i; break; }
                 px = g->text_x;
@@ -2881,6 +2967,7 @@ static void click_text(Notes *n, const Layout *L, Font *fr, Font *fd,
             }
             if (r == want && (float)x < px + cw * 0.5f) { best = i; break; }
             px += cw;
+            i += gl > 0 ? gl : 1;
         }
         if (best >= 0 || r > want) break;
         pos = end < n->len ? end + 1 : end;
@@ -2961,7 +3048,14 @@ static void modal_click(Notes *n, int x, int y, Font *fr, Font *fd) {
 
 static void notes_click(App *a, int x, int y, int buttons) {
     Notes *n = a->state;
-    if (!n || !(buttons & 1)) return;
+    if (!n) return;
+    /* Remember where the desktop last put the pointer: the wheel event has
+     * no position of its own, and this is the only honest record of which
+     * pane the user is pointing at. */
+    n->ptr_x = x;
+    n->ptr_y = y;
+    n->ptr_valid = 1;
+    if (!(buttons & 1)) return;
 
     Font *fr = font_get(FONT_REGULAR, 12);
     Font *fd = font_get(FONT_REGULAR, 10);
@@ -3001,13 +3095,56 @@ static void notes_click(App *a, int x, int y, int buttons) {
 /* ------------------------------------------------------------
  *  Wheel and resize
  * ------------------------------------------------------------ */
+/* Scroll whichever list is showing by three rows a notch (positive = up),
+ * keeping the selected row inside the view. The selection is pulled to
+ * the edge rather than left behind it, so what the wheel reveals is what
+ * Enter acts on. */
+static void list_scroll(Notes *n, int rows, int notches) {
+    if (rows < 1) rows = 1;
+    int step = notches * 3;
+
+    if (n->filter_len > 0) {
+        int max = n->nhits - rows;
+        if (max < 0) max = 0;
+        n->htop -= step;
+        if (n->htop > max) n->htop = max;
+        if (n->htop < 0) n->htop = 0;
+        if (n->nhits < 1) { n->hsel = 0; n->htop = 0; return; }
+        if (n->hsel < n->htop) n->hsel = n->htop;
+        if (n->hsel > n->htop + rows - 1) n->hsel = n->htop + rows - 1;
+        if (n->hsel > n->nhits - 1) n->hsel = n->nhits - 1;
+        return;
+    }
+
+    int max = n->ndocs - rows;
+    if (max < 0) max = 0;
+    n->dtop -= step;
+    if (n->dtop > max) n->dtop = max;
+    if (n->dtop < 0) n->dtop = 0;
+    if (n->ndocs < 1) { n->dsel = 0; n->dtop = 0; return; }
+    if (n->dsel < n->dtop) n->dsel = n->dtop;
+    if (n->dsel > n->dtop + rows - 1) n->dsel = n->dtop + rows - 1;
+    if (n->dsel > n->ndocs - 1) n->dsel = n->ndocs - 1;
+}
+
 static void notes_wheel(App *a, int notches) {
     Notes *n = a->state;
-    if (!n || !notches) return;
+    if (!n || !notches || n->prompt) return;
 
-    if (n->focus == FOCUS_LIST) {
-        if (n->filter_len) n->hsel -= notches * 3;
-        else n->dsel -= notches * 3;
+    Font *fr = font_get(FONT_REGULAR, 12);
+    Font *fd = font_get(FONT_REGULAR, 10);
+    if (!fr || !fd) return;
+    Layout L;
+    layout_build(n, &L, fr, fd);
+
+    /* The wheel event carries no position. When the pointer was last seen
+     * over the sidebar, that is the list; otherwise the pane with the
+     * keyboard - the list when it has focus, the text when it does not. */
+    int over_side = n->ptr_valid ? (n->ptr_x >= 0 && n->ptr_x < L.sbw)
+                                 : (n->focus == FOCUS_LIST || n->focus == FOCUS_FILTER);
+    if (over_side) {
+        int rows = n->filter_len ? hit_rows_visible(&L) : doc_rows_visible(&L);
+        list_scroll(n, rows, notches);
         return;
     }
     if (n->view_preview) {
@@ -3015,11 +3152,6 @@ static void notes_wheel(App *a, int notches) {
         return;
     }
 
-    Font *fr = font_get(FONT_REGULAR, 12);
-    Font *fd = font_get(FONT_REGULAR, 10);
-    if (!fr || !fd) return;
-    Layout L;
-    layout_build(n, &L, fr, fd);
     int lines = line_count(n);
     int max_top = lines - L.g.vis;
     if (max_top < 0) max_top = 0;
@@ -3037,6 +3169,8 @@ static void notes_resize(App *a, int w, int h) {
     n->h = h;
     n->fitted_w = -1;
     n->fitted_h = -1;
+    /* The remembered pointer is in the old window's coordinates. */
+    n->ptr_valid = 0;
     ensure_visible(n, font_get(FONT_REGULAR, 12), font_get(FONT_REGULAR, 10));
 }
 
@@ -3167,14 +3301,35 @@ static void notes_draw(App *a, Surface *s, int x, int y, int w, int h, const The
         n->fitted_h = h;
     }
 
-    /* One offset surface: every painter below works in app-local
-     * coordinates, and the surface routines clip to w x h. That puts
-     * the window at (x,y) and makes it impossible for a stray glyph
-     * or fill to land in another window. */
+    /* Every painter below works in app-local coordinates (0,0 is the
+     * window's content origin). The desktop hands over the whole screen
+     * surface with the window as a clip rectangle in *screen* coordinates,
+     * so the surface must be rebased and the clip translated, or a window
+     * at (140,110) would have its top-left clipped away. Both extents are
+     * clamped to the real surface so a window that pokes off the screen
+     * cannot write past the framebuffer. */
+    if (x < 0 || y < 0) return;
+    int vw = w, vh = h;
+    if (vw > s->w - x) vw = s->w - x;
+    if (vh > s->h - y) vh = s->h - y;
+    if (vw <= 0 || vh <= 0) return;
+
     Surface view = *s;
     view.px = s->px + (size_t)y * (size_t)s->stride + (size_t)x;
-    view.w = w;
-    view.h = h;
+    view.w = vw;
+    view.h = vh;
+    if (s->cx1 > s->cx0) {
+        int cx0 = s->cx0 - x, cy0 = s->cy0 - y;
+        int cx1 = s->cx1 - x, cy1 = s->cy1 - y;
+        if (cx0 < 0) cx0 = 0;
+        if (cy0 < 0) cy0 = 0;
+        if (cx1 > vw) cx1 = vw;
+        if (cy1 > vh) cy1 = vh;
+        if (cx1 <= cx0 || cy1 <= cy0) return;
+        surf_clip(&view, cx0, cy0, cx1 - cx0, cy1 - cy0);
+    } else {
+        surf_unclip(&view);
+    }
 
     surf_fill(&view, 0, 0, w, h, color_mix(th->window_bg, 0xFF000000u, 0.18f));
 

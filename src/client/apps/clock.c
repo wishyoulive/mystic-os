@@ -590,6 +590,12 @@ static int geo_fields(Rect c, const Chrome *C, TabUI *u, int reserve) {
 static void geo_buttons(Rect c, const Chrome *C, TabUI *u, int n) {
     int gap = gap_of(C);
     int bh = C->cell_h + C->cell_h / 2;
+    /* A button row taller than the content would be placed above it, which
+     * is how a 170px window at text scale 1.6 put its buttons in the tab
+     * strip. Clamping the height keeps the row inside the content in every
+     * case, including windows below the window manager's minimum. */
+    if (bh > c.h) bh = c.h;
+    if (bh < 0) bh = 0;
     int bw = (c.w - (n - 1) * gap) / n;
     if (bw < 8) bw = 8;
     u->btn_n = n;
@@ -650,8 +656,11 @@ static void geo_alarm(Rect c, const Chrome *C, TabUI *u) {
     int used = geo_fields(c, C, u, bh + gap + C->cell_h + gap);
     geo_buttons(c, C, u, 2);
 
+    /* The status line lives between the fields and the button row; sizsed
+     * from the button row's top rather than the content bottom, so a short
+     * window cannot make it overlap the buttons. */
     int sy = c.y + used + gap;
-    int sh = (c.y + c.h) - sy;
+    int sh = (u->btn[0].y - gap) - sy;
     if (sh < 0) sh = 0;
     if (sh > 2 * C->cell_h) sh = 2 * C->cell_h;
     u->big.x = c.x;              /* the status text lives here */
@@ -991,10 +1000,19 @@ static void draw_alarm_tab(DC *d, const Wall *w) {
 }
 
 /* The banner for an alarm that fired while another tab was showing. */
+/* The banner that has to reach the user wherever they are.
+ *
+ * The alarm and the timer both raise one, and both are drawn on every tab
+ * except the one that already says it in full: a countdown that expired
+ * while the clock was showing is exactly the thing a timer must not hide,
+ * so the words "TIME UP" travel with the banner instead of staying on the
+ * Timer tab. Returns without drawing when nothing needs attention. */
 static void draw_banner(DC *d) {
     const ClockState *K = d->K;
-    if (!K->a_rings) return;
-    if (K->tab == TAB_ALARM) return;          /* its own tab already says it */
+    int alarm = K->a_rings && K->tab != TAB_ALARM;
+    int timer = K->t_done && K->tab != TAB_TIMER;
+    if (!alarm && !timer) return;
+
     Rect c = d->L->content;
     int h = 3 * d->C->cell_h;
     if (h > c.h) h = c.h;
@@ -1004,18 +1022,33 @@ static void draw_banner(DC *d) {
     r.y = c.y + (c.h - h) / 2;
     r.w = c.w;
     r.h = h;
-    int lit = flash_on(d->now, K->a_flash_until);
+
+    int lit = alarm ? flash_on(d->now, K->a_flash_until)
+                    : flash_on(d->now, K->t_flash_until);
+    u32 edge = alarm ? COL_HOT : COL_WARN;
     gfx_rrect_aa(d->s, (float)r.x, (float)r.y, (float)r.w, (float)r.h, 10.0f,
-                 WITH_A(COL_HOT, lit ? 60 : 30), COL_HOT, 1.4f);
-    char buf[32], line[64];
-    fmt_tod(buf, sizeof(buf), K->a_h, K->a_m);
-    snprintf(line, sizeof(line), "ALARM %s", buf);
+                 WITH_A(edge, lit ? 60 : 30), edge, 1.4f);
+
+    char line[64], sub[64];
+    if (alarm) {
+        char buf[16];
+        fmt_tod(buf, sizeof(buf), K->a_h, K->a_m);
+        snprintf(line, sizeof(line), "ALARM %s", buf);
+        snprintf(sub, sizeof(sub), "space to dismiss");
+    } else {
+        snprintf(line, sizeof(line), "TIME UP");
+        /* the duration that ran out is real data, not a guess */
+        char dur[16];
+        fmt_mmss(dur, sizeof(dur), K->t_dur_ms);
+        snprintf(sub, sizeof(sub), "%s timer finished", dur);
+    }
+
     Rect top = r, bot = r;
     top.h = r.h / 2;
     bot.y = r.y + r.h / 2;
     bot.h = r.h - r.h / 2;
-    text_box(d->s, FONT_SEMIBOLD, top, line, lit ? COL_HOT_TX : COL_HOT);
-    text_box(d->s, FONT_REGULAR, bot, "space to dismiss", COL_TEXT);
+    text_box(d->s, FONT_SEMIBOLD, top, line, lit ? COL_HOT_TX : edge);
+    text_box(d->s, FONT_REGULAR, bot, sub, COL_TEXT);
 }
 
 static void draw_hint(DC *d) {

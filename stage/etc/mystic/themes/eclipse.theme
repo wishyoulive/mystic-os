@@ -1,0 +1,23 @@
+# Eclipse - a near-black sky under an amber corona. One warm light (the
+# accent) and no other; the glow is the ember it leaves on the background.
+#
+# Contrast, WCAG 2.1 on the composited 8 bit sRGB values (docs/THEMES.md):
+#   text      18.63:1 on window_bg   18.74 / 18.52 on panel (bar / in window)
+#   text_dim   6.29:1 on window_bg    6.32 /  6.25 on panel
+#   accent    11.31:1 on window_bg   11.37 / 11.24 on panel
+# Targets are >= 7:1 for body text, >= 4.5:1 for dim text and accent.
+name          = Eclipse
+dark          = 1
+bg_top        = #070404
+bg_bottom     = #170C05
+accent        = #FFB454
+glow          = #8A3E0C
+glow_strength = 0.7
+panel         = #A00E0907
+panel_border  = #3AFFB454
+text          = #FFF6EA
+text_dim      = #A38D74
+window_bg     = #0C0806
+window_border = #3AC0742E
+corner        = 12
+blur          = 1.0

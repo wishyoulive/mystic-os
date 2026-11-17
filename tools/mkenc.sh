@@ -37,6 +37,8 @@
 #    ./tools/mkenc.sh new-key      replace the boot half (old disks stop opening)
 #    ./tools/mkenc.sh reset-disk   move build/disk.img aside so the next boot
 #                                  creates an encrypted one
+#    ./tools/mkenc.sh elf <file>   print an ELF file's program headers and fail
+#                                  if it needs a dynamic loader
 #
 #  Run it AFTER tools/fetch-kernel.sh: that script wipes
 #  stage/lib/modules/<version> and would delete the modules again.
@@ -194,8 +196,16 @@ static ssize_t htest_pread(int fd, void *buf, size_t n, long long off)
 #define KEY_MATERIAL (HALF * 2)
 #define FPRINT 32
 
-#define EXIT_NOHDR 10       /* probe: nothing of ours here, the device is blank */
-#define EXIT_FOREIGN 11     /* probe: nothing of ours here, but something is */
+/* probe results, as shell exit codes - stage/init branches on these */
+#define EXIT_PROBE_BLANK 10     /* first 4 KiB is zero */
+#define EXIT_PROBE_FS 11        /* ext2/3/4 superblock magic at 0x438 */
+#define EXIT_PROBE_UNKNOWN 12   /* neither: never guess */
+/* attach failures, as shell exit codes - the headline must not blame the key
+ * for a device-mapper error, and must not blame dm for a wrong key */
+#define EXIT_BADARG 1
+#define EXIT_KEYFILE 2
+#define EXIT_KEYMISMATCH 3
+#define EXIT_DM 4
 #define DM_MAPPER_DIR "/dev/mapper"
 #define DM_CONTROL DM_MAPPER_DIR "/control"
 
@@ -392,6 +402,12 @@ static void put_le32(unsigned char *p, uint32_t v)
     p[3] = (unsigned char)(v >> 24);
 }
 
+static int tmp_open(char *buf, size_t cap, const char *dir, const char *stem)
+{
+    snprintf(buf, cap, "%s/%s-XXXXXX", dir, stem);
+    return mkstemp(buf);
+}
+
 static void wipe(void *p, size_t n)
 {
     volatile unsigned char *v = p;
@@ -503,7 +519,13 @@ static int keygen(const char *path)
 
 /* ---------------- header codec ---------------- */
 
-enum dev_state { DEV_ERROR = -1, DEV_BLANK = 1, DEV_FOREIGN = 2, DEV_CRYPT = 0 };
+enum dev_state {
+    DEV_ERROR = -1,
+    DEV_CRYPT = 0,
+    DEV_BLANK = 1,      /* first 4 KiB is zero: a disk nothing has written to */
+    DEV_FS = 2,         /* ext2/3/4 superblock magic at byte 0x438 */
+    DEV_UNKNOWN = 3     /* something is there and it is not ours: do not guess */
+};
 
 struct disk_info {
     enum dev_state state;
@@ -526,7 +548,7 @@ static void header_build(unsigned char hdr[HDR_BYTES], const unsigned char mater
     sha256_buf(material, KEY_MATERIAL, hdr + O_FINGERPRINT);
 }
 
-/* returns DEV_CRYPT and fills di, or DEV_BLANK / DEV_FOREIGN / DEV_ERROR */
+/* fills di and returns DEV_CRYPT, DEV_BLANK, DEV_FS, DEV_UNKNOWN or DEV_ERROR */
 static int probe_dev(const char *dev, struct disk_info *di)
 {
     unsigned char buf[HDR_BYTES];
@@ -567,8 +589,8 @@ static int probe_dev(const char *dev, struct disk_info *di)
     /* ext2/3/4 superblock magic, at byte 0x438 of the device. Checked before
      * the all-zero test so a real filesystem is never mistaken for blank. */
     if (n >= 0x43a && buf[0x438] == 0x53 && buf[0x439] == 0xef) {
-        di->state = DEV_FOREIGN;
-        return DEV_FOREIGN;
+        di->state = DEV_FS;
+        return DEV_FS;
     }
     for (i = 0; i < (size_t)n; i++)
         if (buf[i]) { zero = 0; break; }
@@ -576,8 +598,10 @@ static int probe_dev(const char *dev, struct disk_info *di)
         di->state = DEV_BLANK;
         return DEV_BLANK;
     }
-    di->state = DEV_FOREIGN;
-    return DEV_FOREIGN;
+    /* Not blank, no filesystem magic, no header. A damaged header looks
+     * exactly like this, so the only safe answer is "I do not know". */
+    di->state = DEV_UNKNOWN;
+    return DEV_UNKNOWN;
 }
 
 /* ---------------- dm-ioctl ---------------- */
@@ -680,7 +704,7 @@ static int cmd_attach(const char *name, const char *dev, const char *keypath, in
         return die("%s is not a usable mapping name", name, NULL);
     if (probe_dev(dev, &di) != DEV_CRYPT)
         return die("%s has no MYSTICC1 header (run 'init' on a blank disk first)", dev, NULL);
-    if (key_read(keypath, boot) != 0) return 1;
+    if (key_read(keypath, boot) != 0) return EXIT_KEYFILE;
     memcpy(material, boot, HALF);
     memcpy(material + HALF, di.disk_half, HALF);
     sha256_buf(material, KEY_MATERIAL, want);
@@ -690,8 +714,9 @@ static int cmd_attach(const char *name, const char *dev, const char *keypath, in
         to_hex(di.fingerprint, 8, b);
         wipe(material, sizeof material);
         wipe(boot, sizeof boot);
-        return die("key does not match this disk (header %s, key %s) - the disk is "
-                   "left untouched", b, a);
+        die("key does not match this disk (header %s, key %s) - the disk is "
+            "left untouched", b, a);
+        return EXIT_KEYMISMATCH;
     }
     if (dev_size_bytes(dev, &bytes) < 0) goto out;
     if (bytes / HDR_SECTOR <= di.offset_sectors) {
@@ -738,7 +763,7 @@ static int cmd_attach(const char *name, const char *dev, const char *keypath, in
         cfd = open(DM_CONTROL, O_RDWR);
         if (cfd < 0) {
             die_errno("cannot open " DM_CONTROL " (is dm_mod loaded?)", NULL);
-            return 1;
+            return EXIT_DM;
         }
         dm_prepare(&b, name);
         if (ioctl(cfd, DM_DEV_STATUS, &b.dmi) == 0) {
@@ -749,7 +774,7 @@ static int cmd_attach(const char *name, const char *dev, const char *keypath, in
         dm_prepare(&b, name);
         if (dm_simple(cfd, DM_DEV_CREATE, &b.dmi, "DM_DEV_CREATE") < 0) {
             close(cfd);
-            return 1;
+            return EXIT_DM;
         }
         dm_prepare(&b, name);
         b.dmi.target_count = 1;
@@ -765,7 +790,7 @@ static int cmd_attach(const char *name, const char *dev, const char *keypath, in
             dm_prepare(&b, name);
             dm_simple(cfd, DM_DEV_REMOVE, &b.dmi, "DM_DEV_REMOVE (cleanup)");
             close(cfd);
-            return 1;
+            return EXIT_DM;
         }
         memcpy(params, table, plen);
         spec->next = (uint32_t)((sizeof *spec + plen + 7) & ~(size_t)7);
@@ -774,14 +799,14 @@ static int cmd_attach(const char *name, const char *dev, const char *keypath, in
             dm_prepare(&b, name);
             dm_simple(cfd, DM_DEV_REMOVE, &b.dmi, "DM_DEV_REMOVE (cleanup)");
             close(cfd);
-            return 1;
+            return EXIT_DM;
         }
         dm_prepare(&b, name);
         if (dm_simple(cfd, DM_DEV_SUSPEND, &b.dmi, "DM_DEV_SUSPEND (resume)") < 0) {
             dm_prepare(&b, name);
             dm_simple(cfd, DM_DEV_REMOVE, &b.dmi, "DM_DEV_REMOVE (cleanup)");
             close(cfd);
-            return 1;
+            return EXIT_DM;
         }
         /* the kernel wrote the real major:minor into dmi.dev on the way out */
         maj = (unsigned)((b.dmi.dev >> 8) & 0xfffu);
@@ -792,7 +817,7 @@ static int cmd_attach(const char *name, const char *dev, const char *keypath, in
             /* devtmpfs normally creates this node; if it did not, make it. */
             if (mknod(node, S_IFBLK | 0600, makedev(maj, min)) < 0) {
                 die_errno("mapping is live but its device node could not be created", node);
-                return 1;
+                return EXIT_DM;
             }
         }
         printf("active %s %u:%u\n", node, maj, min);
@@ -878,9 +903,7 @@ static int cmd_selftest(void)
         struct disk_info di;
         int fd;
         int ok = 1;
-        snprintf(disk, sizeof disk, "%s/mystic-selftest-disk-XXXXXX", tmpdir);
-        snprintf(keyf, sizeof keyf, "%s/mystic-selftest-key-XXXXXX", tmpdir);
-        fd = mkstemp(disk);
+        fd = tmp_open(disk, sizeof disk, tmpdir, "mystic-selftest-disk");
         if (fd < 0) {
             printf("FAIL  cannot create %s: %s\n", disk, strerror(errno));
             fails++;
@@ -910,7 +933,7 @@ static int cmd_selftest(void)
             }
             unlink(disk);
         }
-        fd = mkstemp(disk);
+        fd = tmp_open(disk, sizeof disk, tmpdir, "mystic-selftest-disk");
         if (fd >= 0) {
             /* an all-zero first 4 KiB is "blank" - that is the first-boot case */
             if (ftruncate(fd, 4096) == 0) {
@@ -924,7 +947,7 @@ static int cmd_selftest(void)
             } else close(fd);
             unlink(disk);
         }
-        fd = mkstemp(disk);
+        fd = tmp_open(disk, sizeof disk, tmpdir, "mystic-selftest-disk");
         if (fd >= 0) {
             /* an ext4 superblock magic at 0x438 must NEVER read as blank */
             unsigned char sb[4096];
@@ -933,16 +956,33 @@ static int cmd_selftest(void)
             sb[0x439] = 0xef;
             if (write_all(fd, sb, sizeof sb) == 0) {
                 close(fd);
-                if (probe_dev(disk, &di) == DEV_FOREIGN)
-                    printf("ok   an ext4 superblock magic reads as foreign, not blank\n");
+                if (probe_dev(disk, &di) == DEV_FS)
+                    printf("ok   an ext4 superblock magic reads as fs, not blank\n");
                 else {
-                    printf("FAIL  an ext4 magic was not reported foreign\n");
+                    printf("FAIL  an ext4 magic was not reported fs\n");
                     fails++;
                 }
             } else close(fd);
             unlink(disk);
         }
-        fd = mkstemp(keyf);
+        fd = tmp_open(disk, sizeof disk, tmpdir, "mystic-selftest-disk");
+        if (fd >= 0) {
+            /* neither zero, nor a filesystem, nor ours: "unknown", never blank.
+             * This is what a damaged MYSTICC1 magic looks like. */
+            unsigned char junk[4096];
+            memset(junk, 0xAA, sizeof junk);
+            if (write_all(fd, junk, sizeof junk) == 0) {
+                close(fd);
+                if (probe_dev(disk, &di) == DEV_UNKNOWN)
+                    printf("ok   data that is not blank and not ext4 reads as unknown\n");
+                else {
+                    printf("FAIL  unrecognised data was not reported unknown\n");
+                    fails++;
+                }
+            } else close(fd);
+            unlink(disk);
+        }
+        fd = tmp_open(keyf, sizeof keyf, tmpdir, "mystic-selftest-key");
         if (fd >= 0) {
             static const unsigned char k32[HALF] = {
                 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
@@ -984,9 +1024,10 @@ static void usage(void)
             "usage: %s <command>\n"
             "  keygen <file>                     32 random bytes, mode 0600\n"
             "  fingerprint <file>                first 16 hex of SHA-256(file)\n"
-            "  probe <dev>                       crypt | blank | foreign\n"
+            "  probe <dev>                       exit 0 crypt, 10 blank, 11 fs, 12 unknown\n"
             "  init <dev> <key-file>             write the MYSTICC1 header (blank disk only)\n"
             "  attach <name> <dev> <key-file>    create + load + resume the mapping\n"
+            "                                    exit 2 key file, 3 wrong key, 4 dm error\n"
             "  detach <name>                     remove the mapping\n"
             "  status <name>                     exit 0 if the mapping exists\n"
             "  selftest                          hash / table / header checks\n",
@@ -1010,7 +1051,7 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "fingerprint") && argc == 3) {
         unsigned char half[HALF], d[FPRINT];
         char hex[17];
-        if (key_read(argv[2], half) != 0) return 1;
+        if (key_read(argv[2], half) != 0) return EXIT_KEYFILE;
         sha256_buf(half, HALF, d);
         wipe(half, sizeof half);
         to_hex(d, 8, hex);
@@ -1021,14 +1062,18 @@ int main(int argc, char **argv)
         struct disk_info di;
         int st = probe_dev(argv[2], &di);
         char hex[FPRINT * 2 + 1];
-        if (st == DEV_ERROR) return 1;
+        if (st == DEV_ERROR) return EXIT_BADARG;
         if (st == DEV_BLANK) {
             printf("blank\n");
-            return EXIT_NOHDR;
+            return EXIT_PROBE_BLANK;
         }
-        if (st == DEV_FOREIGN) {
-            printf("foreign\n");
-            return EXIT_FOREIGN;
+        if (st == DEV_FS) {
+            printf("fs\n");
+            return EXIT_PROBE_FS;
+        }
+        if (st == DEV_UNKNOWN) {
+            printf("unknown\n");
+            return EXIT_PROBE_UNKNOWN;
         }
         to_hex(di.fingerprint, 8, hex);
         printf("crypt %u %s\n", (unsigned)di.version, hex);
@@ -1040,11 +1085,13 @@ int main(int argc, char **argv)
         char hex[17];
         int st = probe_dev(argv[2], &di);
         int fd;
-        if (st == DEV_ERROR) return 1;
+        if (st == DEV_ERROR) return EXIT_BADARG;
         if (st != DEV_BLANK)
             return die("%s already holds %s; init only writes to a blank device", argv[2],
-                       st == DEV_CRYPT ? "an encrypted volume" : "a filesystem");
-        if (key_read(argv[3], boot) != 0) return 1;
+                       st == DEV_CRYPT ? "an encrypted volume"
+                                       : st == DEV_FS ? "a filesystem"
+                                                      : "data that is not a filesystem");
+        if (key_read(argv[3], boot) != 0) return EXIT_KEYFILE;
         memcpy(material, boot, HALF);
         if (urandom_read(material + HALF, HALF) < 0) {
             wipe(boot, sizeof boot);
@@ -1223,7 +1270,12 @@ verify() {
         printf '    size      : %s bytes\n' "$(wc -c < "$STAGE/sbin/mystic-dmcrypt" | tr -d ' ')"
         printf '    mode here : %s (tools/mkimage.py forces 0755 for sbin/* in the image)\n' \
             "$(ls -l "$STAGE/sbin/mystic-dmcrypt" | cut -c1-10)"
-        printf '    elf       : %s\n' "$(elf_report "$STAGE/sbin/mystic-dmcrypt")" || bad=1
+        elf_verdict=$(elf_report "$STAGE/sbin/mystic-dmcrypt"); elf_rc=$?
+        printf '    elf       : %s\n' "$elf_verdict"
+        if [ "$elf_rc" -ne 0 ]; then
+            warn "stage/sbin/mystic-dmcrypt is not a static executable (see above)"
+            bad=1
+        fi
     else
         warn "stage/sbin/mystic-dmcrypt is missing"; bad=1
     fi
@@ -1272,16 +1324,15 @@ verify() {
 #  5. what the next boot will do
 # ====================================================================
 cmd_status() {
+    DISKIMG=${MYSTIC_DISK_IMG:-build/disk.img}
     HOST=$(build_host_helper)
     trap 'rm -f "$HOST" "${HOST%.exe}.pdb"' EXIT
     printf 'kernel modules : %s\n' "$KO_DST"
     for f in $MODULES; do
-        [ -f "$KO_DST/$f" ] && printf '  present      : %s\n' "${f#kernel/}" \
-                            || printf '  MISSING      : %s\n' "${f#kernel/}"
+        [ -f "$KO_DST/$f" ] && printf '  present      : %s\n' "${f#kernel/}"                             || printf '  MISSING      : %s\n' "${f#kernel/}"
     done
     if [ -f "$STAGE/sbin/mystic-dmcrypt" ]; then
-        printf 'helper         : stage/sbin/mystic-dmcrypt (%s bytes)\n' \
-            "$(wc -c < "$STAGE/sbin/mystic-dmcrypt" | tr -d ' ')"
+        printf 'helper         : stage/sbin/mystic-dmcrypt (%s bytes)\n'             "$(wc -c < "$STAGE/sbin/mystic-dmcrypt" | tr -d ' ')"
     else
         printf 'helper         : MISSING - run ./tools/mkenc.sh\n'
     fi
@@ -1290,26 +1341,38 @@ cmd_status() {
     else
         printf 'boot key half  : MISSING\n'
     fi
-    if [ ! -f build/disk.img ]; then
-        printf 'disk           : build/disk.img does not exist yet\n'
+    if [ ! -f "$DISKIMG" ]; then
+        printf 'disk           : %s does not exist yet\n' "$DISKIMG"
         printf 'next boot      : creates it, writes the MYSTICC1 header, mkfs.ext4\n'
         printf '                 inside dm-crypt, mounts it on /root\n'
         return 0
     fi
-    printf 'disk           : build/disk.img (%s bytes)\n' \
-        "$(wc -c < build/disk.img | tr -d ' ')"
-    if "$HOST" probe build/disk.img > "$WORK/status.probe" 2>&1; then
-        printf 'next boot      : unlocks it with the fingerprint above (%s)\n' \
-            "$(cat "$WORK/status.probe")"
+    printf 'disk           : %s (%s bytes)\n' "$DISKIMG" "$(wc -c < "$DISKIMG" | tr -d ' ')"
+    if "$HOST" probe "$DISKIMG" > "$WORK/status.probe" 2>&1; then
+        # A valid header says nothing about the key. attach --table checks the
+        # SHA-256 fingerprint in that header against the boot half and stops
+        # before any ioctl, so this is the verdict the next boot will get.
+        if [ ! -f "$STAGE/etc/mystic/luks.key" ]; then
+            printf 'next boot      : will NOT open it - no boot key at %s\n'                 "$STAGE/etc/mystic/luks.key"
+        elif "$HOST" attach mystic-root "$DISKIMG" "$STAGE/etc/mystic/luks.key" --table > "$WORK/status.table" 2>&1; then
+            printf 'next boot      : unlocks it (%s)\n' "$(cat "$WORK/status.probe")"
+            printf 'dm table       : %s\n' "$(cat "$WORK/status.table")"
+        else
+            printf 'next boot      : will NOT open it - %s\n' "$(cat "$WORK/status.table")"
+        fi
     else
         case "$(cat "$WORK/status.probe")" in
             blank)
                 printf 'next boot      : blank disk -> writes the header and formats it\n' ;;
-            foreign)
-                printf 'next boot      : NO encryption header, and not blank:\n'
-                printf '                 a plain ext4 disk boots unencrypted (same messages\n'
-                printf '                 as before). To encrypt, run ./tools/mkenc.sh reset-disk\n'
-                printf '                 and let the next boot create a fresh volume.\n' ;;
+            fs)
+                printf 'next boot      : NO encryption header, but this is an ext4 disk:\n'
+                printf '                 it boots unencrypted with the same messages as before.\n'
+                printf '                 To encrypt, run ./tools/mkenc.sh reset-disk and let the\n'
+                printf '                 next boot create a fresh volume.\n' ;;
+            unknown)
+                printf 'next boot      : NO header and no filesystem magic - the boot will\n'
+                printf '                 REFUSE to format it. ./tools/mkenc.sh reset-disk to\n'
+                printf '                 start over.\n' ;;
             *)
                 printf 'next boot      : cannot read the disk: %s\n' "$(cat "$WORK/status.probe")" ;;
         esac
@@ -1345,6 +1408,18 @@ cmd_new_key() {
 }
 
 cmd_reset_disk() {
+    # Moving a disk away is only safe advice if the next boot can open the new
+    # one. After a git clean (stage/sbin/ and stage/lib/modules/ are ignored)
+    # it cannot, and a fresh disk would come back unencrypted without a word.
+    missing=""
+    [ -f "$STAGE/etc/mystic/luks.key" ] || missing="$missing key"
+    [ -f "$STAGE/sbin/mystic-dmcrypt" ] || missing="$missing helper"
+    for f in $MODULES; do
+        [ -f "$KO_DST/$f" ] || missing="$missing $(basename "$f")"
+    done
+    if [ -n "$missing" ]; then
+        die "run ./tools/mkenc.sh first: missing$missing - the new disk would come back unencrypted"
+    fi
     if [ ! -f build/disk.img ]; then
         printf 'build/disk.img does not exist - the next boot will create an encrypted one.\n'
         return 0
@@ -1378,13 +1453,16 @@ cmd_test() {
 #
 # Boots stage/init's disk logic with no kernel, no QEMU and no device
 # mapper. What is real here: stage/init itself (sourced, not copied), the
-# host build of stage/sbin/mystic-dmcrypt (so the MYSTICC1 header, the
-# key check and the SHA-256 fingerprint are the shipping code), and the
-# four states a disk can be in. What is fake: the block device is a
-# regular file, mount/mkfs/modprobe are shell scripts, and the three dm
-# ioctls never run (they need a kernel). `disk_present` is replaced for
-# every scenario except the first, because a Windows build host has no
-# block devices at all; scenario 1 keeps the real [ -b ] check.
+# host build of stage/sbin/mystic-dmcrypt (so the MYSTICC1 header, the key
+# check and the SHA-256 fingerprint are the shipping code), and the bytes on
+# the fake disks - the fake mkfs writes a real ext4 superblock magic into the
+# device and the fake mount decides from that magic, so a format is visible
+# to cksum and "there is a filesystem but it will not mount" is a state the
+# simulation can actually reach. What is fake: the block device is a regular
+# file, mount/mkfs/modprobe are shell scripts, and the three dm ioctls never
+# run (they need a kernel). `disk_present` is replaced for every scenario
+# except the first, because a Windows build host has no block devices at all;
+# scenario 1 keeps the real [ -b ] check.
 set -u
 
 ROOT=${ROOT:?}
@@ -1394,22 +1472,25 @@ INIT=$ROOT/stage/init
 BIN=$SIM/bin
 DEV=$SIM/dev
 ST=$SIM/state
-FS=$SIM/fs
+MAP=$SIM/mapping          # stands in for /dev/mapper/mystic-root
 
 pass=0
 fail=0
 ok()  { printf '  PASS  %s\n' "$1"; pass=$((pass + 1)); }
 no()  { printf '  FAIL  %s\n' "$1"; fail=$((fail + 1)); }
-check()      { if printf '%s\n' "$out" | grep -qF -- "$1"; then ok "$1"; else no "$1: expected '$1'"; fi; }
-check_not()  { if printf '%s\n' "$out" | grep -qF -- "$1"; then no "unexpected '$1'"; else ok "no '$1'"; fi; }
+check()     { if printf '%s\n' "$out" | grep -qF -- "$1"; then ok "$1"; else no "expected: $1"; fi; }
+check_not() { if printf '%s\n' "$out" | grep -qF -- "$1"; then no "unexpected: $1"; else ok "no '$1'"; fi; }
+same()      { if [ "$(cksum "$1")" = "$2" ]; then ok "$3"; else no "$3"; fi; }
 
-rm -rf "$BIN" "$DEV" "$FS" "$ST"
-mkdir -p "$BIN" "$DEV" "$FS" "$ST"
+rm -rf "$BIN" "$DEV" "$ST"
+mkdir -p "$BIN" "$DEV" "$ST"
 
 # ---- fake tools -----------------------------------------------------
 cat > "$BIN/mount" <<'FMT_EOF'
 #!/bin/sh
-# fake mount: succeeds only if this device already holds a filesystem
+# fake mount: succeeds only if the device itself carries the ext4 superblock
+# magic at byte 1080 - the first thing a real mount checks. FAKE_MOUNT_FAIL
+# forces the "filesystem is there but will not mount" case.
 i=0; n=$#; dev=""; tgt=""
 while [ "$i" -lt "$n" ]; do
     a=$1; shift; i=$((i + 1))
@@ -1420,8 +1501,9 @@ while [ "$i" -lt "$n" ]; do
     esac
 done
 [ -n "$dev" ] || { echo "fake mount: no device" >&2; exit 2; }
-m=$FAKE_FS/fs$(printf '%s' "$dev" | tr '/' '_')
-[ -f "$m" ] || { echo "mount: $dev: wrong fs type, bad option, bad superblock" >&2; exit 32; }
+[ -f "$FAKE_MOUNT_FAIL" ] && { echo "mount: $dev: I/O error" >&2; exit 32; }
+[ "$(od -v -An -tx1 -j 1080 -N 2 "$dev" 2>/dev/null | tr -d '[:space:]')" = "53ef" ] || {
+    echo "mount: $dev: wrong fs type, bad option, bad superblock" >&2; exit 32; }
 printf '%s' "$dev" > "$FAKE_STATE/mounted"
 echo "fake-mount: $dev on ${tgt:-?}"
 exit 0
@@ -1429,7 +1511,9 @@ FMT_EOF
 
 cat > "$BIN/mkfs.ext4" <<'FMT_EOF'
 #!/bin/sh
-# fake mkfs.ext4 -q -F <dev>: records that the device now holds a filesystem
+# fake mkfs.ext4 -q -F <dev>: writes the real ext2/3/4 superblock magic
+# (0x53EF at byte 1080) into the device, so the change is on the disk and a
+# cksum comparison can see it.
 dev=""
 for a in "$@"; do
     case "$a" in
@@ -1438,8 +1522,15 @@ for a in "$@"; do
     esac
 done
 [ -n "$dev" ] || { echo "fake mkfs.ext4: no device" >&2; exit 2; }
-printf 'ext4' > "$FAKE_FS/fs$(printf '%s' "$dev" | tr '/' '_')"
-echo "fake-mkfs.ext4: ext4 on $dev"
+printf '%s' "$dev" | python -c '
+import os, sys
+p = sys.stdin.read().strip()
+f = open(p, "r+b" if os.path.exists(p) else "wb")
+f.seek(1080)
+f.write(bytes([0x53, 0xEF]))
+f.close()
+' || { echo "fake mkfs.ext4: cannot write the superblock" >&2; exit 1; }
+echo "fake-mkfs.ext4: ext4 superblock written at byte 1080 of $dev"
 exit 0
 FMT_EOF
 
@@ -1463,18 +1554,18 @@ no_modules() {   # a boot where dm_mod/dm_crypt cannot be loaded
 }
 new_disk() {     # new_disk <path> <KiB>  - a blank disk, no filesystem
     python -c "import sys; open(sys.argv[1], 'wb').truncate(int(sys.argv[2]) * 1024)" "$1" "$2"
-    rm -f "$FS/fs$(printf '%s' "$1" | tr '/' '_')"
+    : > "$MAP"
 }
 plain_disk() {   # a disk an older build formatted: ext4 magic, no header
     python - "$1" <<'PYEOF'
 import sys
 d = bytearray(64 * 1024)
-d[0x438] = 0x53          # ext2/3/4 superblock magic 0x53EF at 0x438
+d[0x438] = 0x53          # ext2/3/4 superblock magic 0x53EF at byte 1080
 d[0x439] = 0xef
 open(sys.argv[1], 'wb').write(d)
 PYEOF
-    printf 'ext4' > "$FS/fs$(printf '%s' "$1" | tr '/' '_')"
 }
+mount_will_fail() { : > "$ST/mount-fails"; }
 
 out=""
 run_setup() {    # run_setup [real-block-check 0|1] [helper-path]
@@ -1485,7 +1576,8 @@ run_setup() {    # run_setup [real-block-check 0|1] [helper-path]
         export MYSTIC_INIT_LIB=1 MYSTIC_DISK="$DISK" MYSTIC_KEY="$KEY" \
                MYSTIC_DMCRYPT="$helper" MYSTIC_DM_CONTROL="$ST/control" \
                MYSTIC_MKFS="$BIN/mkfs.ext4" MYSTIC_CRYPT_LOG="$ST/crypt.log" \
-               MYSTIC_MAP=mystic-root FAKE_STATE="$ST" FAKE_FS="$FS"
+               MYSTIC_MAP=mystic-root MYSTIC_MAP_PATH="$MAP" \
+               FAKE_STATE="$ST" FAKE_MOUNT_FAIL="$ST/mount-fails"
         . "$INIT"
         if [ "$real" != 1 ]; then
             disk_present() { [ -f "$MYSTIC_DISK" ]; }
@@ -1503,7 +1595,8 @@ rm -f "$KEY"
 "$DMCRYPT" keygen "$KEY" >/dev/null || { echo "cannot create the test key" >&2; exit 1; }
 
 # ---------------------------------------------------------------- 1
-printf '\n== 1. no disk at all (real [ -b ] check) ==\n'
+echo
+echo "== 1. no disk at all (real [ -b ] check) =="
 DISK=/dev/vda
 reset_boot
 run_setup 1
@@ -1512,7 +1605,8 @@ check "disk: no /dev/vda"
 check_not "fake-mount"
 
 # ---------------------------------------------------------------- 2
-printf '\n== 2. first boot on a blank disk ==\n'
+echo
+echo "== 2. first boot on a blank disk =="
 DISK=$DEV/vda
 new_disk "$DISK" 8192
 reset_boot
@@ -1521,28 +1615,39 @@ show
 check "disk: created dm-crypt volume on $DISK (aes-xts-plain64)"
 check "disk: dm-crypt unlocked, no ext4 inside - creating one"
 check "disk: formatted ext4 inside dm-crypt and mounted on /root"
-check "mounted: /dev/mapper/mystic-root"
+check "mounted: $MAP"
 check "status: aes-xts-plain64, key "
 hdr=$("$DMCRYPT" probe "$DISK" 2>&1)
-show_hdr=$hdr
-printf '        | header now: %s\n' "$show_hdr"
+printf '        | header now: %s\n' "$hdr"
 case "$hdr" in
     "crypt 1 "*) ok "the disk file now starts with a MYSTICC1 header" ;;
     *)           no "the disk file has no MYSTICC1 header ($hdr)" ;;
 esac
+if [ "$(od -v -An -tx1 -j 1080 -N 2 "$MAP" | tr -d '[:space:]')" = "53ef" ]; then
+    ok "the ext4 superblock was written inside the mapping"
+else
+    no "no ext4 superblock inside the mapping"
+fi
+if [ "$(od -v -An -tx1 -j 1080 -N 2 "$DISK" | tr -d '[:space:]')" = "0000" ]; then
+    ok "the raw disk has no ext4 superblock at byte 1080 (ciphertext starts there)"
+else
+    no "an ext4 superblock is visible on the raw disk"
+fi
 
 # ---------------------------------------------------------------- 3
-printf '\n== 3. second boot on the same disk ==\n'
+echo
+echo "== 3. second boot on the same disk =="
 reset_boot
 run_setup
 show
 check "disk: dm-crypt unlocked, formatted ext4 mounted on /root"
-check "mounted: /dev/mapper/mystic-root"
+check "mounted: $MAP"
 check_not "created dm-crypt volume"
 check_not "no ext4 inside"
 
 # ---------------------------------------------------------------- 4
-printf '\n== 4. a plain ext4 disk from an older build ==\n'
+echo
+echo "== 4. a plain ext4 disk from an older build =="
 DISK=$DEV/plain
 plain_disk "$DISK"
 reset_boot
@@ -1553,11 +1658,11 @@ check "disk: $DISK has no encryption header and is not blank"
 check "disk: mounted $DISK (ext4) on /root"
 check_not "created dm-crypt volume"
 check_not "creating ext4 filesystem"
-[ "$(cksum "$DISK")" = "$before" ] && ok "the plain disk was not written to" \
-                                 || no "the plain disk was modified"
+same "$DISK" "$before" "the plain disk was not written to"
 
 # ---------------------------------------------------------------- 5
-printf '\n== 5. encrypted disk, dm modules missing ==\n'
+echo
+echo "== 5. encrypted disk, dm modules missing =="
 DISK=$DEV/vda
 reset_boot
 no_modules
@@ -1568,11 +1673,11 @@ check "disk: $DISK is encrypted but cannot be opened - dm_mod/dm_crypt did not l
 check "disk: refusing to format it, /root stays on the RAM filesystem"
 check_not "creating ext4 filesystem"
 check_not "fake-mount"
-[ "$(cksum "$DISK")" = "$before" ] && ok "the encrypted disk was not written to" \
-                                  || no "the encrypted disk was modified"
+same "$DISK" "$before" "the encrypted disk was not written to"
 
 # ---------------------------------------------------------------- 6
-printf '\n== 6. encrypted disk, wrong key ==\n'
+echo
+echo "== 6. encrypted disk, wrong key =="
 DISK=$DEV/vda
 rm -f "$SIM/wrong.key"
 "$DMCRYPT" keygen "$SIM/wrong.key" >/dev/null
@@ -1585,12 +1690,12 @@ check "disk: encrypted, but the key did not unlock it - $DISK is left untouched"
 check "key does not match this disk"
 check "status: locked (key does not match)"
 check_not "creating ext4 filesystem"
-[ "$(cksum "$DISK")" = "$before" ] && ok "the encrypted disk was not written to" \
-                                  || no "the encrypted disk was modified"
+same "$DISK" "$before" "the encrypted disk was not written to"
 KEY=$SIM/luks.key
 
 # ---------------------------------------------------------------- 7
-printf '\n== 7. blank disk, no key in the image ==\n'
+echo
+echo "== 7. blank disk, no key in the image =="
 DISK=$DEV/fresh
 new_disk "$DISK" 8192
 KEY=$SIM/absent.key
@@ -1604,7 +1709,8 @@ check_not "created dm-crypt volume"
 KEY=$SIM/luks.key
 
 # ---------------------------------------------------------------- 8
-printf '\n== 8. no helper in the image ==\n'
+echo
+echo "== 8. no helper in the image, blank disk =="
 DISK=$DEV/fresh
 new_disk "$DISK" 8192
 reset_boot
@@ -1615,19 +1721,131 @@ check "disk: formatted ext4 and mounted on /root"
 check_not "created dm-crypt volume"
 
 # ---------------------------------------------------------------- 9
-printf '\n== 9. an encrypted disk whose ext4 was never created ==\n'
+echo
+echo "== 9. encrypted volume whose ext4 was never created =="
 DISK=$DEV/emptyvol
 new_disk "$DISK" 8192
 reset_boot
 "$DMCRYPT" init "$DISK" "$KEY" >/dev/null      # a header...
-# ...and no filesystem inside it: the fake filesystem marker belongs to the
-# mapping (/dev/mapper/mystic-root), which every scenario shares, so it has to
-# be cleared explicitly to model mkfs never having run.
-rm -f "$FS/fs_dev_mapper_mystic-root"
+rm -f "$MAP"                                   # ...and no filesystem inside it
 run_setup
 show
 check "disk: dm-crypt unlocked, no ext4 inside - creating one"
 check "disk: formatted ext4 inside dm-crypt and mounted on /root"
+
+# ---------------------------------------------------------------- 10
+echo
+echo "== 10. encrypted volume with an ext4 that will not mount =="
+DISK=$DEV/vda
+reset_boot
+mount_will_fail
+before=$(cksum "$MAP")
+run_setup
+show
+check "disk: dm-crypt unlocked, ext4 is there but did not mount - refusing to format it"
+check "disk: nothing was written; the volume is intact"
+check_not "no ext4 inside"
+check_not "formatted ext4"
+same "$MAP" "$before" "the unmountable volume was not reformatted"
+
+# ---------------------------------------------------------------- 11
+echo
+echo "== 11. header present, helper missing (a git clean removes stage/sbin) =="
+DISK=$DEV/vda
+reset_boot
+before=$(cksum "$DISK")
+run_setup 0 "$SIM/no-such-helper"
+show
+check "disk: $DISK is encrypted but cannot be opened - no $SIM/no-such-helper in the image, and $DISK carries a MYSTICC1 header"
+check "disk: refusing to format it, /root stays on the RAM filesystem"
+check_not "creating ext4 filesystem"
+same "$DISK" "$before" "the encrypted disk was not written to"
+
+# ---------------------------------------------------------------- 12
+echo
+echo "== 12. header with a corrupted version byte =="
+DISK=$DEV/badver
+new_disk "$DISK" 8192
+"$DMCRYPT" init "$DISK" "$KEY" >/dev/null
+python -c "
+import sys
+f = open(sys.argv[1], 'r+b'); f.seek(8); f.write(bytes([0xFF])); f.close()" "$DISK"
+reset_boot
+before=$(cksum "$DISK")
+run_setup
+show
+check "disk: $DISK is encrypted but cannot be opened - the probe failed, and $DISK carries a MYSTICC1 header"
+check "disk: refusing to format it, /root stays on the RAM filesystem"
+check_not "creating ext4 filesystem"
+same "$DISK" "$before" "the unreadable volume was not written to"
+
+# ---------------------------------------------------------------- 13
+echo
+echo "== 13. a disk that is neither blank, nor ext4, nor ours =="
+DISK=$DEV/junk
+python -c "
+import sys
+open(sys.argv[1], 'wb').write(bytes([0xAA]) * 8192)" "$DISK"
+reset_boot
+before=$(cksum "$DISK")
+run_setup
+show
+check "disk: $DISK is not blank, not ext4 and carries no MYSTICC1 header"
+check "disk: $DISK did not mount and is not blank - refusing to format it"
+check_not "creating ext4 filesystem"
+same "$DISK" "$before" "the unrecognised disk was not written to"
+
+# ---------------------------------------------------------------- 14
+echo
+echo "== 14. helper present, dm-crypt fails to create the mapping =="
+DISK=$DEV/vda
+cp "$DMCRYPT" "$SIM/fail-dm.real"
+cat > "$SIM/fail-dm" <<'FMT_EOF'
+#!/bin/sh
+# a helper whose dm ioctl fails, exactly like a missing /dev/mapper/control
+case "$1" in
+    probe) exec "$0.real" "$@" ;;
+esac
+echo "mystic-dmcrypt: dm DM_DEV_CREATE failed: Operation not permitted" >&2
+exit 4
+FMT_EOF
+chmod +x "$SIM/fail-dm"
+reset_boot
+run_setup 0 "$SIM/fail-dm"
+show
+check "disk: dm-crypt could not create the mapping - $DISK is left untouched"
+check "status: locked (dm-crypt error)"
+check_not "key did not unlock it"
+check_not "key does not match"
+
+# ---------------------------------------------------------------- 15
+echo
+echo "== 15. encrypted disk whose boot key file is gone =="
+DISK=$DEV/vda
+reset_boot
+KEY=$SIM/gone.key
+rm -f "$KEY"
+before=$(cksum "$DISK")
+run_setup
+show
+check "disk: cannot read the boot key $KEY - $DISK is left untouched"
+check "status: locked (no usable key)"
+check_not "key does not match"
+same "$DISK" "$before" "the encrypted disk was not written to"
+KEY=$SIM/luks.key
+
+echo
+echo "== 16. an unrecognised disk with no helper in the image =="
+DISK=$DEV/junk2
+python -c "import sys; open(sys.argv[1], 'wb').write(bytes([0xAA]) * 8192)" "$DISK"
+reset_boot
+before=$(cksum "$DISK")
+run_setup 0 "$SIM/no-such-helper"
+show
+check "disk: no $SIM/no-such-helper in the image, and $DISK is not blank and carries no MYSTICC1 header"
+check "disk: $DISK did not mount and is not blank - refusing to format it"
+check_not "creating ext4 filesystem"
+same "$DISK" "$before" "the unrecognised disk was not written to"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ] || exit 1
@@ -1662,6 +1880,7 @@ case "${1:-stage}" in
     key)        cmd_key ;;
     new-key)    cmd_new_key ;;
     reset-disk) cmd_reset_disk ;;
+    elf)        shift; elf_report "${1:?usage: mkenc.sh elf <file>}" ;;
     -h|--help|help)
         awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
         ;;

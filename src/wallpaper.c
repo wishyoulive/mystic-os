@@ -1,29 +1,43 @@
 /* ============================================================
  *  Mystic OS - wallpaper.c
- *  Four backgrounds, painted by the CPU, straight into the
- *  framebuffer surface. No image files, no GPU, no state.
+ *  Six backgrounds, painted by the CPU, straight into the
+ *  framebuffer surface. No image files, no GPU.
  *
  *  Every pixel is a pure function of:
- *      - the theme (so all four work with every theme),
+ *      - the theme (so all six work with every theme),
  *      - the wallpaper index,
  *      - `seconds`, and only for the animated ones.
  *
  *  Cost is what makes this usable on old hardware, so the rules
  *  here are: no transcendental function inside a per-pixel loop
- *  (a 256 entry table does the sin/cos work for Waves, one sqrt
- *  per row does it for Orbits and for the Dusk lights), and the
+ *  unless it is amortised over a table (a 256 entry sine table does
+ *  the sin work for Waves and for the Black Hole's spiral arms, one
+ *  sqrt per row does it for Orbits and the Dusk lights, and the
+ *  Black Hole's geodesics are integrated once and cached), and the
  *  float divide gfx_glow does per pixel becomes a multiply by a
  *  precomputed reciprocal plus a 128 step alpha ramp.
  *
- *  Measured at 1280x800 with the shipping flags (-Os) on the dev
- *  host: Dusk and Waves about 3 ms, Mesh about 1.5 ms, Orbits under
- *  1 ms - roughly 2 to 7 plain full-screen fills' worth of work, a
- *  fill being ~0.45 ms here. Only Waves and Orbits ever need to
- *  repeat at frame rate; the other two are painted once.
+ *  Measured at 1280x800 with the shipping flags (-Os), process CPU
+ *  time, best of 30 draws (this host was running three other builds,
+ *  so the four originals read about twice their idle figures here):
+ *
+ *      Dusk 5.2 ms   Mesh 3.1 ms   Waves 3.1 ms   Orbits 0.5 ms
+ *      Black Hole 16 ms          Nebula 48 ms
+ *
+ *  So the black hole costs about 3x Dusk and the nebula about 9x. Only
+ *  the black hole is ever on the animation path (the desktop repaints
+ *  animated backgrounds at 12.5 Hz, which is ~20% of one core); the
+ *  nebula reports wallpaper_animated() == 0 and is painted once.
+ *
+ *  Both new ones also cap how many pixels they trace: above 360k pixels
+ *  they are computed at 1/q resolution and scaled up bilinearly, because
+ *  both are low-pass pictures and the cost has to stay flat as screens
+ *  grow. See wp_q() / wp_upscale().
  * ============================================================ */
 #include "wallpaper.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* one wave period, in 16.16 fixed point over a 256 entry sine table */
@@ -33,7 +47,9 @@
 
 /* ------------------------------------------------------------ names */
 
-static const char *const WP_NAMES[WALLPAPER_COUNT] = { "Dusk", "Mesh", "Waves", "Orbits" };
+static const char *const WP_NAMES[WALLPAPER_COUNT] = {
+    "Dusk", "Mesh", "Waves", "Orbits", "Black Hole", "Nebula"
+};
 
 const char *wallpaper_name(int index) {
     if (index < 0 || index >= WALLPAPER_COUNT) return NULL;
@@ -41,9 +57,11 @@ const char *wallpaper_name(int index) {
 }
 
 int wallpaper_animated(int index) {
-    /* Dusk and Mesh are still pictures: the desktop can paint them once
-       and then leave the framebuffer alone. */
-    return (index == 2 || index == 3) ? 1 : 0;
+    /* Dusk, Mesh and Nebula are still pictures: the desktop can paint them
+       once and then leave the framebuffer alone. Waves, Orbits and the
+       Black Hole use `seconds`, so they have to be repainted - the black
+       hole turns its disk, which is the whole point of it. */
+    return (index == 2 || index == 3 || index == 4) ? 1 : 0;
 }
 
 static int wp_lower(int c) {
@@ -464,6 +482,663 @@ static void wp_draw_orbits(Surface *s, const Theme *th, double seconds) {
     wp_disc(s, cx, cy, half * 0.045f, core_col, th->dark ? 190 : 150);
 }
 
+/* ------------------------------------------------------ shared noise
+ * A deterministic 32 bit hash. The star fields and the nebula grain are
+ * sampled in normalised coordinates through this, never with rand(), so
+ * the sky is the same picture on every boot and at every resolution.
+ */
+static inline u32 wp_h32(u32 x, u32 y, u32 seed) {
+    u32 h = x * 0x9E3779B1u ^ y * 0x85EBCA77u ^ seed * 0xC2B2AE3Du;
+    h ^= h >> 16; h *= 0x7FEB352Du;
+    h ^= h >> 15; h *= 0x846CA68Bu;
+    h ^= h >> 16;
+    return h;
+}
+
+/* floor() without a libm call: on a baseline x86-64 build floorf() is a
+ * call into libm (no SSE4.1 roundsd), which costs more than everything else
+ * the star field does per pixel. */
+static inline int wp_ifloor(float v) {
+    int i = (int)v;
+    return i - (v < (float)i);
+}
+
+/* atan2 with one divide and three branches; worst error 0.0032 rad, which
+ * is 0.2% of the range we index a geodesic table with. */
+static inline float wp_atan2f(float y, float x) {
+    float ax = fabsf(x), ay = fabsf(y);
+    int swap = (ay > ax);
+    float t = swap ? ax / (ay + 1e-20f) : ay / (ax + 1e-20f);
+    float a = 0.78539816f * t + 0.27323954f * t * (1.0f - t);
+    if (swap) a = 1.57079633f - a;
+    if (x < 0.0f) a = 3.14159265f - a;
+    if (y < 0.0f) a = -a;
+    return a;
+}
+
+/* Brightness of one star from one grid layer, at the normalised sky
+ * position (ux, uy). `cell` is the grid pitch and `rad2` the squared star
+ * radius, both in the same units. Pure: it draws nothing, so the black
+ * hole can decide how much of the star survives the disk in front of it. */
+static inline int wp_star_at(float ux, float uy, float inv_cell, u32 seed,
+                             int thresh, int peak, float inv_rad2) {
+    float gx = ux * inv_cell, gy = uy * inv_cell;
+    int ix = wp_ifloor(gx), iy = wp_ifloor(gy);
+    u32 h = wp_h32((u32)(ix + 65536), (u32)(iy + 65536), seed);
+    if ((int)(h & 0xFFu) >= thresh) return 0;      /* most cells are empty */
+
+    u32 h2 = wp_h32(h, (u32)iy * 2654435761u, seed ^ 0x9E3779B9u);
+    float jx = 0.25f + 0.5f * (float)((h >> 8) & 0xFFu) * (1.0f / 255.0f);
+    float jy = 0.25f + 0.5f * (float)((h >> 16) & 0xFFu) * (1.0f / 255.0f);
+    float px = (gx - (float)ix) - jx;
+    float py = (gy - (float)iy) - jy;
+    float d2 = (px * px + py * py) * inv_rad2;
+    if (d2 >= 1.0f) return 0;
+    float t = 1.0f - d2;
+    /* 40%..100% of `peak`, so the field is not a uniform dust sheet */
+    float mag = 0.40f + 0.60f * (float)(h2 & 0xFFu) * (1.0f / 255.0f);
+    return (int)((float)peak * mag * t * t + 0.5f);
+}
+
+/* --------------------------------------------------- render resolution
+ * The black hole and the nebula are the two backgrounds whose per-pixel cost
+ * is measured in hundreds of cycles rather than tens. Both are low-pass by
+ * nature - a smooth accretion disk, a cloud of gas - so above a threshold
+ * they are traced at 1/q resolution and scaled up bilinearly. That keeps the
+ * per-frame cost flat as the screen grows, and on a 1280x800 display the only
+ * visible difference is a slightly softer photon ring.
+ */
+#define WP_TRACE_MAX 360000
+
+static int wp_q(int w, int h) {
+    int q = 1;
+    while (q < 4 && (w / q) * (h / q) > WP_TRACE_MAX) q++;
+    return q;
+}
+
+/* Bilinear upscale of a q-times smaller image into dst, in 8.8 fixed point:
+ * one add per pixel for the position, four loads, and integer lerps, because
+ * this runs over the whole screen and must stay cheaper than a fill. */
+static void wp_upscale(Surface *dst, const u32 *src, int sw, int sh, int q) {
+    const int step = 256 / q;
+    const int maxx = (sw - 1) * 256, maxy = (sh - 1) * 256;
+    const int lastx = (sw > 1) ? sw - 2 : 0, lasty = (sh > 1) ? sh - 2 : 0;
+
+    for (int y = 0; y < dst->h; y++) {
+        int sy = ((2 * y + 1) * 128) / q - 128;
+        if (sy < 0) sy = 0;
+        if (sy > maxy) sy = maxy;
+        int iy = sy >> 8;
+        if (iy > lasty) iy = lasty;
+        int fy = sy & 255, ify = 256 - fy;
+        const u32 *r0 = src + (size_t)iy * sw;
+        const u32 *r1 = src + (size_t)((iy + 1 <= lasty) ? iy + 1 : iy) * sw;
+        u32 *out = dst->px + (size_t)y * dst->stride;
+        int sx = 128 / q - 128;
+
+        for (int x = 0; x < dst->w; x++, sx += step) {
+            int v = sx;
+            if (v < 0) v = 0;
+            if (v > maxx) v = maxx;
+            int ix = v >> 8;
+            if (ix > lastx) ix = lastx;
+            int fx = v & 255, ifx = 256 - fx;
+            u32 a = r0[ix], b = r0[ix + 1], c = r1[ix], d = r1[ix + 1];
+            int ar = ((int)GET_R(a) * ifx + (int)GET_R(b) * fx) >> 8;
+            int ag = ((int)GET_G(a) * ifx + (int)GET_G(b) * fx) >> 8;
+            int ab = ((int)GET_B(a) * ifx + (int)GET_B(b) * fx) >> 8;
+            int br = ((int)GET_R(c) * ifx + (int)GET_R(d) * fx) >> 8;
+            int bg = ((int)GET_G(c) * ifx + (int)GET_G(d) * fx) >> 8;
+            int bb = ((int)GET_B(c) * ifx + (int)GET_B(d) * fx) >> 8;
+            int rr = (ar * ify + br * fy) >> 8;
+            int rg = (ag * ify + bg * fy) >> 8;
+            int rb = (ab * ify + bb * fy) >> 8;
+            out[x] = 0xFF000000u | ((u32)rr << 16) | ((u32)rg << 8) | (u32)rb;
+        }
+    }
+}
+
+/* Run `body` into a 1/q scratch surface when q > 1. Declared here so both of
+ * the expensive painters share one allocation and one fallback path. */
+static u32 *wp_scratch(int w, int h, int q, int *ow, int *oh) {
+    *ow = (w + q - 1) / q;
+    *oh = (h + q - 1) / q;
+    if (q <= 1) return NULL;
+    return malloc((size_t)(*ow) * (size_t)(*oh) * sizeof(u32));
+}
+
+/* ------------------------------------------------------------ 4. Black Hole
+ * A Schwarzschild black hole seen nearly edge-on, with a thin accretion
+ * disk traced through its own gravitational field. This is the one
+ * wallpaper that is computed rather than painted:
+ *
+ *  - A photon passing the hole at impact parameter b obeys
+ *
+ *        d2u/dphi2 + u = 1.5 u^2 ,      u = 1/r,   rs = 1
+ *
+ *    (the Schwarzschild null geodesic in the equatorial plane). That ODE is
+ *    integrated once, with RK4, for 288 impact parameters, and the radius at
+ *    every pi/224 of sweep is cached in a table. Two photon invariants fall
+ *    straight out of the same table: the capture cross section (rays that
+ *    run into the horizon) and the total sweep to escape (which is what
+ *    lenses the star field).
+ *
+ *  - Geometry: the observer sits at 82 degrees from the disk axis, so the
+ *    disk is very nearly edge-on. For a pixel at sky offset (X, Y) the
+ *    photon's orbital plane is fixed by the impact vector; its line of nodes
+ *    with the disk plane gives the angle psi0 at which the ray starts, and
+ *    therefore the ray crosses the disk plane at sweep psi0, psi0 + pi and
+ *    psi0 + 2pi. Each crossing is one table lookup: that is the direct
+ *    image (the near side of the disk), the lensed image of the far side
+ *    that arcs over and under the shadow, and the photon ring.
+ *
+ *  - The disk is emissive: an r^-3/4 surface-brightness ramp in the theme's
+ *    accent (hot, mixed with white) and glow (cool rim), so the disk belongs
+ *    to the theme instead of being a canned orange.
+ *
+ *  - Relativistic beaming: a circular orbit at r moves at
+ *    beta = sqrt(M/(r-2M)) = sqrt(0.5/(r-1)), its line-of-sight component is
+ *    exact from the pixel geometry, and the observed flux is scaled by
+ *    delta^3 with delta = sqrt(1-1/r) / (1 - beta_los) (gravitational
+ *    redshift and Doppler together). The factor is clamped to 9x so the
+ *    receding side stays visible instead of going black.
+ *
+ *  - The shadow (b < 3*sqrt(3)/2) is black: no disk, no stars. Background
+ *    stars are sampled at the deflected sky position, so they bunch into
+ *    arcs at the critical curve, and a soft photon-ring term sits just
+ *    outside it.
+ *
+ *  The cached table is a pure function of constants (no theme, no time, no
+ *  resolution), so the picture stays a pure function of its arguments; the
+ *  disk pattern is a Keplerian spiral evaluated against `seconds`, so the
+ *  inner rings visibly outrun the outer ones.
+ */
+
+#define WP_BH_NB0   160                    /* b samples, BC .. WP_BH_BM  */
+#define WP_BH_NB1   128                    /* b samples, WP_BH_BM .. max */
+#define WP_BH_NB    (WP_BH_NB0 + WP_BH_NB1)
+#define WP_BH_BM    4.5f                   /* where the b grid coarsens   */
+#define WP_BH_NA    225                    /* sweep samples per b, /3    */
+#define WP_BH_BC    2.59807621f            /* 3*sqrt(3)/2 rs: shadow edge*/
+#define WP_BH_RIN   3.0f                   /* ISCO, rs: disk inner edge  */
+#define WP_BH_ROUT  18.0f                  /* disk outer edge, rs        */
+#define WP_BH_BMAX  46.0f
+#define WP_BH_PI    3.14159265358979
+#define WP_BH_DMAX  9.42477796076938       /* 3*pi of sweep, radians     */
+#define WP_BH_DSC   4.0                    /* screen radius of the shadow */
+#define WP_BH_K0    ((float)WP_BH_NB0 / (WP_BH_BM - WP_BH_BC))
+#define WP_BH_K1    ((float)WP_BH_NB1 / (WP_BH_BMAX - WP_BH_BM))
+#define WP_BH_NS    (WP_BH_NA / 3)         /* samples per pi of sweep    */
+
+static struct {
+    int   built;
+    float sweep[WP_BH_NB];                 /* sweep to escape, radians   */
+    unsigned short r[WP_BH_NB][WP_BH_NA];  /* crossing radius * 64       */
+    int   sinq[256];
+} bhgeo;
+
+/* One ray: integrate the null geodesic from r = 4000 inwards and store the
+ * radius (x64, 0 = "no crossing") at the centre of each sweep bin. Returns
+ * the total sweep to escape, or 0 when the ray is captured. */
+static double wp_bh_trace(double b, unsigned short *out) {
+    const double dphi = WP_BH_DMAX / (double)WP_BH_NA;
+    const double h = dphi * 0.25;
+    double u = 1.0 / 4000.0, v, phi = 0.0;
+    int next = 0, escaped = 0;
+
+    for (int i = 0; i < WP_BH_NA; i++) out[i] = 0;
+
+    double q = 1.0 / (b * b) - u * u + u * u * u;
+    if (!(q > 0.0)) return 0.0;
+    v = sqrt(q);
+
+    while (next < WP_BH_NA && phi < WP_BH_DMAX) {
+        double k1u = v,                 k1v = -u + 1.5 * u * u;
+        double ua = u + 0.5 * h * k1u,  va = v + 0.5 * h * k1v;
+        double k2u = va,                k2v = -ua + 1.5 * ua * ua;
+        double ub = u + 0.5 * h * k2u,  vb = v + 0.5 * h * k2v;
+        double k3u = vb,                k3v = -ub + 1.5 * ub * ub;
+        double uc = u + h * k3u,        vc = v + h * k3v;
+        double k4u = vc,                k4v = -uc + 1.5 * uc * uc;
+        double un = u + h * (k1u + 2.0 * k2u + 2.0 * k3u + k4u) / 6.0;
+        double vn = v + h * (k1v + 2.0 * k2v + 2.0 * k3v + k4v) / 6.0;
+        double pn = phi + h;
+
+        /* record every bin centre this step walked past */
+        while (next < WP_BH_NA && (double)(next) * dphi + 0.5 * dphi <= pn) {
+            double tc = (double)next * dphi + 0.5 * dphi;
+            double f = (h > 0.0) ? (tc - phi) / h : 0.0;
+            double uc2 = u + (un - u) * f;
+            double rr = (uc2 > 0.0) ? 1.0 / uc2 : 0.0;
+            if (rr > 1023.0) rr = 1023.0;
+            out[next] = (unsigned short)(rr * 64.0 + 0.5);
+            next++;
+        }
+
+        u = un; v = vn; phi = pn;
+        if (!(u == u) || !(v == v)) return 0.0;          /* NaN: give up   */
+        if (u > 1.0) return 0.0;                         /* swallowed      */
+        if (u < 1.0 / 3000.0 && v < 0.0) {               /* escaped        */
+            escaped = 1;
+            break;
+        }
+    }
+    /* Past the escape there is no crossing at that sweep, and the honest
+     * value is an infinite radius: the crossing runs off to infinity as the
+     * sweep approaches the escape angle. Filling those bins with a huge
+     * radius makes the bilinear blend climb out of the disk instead of
+     * sweeping through every colour in the palette. */
+    if (escaped) {
+        while (next < WP_BH_NA) out[next++] = 65535;
+    }
+    return (next > 0) ? phi : 0.0;
+}
+
+static void wp_bh_build(void) {
+    for (int i = 0; i < WP_BH_NB; i++) {
+        double b;
+        if (i < WP_BH_NB0) b = (double)WP_BH_BC + (double)i / (double)WP_BH_K0;
+        else               b = (double)WP_BH_BM + (double)(i - WP_BH_NB0) / (double)WP_BH_K1;
+        bhgeo.sweep[i] = (float)wp_bh_trace(b, bhgeo.r[i]);
+    }
+    for (int i = 0; i < 256; i++) {
+        float s = 127.5f + 127.5f * sinf(6.28318530718f * (float)i / 256.0f);
+        bhgeo.sinq[i] = (int)(s + 0.5f);
+    }
+    bhgeo.built = 1;
+}
+
+/* b -> table coordinate in samples. The grid is uniform, so the index is a
+ * multiply and a compare, but it is split at WP_BH_BM: 0.012 rs steps
+ * through the strong field where the photon ring lives, 0.32 rs steps
+ * outside it, where the image is smooth and interpolation absorbs the
+ * difference. */
+static inline float wp_bh_bidx(float b) {
+    if (b < WP_BH_BM) return (b - WP_BH_BC) * WP_BH_K0;
+    return (float)WP_BH_NB0 + (b - WP_BH_BM) * WP_BH_K1;
+}
+
+/* crossing radius at impact parameter b after `dlt` radians of sweep;
+ * 0 when that crossing does not exist (captured, or already escaped) */
+static inline float wp_bh_radius(float t, int j, float fs) {
+    if (t < 0.0f || t >= (float)(WP_BH_NB - 1)) return 0.0f;
+    if (j < 0 || j >= WP_BH_NA - 1) return 0.0f;
+    int i = (int)t;
+    float ft = t - (float)i;
+    float a = (float)bhgeo.r[i][j]     + ((float)bhgeo.r[i][j + 1]     - (float)bhgeo.r[i][j])     * fs;
+    float c = (float)bhgeo.r[i + 1][j] + ((float)bhgeo.r[i + 1][j + 1] - (float)bhgeo.r[i + 1][j]) * fs;
+    return (a + (c - a) * ft) * (1.0f / 64.0f);
+}
+
+static inline float wp_bh_sweep(float b) {
+    float t = wp_bh_bidx(b);
+    if (t < 0.0f) return 0.0f;
+    if (t >= (float)(WP_BH_NB - 1)) return (float)WP_BH_PI;
+    int i = (int)t;
+    float ft = t - (float)i;
+    return bhgeo.sweep[i] + (bhgeo.sweep[i + 1] - bhgeo.sweep[i]) * ft;
+}
+
+static void wp_bh_paint(Surface *s, const Theme *th, double seconds) {
+    const int   W = s->w, H = s->h;
+    const float S  = 0.5f * (float)(W < H ? W : H);      /* px per unit    */
+    /* the hole sits a little off centre, which reads better as a desktop */
+    const float cx = (float)W * 0.545f, cy = (float)H * 0.470f;
+    /* 82 degrees from the disk axis: nearly edge-on, but enough tilt that
+       the disk has a visible thickness on screen */
+    const float ci = 0.13917310f, si = 0.99026807f;
+
+    if (!bhgeo.built) wp_bh_build();
+
+    /* ---- disk palette, from the theme up ---- */
+    enum { NC = 160 };
+    u32   lut[NC];
+    float bl[NC], gl[NC], ol[NC], sl[NC];
+    const float lspan = WP_BH_ROUT - WP_BH_RIN;
+    u32 hot  = wp_opaque(color_mix(th->accent, RGB(0xFF, 0xF4, 0xDE), 0.62f));
+    u32 warm = wp_opaque(th->accent);
+    u32 cool = wp_opaque(color_mix(th->accent, th->glow, 0.62f));
+    u32 rim  = wp_opaque(color_mix(th->glow, th->bg_bottom, 0.45f));
+
+    for (int i = 0; i < NC; i++) {
+        float t = (float)i / (float)(NC - 1);
+        float r = WP_BH_RIN + lspan * t;
+        /* r^-3/4 emissivity, with a soft inner lip and a soft outer rim so
+           the disk does not end in a hard edge */
+        float env = 1.65f * powf(WP_BH_RIN / r, 1.0f);
+        float lip = (r < WP_BH_RIN * 1.22f) ? (r - WP_BH_RIN) / (0.22f * WP_BH_RIN) : 1.0f;
+        if (lip < 0.0f) lip = 0.0f;
+        float rimf = (t > 0.80f) ? (1.0f - (t - 0.80f) / 0.20f) : 1.0f;
+        if (rimf < 0.0f) rimf = 0.0f;
+        env *= lip * rimf * rimf;
+
+        /* a narrow bright inner edge: the hottest, fastest material sits at
+           the ISCO and that is what the eye reads as "the disk" */
+        if (t < 0.18f) env *= 1.0f + 0.55f * (1.0f - t / 0.18f);
+
+        u32 c;
+        if (t < 0.26f)      c = wp_lerp_color(hot,  warm, (int)(t / 0.26f * 256.0f));
+        else if (t < 0.68f) c = wp_lerp_color(warm, cool, (int)((t - 0.26f) / 0.42f * 256.0f));
+        else                c = wp_lerp_color(cool, rim,  (int)((t - 0.68f) / 0.32f * 256.0f));
+
+        int e8 = (int)(env * 255.0f + 0.5f);
+        if (e8 > 255) e8 = 255;                 /* RGB() does not clamp, and   */
+        if (e8 < 0) e8 = 0;                     /* an overflow would carry into */
+        lut[i] = RGB((u32)(GET_R(c) * e8 / 255),/* the next channel: this is   */
+                     (u32)(GET_G(c) * e8 / 255),/* what turned the disk rainbow */
+                     (u32)(GET_B(c) * e8 / 255));
+
+        float beta = sqrtf(0.5f / (r - 1.0f));
+        if (beta > 0.75f) beta = 0.75f;
+        bl[i] = beta;                          /* orbital speed, c        */
+        gl[i] = sqrtf(1.0f - 1.0f / r);         /* gravitational redshift  */
+        ol[i] = sqrtf(0.5f / (r * r * r));      /* Keplerian omega         */
+        sl[i] = 2.4f * logf(r / WP_BH_RIN);     /* spiral pitch, radians   */
+    }
+
+    /* ---- display curve: linear to 128, then a soft shoulder, so the sky
+       keeps its exact values and the disk rolls off instead of clipping -- */
+    u8 tone[1024];
+    for (int i = 0; i < 1024; i++) {
+        if (i <= 128) tone[i] = (u8)i;
+        else {
+            float d = (float)(i - 128) * (1.0f / 127.0f);
+            tone[i] = (u8)(128.0f + 127.0f * (d / (1.0f + d)) + 0.5f);
+        }
+    }
+
+    /* ---- the sky the hole sits in ---- */
+    u32 sky_top = wp_opaque(color_mix(th->bg_top, RGB(0, 0, 0), 0.62f));
+    u32 sky_bot = wp_opaque(color_mix(th->bg_bottom, RGB(0, 0, 0), 0.48f));
+
+    const float tf = (float)((seconds > 0.0) ? seconds : 0.0) * 0.45f;
+    const float invS = 1.0f / S;
+    const float invca = 1.0f / 0.021f;
+    const float invra = (S * 0.021f) / 0.80f;
+    const float bmaxd = WP_BH_ROUT * 1.06f;
+
+    for (int y = 0; y < H; y++) {
+        const float dy = ((float)y + 0.5f - cy) * invS;
+        int ty = (H > 1) ? (y * 256 + (H - 1) / 2) / (H - 1) : 0;
+        if (ty > 256) ty = 256;
+        const int bgr = wp_lerp8((int)GET_R(sky_top), (int)GET_R(sky_bot), ty);
+        const int bgg = wp_lerp8((int)GET_G(sky_top), (int)GET_G(sky_bot), ty);
+        const int bgb = wp_lerp8((int)GET_B(sky_top), (int)GET_B(sky_bot), ty);
+        u32 *row = s->px + (size_t)y * s->stride;
+
+        for (int x = 0; x < W; x++) {
+            const float dx = ((float)x + 0.5f - cx) * invS;
+            const float rho = sqrtf(dx * dx + dy * dy);
+            const float invrho = 1.0f / (rho + 1e-6f);
+            const float b = rho * (WP_BH_BC * WP_BH_DSC);
+            int R = bgr, G = bgg, B = bgb, star = 0;
+
+            if (b < WP_BH_BC) {
+                /* inside the shadow: no disk, no stars, nothing comes back */
+                R = 2; G = 2; B = 4;
+            } else {
+                /* ---- background stars, at the deflected position ---- */
+                float defl = wp_bh_sweep(b) - (float)WP_BH_PI;
+                if (defl < 0.0f) defl = 0.0f;
+                float wrp = defl * 0.22f * invrho;      /* one divide, both axes */
+                star = wp_star_at(dx + dx * wrp, dy + dy * wrp,
+                                  invca, 0x5EEDu, 15, 225, invra);
+
+                /* ---- the disk, one addition per equatorial crossing ---- */
+                if (b < bmaxd) {
+                    float qn = sqrtf(dx * dx * ci * ci + dy * dy);
+                    float psi = wp_atan2f(ci, si * dy * invrho);
+                    float bm = (qn > 1e-9f) ? (dx * ci * si / qn) : 0.0f;
+                    float az = wp_atan2f(dy, dx * ci);
+                    /* one table coordinate, then an integer step per pi of
+                       sweep: no multiply or sqrt inside the crossing loop */
+                    float t = wp_bh_bidx(b);
+                    float s0 = psi * ((float)WP_BH_NA / (float)WP_BH_DMAX) - 0.5f;
+                    int   j0 = (int)s0;
+                    float fs = s0 - (float)j0;
+                    int   side = 1;
+
+                    /* the third crossing only exists within a few percent of
+                       the critical curve, so it is gated on b and skipped for
+                       99% of the screen instead of costing a lookup */
+                    int nc = (b < WP_BH_BC * 1.25f) ? 3 : 2;
+                    for (int k = 0; k < nc; k++, j0 += WP_BH_NS, side = -side) {
+                        float r = wp_bh_radius(t, j0, fs);
+                        if (r < WP_BH_RIN || r > WP_BH_ROUT) continue;
+                        int li = (int)((r - WP_BH_RIN) * ((float)(NC - 1) / lspan));
+                        if (li < 0) li = 0;
+                        if (li > NC - 1) li = NC - 1;
+
+                        /* delta = sqrt(1-1/r) / (1 - beta_los), flux ~ delta^3 */
+                        float dop = 1.0f - bm * (float)side * bl[li];
+                        if (dop < 0.10f) dop = 0.10f;
+                        float gain = gl[li] / dop;
+                        gain = gain * gain * gain;
+                        if (gain > 9.0f) gain = 9.0f;
+
+                        /* trailing spiral: two and three arm harmonics on a
+                           Keplerian shear, so the inner disk outruns the rim */
+                        float ph = az + sl[li] + (side < 0 ? (float)WP_BH_PI : 0.0f)
+                                   - ol[li] * tf;
+                        int ph16 = (int)(ph * 10430.378f);
+                        int h2 = bhgeo.sinq[(ph16 >> 7) & 255];
+                        int h3 = bhgeo.sinq[(ph16 >> 6) & 255];
+                        int pat = 128 + ((h2 - 128) * 3) / 8 + ((h3 - 128) * 2) / 8;
+                        int inten = (int)(gain * (float)pat * 2.0f);
+
+                        u32 c = lut[li];
+                        R += ((int)GET_R(c) * inten) >> 8;
+                        G += ((int)GET_G(c) * inten) >> 8;
+                        B += ((int)GET_B(c) * inten) >> 8;
+                    }
+                }
+
+                /* ---- photon ring: a thin bright halo just outside the
+                   critical curve, where every crossing piles up ---- */
+                if (b < WP_BH_BC * 1.75f) {
+                    float t = (b - WP_BH_BC) / (WP_BH_BC * 0.055f);
+                    float gr = 1.0f / (1.0f + t * t);
+                    gr *= gr;
+                    int gi = (int)(gr * 235.0f);
+                    R += ((int)GET_R(hot) * gi) >> 8;
+                    G += ((int)GET_G(hot) * gi) >> 8;
+                    B += ((int)GET_B(hot) * gi) >> 8;
+                }
+            }
+
+            /* stars sit behind the disk, not on it: fade them out by how
+               much light the crossings already put on this pixel */
+            if (star > 0) {
+                int lit = R - bgr;
+                if (G - bgg > lit) lit = G - bgg;
+                if (B - bgb > lit) lit = B - bgb;
+                if (lit >= 190) star = 0;
+                else if (lit > 0) star -= (star * lit) / 190;
+                R += star; G += star; B += star;
+            }
+
+            /* a little grain, so the smooth areas have some texture */
+            int nz = (int)(wp_h32((u32)x, (u32)y, 0x51C7u) & 15u) - 7;
+            R += nz >> 2; G += nz >> 2; B += nz >> 2;
+            if (R < 0) R = 0; if (R > 1023) R = 1023;
+            if (G < 0) G = 0; if (G > 1023) G = 1023;
+            if (B < 0) B = 0; if (B > 1023) B = 1023;
+            row[x] = 0xFF000000u | ((u32)tone[R] << 16) | ((u32)tone[G] << 8)
+                   | (u32)tone[B];
+        }
+    }
+}
+
+/* Paint the black hole. Above WP_TRACE_MAX pixels the whole picture is
+ * traced into a 1/q scratch surface and scaled up, so the cost of the frame
+ * stays bounded: the disk and the sky are smooth, and only the photon ring
+ * loses a little sharpness. */
+static void wp_draw_blackhole(Surface *s, const Theme *th, double seconds) {
+    int q = wp_q(s->w, s->h);
+    int sw = s->w, sh = s->h;
+    u32 *buf = wp_scratch(s->w, s->h, q, &sw, &sh);
+    if (!buf) { wp_bh_paint(s, th, seconds); return; }
+
+    Surface tmp;
+    tmp.px = buf; tmp.w = sw; tmp.h = sh; tmp.stride = sw;
+    tmp.cx0 = tmp.cy0 = tmp.cx1 = tmp.cy1 = 0;
+    wp_bh_paint(&tmp, th, seconds);
+    wp_upscale(s, buf, sw, sh, q);
+    free(buf);
+}
+
+/* ------------------------------------------------------------ 5. Nebula
+ * Value-noise fbm, domain warped twice, in the theme's own two light
+ * colours, with a soft core and a star field. Static: the desktop paints
+ * it once. The noise is sampled in normalised coordinates, so the same
+ * clouds appear at every resolution.
+ */
+static inline float wp_vnoise(float x, float y, u32 seed) {
+    int ix = wp_ifloor(x), iy = wp_ifloor(y);
+    float tx = x - (float)ix, ty = y - (float)iy;
+    float sx = tx * tx * (3.0f - 2.0f * tx);
+    float sy = ty * ty * (3.0f - 2.0f * ty);
+
+    float a = (float)(wp_h32((u32)ix, (u32)iy, seed) & 0xFFFFFFu) * (1.0f / 16777215.0f);
+    float b = (float)(wp_h32((u32)ix + 1u, (u32)iy, seed) & 0xFFFFFFu) * (1.0f / 16777215.0f);
+    float c = (float)(wp_h32((u32)ix, (u32)iy + 1u, seed) & 0xFFFFFFu) * (1.0f / 16777215.0f);
+    float d = (float)(wp_h32((u32)ix + 1u, (u32)iy + 1u, seed) & 0xFFFFFFu) * (1.0f / 16777215.0f);
+
+    float ab = a + (b - a) * sx;
+    float cd = c + (d - c) * sx;
+    return ab + (cd - ab) * sy;
+}
+
+static inline float wp_fbm(float x, float y, int oct, u32 seed) {
+    float sum = 0.0f, amp = 1.0f, norm = 0.0f;
+    for (int i = 0; i < oct; i++) {
+        sum += amp * wp_vnoise(x, y, seed + (u32)i * 131u);
+        norm += amp;
+        /* rotate by 37 degrees and double: no axis-aligned grain */
+        float nx = 2.02f * (0.7986f * x - 0.6018f * y) + 11.3f;
+        float ny = 2.02f * (0.6018f * x + 0.7986f * y) - 7.1f;
+        x = nx; y = ny;
+        amp *= 0.55f;
+    }
+    return sum / (norm > 0.0f ? norm : 1.0f);
+}
+
+static void wp_nebula_paint(Surface *s, const Theme *th, double seconds) {
+    const int   W = s->w, H = s->h;
+    const float S = 0.5f * (float)(W < H ? W : H);
+    const float cx = (float)W * 0.42f, cy = (float)H * 0.58f;
+    const float amp = th->dark ? 1.0f : 0.35f;
+
+    u32 sky_top = wp_opaque(color_mix(th->bg_top, RGB(0, 0, 0), th->dark ? 0.55f : 0.05f));
+    u32 sky_bot = wp_opaque(color_mix(th->bg_bottom, RGB(0, 0, 0), th->dark ? 0.35f : 0.02f));
+    gfx_gradient(s, 0, 0, W, H, sky_top, sky_bot);
+
+    const int cr = (int)GET_R(th->accent), cg = (int)GET_G(th->accent), cb = (int)GET_B(th->accent);
+    const int dr = (int)GET_R(th->glow),   dg = (int)GET_G(th->glow),   db = (int)GET_B(th->glow);
+
+    const float invS = 1.0f / S;
+    for (int y = 0; y < H; y++) {
+        const float dy = ((float)y + 0.5f - cy) * invS;
+        u32 *row = s->px + (size_t)y * s->stride;
+        for (int x = 0; x < W; x++) {
+            const float dx = ((float)x + 0.5f - cx) * invS;
+            const float u = dx * 2.15f, v = dy * 2.15f;
+
+            /* two warped fbm fields: the first one is the density, the
+               second one decides which of the two hues the cloud takes */
+            float q = wp_fbm(u, v, 2, 0x4E0Bu);
+            float f1 = wp_fbm(u + 2.10f * q - 3.4f, v + 2.10f * q + 5.7f, 4, 0x9E37u);
+            float f2 = wp_fbm(u - 1.70f * q + 8.1f, v + 1.30f * q - 2.6f, 2, 0xB529u);
+
+            /* density: a soft threshold, squared so the wisps are thin and
+               most of the sky stays empty; the low frequency field q decides
+               which half of the picture the cloud belongs to, so there are
+               dark regions instead of an even marble */
+            float d = (f1 - 0.40f) * 2.30f;
+            if (d < 0.0f) d = 0.0f;
+            if (d > 1.0f) d = 1.0f;
+            d = d * d * (3.0f - 2.0f * d);
+            float reg = 0.35f + 1.30f * q * q;
+            float m = d * d * amp * reg;
+
+            /* hue: 0 -> glow (cool), 1 -> accent (hot) */
+            float hh = (f2 - 0.30f) * 2.2f;
+            if (hh < 0.0f) hh = 0.0f;
+            if (hh > 1.0f) hh = 1.0f;
+
+            int R = wp_lerp8(dr, cr, (int)(hh * 256.0f));
+            int G = wp_lerp8(dg, cg, (int)(hh * 256.0f));
+            int B = wp_lerp8(db, cb, (int)(hh * 256.0f));
+
+            u32 base = row[x];
+            int br = (int)GET_R(base), bg = (int)GET_G(base), bb = (int)GET_B(base);
+            /* screen blend of a coloured light on a dark sky: the cloud adds
+               light, it does not paint over the background */
+            R = br + (int)((float)R * m * 1.45f);
+            G = bg + (int)((float)G * m * 1.45f);
+            B = bb + (int)((float)B * m * 1.45f);
+
+            /* a soft bright core, dust-lit from inside */
+            float cd2 = dx * dx + dy * dy;
+            float core = 1.0f / (1.0f + cd2 * 26.0f);
+            core *= core;
+            int ci8 = (int)(core * 150.0f * amp);
+            R += ci8; G += ci8; B += (ci8 * 9) / 8;
+
+            if (R > 255) R = 255;
+            if (G > 255) G = 255;
+            if (B > 255) B = 255;
+            row[x] = 0xFF000000u | ((u32)R << 16) | ((u32)G << 8) | (u32)B;
+        }
+    }
+
+    (void)seconds;
+}
+
+/* Stars are drawn at full resolution, after the cloud has been scaled up, so
+ * they stay points instead of blobs. */
+static void wp_draw_nebula(Surface *s, const Theme *th) {
+    const int   W = s->w, H = s->h;
+    const float S = 0.5f * (float)(W < H ? W : H);
+    const float cx = (float)W * 0.42f, cy = (float)H * 0.58f;
+    const float invS = 1.0f / S;
+    const float invca = 1.0f / 0.028f, invcb = 1.0f / 0.012f;
+    const float invra = (S * 0.028f) / 0.85f, invrb = (S * 0.012f) / 0.70f;
+
+    int q = wp_q(W, H);
+    int sw = W, sh = H;
+    u32 *buf = wp_scratch(W, H, q, &sw, &sh);
+    if (!buf) {
+        wp_nebula_paint(s, th, 0.0);
+    } else {
+        Surface tmp;
+        tmp.px = buf; tmp.w = sw; tmp.h = sh; tmp.stride = sw;
+        tmp.cx0 = tmp.cy0 = tmp.cx1 = tmp.cy1 = 0;
+        wp_nebula_paint(&tmp, th, 0.0);
+        wp_upscale(s, buf, sw, sh, q);
+        free(buf);
+    }
+
+    for (int y = 0; y < H; y++) {
+        const float dy = ((float)y + 0.5f - cy) * invS;
+        u32 *row = s->px + (size_t)y * s->stride;
+        for (int x = 0; x < W; x++) {
+            const float dx = ((float)x + 0.5f - cx) * invS;
+            int sa = wp_star_at(dx, dy, invca, 0x5EEDu, 15, 225, invra);
+            int sb = wp_star_at(dx, dy, invcb, 0x51A2u, 30, 80,  invrb);
+            int sv = sa + sb;
+            if (!sv) continue;
+            u32 c = row[x];
+            int R = (int)GET_R(c) + sv, G = (int)GET_G(c) + (sv * 245) / 256,
+                B = (int)GET_B(c) + (sv * 235) / 256;
+            if (R > 255) R = 255;
+            if (G > 255) G = 255;
+            if (B > 255) B = 255;
+            row[x] = 0xFF000000u | ((u32)R << 16) | ((u32)G << 8) | (u32)B;
+        }
+    }
+}
+
 /* ------------------------------------------------------------ public */
 
 void wallpaper_draw(Surface *s, const Theme *th, int index, double seconds) {
@@ -475,10 +1150,12 @@ void wallpaper_draw(Surface *s, const Theme *th, int index, double seconds) {
     if (index < 0 || index >= WALLPAPER_COUNT) index = 0;
 
     switch (index) {
-        case 1: wp_draw_mesh(s, th);            break;
-        case 2: wp_draw_waves(s, th, seconds);  break;
-        case 3: wp_draw_orbits(s, th, seconds); break;
+        case 1: wp_draw_mesh(s, th);                  break;
+        case 2: wp_draw_waves(s, th, seconds);        break;
+        case 3: wp_draw_orbits(s, th, seconds);       break;
+        case 4: wp_draw_blackhole(s, th, seconds);    break;
+        case 5: wp_draw_nebula(s, th);                break;
         case 0:
-        default: wp_draw_dusk(s, th);           break;
+        default: wp_draw_dusk(s, th);                 break;
     }
 }

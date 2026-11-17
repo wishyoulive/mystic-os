@@ -38,13 +38,13 @@ To move an existing plain disk to an encrypted one, see
 
 | piece | file | what it is |
 |---|---|---|
-| on-disk format + dm ioctls | `tools/mkenc.sh:99-1122` (the C source embedded in the tool) | `mystic-dmcrypt`: 1,021 lines of C, no dependencies |
-| compiled helper | `stage/sbin/mystic-dmcrypt` | static musl ELF, 40,552 bytes as built here |
+| on-disk format + dm ioctls | `tools/mkenc.sh:100-1169` (the C source embedded in the tool) | `mystic-dmcrypt`: 1,069 lines of C, no dependencies |
+| compiled helper | `stage/sbin/mystic-dmcrypt` | static musl ELF, 41,048 bytes as built here |
 | boot half of the key | `stage/etc/mystic/luks.key` | 32 bytes from `/dev/urandom`, created once by `mkenc.sh` |
-| module staging | `tools/mkenc.sh:77` `stage_modules()` | copies `dm-mod.ko`, `encrypted-keys.ko`, `dm-crypt.ko` out of the cached kernel package |
-| build / verify | `tools/mkenc.sh:1126` `build_helper()`, `:1219` `verify()` | exact compile command, ELF check, vermagic check, key length check |
-| boot logic | `stage/init:86-284` | the state machine in [7](#7-the-boot-sequence) |
-| boot-path simulation | `tools/mkenc.sh:1367` `cmd_test()` | runs `stage/init` against a fake `/dev`, fake `mount`/`mkfs`, real helper |
+| module staging | `tools/mkenc.sh:79` `stage_modules()` | copies `dm-mod.ko`, `encrypted-keys.ko`, `dm-crypt.ko` out of the cached kernel package |
+| build / verify | `tools/mkenc.sh:1173` `build_helper()`, `:1266` `verify()` | exact compile command, ELF check, vermagic check, key length check |
+| boot logic | `stage/init:106-412` | the state machine in [7](#7-the-boot-sequence) |
+| boot-path simulation | `tools/mkenc.sh:1442` `cmd_test()` | runs `stage/init` against a fake `/dev`, fake `mount`/`mkfs`, real helper |
 
 There is no `cryptsetup` and no `dmsetup` in the image. `stage/sbin` contains
 `mkfs.ext4` and `mystic-dmcrypt`; that is the entire userspace for this feature.
@@ -69,9 +69,9 @@ XTS are in the kernel image. `CONFIG_CRYPTO_ESSIV=m` matters only if a different
 IV mode were used; this design uses `plain64`.
 
 The two device-mapper modules are built as modules, and
-`stage/lib/modules/<ver>/kernel/drivers/md/` **was empty before this work**:
+`stage/lib/modules/<ver>/kernel/drivers/md/` was empty before this work:
 `tools/fetch-kernel.sh` copies a hand-written list of subtrees
-(`MODULE_TREES`, `tools/fetch-kernel.sh:27-47`) and `kernel/drivers/md`,
+(`MODULE_TREES`, `tools/fetch-kernel.sh:27-41`) and `kernel/drivers/md`,
 `kernel/security/keys` are not in it. `dm-crypt.ko` is in the upstream package
 and `modules.dep` says it needs:
 
@@ -110,7 +110,7 @@ the difference is not worth a fourth module that can fail to load.
 |---|---|
 | `cryptsetup` | libcryptsetup, libdevmapper, libuuid, libblkid, libjson-c, argon2, and a LUKS2 metadata parser |
 | `dmsetup` | libdevmapper, libuuid, libblkid (devmapper is a separate source tree with its own build system) |
-| `mystic-dmcrypt` | nothing. musl, three ioctls, 40,552 bytes |
+| `mystic-dmcrypt` | nothing. musl, three ioctls, 41,048 bytes |
 
 A dm-crypt target is a table *string*. Creating one is:
 
@@ -129,14 +129,35 @@ the key blanked out (`mystic-dmcrypt attach mystic-root /dev/vda <key> --table`)
 ```
 
 `129024 = 131072 - 2048`: the first 1 MiB of the disk is the header area, and
-sector 2048 of the mapping is sector 2048 of the block device. The kernel reports the
-mapping's major:minor in the ioctl reply, so the helper creates
+sector 2048 of the mapping is sector 2048 of the block device. The kernel
+reports the mapping's major:minor in the ioctl reply, so the helper creates
 `/dev/mapper/mystic-root` itself with `mknod` if devtmpfs did not.
 
 The LUKS header format is *not* implemented. This is not a LUKS volume;
 `cryptsetup luksDump` will not read it. What we give up compared with LUKS:
 multiple key slots, passphrase-based key derivation (Argon2), an authenticated
 header, and interoperability. See [9](#9-what-is-not-implemented).
+
+### 4.1 Exit codes (the shell branches on these, so they are part of the ABI)
+
+| `mystic-dmcrypt probe <dev>` | |
+|---|---|
+| 0 | `crypt <version> <fingerprint>` — a MYSTICC1 header that parses |
+| 10 | `blank` — the first 4 KiB is all zero |
+| 11 | `fs` — ext2/3/4 superblock magic at byte 0x438 |
+| 12 | `unknown` — not blank, no filesystem magic, no header |
+| 1 | the device could not be opened, or its header is unparseable |
+
+| `mystic-dmcrypt attach <name> <dev> <key>` | |
+|---|---|
+| 0 | the mapping is live (or was already live) |
+| 2 | the key file is missing, unreadable, or not exactly 32 bytes |
+| 3 | the key does not match the header fingerprint — nothing was touched |
+| 4 | the device mapper refused: no `/dev/mapper/control`, an ioctl failed, or the node could not be created |
+| 1 | bad arguments, no header, or the device is too small |
+
+Codes 2, 3 and 4 are what let `stage/init` say *why* a volume did not open
+instead of blaming the key for everything. See [7](#7-the-boot-sequence).
 
 ---
 
@@ -172,7 +193,7 @@ before anything is formatted**. `stage/init` never formats a disk whose header
 it could not open. It is a verifier, so as long as both halves are 256-bit
 random it hides nothing useful. It *would* be an offline-crackable oracle if
 the key were a passphrase — which is why `key_read()`
-(`tools/mkenc.sh:459`) refuses any key file that is not exactly 32 bytes rather
+(`tools/mkenc.sh:476`) refuses any key file that is not exactly 32 bytes rather
 than truncating a passphrase into one.
 
 The IV mode is `plain64`: the tweak is the sector number, with no per-disk
@@ -205,10 +226,19 @@ the same archive as the disk image), you have implemented the "key stored on the
 disk" variant from the brief and the protection against offline inspection of
 that disk is *zero*.
 
-`stage/etc/mystic/luks.key` is **not** in `.gitignore` as this tree stands
-(`build/`, `*.img`, `*.bin`, `stage/lib/modules/` and `stage/sbin/` are). Add it.
-A committed boot half is not enough to read a disk image — that is the point of
-the split — but it is half of the secret handed out for free.
+**The key file is already tracked by git in this repository** — not merely
+unignored. `git ls-files stage/etc/mystic/luks.key` lists it, so adding it to
+`.gitignore` will not help. Until it is untracked, every commit publishes the
+boot half:
+
+```sh
+git rm --cached stage/etc/mystic/luks.key   # keep the working copy
+./tools/mkenc.sh new-key                    # and retire the published half
+```
+
+A published boot half is not enough to read a disk image — that is the point of
+the split — but it is half of the secret handed out for free, and it makes the
+`new-key` rotation above mandatory rather than optional.
 
 ### 6.2 Why there is no passphrase prompt at boot
 
@@ -244,7 +274,7 @@ believe the PIN protects `/root` at rest.
 |---|---|
 | `build/disk.img` (the realistic offline case) | ciphertext. `/root`, `/root/notes`, `boots.txt`: unreadable. |
 | `build/disk.img` + `build/initramfs.cpio.gz` | plaintext. Both halves. |
-| a copy of this git repository (if `stage/etc/mystic/luks.key` was committed) | the boot half only — not enough without a disk image. But it removes half the work, so do not commit it. |
+| a copy of this git repository (the boot half is tracked, see 6.1) | the boot half only — not enough without a disk image, but it is half the work. |
 | root inside the running OS | everything. The mapping is open, the key is in `/etc/mystic/luks.key`, and the kernel holds the key for the live mapping. dm-crypt is not a defence against a live root. |
 | the physical machine while it is running | everything, including a cold-boot or DMA attack on RAM. |
 | write access to `build/disk.img` | they cannot read it, but they can **corrupt** it: there is no authentication (see 6.5). |
@@ -258,10 +288,13 @@ believe the PIN protects `/root` at rest.
   cannot tell you the data was modified. `dm-integrity` (or an AEAD mode) would
   be needed; it costs a second mapping and is not implemented.
 * **No header authentication.** The 1 MiB header is plaintext and unauthenticated.
-  The fingerprint catches a *wrong key*, not a *tampered header*. Someone who
-  rewrites the disk half and the fingerprint just makes the volume impossible to
-  open (the data key changes, so the ciphertext becomes noise). That is
-  vandalism, not a bypass, but it is worth knowing.
+  The fingerprint catches a *wrong key*, not a *tampered header*. What tampering
+  does now: flipping the version byte, the offset, the cipher id or the disk
+  half makes the header unparseable or the fingerprint wrong, and the boot
+  **refuses** to touch the disk (simulation scenarios 12 and 13). The one
+  remaining case is a header that is zeroed completely: the disk then reads as
+  `blank`, and a blank disk is formatted (scenario 2). Zeroing the header is
+  equivalent to deleting the key file — it is a wipe, not a bypass.
 * **No anti-rollback.** An old copy of the disk image opens with the current key.
 * **No protection of the swap or RAM.** There is no swap; the desktop keeps
   `/root` contents in page cache in the clear like any Linux.
@@ -270,39 +303,58 @@ believe the PIN protects `/root` at rest.
 
 ## 7. The boot sequence
 
-`stage/init:249` `setup_disk()` runs one probe and then branches. The probe
-(`mystic-dmcrypt probe /dev/vda`) reads the first 4 KiB and classifies the
-device; nothing is written and nothing is mounted to decide.
+`stage/init:350` `setup_disk()` classifies the device, then branches. The
+classification has two independent sources, and that is deliberate:
+
+1. `mystic-dmcrypt probe` (`stage/init:186`) — the normal path.
+2. `dev_probe_shell` (`stage/init:149`) — three reads of the device with
+   `dd`/`tr`/`cksum` (no `od`: its `-j`/`-N`/`-v` extensions are not guaranteed
+   by a busybox build) answering header / blank / other. It is used when the
+   helper is **missing from the image** (a `git clean` removes the ignored
+   `stage/sbin/`) or when the helper fails.
+
+So a device whose first eight bytes are `MYSTICC1` is recognised as ours even
+with no helper, no modules and no key. It is never handed to `mkfs`.
 
 | state | meaning | what init does | message |
 |---|---|---|---|
 | no device | `[ -b /dev/vda ]` false | nothing | `disk: no /dev/vda` *(unchanged)* |
-| `blank` | first 4 KiB all zero, no ext4 magic | write header, open mapping, `mkfs.ext4`, mount | `disk: created dm-crypt volume on /dev/vda (aes-xts-plain64)` then `disk: formatted ext4 inside dm-crypt and mounted on /root` |
+| `blank` | first 4 KiB all zero | write header, open mapping, `mkfs.ext4`, mount | `disk: created dm-crypt volume on /dev/vda (aes-xts-plain64)` then `disk: formatted ext4 inside dm-crypt and mounted on /root` |
 | `crypt <fp>` | our header, fingerprint matches | open mapping, mount | `disk: dm-crypt unlocked, formatted ext4 mounted on /root` |
-| `crypt <fp>`, no ext4 inside | header exists, mkfs never finished | open mapping, `mkfs.ext4`, mount | `disk: dm-crypt unlocked, no ext4 inside - creating one` |
-| `locked:` | our header, but `dm_mod`/`dm_crypt` did not load | **refuse**: no format, no mount | `disk: … is encrypted but cannot be opened` / `disk: refusing to format it` |
-| `locked (key does not match)` | header opened, wrong key | **refuse**: no format, no mount | `disk: encrypted, but the key did not unlock it` |
-| `foreign` | no header, but not blank (a plain ext4 disk from an older build) | the original code path | `disk: /dev/vda has no encryption header and is not blank`, then `disk: mounted /dev/vda (ext4) on /root` or the old format path *(unchanged)* |
-| `unavailable:` | no helper in the image, or no modules and a blank disk | the original code path | `disk: dm-crypt unavailable - …` then the old messages *(unchanged)* |
+| `crypt <fp>`, ext4 magic absent inside the mapping | header exists, mkfs never finished | open mapping, `mkfs.ext4`, mount | `disk: dm-crypt unlocked, no ext4 inside - creating one` |
+| `crypt <fp>`, ext4 magic present but mount failed | a filesystem that will not mount | **refuse**: no mkfs, no mount | `disk: dm-crypt unlocked, ext4 is there but did not mount - refusing to format it` |
+| `locked: no helper` | header present, helper missing | **refuse** | `disk: … is encrypted but cannot be opened - no … in the image, and … carries a MYSTICC1 header` |
+| `locked: no modules` | header present, `dm_mod`/`dm_crypt` did not load | **refuse** | `disk: … is encrypted but cannot be opened - dm_mod/dm_crypt did not load` |
+| `locked: probe failed` | header present, helper cannot parse it | **refuse** | `disk: … is encrypted but cannot be opened - the probe failed, and … carries a MYSTICC1 header` |
+| `locked (key does not match)` | header opened, key differs (exit 3) | **refuse** | `disk: encrypted, but the key did not unlock it` |
+| `locked (no usable key)` | key file missing/short (exit 2) | **refuse** | `disk: cannot read the boot key …` |
+| `locked (dm-crypt error)` | ioctl/control-node failure (exit 4) | **refuse** | `disk: dm-crypt could not create the mapping` |
+| `fs` | helper said "ext4 magic, no header" | the original path: mount, else mkfs | `disk: … has no encryption header and is not blank`, then `disk: mounted … (ext4) on /root` *(unchanged)* |
+| `keep: unknown` | helper said "not blank, no filesystem magic, no header" | try to mount; **refuse to format** | `disk: … is not blank, not ext4 and carries no MYSTICC1 header` then `disk: … did not mount and is not blank - refusing to format it` |
+| `keep: other` | no helper, and the device is neither blank nor ours | try to mount; **refuse to format** | `disk: no … in the image, and … is not blank and carries no MYSTICC1 header` |
+| `unavailable` | blank disk, no helper or no modules | the original path: mkfs plain | `disk: dm-crypt unavailable - …` then `disk: formatted ext4 and mounted on /root` |
 
-Three rules make this safe rather than clever:
+Four rules make this safe rather than clever:
 
-1. **`mkfs` never runs on a device that carries a header.** If the header is
-   there and cannot be opened, `/root` is left on the RAM filesystem and the OS
-   still boots. That is the `locked` rows.
-2. **The old behaviour is kept verbatim** for a disk that is not ours
-   (`foreign`, `unavailable`). That is what keeps an existing `build/disk.img`
-   booting after this change, and it is why the "disk did not mount, creating
-   ext4 filesystem" path and its documented KNOWN RISK comment are still there.
-3. **A blank disk with no key in the image does not silently become encrypted
-   with a key that will be lost at reboot.** There is no persistent place to put
-   a key generated at runtime: the initramfs is a read-only cpio, so a key
-   generated into RAM would make the volume unreadable on the next boot. init
-   therefore says `disk: no encryption key at … - using plain ext4` and takes
-   the old path. `tools/mkenc.sh` always creates the key, so this only happens
-   in a broken build.
+1. **A device that carries our header is never formatted**, whatever is missing:
+   not the helper, not the modules, not the key, not a parsable header.
+2. **A failed mount is not proof that there is no filesystem.** Inside the
+   mapping, the ext4 superblock magic at byte 1080 is checked before `mkfs`
+   runs. A corrupted superblock, an unsupported feature or a transient dm error
+   leaves the volume intact and `/root` unmounted.
+3. **The pre-encryption behaviour is kept verbatim** for an ext4 disk (`fs`):
+   mount it, and if that fails, format it — the documented KNOWN RISK in
+   `stage/init:319`. The only case that changed is a disk that is neither blank,
+   nor ext4, nor ours: that used to be formatted too, and is now left alone,
+   because a damaged header looks exactly like that.
+4. **A blank disk with no key in the image does not silently become encrypted**
+   with a key that will be lost at reboot. There is no persistent place to put a
+   key generated at runtime (the initramfs is a read-only cpio), so init says
+   `disk: no encryption key at … - using plain ext4` and takes the old path.
+   `tools/mkenc.sh` always creates the key, so this only happens in a broken
+   build.
 
-The probe state is also printed, so a boot log tells you which one happened:
+The probe state is also printed, so a boot log says which one happened:
 
 ```
 crypt    : aes-xts-plain64, key 6c67030f117e8ce0     (example, from a simulation run)
@@ -352,9 +404,12 @@ there is nowhere to put the ciphertext, and the image has no `losetup`, no
 `boots.txt` and whatever the apps made in `/root` — nothing that cannot be
 retyped.
 
-To start encrypted:
+To start encrypted, **stage first** — `reset-disk` refuses to move the disk
+unless the key, the helper and the modules are all in place, because a fresh disk
+built without them would come back unencrypted and say nothing about it:
 
 ```sh
+./tools/mkenc.sh              # key + helper + modules, or reset-disk will refuse
 ./tools/mkenc.sh reset-disk   # moves build/disk.img to build/disk.img.plain-<UTC>
 ./image.sh                    # next boot creates the volume and formats it
 ```
@@ -377,6 +432,11 @@ is now useless. To open an old disk again, boot with the saved file in place:
 # inside the OS, with the old half copied in:
 mystic-dmcrypt attach mystic-root /dev/vda /etc/mystic/luks.key.old
 ```
+
+`./tools/mkenc.sh status` says so before you boot: it runs `attach --table`
+against `build/disk.img`, which verifies the fingerprint and stops before any
+ioctl, so a wrong boot half prints `next boot: will NOT open it - …` instead of
+a cheerful "unlocks it".
 
 A real key-rotation (re-encrypt with a new data key, keeping the filesystem)
 would need dm-crypt's `cryptsetup reencrypt` machinery, which does not exist
@@ -417,25 +477,46 @@ in QEMU.
 ### 10.1 Compilation
 
 ```
-$ zig cc -target x86_64-linux-musl -Os -static -Wall -Wextra \
+$ zig cc -target x86_64-linux-musl -Os -static -Isrc -Wall -Wextra \
       -Wno-unused-parameter -c build/mkenc/mystic-dmcrypt.c -o build/mkenc/x.o
 (no output)
 ```
 
 The same source also compiles for the host with `-DMYSTIC_HOSTTEST=1`, which
-replaces the three ioctls with nothing and the block-device size ioctl with
-`stat()`, so the rest of the program can actually be executed here.
+replaces the three ioctls with a printed table and the block-device size ioctl
+with `stat()`, so the rest of the program runs on this machine.
 
-### 10.2 `./tools/mkenc.sh test` — 35 assertions, 0 failures
+`./tools/mkenc.sh elf <file>` prints the ELF verdict and exits non-zero when the
+file needs a dynamic loader, which is how the static-helper check is tested:
 
-The simulation (`tools/mkenc.sh:1367`, script generated into
+```
+$ ./tools/mkenc.sh elf stage/sbin/mystic-dmcrypt
+ET_EXEC, 6 program header(s), no PT_INTERP (static)          exit 0
+$ ./tools/mkenc.sh elf <a PT_INTERP ELF>
+ET_EXEC, 1 program header(s), PT_INTERP present (DYNAMIC)    exit 1
+```
+
+With that ELF planted as `stage/sbin/mystic-dmcrypt` and the compile step
+skipped, `./tools/mkenc.sh` prints
+`WARNING: stage/sbin/mystic-dmcrypt is not a static executable (see above)` and
+`error: verification failed` — the check can fail.
+
+### 10.2 `./tools/mkenc.sh test` — 66 assertions, 0 failures
+
+The simulation (`tools/mkenc.sh:1442`, script generated into
 `build/mkenc/sim/run.sh`) **sources the real `stage/init`** with
 `MYSTIC_INIT_LIB=1`, points `MYSTIC_DISK` at a regular file, and puts a fake
-`mount`, `mkfs.ext4` and `modprobe` first on `PATH`. The helper is the real
-thing: the host build of the same C, so the header it writes, the SHA-256 it
-computes and the key check it performs are the shipping code. Nine scenarios
-(paths shortened to `…`; the fingerprints differ on every run because the
-simulation generates a fresh key each time):
+`mount`, `mkfs.ext4` and `modprobe` first on `PATH`. Two things make the
+evidence real rather than cosmetic:
+
+* the helper is the **host build of the shipping C**, so the header it writes,
+  the SHA-256 it computes and the key check it performs are the same code;
+* the fake `mkfs.ext4` writes the actual ext4 superblock magic into the device
+  and the fake `mount` decides from that magic, so a format is visible to
+  `cksum` and "there is a filesystem but it will not mount" is reachable.
+
+Sixteen scenarios (paths shortened to `…`; the fingerprints differ on every run
+because the simulation generates a fresh key each time):
 
 ```
 == 1. no disk at all (real [ -b ] check) ==
@@ -445,32 +526,34 @@ simulation generates a fresh key each time):
   PASS  no 'fake-mount'
 
 == 2. first boot on a blank disk ==
-        | crypt: initialised 4096-byte header, data at sector 2048, fingerprint 18207b0fbad38382
+        | crypt: initialised 4096-byte header, data at sector 2048, fingerprint 94502eef5a82cd1f
         | disk: created dm-crypt volume on …/dev/vda (aes-xts-plain64)
         | crypt: host-test: mapping mystic-root from 0 14336 crypt aes-xts-plain64 <64-byte key> 0 …/dev/vda 2048
         | disk: dm-crypt unlocked, no ext4 inside - creating one
-        | fake-mount: /dev/mapper/mystic-root on /root
+        | fake-mount: …/mapping on /root
         | disk: formatted ext4 inside dm-crypt and mounted on /root
-        | crypt: aes-xts-plain64, key fingerprint 18207b0fbad38382
-        | status: aes-xts-plain64, key 18207b0fbad38382
-        | mounted: /dev/mapper/mystic-root
+        | crypt: aes-xts-plain64, key fingerprint 94502eef5a82cd1f
+        | status: aes-xts-plain64, key 94502eef5a82cd1f
+        | mounted: …/mapping
   PASS  disk: created dm-crypt volume on …/dev/vda (aes-xts-plain64)
   PASS  disk: dm-crypt unlocked, no ext4 inside - creating one
   PASS  disk: formatted ext4 inside dm-crypt and mounted on /root
-  PASS  mounted: /dev/mapper/mystic-root
+  PASS  mounted: …/mapping
   PASS  status: aes-xts-plain64, key 
-        | header now: crypt 1 18207b0fbad38382
+        | header now: crypt 1 94502eef5a82cd1f
   PASS  the disk file now starts with a MYSTICC1 header
+  PASS  the ext4 superblock was written inside the mapping
+  PASS  the raw disk has no ext4 superblock at byte 1080 (ciphertext starts there)
 
 == 3. second boot on the same disk ==
         | crypt: host-test: mapping mystic-root from 0 14336 crypt aes-xts-plain64 <64-byte key> 0 …/dev/vda 2048
-        | fake-mount: /dev/mapper/mystic-root on /root
+        | fake-mount: …/mapping on /root
         | disk: dm-crypt unlocked, formatted ext4 mounted on /root
-        | crypt: aes-xts-plain64, key fingerprint 18207b0fbad38382
-        | status: aes-xts-plain64, key 18207b0fbad38382
-        | mounted: /dev/mapper/mystic-root
+        | crypt: aes-xts-plain64, key fingerprint 94502eef5a82cd1f
+        | status: aes-xts-plain64, key 94502eef5a82cd1f
+        | mounted: …/mapping
   PASS  disk: dm-crypt unlocked, formatted ext4 mounted on /root
-  PASS  mounted: /dev/mapper/mystic-root
+  PASS  mounted: …/mapping
   PASS  no 'created dm-crypt volume'
   PASS  no 'no ext4 inside'
 
@@ -499,7 +582,7 @@ simulation generates a fresh key each time):
 
 == 6. encrypted disk, wrong key ==
         | disk: encrypted, but the key did not unlock it - …/dev/vda is left untouched
-        |   mystic-dmcrypt: key does not match this disk (header 18207b0fbad38382, key dca46dcf8787be9a) - the disk is left untouched
+        |   mystic-dmcrypt: key does not match this disk (header 94502eef5a82cd1f, key b64b0a28faa8c7bb) - the disk is left untouched
         | status: locked (key does not match)
   PASS  disk: encrypted, but the key did not unlock it - …/dev/vda is left untouched
   PASS  key does not match this disk
@@ -518,7 +601,7 @@ simulation generates a fresh key each time):
   PASS  disk: formatted ext4 and mounted on /root
   PASS  no 'created dm-crypt volume'
 
-== 8. no helper in the image ==
+== 8. no helper in the image, blank disk ==
         | disk: dm-crypt unavailable - no …/no-such-helper in the image
         | disk: …/dev/fresh did not mount, creating ext4 filesystem
         | fake-mount: …/dev/fresh on /root
@@ -529,26 +612,98 @@ simulation generates a fresh key each time):
   PASS  disk: formatted ext4 and mounted on /root
   PASS  no 'created dm-crypt volume'
 
-== 9. an encrypted disk whose ext4 was never created ==
+== 9. encrypted volume whose ext4 was never created ==
         | crypt: host-test: mapping mystic-root from 0 14336 crypt aes-xts-plain64 <64-byte key> 0 …/dev/emptyvol 2048
         | disk: dm-crypt unlocked, no ext4 inside - creating one
-        | fake-mount: /dev/mapper/mystic-root on /root
+        | fake-mount: …/mapping on /root
         | disk: formatted ext4 inside dm-crypt and mounted on /root
-        | crypt: aes-xts-plain64, key fingerprint da67ca04cb8fd76f
-        | status: aes-xts-plain64, key da67ca04cb8fd76f
-        | mounted: /dev/mapper/mystic-root
+        | crypt: aes-xts-plain64, key fingerprint c75732d041371eae
+        | status: aes-xts-plain64, key c75732d041371eae
+        | mounted: …/mapping
   PASS  disk: dm-crypt unlocked, no ext4 inside - creating one
   PASS  disk: formatted ext4 inside dm-crypt and mounted on /root
 
-35 passed, 0 failed
+== 10. encrypted volume with an ext4 that will not mount ==
+        | crypt: host-test: mapping mystic-root from 0 14336 crypt aes-xts-plain64 <64-byte key> 0 …/dev/vda 2048
+        | disk: dm-crypt unlocked, ext4 is there but did not mount - refusing to format it
+        | disk: nothing was written; the volume is intact
+        | status: unlocked, ext4 present but not mounted
+  PASS  disk: dm-crypt unlocked, ext4 is there but did not mount - refusing to format it
+  PASS  disk: nothing was written; the volume is intact
+  PASS  no 'no ext4 inside'
+  PASS  no 'formatted ext4'
+  PASS  the unmountable volume was not reformatted
+
+== 11. header present, helper missing (a git clean removes stage/sbin) ==
+        | disk: …/dev/vda is encrypted but cannot be opened - no …/no-such-helper in the image, and …/dev/vda carries a MYSTICC1 header
+        | disk: refusing to format it, /root stays on the RAM filesystem
+        | status: locked (no …/no-such-helper in the image, and …/dev/vda carries a MYSTICC1 header)
+  PASS  disk: …/dev/vda is encrypted but cannot be opened - no …/no-such-helper in the image, and …/dev/vda carries a MYSTICC1 header
+  PASS  disk: refusing to format it, /root stays on the RAM filesystem
+  PASS  no 'creating ext4 filesystem'
+  PASS  the encrypted disk was not written to
+
+== 12. header with a corrupted version byte ==
+        | disk: …/dev/badver is encrypted but cannot be opened - the probe failed, and …/dev/badver carries a MYSTICC1 header
+        | disk: refusing to format it, /root stays on the RAM filesystem
+        | status: locked (the probe failed, and …/dev/badver carries a MYSTICC1 header)
+  PASS  disk: …/dev/badver is encrypted but cannot be opened - the probe failed, and …/dev/badver carries a MYSTICC1 header
+  PASS  disk: refusing to format it, /root stays on the RAM filesystem
+  PASS  no 'creating ext4 filesystem'
+  PASS  the unreadable volume was not written to
+
+== 13. a disk that is neither blank, nor ext4, nor ours ==
+        | disk: …/dev/junk is not blank, not ext4 and carries no MYSTICC1 header
+        | disk: …/dev/junk did not mount and is not blank - refusing to format it
+        | disk: nothing was written; delete build/disk.img (or run
+        | disk: ./tools/mkenc.sh reset-disk) if you want a fresh disk
+        | status: present but not mountable (left untouched)
+  PASS  disk: …/dev/junk is not blank, not ext4 and carries no MYSTICC1 header
+  PASS  disk: …/dev/junk did not mount and is not blank - refusing to format it
+  PASS  no 'creating ext4 filesystem'
+  PASS  the unrecognised disk was not written to
+
+== 14. helper present, dm-crypt fails to create the mapping ==
+        | disk: dm-crypt could not create the mapping - …/dev/vda is left untouched
+        |   mystic-dmcrypt: dm DM_DEV_CREATE failed: Operation not permitted
+        | status: locked (dm-crypt error)
+  PASS  disk: dm-crypt could not create the mapping - …/dev/vda is left untouched
+  PASS  status: locked (dm-crypt error)
+  PASS  no 'key did not unlock it'
+  PASS  no 'key does not match'
+
+== 15. encrypted disk whose boot key file is gone ==
+        | disk: cannot read the boot key …/gone.key - …/dev/vda is left untouched
+        |   mystic-dmcrypt: cannot open key …/gone.key: No such file or directory
+        | status: locked (no usable key)
+  PASS  disk: cannot read the boot key …/gone.key - …/dev/vda is left untouched
+  PASS  status: locked (no usable key)
+  PASS  no 'key does not match'
+  PASS  the encrypted disk was not written to
+
+== 16. an unrecognised disk with no helper in the image ==
+        | disk: no …/no-such-helper in the image, and …/dev/junk2 is not blank and carries no MYSTICC1 header
+        | disk: …/dev/junk2 did not mount and is not blank - refusing to format it
+        | disk: nothing was written; delete build/disk.img (or run
+        | disk: ./tools/mkenc.sh reset-disk) if you want a fresh disk
+        | status: present but not mountable (left untouched)
+  PASS  disk: no …/no-such-helper in the image, and …/dev/junk2 is not blank and carries no MYSTICC1 header
+  PASS  disk: …/dev/junk2 did not mount and is not blank - refusing to format it
+  PASS  no 'creating ext4 filesystem'
+  PASS  the unrecognised disk was not written to
+
+66 passed, 0 failed
 ```
 
-Scenarios 4, 5 and 6 compare `cksum` before and after: the disk file is
-byte-identical afterwards, which is the property that matters (no accidental
-`mkfs` over data). Scenario 1 uses the real `[ -b ]` test rather than the fake;
-the other scenarios replace `disk_present()` because a Windows build host has no
-block devices at all. That substitution is stated at the top of the generated
-script.
+Scenarios 4, 5, 6, 10, 11, 12, 13 and 15 compare `cksum` before and after: the
+device is byte-identical afterwards, which is the property that matters (no
+`mkfs` over data). Scenario 10 forces a real mount failure on a volume whose
+ext4 magic is present, and asserts both the refusal message and the unchanged
+checksum. Scenarios 11 and 12 are the two data-loss paths the critic reproduced:
+a header with the helper missing, and a header with a corrupted version byte.
+Scenario 1 uses the real `[ -b ]` test; the other scenarios replace
+`disk_present()` because a Windows build host has no block devices at all. That
+substitution is stated at the top of the generated script.
 
 ### 10.3 Helper self-test
 
@@ -559,7 +714,8 @@ exact dm table string for a 2 MiB device and for a 64 MiB device
 (`0 129024 crypt aes-xts-plain64 … 0 /dev/vda 2048`); a 4 KiB header written to
 a file and read back through `probe()` including both halves and the
 fingerprint; a blank 4 KiB file classified `blank`; an ext4 superblock magic
-classified `foreign`; and `key_read()` accepting 32 bytes and refusing 33.
+classified `fs`; unrecognised non-zero data classified `unknown` (never blank);
+and `key_read()` accepting 32 bytes and refusing 33.
 
 ```
 ok   sha256("")
@@ -571,10 +727,18 @@ ok   dm table, 2 MiB device -> 2048 data sectors at offset 2048
 ok   dm table, 64 MiB device -> 129024 data sectors
 ok   probe() finds the header and reads the disk half back
 ok   header fields: version 1, offset 2048 sectors, key 64 bytes
+ok   an all-zero 4 KiB device is blank
+ok   an ext4 superblock magic reads as fs, not blank
+ok   data that is not blank and not ext4 reads as unknown
 ok   key_read() accepts exactly 32 bytes
 ok   key_read() refuses a 33-byte file
 ok   0 check(s) failed
 ```
+
+(The blank/fs/unknown cases were previously skipped in silence: `mkstemp()`
+rewrites its template, so the second and later `mkstemp(disk)` calls failed and
+their `if (fd >= 0)` bodies never ran. They go through a `tmp_open()` helper
+now.)
 
 ### 10.4 Packaging
 
@@ -582,25 +746,22 @@ ok   0 check(s) failed
 (`build/mkenc/pack-test.cpio.gz`) and the archive inspected entry by entry:
 
 ```
-etc/mystic/luks.key                     mode 0100644, 32 bytes
-init                                    mode 0100755, 14749 bytes, 0 CR bytes
-sbin/mystic-dmcrypt                     mode 0100755, 40552 bytes
-lib/modules/…/drivers/md/dm-crypt.ko    mode 0100644, 148999 bytes
-lib/modules/…/drivers/md/dm-mod.ko      mode 0100644, 462255 bytes
-lib/modules/…/security/keys/…/encrypted-keys.ko  0100644, 54367 bytes
+etc/mystic/luks.key      mode 0100644, 32 bytes
+init                     mode 0100755, 20770 bytes, 0 CR bytes
+sbin/mystic-dmcrypt      mode 0100755, 41048 bytes
 ```
 
-Two facts worth flagging: `mkimage.py` forces mode `0644` on every non-executable
-file, so the boot half is **world-readable inside the initramfs**. Before the
-desktop starts, only root processes exist. The desktop's app sandbox gives an
-app no `/etc` at all unless the app declared network access, in which case it
-binds exactly `/etc/resolv.conf` and `/etc/hosts` (`src/wmsrv.c:438-449`), so a
-uid-1000 app cannot see `/etc/mystic/luks.key` —
-this is not a hole today, but it is one bind mount away from being one. If you
-ever rebuild the jail with all of `/etc`, make this file mode 0600 in the cpio
-first (which means teaching `tools/mkimage.py` to preserve modes). The other
-fact is `/init` with zero CR bytes, because a CRLF in a shell script is one of
-the documented ways to break this project's boot.
+plus the three kernel modules under `lib/modules/…`. Two facts worth flagging:
+`mkimage.py` forces mode `0644` on every non-executable file, so the boot half
+is **world-readable inside the initramfs**. Before the desktop starts, only root
+processes exist. The desktop's app sandbox gives an app no `/etc` at all unless
+the app declared network access, in which case it binds exactly
+`/etc/resolv.conf` and `/etc/hosts` (`src/wmsrv.c:438-449`), so a uid-1000 app
+cannot see `/etc/mystic/luks.key` — this is not a hole today, but it is one bind
+mount away from being one. If you ever rebuild the jail with all of `/etc`, make
+this file mode 0600 in the cpio first (which means teaching `tools/mkimage.py`
+to preserve modes). The other fact is `/init` with zero CR bytes, because a CRLF
+in a shell script is one of the documented ways to break this project's boot.
 
 ### 10.5 What has never run
 
@@ -610,9 +771,10 @@ struct sizes, 312 and 40 bytes) but they have never executed: that needs a
 kernel, and this environment has no way to run one that I am allowed to use. The
 first real boot is their first execution. Everything up to the ioctl boundary is
 covered above; the ioctl sequence itself follows libdevmapper's and is four
-calls long, and every failure prints the ioctl name and `strerror(errno)`, so a
-first-boot failure will say exactly which call failed. Treat the first boot as
-the test it is.
+calls long, and every failure prints the ioctl name and `strerror(errno)` and
+exits 4, so a first-boot failure will say exactly which call failed and the boot
+will say `locked (dm-crypt error)` and leave the disk alone. Treat the first
+boot as the test it is.
 
 ### 10.6 Coupling to `tools/smoke.sh`
 
@@ -644,14 +806,15 @@ printf '%s' "$out" | grep -Eq 'mounted /dev/vda \(ext4\)|formatted ext4|mounted 
 
 ```sh
 ./tools/mkenc.sh                 # stage everything, verify, print the fingerprint
-./tools/mkenc.sh status          # what the next boot will do with build/disk.img
-./tools/mkenc.sh test            # 9 boot-path scenarios, 35 assertions, no QEMU
+./tools/mkenc.sh status          # what the next boot will do (checks the key, not just the header)
+./tools/mkenc.sh test            # 16 boot-path scenarios, 66 assertions, no QEMU
 ./tools/mkenc.sh key             # key file, length, fingerprint
 ./tools/mkenc.sh new-key         # replace the boot half (old disks stop opening)
 ./tools/mkenc.sh reset-disk      # park build/disk.img so the next boot encrypts
+./tools/mkenc.sh elf <file>      # static-ELF check used by verify()
 
 # inside the OS
-mystic-dmcrypt probe /dev/vda          # crypt <ver> <fp> | blank | foreign
+mystic-dmcrypt probe /dev/vda          # exit 0 crypt | 10 blank | 11 fs | 12 unknown
 mystic-dmcrypt attach mystic-root /dev/vda /etc/mystic/luks.key --table   # shape only
 mystic-dmcrypt status mystic-root
 mystic-dmcrypt detach mystic-root
@@ -663,9 +826,13 @@ mystic-dmcrypt selftest
 | `disk: created dm-crypt volume on /dev/vda (aes-xts-plain64)` | first boot: header written |
 | `disk: dm-crypt unlocked, formatted ext4 mounted on /root` | normal encrypted boot |
 | `disk: formatted ext4 inside dm-crypt and mounted on /root` | header existed, filesystem did not |
+| `disk: dm-crypt unlocked, ext4 is there but did not mount - refusing to format it` | the volume is intact; investigate instead of reformatting |
 | `disk: encrypted, but the key did not unlock it` | wrong boot half; nothing was touched |
-| `disk: … is encrypted but cannot be opened` | header present, dm modules absent; nothing was touched |
+| `disk: cannot read the boot key …` | key file missing or not 32 bytes |
+| `disk: dm-crypt could not create the mapping` | device-mapper error; nothing was touched |
+| `disk: … is encrypted but cannot be opened` | header present, helper/modules/parser missing; nothing was touched |
 | `disk: … has no encryption header and is not blank` | plain ext4 disk from an older build |
+| `disk: … did not mount and is not blank - refusing to format it` | unrecognisable disk; left untouched |
 | `disk: no encryption key at …` | no boot half in the image; plain ext4 |
 | `crypt : aes-xts-plain64, key <hex>` | probe line: the volume that was opened |
 | `crypt : locked (…)` | probe line: the volume that was refused |
