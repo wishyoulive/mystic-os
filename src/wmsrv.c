@@ -44,13 +44,19 @@ static void sendf(WmClient *c, const char *fmt, ...) {
     (void)w;
 }
 
+static int screen_w = 1280, screen_h = 800;
+
+void wms_set_screen(int w, int h) {
+    if (w > 0 && h > 0) { screen_w = w; screen_h = h; }
+}
+
 static int make_shm(WmClient *c) {
     snprintf(c->shm_path, sizeof(c->shm_path), "/dev/shm/mystic-%d-%d", (int)getpid(), ++shm_seq);
     unlink(c->shm_path);
     int fd = open(c->shm_path, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd < 0) return -1;
 
-    size_t bytes = (size_t)c->stride * (size_t)c->h * 4;
+    size_t bytes = (size_t)c->stride * (size_t)c->maxh * 4;
     if (ftruncate(fd, (off_t)bytes) < 0) { close(fd); unlink(c->shm_path); return -1; }
 
     c->px = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -66,7 +72,7 @@ static int make_shm(WmClient *c) {
 
 static void free_shm(WmClient *c) {
     if (c->px && c->px != MAP_FAILED) {
-        size_t bytes = (size_t)c->stride * (size_t)c->h * 4;
+        size_t bytes = (size_t)c->stride * (size_t)c->maxh * 4;
         munmap(c->px, bytes);
     }
     c->px = NULL;
@@ -144,7 +150,12 @@ static void handle_line(WmClient *c, char *line) {
         snprintf(c->title, sizeof(c->title), "%s", title);
         c->w = w;
         c->h = h;
-        c->stride = w;                       /* keep it simple and explicit */
+        /* The buffer is allocated for the whole screen, not the size the app
+         * asked to open at: otherwise a client can never grow, and maximising
+         * its window just draws the same small picture in a bigger frame. */
+        c->maxw = w > screen_w ? w : screen_w;
+        c->maxh = h > screen_h ? h : screen_h;
+        c->stride = c->maxw;                 /* keep it simple and explicit */
 
         if (make_shm(c) < 0) {
             sendf(c, "ERR no shm\n");
@@ -154,7 +165,7 @@ static void handle_line(WmClient *c, char *line) {
             wms_shutdown_client(c);
             return;
         }
-        sendf(c, "OK %s %d\n", c->shm_path, c->stride);
+        sendf(c, "OK %s %d %d %d\n", c->shm_path, c->stride, c->maxw, c->maxh);
         c->want_frame = 1;
         fprintf(stderr, "wms: %s connected %dx%d\n", c->id, c->w, c->h);
         return;

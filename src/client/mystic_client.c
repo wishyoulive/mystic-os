@@ -108,12 +108,24 @@ int mc_open(MClient *c, const char *id, const char *title, int w, int h) {
     int stride = w;
     if (sscanf(line + 3, "%127s %d", shm, &stride) < 1) return mc_open_fail(c);
 
+    /* the server allocates the buffer for the whole screen and tells us the
+     * maximum; the window size is our own request, and RESIZE events move
+     * the drawing area inside that mapping */
+    int maxw = w, maxh = h;
+    if (sscanf(line + 3, "%127s %d %d %d", shm, &stride, &maxw, &maxh) < 3) {
+        maxw = stride > 0 ? stride : w;
+        maxh = h;
+    }
+    if (maxw < w) maxw = w;
+    if (maxh < h) maxh = h;
+    c->maxw = maxw;
+    c->maxh = maxh;
     snprintf(c->shm, sizeof(c->shm), "%s", shm);
     c->stride = stride;
 
     int fd = open(shm, O_RDWR);
     if (fd < 0) { perror("open shm"); return mc_open_fail(c); }
-    size_t bytes = (size_t)stride * (size_t)h * 4;
+    size_t bytes = (size_t)stride * (size_t)maxh * 4;
     c->px = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (c->px == MAP_FAILED) {

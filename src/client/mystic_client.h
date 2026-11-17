@@ -26,6 +26,7 @@ typedef struct {
 typedef struct {
     int   fd;
     int   w, h, stride;
+    int   maxw, maxh;   /* the mapping can grow to this */
     uint32_t *px;
     char  shm[128];
     char  rx[2048];
