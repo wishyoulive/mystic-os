@@ -40,12 +40,26 @@
 #include <sys/stat.h>
 
 #define NOTES_MAX   65536
-#define LINE_H      16.0f
 #define TOP_PAD     6      /* space above the first text row        */
-#define FOOT_H      26     /* footer band, rule plus one 10 px line */
 #define TEXT_GAP    8      /* gap between gutter rule and glyphs    */
 #define GUTTER_PAD  6      /* gutter's own left inset               */
 #define ERR_COLOR   0xFFFF7B72u  /* footer text when a save failed   */
+
+/* ------------------------------------------------------------
+ *  Vertical metrics, derived from the fonts at draw time.
+ *
+ *  LINE_H and FOOT_H used to be fixed here. font_get() is where the
+ *  global text scale is applied (src/font.c:125), so a fixed row
+ *  stride would print each line of the file on top of the last one and
+ *  a fixed footer would cut the status line. Instead one text row is
+ *  one font line box plus 2 px of leading, and the footer band is its
+ *  own line box plus the rule and the small gap above the bottom edge.
+ *  notes_draw(), notes_click(), ensure_visible() and caret_page() all
+ *  go through line_h_of()/visible_rows(), so a click lands on the row
+ *  the painter drew and the caret scrolls against the same budget.
+ * ------------------------------------------------------------ */
+static float line_h_of(Font *fr) { return font_height(fr) + 2.0f; }   /* one text row  */
+static float foot_h_of(Font *fd) { return font_height(fd) + 8.0f; }   /* rule + one line */
 
 typedef struct {
     char  *buf;
@@ -178,8 +192,8 @@ static void fit_footer(char *s, size_t cap, Font *fd, float maxw) {
 }
 
 /* Rows of text that fit between the top padding and the footer. */
-static int visible_rows(const Notes *n) {
-    int rows = (int)((float)(n->h - FOOT_H) / LINE_H);
+static int visible_rows(const Notes *n, Font *fr, Font *fd) {
+    int rows = (int)(((float)n->h - foot_h_of(fd)) / line_h_of(fr));
     return rows < 1 ? 1 : rows;
 }
 
@@ -269,7 +283,7 @@ static void ensure_visible(Notes *n, Font *fr, Font *fd) {
     if (n->top_row < 0) n->top_row = 0;
 
     float avail = text_avail_px(n, fd);
-    int   vis = visible_rows(n);
+    int   vis = visible_rows(n, fr, fd);
     int   caret_line = line_index_at(n, n->cur);
 
     if (caret_line < n->top) {         /* caret above: pull the window up */
@@ -306,7 +320,7 @@ static void ensure_visible(Notes *n, Font *fr, Font *fd) {
  * and take the caret with it, so the two never disagree. */
 static void caret_page(Notes *n, Font *fr, Font *fd, int dir) {
     int lines = line_count(n);
-    int vis = visible_rows(n);
+    int vis = visible_rows(n, fr, fd);
     int line = line_index_at(n, n->cur);
     int target = line + dir * vis;
     if (target < 0) target = 0;
@@ -669,8 +683,11 @@ static void notes_draw(App *a, Surface *s, int x, int y, int w, int h, const The
     int   lines = line_count(n);
     float gutter = gutter_width_px(n, fd);
     float avail = text_avail_px(n, fd);
-    int   vis = visible_rows(n);
-    int   body_h = h - FOOT_H > 0 ? h - FOOT_H : 0;
+    int   vis = visible_rows(n, fr, fd);
+    /* one text row, from the font that is about to draw the file */
+    float lh = line_h_of(fr);
+    float foot_h = foot_h_of(fd);
+    int   body_h = (float)h - foot_h > 0.0f ? (int)((float)h - foot_h) : 0;
 
     if (n->top > lines - 1) { n->top = lines - 1; n->top_row = 0; }
     if (n->top < 0) { n->top = 0; n->top_row = 0; }
@@ -700,8 +717,8 @@ static void notes_draw(App *a, Surface *s, int x, int y, int w, int h, const The
             char num[16];
             snprintf(num, sizeof(num), "%d", line + 1);
             float num_x = (float)x + gutter - (float)TEXT_GAP - font_width(fd, num);
-            float num_y = (float)y + (float)TOP_PAD + (float)(num_row - base) * LINE_H
-                        + (LINE_H - font_height(fd)) * 0.5f;
+            float num_y = (float)y + (float)TOP_PAD + (float)(num_row - base) * lh
+                        + (lh - font_height(fd)) * 0.5f;
             u32 num_col = (line == caret_line) ? color_alpha(th->text, 0.95f)
                                                : color_alpha(th->text, 0.38f);
             font_draw(s, fd, num_x, num_y, num, num_col);
@@ -716,9 +733,9 @@ static void notes_draw(App *a, Surface *s, int x, int y, int w, int h, const The
                 row++;
                 if (row >= last_row) break;
             }
-            float py = (float)y + (float)TOP_PAD + (float)(row - base) * LINE_H;
+            float py = (float)y + (float)TOP_PAD + (float)(row - base) * lh;
             if (row >= base) {
-                if (at_caret) surf_blend(s, (int)px, (int)py, 1, (int)LINE_H, th->accent);
+                if (at_caret) surf_blend(s, (int)px, (int)py, 1, (int)lh, th->accent);
                 font_draw(s, fr, px, py, one, th->text);
             }
             px += cw;
@@ -726,8 +743,8 @@ static void notes_draw(App *a, Surface *s, int x, int y, int w, int h, const The
 
         /* Caret parked just before the newline, or at the end of the buffer. */
         if (n->cur == end && row >= base && row < last_row) {
-            float py = (float)y + (float)TOP_PAD + (float)(row - base) * LINE_H;
-            surf_blend(s, (int)px, (int)py, 1, (int)LINE_H, th->accent);
+            float py = (float)y + (float)TOP_PAD + (float)(row - base) * lh;
+            surf_blend(s, (int)px, (int)py, 1, (int)lh, th->accent);
         }
 
         pos = end < n->len ? end + 1 : end;
@@ -737,8 +754,10 @@ static void notes_draw(App *a, Surface *s, int x, int y, int w, int h, const The
         row++;
     }
 
-    /* Footer: rule, then buffer length against the size on disk. */
-    surf_blend(s, x + 4, (int)(y + h) - 20, w - 8, 1, th->panel_border);
+    /* Footer: rule, then buffer length against the size on disk. Both sit
+     * in the band foot_h_of() reserves, so a scaled-up line cannot spill. */
+    float foot_y = (float)(y + h) - font_height(fd) - 4.0f;
+    surf_blend(s, x + 4, (int)(foot_y - 4.0f), w - 8, 1, th->panel_border);
 
     char foot[192];
     int unsaved = n->dirty || (n->disk_len >= 0 && n->disk_len != (long)n->len);
@@ -773,7 +792,7 @@ static void notes_draw(App *a, Surface *s, int x, int y, int w, int h, const The
                      n->len, n->disk_len, unsaved ? "  -  unsaved" : "");
     }
     fit_footer(foot, sizeof(foot), fd, (float)(w - 16));
-    font_draw(s, fd, (float)x + 8, (float)(y + h) - 16, foot,
+    font_draw(s, fd, (float)x + 8, foot_y, foot,
               n->err[0] ? ERR_COLOR : color_alpha(th->text, 0.55f));
 }
 
@@ -840,8 +859,8 @@ static void notes_click(App *a, int x, int y, int buttons) {
     Font *fd = font_get(FONT_REGULAR, 10);
     if (!fr || !fd) return;
 
-    int band = (int)(((float)y - (float)TOP_PAD) / LINE_H);
-    if (band < 0 || band >= visible_rows(n)) return;   /* outside the text */
+    int band = (int)(((float)y - (float)TOP_PAD) / line_h_of(fr));
+    if (band < 0 || band >= visible_rows(n, fr, fd)) return;   /* outside the text */
 
     float avail = text_avail_px(n, fd);
     float left = gutter_width_px(n, fd) + (float)TEXT_GAP;

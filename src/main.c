@@ -28,6 +28,14 @@
 #define FONT_DIR  "/usr/share/fonts"
 #define MAX_WINDOWS 10
 
+/* Every metric that has to follow the text scale. Nothing below is a
+ * hardcoded pixel height, which is what made scaling unsafe before. */
+static int title_h(void) { return ui_px(40); }      /* window title bar */
+static int topbar_h(void) { return ui_px(34); }     /* screen top bar   */
+static int dock_isz(void) { return ui_px(40); }     /* taskbar icon     */
+static int dock_gap(void) { return ui_px(16); }
+static int dock_pad(void) { return ui_px(12); }
+
 static Display disp;
 static Surface screen;
 static Surface scene;
@@ -114,6 +122,43 @@ static void icon_gear(Surface *s, float x, float y, float sz, u32 fg) {
     gfx_rrect_aa(s, cx - sz * 0.19f, cy - sz * 0.19f, sz * 0.38f, sz * 0.38f, sz * 0.19f, 0, fg, sz * 0.08f);
 }
 
+static void icon_clock(Surface *s, float x, float y, float sz, u32 fg) {
+    float cx = x + sz * 0.5f, cy = y + sz * 0.5f, r = sz * 0.36f;
+    gfx_rrect_aa(s, cx - r, cy - r, r * 2, r * 2, r, 0, fg, sz * 0.07f);
+    gfx_line(s, cx, cy, cx, cy - r * 0.62f, sz * 0.07f, fg);
+    gfx_line(s, cx, cy, cx + r * 0.52f, cy + r * 0.18f, sz * 0.07f, fg);
+}
+
+static void icon_paint(Surface *s, float x, float y, float sz, u32 fg) {
+    float px = x + sz * 0.30f, py = y + sz * 0.72f;
+    gfx_line(s, px, py, x + sz * 0.74f, y + sz * 0.26f, sz * 0.13f, fg);
+    gfx_rrect_aa(s, x + sz * 0.18f, y + sz * 0.62f, sz * 0.16f, sz * 0.16f, sz * 0.08f, fg, 0, 0);
+}
+
+static void icon_life(Surface *s, float x, float y, float sz, u32 fg) {
+    float c = sz * 0.11f, g = sz * 0.17f;
+    float ox = x + (sz - (2 * g + c)) / 2, oy = y + (sz - (2 * g + c)) / 2;
+    for (int r = 0; r < 3; r++)
+        for (int col = 0; col < 3; col++)
+            if ((r * 3 + col) % 4 != 1)
+                gfx_rrect(s, ox + col * g, oy + r * g, c, c, c * 0.35f, fg);
+}
+
+static void icon_mandel(Surface *s, float x, float y, float sz, u32 fg) {
+    float cx = x + sz * 0.42f, cy = y + sz * 0.5f;
+    for (int i = 0; i < 3; i++) {
+        float r = sz * (0.10f + i * 0.10f);
+        gfx_rrect_aa(s, cx - r, cy - r, r * 2, r * 2, r, 0, fg, sz * 0.055f);
+    }
+    gfx_rrect_aa(s, cx + sz * 0.22f, cy - sz * 0.06f, sz * 0.12f, sz * 0.12f, sz * 0.06f, fg, 0, 0);
+}
+
+static void icon_sysmon(Surface *s, float x, float y, float sz, u32 fg) {
+    gfx_line(s, x + sz * 0.18f, y + sz * 0.66f, x + sz * 0.36f, y + sz * 0.42f, sz * 0.07f, fg);
+    gfx_line(s, x + sz * 0.36f, y + sz * 0.42f, x + sz * 0.54f, y + sz * 0.56f, sz * 0.07f, fg);
+    gfx_line(s, x + sz * 0.54f, y + sz * 0.56f, x + sz * 0.82f, y + sz * 0.30f, sz * 0.07f, fg);
+}
+
 static void icon_calc(Surface *s, float x, float y, float sz, u32 fg) {
     gfx_rrect_aa(s, x + sz * 0.18f, y + sz * 0.10f, sz * 0.64f, sz * 0.80f, sz * 0.10f,
                  0, fg, sz * 0.055f);
@@ -148,6 +193,33 @@ static void icon_pencil(Surface *s, float x, float y, float sz, u32 fg) {
     };
     gfx_polygon(s, pts, 4, fg);
     gfx_line(s, x + sz * 0.16f, y + sz * 0.64f, x + sz * 0.20f, y + sz * 0.80f, sz * 0.05f, fg);
+}
+
+typedef void (*IconFn)(Surface *, float, float, float, u32);
+
+static IconFn icon_for_id(const char *id, int is_term) {
+    if (is_term) return icon_terminal;
+    if (!id) return icon_gear;
+    if (!strcmp(id, "files"))    return icon_folder;
+    if (!strcmp(id, "settings")) return icon_gear;
+    if (!strcmp(id, "monitor"))  return icon_bars;
+    if (!strcmp(id, "notes"))    return icon_pencil;
+    if (!strcmp(id, "store"))    return icon_grid;
+    if (!strcmp(id, "calc"))     return icon_calc;
+    if (!strcmp(id, "clock"))    return icon_clock;
+    if (!strcmp(id, "paint"))    return icon_paint;
+    if (!strcmp(id, "life"))     return icon_life;
+    if (!strcmp(id, "mandel"))   return icon_mandel;
+    if (!strcmp(id, "sysmon"))   return icon_sysmon;
+    return icon_gear;
+}
+
+static IconFn icon_for_window(Window *w) {
+    if (w->kind == WIN_TERM) return icon_terminal;
+    if (w->kind == WIN_CLIENT && w->client >= 0 && w->client < WM_MAX_CLIENTS)
+        return icon_for_id(clients[w->client].id, 0);
+    if (w->app && w->app->vt && w->app->vt->id) return icon_for_id(w->app->vt->id, 0);
+    return icon_gear;
 }
 
 /* ------------------------------------------------------------ window mgmt */
@@ -191,17 +263,21 @@ static Window *win_open(int kind, const char *app_id) {
         w->z = ++z_top;
 
         if (kind == WIN_TERM) {
-            w->w = 640; w->h = 380;
+            w->w = ui_px(640); w->h = ui_px(380);
             w->x = 60 + (i % 3) * 40;
             w->y = 70 + (i % 3) * 40;
-            float cw = 7.0f, ch = 16.0f;
+            Font *fmc = font_get(FONT_MONO, 12);
+            float cw = font_width(fmc, "M");
+            float ch = font_height(fmc);
+            if (cw < 4.0f) cw = 4.0f;
+            if (ch < 8.0f) ch = 8.0f;
             int cols = (int)((w->w - 24) / cw);
             int rows = (int)((w->h - 56) / ch);
             w->term = term_create(cols, rows, "/bin/sh");
             snprintf(w->title, sizeof(w->title), "Terminal");
             if (!w->term) { memset(w, 0, sizeof(*w)); return NULL; }
         } else {
-            w->w = 520; w->h = 360;
+            w->w = ui_px(520); w->h = ui_px(360);
             w->x = 140 + (i % 3) * 40;
             w->y = 110 + (i % 3) * 40;
             w->app = app_new(app_id, w->w - 2, w->h - 40 - 2);
@@ -216,28 +292,32 @@ static Window *win_open(int kind, const char *app_id) {
 }
 
 /* ------------------------------------------------------------ dock */
-typedef struct {
-    const char *app_id;   /* NULL for terminal */
-    const char *label;
-    void (*icon)(Surface *, float, float, float, u32);
-} DockItem;
 
-static const DockItem DOCK[] = {
-    { NULL,          "Terminal", icon_terminal },
-    { "files",       "Files",    icon_folder },
-    { "settings",    "Settings", icon_gear },
-    { "monitor",     "Monitor",  icon_bars },
-    { "notes",       "Notes",    icon_pencil },
-};
-#define DOCK_N ((int)(sizeof(DOCK) / sizeof(DOCK[0])))
+static int taskbar_count(void) {
+    int n = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) if (wins[i].used) n++;
+    return n;
+}
 
-static void dock_rect(int *dx, int *dy, int *dw, int *dh) {
-    const int isz = 40, gap = 20, pad = 14;
-    int w = DOCK_N * isz + (DOCK_N - 1) * gap + pad * 2;
+static Window *taskbar_at(int n) {
+    int k = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++)
+        if (wins[i].used && k++ == n) return &wins[i];
+    return NULL;
+}
+
+/* Taskbar geometry. The bar is a list of open windows, not a launcher - the
+ * eye in the top bar is the launcher. With nothing open there is no bar. */
+static int dock_rect(int *dx, int *dy, int *dw, int *dh) {
+    int n = taskbar_count();
+    if (n <= 0) { *dx = *dy = *dw = *dh = 0; return 0; }
+    const int isz = dock_isz(), gap = dock_gap(), pad = dock_pad();
+    int w = n * isz + (n - 1) * gap + pad * 2;
     int h = isz + pad * 2;
     *dw = w; *dh = h;
     *dx = (disp.w - w) / 2;
     *dy = disp.h - h - 22;
+    return 1;
 }
 
 static void draw_launcher(Surface *s, const Theme *th);
@@ -376,7 +456,7 @@ static void draw_desktop(Surface *s, const Theme *th) {
     gfx_glow(s, W * 0.55f, H * 1.02f, W * 0.50f, th->glow, th->glow_strength * 0.55f);
 
     /* ---------------- top bar ---------------- */
-    const int bar = 34;
+    const int bar = topbar_h();
     if (th->blur > 0) gfx_blur_region(s, 0, 0, W, bar, (int)(18 * th->blur));
     surf_blend(s, 0, 0, W, bar, color_alpha(th->panel, 0.55f));
     surf_blend(s, 0, bar, W, 1, th->panel_border);
@@ -423,7 +503,7 @@ static void draw_desktop(Surface *s, const Theme *th) {
         gfx_rrect_aa(s, (float)cur->x, (float)cur->y, (float)cur->w, (float)cur->h, cx,
                      th->window_bg, th->window_border, 1.0f);
 
-        const int tb = 40;
+        const int tb = title_h();
         surf_blend(s, cur->x + 1, cur->y + 1, cur->w - 2, tb, color_alpha(th->panel, 0.30f));
         surf_blend(s, cur->x + 1, cur->y + tb, cur->w - 2, 1, th->panel_border);
 
@@ -445,8 +525,14 @@ static void draw_desktop(Surface *s, const Theme *th) {
         int cw0 = cur->w - 2, ch0 = cur->h - tb - 2;
 
         if (cur->kind == WIN_TERM && cur->term) {
-            Font *fm = font_get(FONT_REGULAR, 12);
-            term_draw(cur->term, s, cx0, cy0, cw0, ch0, fm, 7.0f, 16.0f);
+            /* a terminal needs a monospace face: with a proportional font the
+             * columns drift and 'ls' output stops lining up at larger scales */
+            Font *fm = font_get(FONT_MONO, 12);
+            float cw_cell = font_width(fm, "M");
+            float ch_cell = font_height(fm);
+            if (cw_cell < 4.0f) cw_cell = 4.0f;
+            if (ch_cell < 8.0f) ch_cell = 8.0f;
+            term_draw(cur->term, s, cx0, cy0, cw0, ch0, fm, cw_cell, ch_cell);
         } else if (cur->app) {
             app_draw(cur->app, s, cx0, cy0, cw0, ch0, th);
         } else if (cur->kind == WIN_CLIENT && cur->client >= 0) {
@@ -478,50 +564,68 @@ static void draw_desktop(Surface *s, const Theme *th) {
         }
     }
 
-    /* ---------------- dock ---------------- */
-    int dx, dy, dw, dh;
-    dock_rect(&dx, &dy, &dw, &dh);
-    float dr = (float)dh * 0.32f;
+    /* ---------------- taskbar: open windows, with dock magnification ---- */
+    {
+        int dx, dy, dw, dh;
+        if (dock_rect(&dx, &dy, &dw, &dh)) {
+            float dr = (float)dh * 0.32f;
+            gfx_shadow(s, (float)dx, (float)dy, (float)dw, (float)dh, dr, 18, 0.5f);
+            if (th->blur > 0) gfx_blur_region(s, dx, dy, dw, dh, (int)(20 * th->blur));
+            gfx_rrect_aa(s, (float)dx, (float)dy, (float)dw, (float)dh, dr,
+                         th->panel, th->panel_border, 1.0f);
 
-    gfx_shadow(s, (float)dx, (float)dy, (float)dw, (float)dh, dr, 18, 0.5f);
-    if (th->blur > 0) gfx_blur_region(s, dx, dy, dw, dh, (int)(20 * th->blur));
-    gfx_rrect_aa(s, (float)dx, (float)dy, (float)dw, (float)dh, dr, th->panel, th->panel_border, 1.0f);
+            const int isz = dock_isz(), gap = dock_gap(), pad = dock_pad();
+            int n = taskbar_count();
+            Window *focused = win_top();
+            int near_bar = (input.mouse_y > dy - 110 && input.mouse_y < dy + dh + 20);
 
-    const int isz = 40, gap = 20, pad = 14;
-    for (int i = 0; i < DOCK_N; i++) {
-        float ix = (float)(dx + pad + i * (isz + gap));
-        float iy = (float)(dy + pad);
-        int hovered = (input.mouse_x >= ix && input.mouse_x < ix + isz &&
-                       input.mouse_y >= iy && input.mouse_y < iy + isz);
-        u32 bg = hovered ? color_alpha(th->accent, 0.22f) : color_alpha(th->text, 0.07f);
-        gfx_rrect_aa(s, ix, iy, (float)isz, (float)isz, 11.0f, bg, 0, 0);
-        DOCK[i].icon(s, ix, iy, (float)isz, hovered ? th->accent : th->text);
+            for (int i = 0; i < n; i++) {
+                Window *w = taskbar_at(i);
+                if (!w) continue;
+                float bx = (float)(dx + pad + i * (isz + gap));
+                float by = (float)(dy + pad);
+                float cx0 = bx + isz * 0.5f;
 
-        /* a dot under the icon when that app is open */
-        int open = 0;
-        for (int wi = 0; wi < MAX_WINDOWS; wi++) {
-            if (!wins[wi].used) continue;
-            if (DOCK[i].app_id) {
-                if (wins[wi].app && wins[wi].app->vt && !strcmp(wins[wi].app->vt->id, DOCK[i].app_id))
-                    open = 1;
-            } else if (wins[wi].term) {
-                open = 1;
+                /* Dock magnification: icons grow near the pointer and sink
+                 * back. Gaussian on the distance, so neighbours scale too. */
+                float scale = 1.0f;
+                if (near_bar) {
+                    float d = (float)input.mouse_x - cx0;
+                    float t = d / 62.0f;
+                    scale = 1.0f + 0.45f * expf(-t * t * 0.5f);
+                }
+                float sz = isz * scale;
+                float ix = cx0 - sz * 0.5f;
+                float iy = by + (isz - sz) * 0.55f;
+
+                int hovered = (input.mouse_x >= bx && input.mouse_x < bx + isz &&
+                               input.mouse_y >= dy && input.mouse_y < dy + dh);
+                int is_focus = (w == focused);
+                u32 bg = is_focus ? color_alpha(th->accent, 0.28f)
+                                  : (hovered ? color_alpha(th->accent, 0.18f)
+                                             : color_alpha(th->text, 0.07f));
+                gfx_rrect_aa(s, ix, iy, sz, sz, 11.0f * scale, bg, 0, 0);
+
+                IconFn fn = icon_for_window(w);
+                u32 fg = w->hidden ? color_alpha(th->text, 0.45f)
+                                   : (is_focus || hovered ? th->accent : th->text);
+                fn(s, ix, iy, sz, fg);
+
+                if (is_focus)
+                    gfx_rrect_aa(s, cx0 - 7, (float)(dy + dh) - 5, 14, 3, 1.5f, th->accent, 0, 0);
+
+                if (hovered) {
+                    Font *ft = font_get(FONT_MEDIUM, 11);
+                    float lw = font_width(ft, w->title);
+                    float tx = cx0 - lw / 2 - 7;
+                    float ty = (float)dy - 26;
+                    if (tx < 4) tx = 4;
+                    if (tx + lw + 14 > (float)s->w) tx = (float)s->w - lw - 18;
+                    gfx_rrect_aa(s, tx, ty, lw + 14, 19, 9,
+                                 color_alpha(th->window_bg, 0.96f), th->panel_border, 1.0f);
+                    font_draw(s, ft, tx + 7, ty + 4, w->title, th->text);
+                }
             }
-        }
-        if (open)
-            gfx_rrect_aa(s, ix + (float)isz / 2 - 2, iy + (float)isz + 3, 4, 4, 2, th->accent, 0, 0);
-
-        /* the icon's name, above it, while hovered */
-        if (hovered) {
-            Font *ft = font_get(FONT_MEDIUM, 11);
-            float lw = font_width(ft, DOCK[i].label);
-            float bx = ix + (float)isz / 2 - lw / 2 - 7;
-            float by = (float)dy - 24;
-            if (bx < 4) bx = 4;
-            if (bx + lw + 14 > (float)s->w) bx = (float)s->w - lw - 18;
-            gfx_rrect_aa(s, bx, by, lw + 14, 19, 9, color_alpha(th->window_bg, 0.96f),
-                         th->panel_border, 1.0f);
-            font_draw(s, ft, bx + 7, by + 4, DOCK[i].label, th->text);
         }
     }
 
@@ -559,7 +663,7 @@ static const LauncherItem LAUNCHER[] = {
 static int launcher_items(void) { return LAUNCHER_N + bundle_count; }
 
 static void launcher_geom(int idx, int *tx, int *ty, int *tw, int *th) {
-    const int cols = 3, tile = 128, gap = 18, grid_h = 118;
+    const int cols = 3, tile = ui_px(128), gap = ui_px(18), grid_h = ui_px(118);
     int rows = (launcher_items() + cols - 1) / cols;
     int gw = cols * tile + (cols - 1) * gap;
     int gh = rows * grid_h + (rows - 1) * gap;
@@ -576,7 +680,7 @@ static void draw_launcher(Surface *s, const Theme *th) {
     /* dim everything behind */
     surf_blend(s, 0, 0, s->w, s->h, 0xAA000000u);
 
-    const int cols = 3, tile = 128, gap = 18, grid_h = 118;
+    const int cols = 3, tile = ui_px(128), gap = ui_px(18), grid_h = ui_px(118);
     int rows = (launcher_items() + cols - 1) / cols;
     int gw = cols * tile + (cols - 1) * gap;
     int gh = rows * grid_h + (rows - 1) * gap;
@@ -603,7 +707,7 @@ static void draw_launcher(Surface *s, const Theme *th) {
         gfx_rrect_aa(s, (float)tx, (float)ty, (float)tw, (float)th2, 14.0f, bg,
                      selected ? th->accent : 0, selected ? 1.5f : 0.0f);
 
-        float isz = 52;
+        float isz = (float)ui_px(52);
         const char *label;
         if (i < LAUNCHER_N) {
             LAUNCHER[i].icon(s, (float)tx + (tw - isz) / 2, (float)ty + 18, isz,
@@ -644,7 +748,7 @@ static void draw_lock_screen(Surface *s, const Theme *th) {
     if (th->blur > 0) gfx_blur_region(s, 0, 0, s->w, s->h, 40);
     surf_blend(s, 0, 0, s->w, s->h, 0xB0000000u);
 
-    int pw = 380, ph = 210;
+    int pw = ui_px(380), ph = ui_px(210);
     int px = (s->w - pw) / 2, py = (s->h - ph) / 2;
 
     gfx_shadow(s, (float)px, (float)py, (float)pw, (float)ph, 20, 26, 0.6f);
@@ -784,7 +888,7 @@ static int handle_click(void) {
     }
     if (hit) {
         win_focus(hit);
-        int tb = 40;
+        int tb = title_h();
         int lx = mx - hit->x, ly = my - hit->y;
         /* red closes, yellow minimises - only on the dots themselves, which
          * sit at y+15..y+25; a full-height hit box killed windows by accident */
@@ -830,32 +934,20 @@ static int handle_click(void) {
         return 1;
     }
 
-    /* dock */
-    int dx, dy, dw, dh;
-    dock_rect(&dx, &dy, &dw, &dh);
-    const int isz = 40, gap = 20, pad = 14;
-    if (my >= dy && my < dy + dh) {
-        for (int i = 0; i < DOCK_N; i++) {
-            int ix = dx + pad + i * (isz + gap);
-            if (mx >= ix && mx < ix + isz) {
-                /* a minimised app of this kind comes back rather than a duplicate */
-                for (int wi = 0; wi < MAX_WINDOWS; wi++) {
-                    Window *w = &wins[wi];
-                    if (!w->used || !w->hidden) continue;
-                    int same = 0;
-                    if (DOCK[i].app_id)
-                        same = (w->app && w->app->vt && w->app->vt->id &&
-                                !strcmp(w->app->vt->id, DOCK[i].app_id));
-                    else
-                        same = (w->term != NULL);
-                    if (same) {
-                        w->hidden = 0;
-                        win_focus(w);
-                        return 1;
-                    }
-                }
-                if (DOCK[i].app_id) win_open(WIN_APP, DOCK[i].app_id);
-                else                win_open(WIN_TERM, NULL);
+    /* taskbar */
+    {
+        int dx, dy, dw, dh;
+        if (dock_rect(&dx, &dy, &dw, &dh) && my >= dy && my < dy + dh) {
+            const int isz = dock_isz(), gap = dock_gap(), pad = dock_pad();
+            int n = taskbar_count();
+            for (int i = 0; i < n; i++) {
+                int bx = dx + pad + i * (isz + gap);
+                if (mx < bx || mx >= bx + isz) continue;
+                Window *w = taskbar_at(i);
+                if (!w) continue;
+                if (w->hidden) { w->hidden = 0; win_focus(w); }        /* restore */
+                else if (w == win_top()) { w->hidden = 1; }            /* put away */
+                else { win_focus(w); }                                 /* focus */
                 return 1;
             }
         }
@@ -866,7 +958,11 @@ static int handle_click(void) {
 /* ------------------------------------------------------------ main */
 int main(void) {
     if (disp_open(&disp, "/dev/fb0") < 0) return 1;
+    /* the text scale must be known before the first font is requested */
+    ui_scale_load("/etc/mystic/ui.conf");
     font_init(FONT_DIR);
+    fprintf(stderr, "ui: scale %.2f", ui_scale_get());
+    fputc(10, stderr);
 
     screen.w = disp.w; screen.h = disp.h; screen.stride = disp.w;
     screen.px = calloc((size_t)screen.w * screen.h, 4);
@@ -1118,7 +1214,7 @@ int main(void) {
         if (input.released & 1) {
             if (drag_win >= 0 && wins[drag_win].used) {
                 Window *w = &wins[drag_win];
-                const int bar = 34;
+                const int bar = topbar_h();
                 if (w->y <= bar + 6) {                       /* top edge: full width */
                     w->x = 0; w->y = bar; w->w = disp.w; w->h = disp.h - bar - 90;
                 } else if (w->x <= 8) {                      /* left edge: left half */

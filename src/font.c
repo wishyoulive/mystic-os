@@ -37,7 +37,8 @@ struct Font {
 };
 
 static const char *FONT_FILES[FONT_COUNT] = {
-    "Lato-Regular.ttf", "Lato-Bold.ttf", "Lato-Black.ttf"
+    "Lato-Regular.ttf", "Lato-Bold.ttf", "Lato-Black.ttf",
+    "JetBrainsMono-Regular.ttf"
 };
 
 static Font *fonts;
@@ -119,6 +120,13 @@ static Font *load_one(int face, float size) {
 
 Font *font_get(int face, float size) {
     if (!font_ready || face < 0 || face >= FONT_COUNT) return NULL;
+
+    /* one place applies the global text scale: every caller asks for a
+     * nominal size and gets the scaled one back, so no layout can forget. */
+    size *= ui_scale_get();
+    size = (float)((int)(size * 2.0f + 0.5f)) / 2.0f;
+    if (size < 5.0f) size = 5.0f;
+    if (size > 96.0f) size = 96.0f;
 
     for (Font *f = fonts; f; f = f->next)
         if (f->face == face && fabsf(f->size - size) < 0.01f)

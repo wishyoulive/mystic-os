@@ -2,9 +2,10 @@
 
 You can write C. You want a window with your pixels in it, on a real screen,
 booted from a real kernel. This document is the path from an empty file to that
-window, and it is written from the tree as it is — every command, path and
-number below was read out of the files named next to it. Where the code and this
-text disagree, the code is right.
+window, and it is written from the tree as it is — every command and path below
+was read out of the files named next to it, and where a number was measured by
+booting the image the text says so. Where the code and this text disagree, the
+code is right.
 
 Read `README.md` (what the OS is and the rules it keeps), `docs/ARCHITECTURE.md`
 (how a boot becomes a desktop) and `docs/IPC.md` (the display protocol) first.
@@ -67,8 +68,10 @@ Other modes, all from `image.sh`:
 | `./image.sh themes` | one boot, screenshot each theme via `sendkey` | `build/theme1.png` … `theme3.png` |
 
 There is no incremental path: every `./image.sh` rebuilds the desktop, repacks
-the initramfs and reboots. That is tens of seconds. It is also why "it worked
-on my machine" and "it booted" are the same sentence in this project.
+the initramfs and reboots. Measured on the machine this guide was written on:
+12 s for `probe` (build + pack + boot + poweroff) and 21 s for `shot 8`, of
+which 8 s is the wait, not the build. It is also why "it worked on my machine"
+and "it booted" are the same sentence in this project.
 
 ---
 
@@ -109,9 +112,10 @@ compiles but nothing can open it):
 2. `src/mystic.h` — an `#ifdef WITH_<ID> extern const AppVT app_vt_<id>;`
    block next to the existing ones.
 3. `src/apps.c` — add `&app_vt_<id>` to `REGISTRY[]` inside `#ifdef WITH_<ID>`.
-4. `tools/build-desktop.sh:28` — add the id to
-   `for app in files settings monitor notes store`; that loop appends the source
-   and defines `-DWITH_<ID>`.
+4. `tools/build-desktop.sh` — add the id as one more word to the `for app in …`
+   loop. That loop is the only thing that decides which `src/apps/*.c` files are
+   compiled into the desktop and which `-DWITH_<ID>` macros exist, so an app
+   missing from it is silently absent — it will not even fail to link.
 5. `src/main.c` — a `LauncherItem` in `LAUNCHER[]` (id, label, icon routine),
    and/or an F-key case in the `switch (k)` that launches F1…F5. Without one of
    those, no code path ever calls `win_open(WIN_APP, "<id>")` and the app is
@@ -240,6 +244,13 @@ What each part is doing, in the SDK's own terms (`src/client/mystic_client.h`):
   click your window before wondering why typing does nothing.
 - `MC_CLOSE` means the user pressed your red dot or the socket closed. Call
   `mc_close(&c)` and return — do not keep drawing into a window that is gone.
+- `MC_RESIZE` arrives when the user drags the window's bottom-right grip, but
+  **nothing grows your buffer**: the server only sends the message, `mc_poll`
+  does not re-map the shared memory, and the compositor copies
+  `min(window, your w × h)`. So a window dragged (or double-clicked) bigger than
+  your `HELLO` size just has an unpainted area — it does not crash and it does
+  not scale. Ignore `MC_RESIZE`, or redraw within your original rectangle; do
+  not treat `ev.w`/`ev.h` as the new size of `c.px`.
 
 ### 4.2 Build and package
 
@@ -280,12 +291,21 @@ desc = Mystic OS application
 exec = bin
 ```
 
-Parsed by `wms_scan_apps()` (`src/wmsrv.c:228`): one field per line, split on the
-first `=`, spaces trimmed on both sides of the key and after the value. Unknown
-keys are ignored. Buffers are `name[64]`, `desc[160]`, `exec[128]`, `id[32]`
-(from the directory name), and lines are read 256 bytes at a time — longer
-values are silently truncated. A missing `name` falls back to the directory
-name; a missing `exec` falls back to `bin`.
+Parsed by `wms_scan_apps()` (`src/wmsrv.c:228`): one field per line, split at the
+first `=`. The key is trimmed on both sides; the value only loses **leading**
+spaces. Trailing spaces are kept, because the only thing removed from the end of
+the value is the `\n` itself. Unknown keys are ignored. Buffers are `name[64]`,
+`desc[160]`, `exec[128]`, `id[32]` (from the directory name), and lines are read
+256 bytes at a time — longer values are silently truncated. A missing `name`
+falls back to the directory name; a missing `exec` falls back to `bin`.
+
+That asymmetry has teeth. Write `name = Demo` followed by two spaces and the
+tile label ends in two spaces; write `exec = bin` followed by a space and the
+launcher looks for a file literally called `bin ` (with the space), which does
+not exist, so `execl` fails with ENOENT and you get no window. The same applies
+to a `\r` left at the end of every line by a CRLF file: only `\n` is stripped,
+so `exec` becomes `bin\r`. `mkapp.sh` writes clean LF lines; a manifest edited
+in a Windows editor may not — see §8.1.
 
 `mkapp.sh` derives `name` by capitalising the first character of the id and
 writes `desc = Mystic OS application` unless you pass a second argument:
@@ -312,12 +332,19 @@ headers back). Section 8.2 is what that looks like at runtime.
 ./image.sh
 ```
 
-Then Super, or click the eye, to open the launcher. Installed bundles are
-appended **after** the seven built-in tiles (the `LAUNCHER[]` table of
-`LauncherItem`s in `src/main.c`: Terminal, Files, Settings, Monitor, Notes,
-Apps, System), in id order (`qsort` by id, `src/wmsrv.c:267`). Your tile is
-labelled with the manifest `name` and drawn as the first letter of that name
-inside a rounded square (the bundle branch of `draw_launcher()` in `src/main.c`).
+Then Super, or click the eye, to open the launcher. The grid is two lists
+concatenated: the built-in apps first (the `LAUNCHER[]` table of `LauncherItem`s
+in `src/main.c`), then every installed bundle in id order (`qsort` by id,
+`src/wmsrv.c:267`). Your tile is labelled with the manifest `name` and drawn as
+the first letter of that name inside a rounded square (the bundle branch of
+`draw_launcher()` in `src/main.c`); none of that comes from your code.
+
+Verified by booting this tree and pressing Super: the built-in tiles came first,
+then the installed bundles alphabetically by id, each showing the first letter of
+its manifest `name`. Because the label is `name` and not the id, two bundles can
+render identical tiles — the shipped external Files app is called
+`Files (app)` in its manifest for exactly that reason, so its tile cannot be
+confused with the built-in Files tile.
 
 Clicking the tile forks and execs `/usr/share/mystic/apps/demo/bin`
 (`wms_launch`, `src/wmsrv.c:271`) with two variables set for the child:
@@ -334,12 +361,27 @@ because adding the bundle means repacking the image anyway.
 
 ## 5. Testing
 
-Ordered from cheapest to most honest.
+Start with the test that answers the real question, then use the machine checks
+to prove it to someone who was not watching.
+
+**`./image.sh run`** — boot the desktop in a window, open your app from the
+launcher, use it: type, click, drag it by the title bar, close it with the red
+dot. Then read the console output of the boot for `wms:` lines and for your own
+`fprintf(stderr, …)`. Nothing else substitutes for this; the rest of this
+section exists so that "it worked" is checkable when you are not there.
 
 **`./tools/smoke.sh --quick`** — no QEMU. Compiles every `src/*.c` and
-`src/apps/*.c` with `-Wall -Wextra -Wno-unused-parameter` and fails on the first
-warning. Seconds. Note what it does *not* cover: `src/client/apps/*.c`, so your
-external app is checked by `mkapp.sh`'s compile step, not by this.
+`src/apps/*.c` with `-Wall -Wextra -Wno-unused-parameter` and passes a file when
+the compiler exits 0. Note precisely what that does and does not mean, because
+it is easy to over-read: `zig cc` prints warnings and still exits 0, and smoke
+sends the compiler's stderr to `/tmp/smoke.err` — a file it overwrites for every
+file and only prints when a compile fails. **Warnings are therefore neither
+fatal nor visible** in a passing run, and the loop does not stop at the first
+one, it compiles every file regardless. The check is "this file compiles", not
+"this file is clean". Read the warnings in the build output yourself, or add
+`-Werror` to your own command. Note also what the list does *not* cover:
+`src/client/apps/*.c`, so your external app is checked by `mkapp.sh`'s compile
+step, not by this.
 
 **`./tools/smoke.sh`** — the full run: two probe boots, one desktop boot, then
 the compile checks. Every check prints `PASS` or `FAIL`, and the script exits
@@ -362,7 +404,7 @@ development, so the list is earned rather than invented:
 | desktop opened the display | `display: WxH 32bpp` on stderr (`src/fb.c:49`) | the desktop never got `/dev/fb0` |
 | desktop bound a keyboard | `input: keyboard <name>` on stderr | no event device, or the capability probe classified nothing |
 | desktop did not crash | no `segfault` in the desktop boot log | your bug |
-| compiles clean: `src/<file>.c` | `-Wall -Wextra` clean, one check per file | a warning — the project treats warnings as failures |
+| compiles clean: `src/<file>.c` | that file compiles: the compiler exited 0. A warning passes this check, and its text lands in `/tmp/smoke.err` (overwritten per file, printed only on failure) | a hard error — syntax, unknown type, missing include |
 
 Environment knobs, from the header of `tools/smoke.sh`: `MAX_BOOT_SECONDS` (5),
 `BOOT_TIMEOUT` (60), `ACCEL_TIMEOUT` (25), `DESKTOP_WAIT` (12), `QEMU`,
@@ -372,7 +414,11 @@ the guest, `smoke.sh` retries once with plain emulation and says so.
 **`./image.sh probe`** — the same probe boot, printed for a human. Use it when
 smoke says a module or a device is missing; it prints the kernel, uptime, memory,
 the real module list, DRM/fb facts out of `/sys`, the input devices, the disk
-state, the boot counter and a permissions test file.
+state, the boot counter and a permissions test file. A run of this tree while
+writing this guide reported `kernel: 6.18.63-0-virt`, `uptime: 0.86s`,
+`memory: 216 MB`, `card0: yes`, `fb0 : yes`, a 1280×800 `bochs-drmdrmfb`, two
+input devices and `disk: mounted, boot counter now 26` — every one of those
+numbers comes from the guest's own `/proc` and `/sys`, which is the point.
 
 **`./image.sh shot 10`** — boot headless and screendump at 10 s into
 `build/shot.png`. The captures in `docs/screenshots/` are real captures from the
@@ -402,7 +448,7 @@ stage/                          the only files that are "us" in the rootfs
   etc/mystic/themes/*.theme     three themes, parsed by src/theme.c
   etc/mystic/passwd             lock-screen hash
   usr/share/mystic/apps/<id>/   installed bundles: manifest + bin
-  usr/bin/mystic-desktop        the compiled desktop (git-tracked, rewritten by builds)
+  usr/bin/mystic-desktop        the compiled desktop - a build output, ignored by git
   usr/share/fonts/*.ttf         Lato, copied from assets/
   lib/modules/<ver>/            staged kernel modules
 
@@ -419,23 +465,33 @@ src/
   term.c                        forkpty + /bin/sh + a VT100-subset parser
   sha256.c                      password hashing
   apps.c                        the AppVT registry
-  apps/*.c                      in-desktop apps (files, settings, monitor, notes, store, sysinfo)
+  apps/*.c                      in-desktop apps, one file per app; the live set is
+                                REGISTRY[] in apps.c plus the LAUNCHER[] tiles in main.c
   client/
     mystic_client.h/.c          the external-app SDK: mc_open/present/poll/close
-    apps/*.c                    external apps (clock, files, life, mandel, paint, sysmon)
+    apps/*.c                    external apps, one file per app; what ships as a bundle
+                                is whatever mkapp.sh has put under
+                                stage/usr/share/mystic/apps/
 
 docs/                           ARCHITECTURE.md, IPC.md, screenshots/, this file
 build/                          all generated: desktop binary, initramfs, disk, screenshots
 ```
 
-`build/` is gitignored. `.gitattributes` pins `*.sh`, `tools/*.py` and
-`stage/init` to `text eol=lf` — see §8.1 for why that line exists.
+`build/` is gitignored, and so is every build output inside `stage/`: the
+`.gitignore` lists `stage/usr/bin/mystic-desktop`,
+`stage/usr/share/mystic/apps/*/bin`, `stage/lib/modules/`,
+`stage/usr/share/fonts/*.ttf`, `stage/sbin/` and `stage/usr/lib/`. Building and
+booting therefore never dirties a tracked file — checked by comparing `git
+status` before and after a full `./image.sh probe`: identical. `.gitattributes`
+pins `*.sh`, `tools/*.py` and `stage/init` to `text eol=lf` — see §8.1 for why
+that line exists.
 
 ---
 
 ## 7. The invariants this project enforces
 
-These are not aspirations; each one is checked by something in the tree.
+These are the rules the tree is held to. Most are enforced by something you can
+run; where a rule is a convention rather than a gate, the text says which.
 
 1. **Nothing is "done" until it has been built and booted here.** README rule 1.
    A commit message in this repo names the boot it was seen in ("Verified: …"),
@@ -457,9 +513,14 @@ These are not aspirations; each one is checked by something in the tree.
    must be `init`, live under `bin/`-style directories, or end in `/bin`.
 6. **LF line endings in anything the kernel or a shell executes.**
    `.gitattributes`; see §8.1.
-7. **Compile clean.** `build-desktop.sh` uses `-Wall -Wextra
-   -Wno-unused-parameter -fno-sanitize=all`; `smoke.sh` compiles every file in
-   `src/` and `src/apps/` with the same warnings and fails on any of them.
+7. **Zero warnings, by convention rather than by tooling.**
+   `build-desktop.sh` compiles the desktop with `-Wall -Wextra
+   -Wno-unused-parameter`; `smoke.sh` compiles every file in `src/` and
+   `src/apps/` with the same flags. Neither passes `-Werror`, and `zig cc` exits
+   0 on warnings, so a warning prints during a build and the build carries on —
+   this tree has built with one (`unused function 'icon_for_window'` in
+   `src/main.c`). Keep the output empty anyway: a warning is a defect you have
+   not read yet.
 8. **Draw inside the rectangle you were given.** The compositor copies exactly
    `w × h` from your buffer, and hands in-desktop apps the whole scene surface.
 
@@ -514,7 +575,7 @@ mouse.
 
 **Cause.** Alpine's `linux-virt` builds the graphics, framebuffer, input and
 filesystem drivers as loadable modules, and `stage/init`'s `load_modules()`
-(line 32) modprobes an explicit list of 23 names. `tools/fetch-kernel.sh` stages
+(line 32) modprobes an explicit list by name. `tools/fetch-kernel.sh` stages
 whole module subtrees rather than a hand-picked list, for a stated reason: "a
 cherry-picked list means chasing `unknown symbol` errors one build at a time"
 (`tools/fetch-kernel.sh:23`). A module that is missing, or whose version does
@@ -527,8 +588,9 @@ subtree to `MODULE_TREES` in `tools/fetch-kernel.sh` if it is not already
 staged. Note that `image.sh` only calls `fetch-kernel.sh` when the kernel binary
 or the unpacked module package is missing, so after editing `MODULE_TREES` run
 `./tools/fetch-kernel.sh` explicitly. Then check `./image.sh probe`: the `modules :` line is
-`/proc/modules`, i.e. what actually loaded, and `card0: yes` / `fb0 : yes` are
-the two facts the desktop needs.
+`/proc/modules`, i.e. what actually loaded — more names than the list, because
+dependencies travel with their dependants (26 on a probe boot of this tree).
+`card0: yes` and `fb0 : yes` are the two facts the desktop needs.
 
 ### 8.4 devpts not mounted — forkpty fails
 
@@ -556,7 +618,7 @@ is the exact test. From a shell, `ls /dev/pts` shows whether the mount is there.
 | crash after N frames | you wrote outside `c->w * c->h`; nothing clips your buffer for you |
 | keys do nothing | the window is not focused — click it; keys go to the focused window only |
 | mouse does nothing | the pointer is outside the content rect, or you ignored `ev.buttons & 1` |
-| app appears twice in the launcher | two directories under `stage/usr/share/mystic/apps/`, or a stale `build/app-<id>` was reused |
+| two identical tiles in the launcher | two bundle directories under `WM_APP_DIR`, or two manifests with the same `name` — tiles are drawn from `name`, not from the id |
 
 Your app inherits the desktop's stderr — the console PID 1 was started on — so
 `fprintf(stderr, …)` is the debugger, and printing `getpid()` is a cheap way to
@@ -568,8 +630,9 @@ prove the app is a separate process, which is the entire point of the SDK.
 
 - [ ] `./tools/mkapp.sh <id>` succeeds, and `stage/usr/share/mystic/apps/<id>/`
       contains `manifest` and `bin`.
-- [ ] The build is warning-free (zig prints warnings; `smoke.sh` treats them as
-      failures for in-desktop code).
+- [ ] The build printed no warnings. Look at the `./image.sh` output itself:
+      `zig` prints them there and `smoke.sh` hides them, so no script will fail
+      for you.
 - [ ] `./image.sh` boots, the app appears in the launcher (Super), and clicking
       it opens a window that draws.
 - [ ] Keys and clicks do what you say they do; closing the window makes the

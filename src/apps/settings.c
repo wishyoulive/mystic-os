@@ -13,8 +13,16 @@
 #include <string.h>
 
 #define MAX_THEMES 12
-#define ROW_H 18.0f
 
+/* ------------------------------------------------------------
+ * Every vertical metric below is derived from the font that draws in
+ * it, at draw time. font_get() applies the global text scale (see
+ * src/font.c:125), so the theme rows and the section strides grow and
+ * shrink with the glyphs instead of overlapping them. There is no
+ * colour, key or behaviour change here - only the geometry that has to
+ * follow the text. settings_click() calls row_h_of() with the same
+ * font the painter uses, so a click lands on the row it hit.
+ * ------------------------------------------------------------ */
 typedef struct {
     char  file[64];
     char  name[64];
@@ -29,6 +37,15 @@ typedef struct {
     int      scroll;
     char     status[64];  /* real result of the last apply_theme() */
 } Settings;
+
+/* One list row: the row's own font line box plus 4 px of leading. */
+static float row_h_of(Font *fr) { return font_height(fr) + 4.0f; }
+
+/* One ordinary text line: line box plus 2 px. */
+static float line_h_of(Font *f) { return font_height(f) + 2.0f; }
+
+/* One section heading, including the gap under it. */
+static float head_h_of(Font *fh) { return font_height(fh) + 4.0f; }
 
 static void read_file(const char *path, char *out, size_t n) {
     out[0] = 0;
@@ -182,19 +199,21 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h, const 
     Font *fd = font_get(FONT_REGULAR, 10);
     if (!fh || !fr) return;
 
+    const float rh = row_h_of(fr);          /* the one row height: draw and click */
+
     float py = (float)y + 6;
     char line[256];
 
     font_draw(s, fh, (float)x + 6, py, "Display", th->text);
-    py += 20;
+    py += head_h_of(fh);
     read_file("/sys/class/graphics/fb0/virtual_size", line, sizeof(line));
     char pix[96];
     snprintf(pix, sizeof(pix), "  %s pixels", line);
     font_draw(s, fr, (float)x + 6, py, pix, th->text_dim);
-    py += 22;
+    py += line_h_of(fr) + 4.0f;
 
     font_draw(s, fh, (float)x + 6, py, "Memory", th->text);
-    py += 20;
+    py += head_h_of(fh);
     long total = mem_kb("MemTotal:"), avail = mem_kb("MemAvailable:");
     long used = total - avail;
     if (used < 0) used = 0;
@@ -204,26 +223,28 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h, const 
     gfx_rrect_aa(s, (float)x + 6, py, mw, 7, 3.5f, color_alpha(th->text, 0.10f), 0, 0);
     if (frac > 0.01f)
         gfx_rrect_aa(s, (float)x + 6, py, mw * frac, 7, 3.5f, th->accent, 0, 0);
-    py += 12;
+    py += 12;                      /* the 7 px bar and the gap under it, not text */
     snprintf(line, sizeof(line), "  %ld MB used of %ld MB", used / 1024, total / 1024);
     font_draw(s, fr, (float)x + 6, py, line, th->text_dim);
-    py += 24;
+    py += line_h_of(fr) + 8.0f;
 
     font_draw(s, fh, (float)x + 6, py, "Theme", th->text);
-    py += 20;
+    py += head_h_of(fh);
 
     /* The list scrolls inside the height that is really left. The System
      * block is pinned to the bottom and drawn only when a whole theme row
      * still fits above it; the old code drew every row, then System, then
      * the hint at fixed offsets, so with more themes than fit (or a window
      * dragged to its 280x160 minimum) they were painted over the frame and
-     * the desktop. SYS_H = gap 8 + title 20 + kernel 18 + uptime 18 + hint 14. */
-    const float SYS_H = 78.0f;
+     * the desktop. SYS_H is now the sum of the real font lines it holds:
+     * gap 8 + title + kernel + uptime + hint, each its own font's height. */
+    const float SYS_H = 8.0f + head_h_of(fh) + (line_h_of(fr) + 1.0f) * 2.0f
+                        + line_h_of(fd);
     float theme_bottom = (float)(y + h) - 6.0f;
-    int have_sys = (theme_bottom - py) >= (SYS_H + ROW_H);
+    int have_sys = (theme_bottom - py) >= (SYS_H + rh);
     if (have_sys) theme_bottom -= SYS_H;
 
-    int vis = (int)((theme_bottom - py) / ROW_H);
+    int vis = (int)((theme_bottom - py) / rh);
     if (vis < 0) vis = 0;
     if (vis > st->count) vis = st->count;
 
@@ -249,28 +270,28 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h, const 
         r->y = py - (float)y;         /* local, because that is what clicks get */
         int selected = (idx == st->sel);
         if (selected)
-            gfx_rrect_aa(s, (float)x + 4, py - 2, (float)w - 8, ROW_H, 4.0f,
+            gfx_rrect_aa(s, (float)x + 4, py - 2, (float)w - 8, rh, 4.0f,
                          color_alpha(th->accent, 0.20f), 0, 0);
         snprintf(line, sizeof(line), "%d   %s", idx + 1, r->name);
         font_draw(s, fr, (float)x + 10, py, line, selected ? th->text : th->text_dim);
-        py += ROW_H;
+        py += rh;
     }
 
     if (have_sys) {
         py += 8;
         font_draw(s, fh, (float)x + 6, py, "System", th->text);
-        py += 20;
+        py += head_h_of(fh);
         read_file("/proc/sys/kernel/osrelease", line, sizeof(line));
         char buf[160];
         snprintf(buf, sizeof(buf), "  kernel %s", line);
         font_draw(s, fr, (float)x + 6, py, buf, th->text_dim);
-        py += 18;
+        py += line_h_of(fr) + 1.0f;
         read_file("/proc/uptime", line, sizeof(line));
         snprintf(buf, sizeof(buf), "  up %d s", atoi(line));
         font_draw(s, fr, (float)x + 6, py, buf, th->text_dim);
-        py += 18;
+        py += line_h_of(fr) + 1.0f;
     }
-    if (py + 12.0f <= (float)(y + h))
+    if (py + line_h_of(fd) <= (float)(y + h))
         font_draw(s, fd, (float)x + 6, py,
                   st->status[0] ? st->status : "press 1-9 or click to switch theme",
                   st->status[0] ? color_alpha(th->accent, 0.80f)
@@ -297,10 +318,14 @@ static void settings_click(App *a, int x, int y, int buttons) {
     Settings *s = a->state;
     (void)x; (void)buttons;
     if (!s) return;
+    /* the same font, hence the same row height, the painter used */
+    Font *fr = font_get(FONT_REGULAR, 11);
+    if (!fr) return;
+    float rh = row_h_of(fr);
     for (int i = 0; i < s->count; i++) {
         float ry = s->rows[i].y;
         if (ry < 0.0f) continue;      /* scrolled out of view: not hittable */
-        if ((float)y >= ry - 2.0f && (float)y < ry + ROW_H) {
+        if ((float)y >= ry - 2.0f && (float)y < ry + rh) {
             s->sel = i;
             apply_theme(s);
             return;
