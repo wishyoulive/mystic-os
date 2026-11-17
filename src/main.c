@@ -13,6 +13,7 @@
 #include "mystic.h"
 #include "ipc.h"
 #include "wallpaper.h"
+#include <unistd.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -275,6 +276,28 @@ static void win_reset(Window *w) {
     unsigned g = w->gen;
     memset(w, 0, sizeof(*w));
     w->gen = g + 1;
+}
+
+/* Settings live in the RAM rootfs. Whenever one changes, mirror it onto the
+ * ext4 disk so it survives a reboot; stage/init:restore_settings copies them
+ * back at boot. Failure here is not fatal (a read-only disk still runs). */
+static void persist_settings(void) {
+    static const char *names[] = { "ui.conf", "wallpaper", "current-theme" };
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char src[128], dst[128], buf[512];
+        snprintf(src, sizeof(src), "/etc/mystic/%s", names[i]);
+        snprintf(dst, sizeof(dst), "/root/mystic-%s", names[i]);
+        FILE *in = fopen(src, "rb");
+        if (!in) continue;
+        size_t n = fread(buf, 1, sizeof(buf), in);
+        fclose(in);
+        FILE *out = fopen(dst, "wb");
+        if (!out) continue;
+        if (fwrite(buf, 1, n, out) != n) { fclose(out); continue; }
+        fflush(out);
+        fsync(fileno(out));
+        fclose(out);
+    }
 }
 
 static void win_close(Window *w) {
@@ -1554,7 +1577,7 @@ int main(void) {
             {
                 float before = ui_scale_get();
                 ui_scale_load("/etc/mystic/ui.conf");
-                if (ui_scale_get() != before) dirty = 1;
+                if (ui_scale_get() != before) { dirty = 1; persist_settings(); }
 
                 FILE *wf = fopen("/etc/mystic/wallpaper", "r");
                 if (wf) {
@@ -1563,7 +1586,7 @@ int main(void) {
                         char *nl = strchr(wn, 10);
                         if (nl) *nl = 0;
                         int idx = wallpaper_from_name(wn);
-                        if (idx >= 0 && idx != wall_index) { wall_index = idx; dirty = 1; }
+                        if (idx >= 0 && idx != wall_index) { wall_index = idx; dirty = 1; persist_settings(); }
                     }
                     fclose(wf);
                 }
@@ -1576,7 +1599,7 @@ int main(void) {
                     char *nl = strchr(want, '\n');
                     if (nl) *nl = 0;
                     for (int i = 0; i < theme_count; i++)
-                        if (!strcmp(want, themes[i].name)) theme_index = i;
+                        if (!strcmp(want, themes[i].name)) { theme_index = i; persist_settings(); }
                 }
                 fclose(tf);
             }

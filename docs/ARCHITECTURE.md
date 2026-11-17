@@ -110,18 +110,23 @@ the boot, and `/root` is the only path backed by a disk (§5).
    `udhcpc -i eth0 -q -n -t 4 -T 2 -s /etc/udhcpc.script`, then it prints either
    the leased IPv4 address or `net: eth0 present but no lease`.
 6. `setup_disk()` — see §5.
-7. Probe mode: if `/proc/cmdline` contains `mystic.probe=1`, print kernel,
+7. `restore_settings()` — copies `/root/mystic-{ui.conf,wallpaper,current-theme}`
+   back over `/etc/mystic/…` if they exist, so a settings choice made in a previous
+   boot is in place before the desktop starts (§5.2).
+8. Probe mode: if `/proc/cmdline` contains `mystic.probe=1`, print kernel,
    `/proc/uptime`, `/proc/meminfo`, `/proc/modules`, DRM/fb facts from
-   `/sys/class/drm/*` and `/sys/class/graphics/*/name`, input device names, the
-   boot counter in `/root/boots.txt` and a permissions test file, then
-   `sync; poweroff -f`. This is what `tools/smoke.sh` and `image.sh probe` read.
-8. Unbind the framebuffer console: for each `/sys/class/vtconsole/vtcon*`, read
+   `/sys/class/drm/*` and `/sys/class/graphics/*/name`, the network state
+   (`/sys/class/net/eth0/operstate`, one `udhcpc` run with its exit code, and
+   `ip addr show eth0`), input device names, the boot counter in
+   `/root/boots.txt` and a permissions test file, then `sync; poweroff -f`. This
+   is what `tools/smoke.sh` and `image.sh probe` read.
+9. Unbind the framebuffer console: for each `/sys/class/vtconsole/vtcon*`, read
    `name`; if it contains `frame buffer`, write `0` to `bind`. Otherwise fbcon
    keeps painting its block cursor over the desktop's pixels. `src/fb.c`
    `claim_console()` applies a second guard: `open("/dev/tty0")` and
    `ioctl(KDSETMODE, KD_GRAPHICS)`.
-9. `exec /usr/bin/mystic-desktop`. If the binary or `/dev/fb0` is missing, print
-   `/etc/mystic-banner` plus kernel/memory/display facts and `exec /bin/sh`.
+10. `exec /usr/bin/mystic-desktop`. If the binary or `/dev/fb0` is missing, print
+    `/etc/mystic-banner` plus kernel/memory/display facts and `exec /bin/sh`.
 
 ### 1.4 Input devices without udev
 
@@ -282,9 +287,10 @@ blur enabled.
 
 `gfx_rrect_aa()` is the primitive every panel, window and pill is built from. For
 each pixel centre `p` it computes the signed distance to a rounded rectangle in
-`rrect_dist()`:
+`rrect_dist()` — the maths, not the source, which spells the same thing out with
+`fabsf`/`sqrtf`:
 
-```c
+```text
 halfw = w/2; halfh = h/2;  r = min(r, min(halfw, halfh));
 q  = |p - centre| - (half - r);          /* qx, qy */
 d  = length(max(q,0)) + min(max(qx,qy),0) - r;
@@ -297,7 +303,7 @@ d  = length(max(q,0)) + min(max(qx,qy),0) - r;
 Coverage is then a 1-pixel linear ramp, which is what produces antialiased edges
 without any sampling tables:
 
-```c
+```text
 cov = 0.5f - d;   clamp to [0,1]
 ```
 
@@ -311,11 +317,13 @@ weighted by its coverage times the colour's own alpha, then written with a force
 
 `gfx_blur_region(s, rx, ry, rw, rh, radius)` blurs whatever has already been
 painted underneath the region, which is why the glass reads as glass: the
-backdrop is genuinely convolved, not tinted.
+backdrop is genuinely convolved, not tinted. It is a thin wrapper over
+`blur_run(s, rx, ry, rw, rh, radius, 3)`; the shadow path calls the same function
+with `ch = 1` (see below).
 
 1. Clip the region to the surface. `F = 4`; `sw = ceil(w/F)`, `sh = ceil(h/F)`.
-2. Downsample by box-averaging each 4×4 block into a float RGB triple
-   (`calloc(sw*sh*3)` twice: `small` and `tmp`).
+2. Downsample by box-averaging each 4×4 block into float RGB triples in two
+   buffers, `small` and `tmp`.
 3. `r = max(1, radius / F)`.
 4. Three passes. Each pass is a horizontal box filter of radius `r` (edges
    clamped by repeating the border pixel) written to `tmp`, `memcpy` back, then
@@ -324,15 +332,26 @@ backdrop is genuinely convolved, not tinted.
 
 Three boxes approximate a Gaussian closely enough that the difference is not
 visible, and doing it at quarter resolution cuts the work by 16×. If
-`radius <= 0`, or the allocation fails, the function returns without touching the
-region.
+`radius <= 0`, or the buffers cannot be grown, the function returns without
+touching the region.
 
-`gfx_shadow()` reuses it: allocate a scratch `Surface` of the shadow bounds
-(`pad = spread*3`), paint a **white** rounded rect at `(pad, pad)` inset by `pad`,
-blur it with `radius = spread`, then use the blurred **red channel** as the shadow
-mask and multiply the destination by `(255 - a*alpha)/255` per channel. White, not
-black: the blurred alpha of a black rect is zero, so a black mask drew nothing at
-all. A shadow can therefore only darken, never paint.
+Those two buffers are **not** allocated per call. This is a single-threaded
+compositor, so they live at file scope (`blur_small`, `blur_tmp`) and
+`scratch_grow()` only ever `realloc`s them to the largest size any frame has
+needed — doubling, and leaving the old buffer intact if the allocation fails. A
+repaint used to `calloc` and `free` a few megabytes per visible window; the cost
+was not only the allocator but the page faults of touching brand-new pages.
+
+`gfx_shadow()` reuses the same machinery: a scratch `Surface` of the shadow
+bounds (`pad = spread*3`), clipped to the destination grown by `pad + 4*F` on
+whole `F` cells so the downsample grid — and every blurred value with it — stays
+where it was. It paints a **white** rounded rect at `(pad, pad)`, blurs it with
+`blur_run(…, 1)` at `radius = spread`, then uses the blurred **red channel** as
+the shadow mask and multiplies the destination by `(255 - a*alpha)/255` per
+channel. White, not black: the blurred alpha of a black rect is zero, so a black
+mask drew nothing at all. One channel is enough because R, G and B of the mask
+are the same number, so a shadow pays a third of the arithmetic. A shadow can
+therefore only darken, never paint.
 
 ### 2.7 Text: TrueType with a per-font glyph cache
 
@@ -350,12 +369,17 @@ otherwise `load_one()` reads the whole `.ttf` into memory, `stbtt_InitFont`,
 `size * 1.4`.
 
 Each `Font` owns its cache: `Glyph cache[2048]` keyed by **codepoint**, not by
-glyph index. `glyph_get(f, cp)` starts at `slot = cp % MAX_GLYPHS` and probes
-forward; the first unused slot is rasterised in place by `glyph_rasterise()`
+glyph index, plus a `last_use` clock. `glyph_get(f, cp)` starts at
+`slot = cp % MAX_GLYPHS` and walks the table; because eviction can free a slot in
+the middle of another codepoint's probe run, a miss walks the whole table rather
+than stopping at the first empty slot, which is correct wherever an entry ended
+up. The first rasterisation goes into the first free slot via `glyph_rasterise()`
 (`stbtt_GetGlyphHMetrics` for the advance, `stbtt_GetGlyphBitmapBox` for the
 offsets, `stbtt_MakeGlyphBitmap` into an 8-bit coverage buffer of `w*h` bytes,
-refusing anything over 512 px). A full table makes `glyph_get` return `NULL` and
-that character is skipped rather than evicting something.
+refusing anything over 512 px). When the table is full the least recently used
+glyph is evicted — its bitmap `free`d, its slot reused — so a program that shows
+more than 2048 distinct codepoints over a session keeps rendering instead of
+going permanently blind.
 
 `font_draw()` walks the UTF-8 string (`utf8_next`, 1–4 bytes), advances a pen by
 `g->advance`, places each bitmap at `(pen + xoff, y + ascent + yoff)` and blends
@@ -397,9 +421,10 @@ it to 0.8 … 1.6, and stops. A missing file, or a file with no `scale` line,
 leaves 1.0. The shipped file is `scale = 1.0`.
 
 The same function is called again once per wall-clock second (§3.6), which is how
-a change to the file — from Settings or from a shell — takes effect without a
-restart: the next `font_get()` loads new sizes and the next compose lays every
-band out with the new `ui_px()` value.
+a change to the file takes effect without a restart: the next `font_get()` loads
+new sizes and the next compose lays every band out with the new `ui_px()` value.
+Settings offers the five values the parser accepts (0.8, 1.0, 1.2, 1.4, 1.6) as
+rows; a shell can write any number in 0.8 … 1.6.
 
 Two accessors use it:
 
@@ -409,7 +434,7 @@ Two accessors use it:
 * `ui_px(base)` returns `(int)(base * scale + 0.5f)`, floored at 1 so a 1 px
   border stays a 1 px border at 0.8.
 
-`src/main.c` names the four bands it needs instead of using numbers:
+`src/main.c` names the metrics it needs instead of using numbers:
 `title_h()` = `ui_px(40)`, `topbar_h()` = `ui_px(34)`, `dock_isz()` = `ui_px(40)`,
 plus `dock_gap()` = `ui_px(16)` and `dock_pad()` = `ui_px(12)` for the taskbar.
 Window open sizes (`ui_px(640) × ui_px(380)` for a terminal,
@@ -459,7 +484,8 @@ and fills black if the theme is missing, so the screen can never be left
 unpainted.
 
 The shipped `stage/etc/mystic/wallpaper` says `Orbits`, so the desktop animates
-out of the box.
+out of the box. Settings has one row per wallpaper (`wallpaper_name()` is the
+list), which is what makes the four reachable without a text editor.
 
 ---
 
@@ -485,21 +511,30 @@ typedef struct {
     int   maxed;         /* maximised by double-click */
     int   restore_x, restore_y, restore_w, restore_h;
     int   z;
+    unsigned gen;        /* slot generation: bumped whenever the slot changes hands */
 } Window;
 
 static Window wins[MAX_WINDOWS];
 static int    z_top;
 static int    drag_win = -1, drag_dx, drag_dy;
+static unsigned drag_gen;         /* generation of the window being dragged   */
 static int    resize_win = -1;
+static unsigned resize_gen;       /* generation of the window being resized   */
 
 static WmClient clients[WM_MAX_CLIENTS];
 static WmApp   bundles[WM_MAX_APPS];
 ```
 
 `MAX_WINDOWS` is 10, `WM_MAX_CLIENTS` 8 and `WM_MAX_APPS` 32; the last two come
-from `src/ipc.h`. The launcher (`launcher_open`, `launcher_sel`), the starting
-cursor position for the pointer (`mouse_prev`) and the wallpaper state
-(`wall_index`, `wall_t0`, `wall_last`) are further file statics.
+from `src/ipc.h`. The launcher (`launcher_open`, `launcher_sel`), the pointer's
+previous position (`mouse_prev`) and the wallpaper state (`wall_index`, `wall_t0`,
+`wall_last`) are further file statics.
+
+A slot index alone is not a window identity: slots are reused as soon as one
+closes. `win_reset()` zeroes a slot and bumps its `gen`, and both drag and resize
+remember the generation they started on, so an interaction that outlives its
+window is dropped instead of moving whatever moved into the slot (`F9` in the
+code comments).
 
 ### 3.2 Z-order
 
@@ -539,7 +574,8 @@ the content rectangle the compositor will hand them at any text scale.
 `win_close()` calls `term_destroy()` (which closes the pty, hangs the shell up,
 reaps it and frees the grid plus the 600-line scrollback), `app_free()` (which
 runs `vt->free`), and for a client `wms_notify_close()` then
-`wms_shutdown_client()` — then `memset`s the slot. Terminals are also closed
+`wms_shutdown_client()` — then `win_reset()` clears the slot and bumps its
+generation. Terminals are also closed
 automatically when `term_pump()` reports the shell has gone (`term_alive()` false),
 which is how typing `exit` in a terminal closes its window. The frame loop also
 runs `waitpid(-1, NULL, WNOHANG)` until it returns 0, which reaps launched apps
@@ -563,21 +599,24 @@ swallowed its clicks.
    launcher. Nothing else is considered while it is open.
 4. **Window body.** The topmost non-minimised window whose rectangle contains the
    pointer wins (max `z`). It is focused first, so clicking anywhere raises.
-5. **Close dot.** Local `13 <= ly < 27` and `14 <= lx < 24` — the red circle —
-   calls `win_close()`. The hit box is the dot itself, not the whole title strip.
-6. **Minimise dot.** The same rows, `32 <= lx < 42` — the yellow circle — sets
+5. **Close dot.** The red circle: `dot_y - 2 <= ly < dot_y + DOT_SZ + 2` and
+   `14 <= lx < 24`, where `dot_y = traffic_y(title_h())`. It calls `win_close()`;
+   the hit box is the dot itself, not the whole title strip. Draw and hit test
+   share `traffic_y()`, so the target cannot drift away from the dot when the bar
+   grows.
+6. **Minimise dot.** The same band, `32 <= lx < 42` — the yellow circle — sets
    `hidden = 1`.
-7. **Resize grip.** `lx >= w-18 && ly >= h-18` sets `resize_win` to the slot index.
+7. **Resize grip.** `lx >= w-18 && ly >= h-18` records `resize_win` and the
+   window's generation.
 8. **Double-click on the title bar.** `ly < title_h()` and `input.clicked2`
    toggles maximise. The press that carries `clicked2` records `restore_*` and
    sets the window to `(0, topbar_h(), disp.w, disp.h - topbar_h() - reserved)`,
    where `reserved` is the taskbar band plus `ui_px(12)` when the bar is showing
    and `ui_px(16)` when it is not; the next double click restores the saved
-   rectangle. An in-desktop app gets `vt->resize()` here, so an app that can
-   reflow does; a client window is only moved and resized (no `RESIZE` is sent
-   from this path, so its buffer keeps its size and the blit clips).
-9. **Title bar.** `ly < title_h()` sets `drag_win` and records the grab offset
-   (`drag_dx`, `drag_dy`) in window-local coordinates.
+   rectangle. Both cases end in `window_resized()` (§3.5), so an app, a client and
+   a terminal all learn their new content size.
+9. **Title bar.** `ly < title_h()` records `drag_win`, the window's generation and
+   the grab offset (`drag_dx`, `drag_dy`) in window-local coordinates.
 10. **Body click.** `app_click(a, lx-1, ly-tb-1, buttons)` — the same content
     origin (`x+1, y+tb+1`) the compositor draws at, in window-local coordinates —
     or, for a client window, `wms_notify_mouse()`.
@@ -589,26 +628,34 @@ minimised window is not part of the world until the taskbar brings it back.
 ### 3.5 Drag, resize, snap, maximise
 
 Drag and resize are per-frame state machines while button 1 is held, not event
-streams:
+streams. Both record the slot **and** its generation when they start, and drop the
+interaction if the slot has since changed hands (`F9`).
 
 * **Drag** — `nx = mouse_x - drag_dx`, `ny = mouse_y - drag_dy`, clamped so
   `x >= 0`, `y >= 34` (the top bar stays visible), `x+w <= disp.w`,
   `y+h <= disp.h`. The window is repositioned only when the result differs, so an
   immobile drag does not dirty the frame.
 * **Resize** — `nw = mouse_x - w->x + 1`, `nh = mouse_y - w->y + 1`, floor
-  280 × 160, then `vt->resize(a, w-2, h-42)` for an in-desktop app or
-  `wms_notify_resize()` for a client. `term.c` does have `term_resize()` /
-  `term_resize_px()`, which rebuild the grid and scrollback at a new size and
-  `ioctl(TIOCSWINSZ)` the pty, but the window manager does not call them yet, so
-  a terminal keeps the column count it was opened with.
+  280 × 160, then `window_resized()`.
+
+`window_resized(w)` is the single place that tells a window's owner its content
+rectangle changed, with `(w-2, h-title_h()-2)` — the same rectangle
+`draw_desktop()` will hand it:
+
+* a terminal gets `term_resize_px()`, which rebuilds the grid and the scrollback at
+  the new width and `ioctl(TIOCSWINSZ)`s the pty, so the shell reflows on
+  `SIGWINCH`;
+* a client window gets `RESIZE <w> <h>`;
+* an in-desktop app gets `vt->resize()`.
+
+Maximise goes through the same helper, so all three kinds see their new size.
 
 Releasing button 1 clears both (`drag_win = resize_win = -1`). A release also
 snaps the dragged window when it ended near a screen edge: top edge within 6 px of
 the `topbar_h()` bar → full width (`x=0, y=bar, w=disp.w, h=disp.h-bar-90`);
-`x <= 8` → left half; `x+w >= disp.w-8` → right half. The snap calls
-`vt->resize()` for an in-desktop app, so an app that can reflow does; a client
-window is only moved and given a new rectangle here (only the corner grip sends
-`RESIZE`), so its buffer keeps the size it asked for and the blit clips.
+`x <= 8` → left half; `x+w >= disp.w-8` → right half. Snap calls
+`window_resized()` too. The `90` in those heights is a hardcoded reservation for
+the taskbar, unlike the maximise path, which measures it (§3.4).
 
 ### 3.6 Keyboard and the clock tick
 
@@ -654,8 +701,9 @@ in-desktop apps change the desktop without a private API:
   switches the background and marks the frame dirty.
 * `/etc/mystic/current-theme` — the first line is matched against `Theme::name`
   (the `name =` field inside the file, not its file name) and switches the theme.
-  `src/apps/settings.c` writes exactly that name, so choosing a theme there works;
-  the write itself is lost on reboot because `/etc` is the initramfs (§5.2).
+  `src/apps/settings.c` writes exactly that name, so choosing a theme there works.
+  All three changes also call `persist_settings()`, which mirrors the files onto
+  `/root` so they survive a reboot (§5.2).
 * `/run/mystic/launch.request` — the Apps window cannot fork, so it writes a
   bundle id there and the desktop launches it, then `remove()`s the file (§4.6).
 
@@ -688,6 +736,7 @@ new width (keeping the surviving top-left cells, blanking the rest, rebuilding t
 history in age order) and sends `TIOCSWINSZ`, which is what makes the shell reflow
 with `SIGWINCH`; `term_resize_px()` is the same thing from the pixel rectangle the
 terminal is drawn into, using the cell metrics above.
+
 `term_pump()` reads 2048-byte chunks up to a 64 KiB budget per call and feeds
 them one at a time to `feed_byte()`, a small state machine: state 0 is text (CR,
 LF, BS, TAB and BEL are handled there), state 1 is `ESC`, state 2 accumulates CSI
@@ -802,8 +851,10 @@ scaled by `ui_px()` — it is the same 30×28 target at every text scale.
 The bar at the bottom is a list of **open windows**, not a launcher: there is one
 tile per `used` window in `wins[]`, in slot order, and no tile at all when nothing
 is open (`dock_rect()` returns 0 and the bar is not drawn). `taskbar_at(n)` maps a
-tile index to its window, and the same function is used by the painter and by the
-hit test, so a click always lands on the tile that was drawn.
+tile index to its window and both the painter and `taskbar_click()` use it, so a
+click is always attributed to the same window that the tile belongs to.
+(Geometry exception: the hit box is the unmagnified `dock_isz()` square while the
+painter may have grown the tile — see *Known rough edges*.)
 
 Geometry: width `n*dock_isz() + (n-1)*dock_gap() + 2*dock_pad()`, height
 `dock_isz() + 2*dock_pad()`, centred horizontally, `22` px above the bottom edge,
@@ -883,7 +934,7 @@ but not defined is simply not referenced.
 | `vt->draw(a, s, x, y, w, h, th)` | `app_draw()` ← `draw_desktop()` | every composed frame, content rectangle `(x+1, y+title_h()+1, w-2, h-title_h()-2)` |
 | `vt->key(a, bytes, n)` | `app_key()` ← `main()` | top window only: escape sequences per key, then the printable `text[]` once per frame |
 | `vt->click(a, x, y, buttons)` | `app_click()` ← `handle_click()` | left press inside the body, window-local coordinates |
-| `vt->resize(a, w, h)` | `main()` drag / snap / maximise handlers | called with `w-2, h-42` (the same size `init` got, which is one pixel taller than the draw rectangle when `title_h() == 40`) |
+| `vt->resize(a, w, h)` | `window_resized()` ← drag / snap / maximise handlers | called with `w-2, h-title_h()-2`, the same rectangle `draw` gets. `init` is still called with `w-2, h-42` from `win_open()`, which equals that only at scale 1.0 |
 | `vt->free(a)` | `app_free()` ← `win_close()` | window closed |
 
 `app_draw`, `app_key`, `app_click` and `app_free` are all null-safe: a missing
@@ -936,9 +987,15 @@ No app invents numbers:
   `strerror(errno)` when `opendir` fails. Its sort order, breadcrumbs and
   toolbar/row geometry are all derived from the fonts it draws with.
 * `notes` reads and writes `/root/notes.txt` with `fsync` (§5.3).
-* `settings` scans `/etc/mystic/themes` with `readdir`/`fopen`, reads the
-  `name =` line of each `.theme` file (falling back to the file name when the
-  line is missing) and writes the chosen `name` to `/etc/mystic/current-theme`.
+* `settings` is the live control panel: one flat list built from the real system
+  — five text sizes (the values `ui_scale_load()` accepts), every wallpaper
+  `wallpaper_name()` knows, then every theme file, read with `readdir`/`fopen`
+  (parsing `name =`, falling back to the file name). Choosing a row writes the
+  real config the desktop re-reads once a second: `scale = 1.2` to
+  `/etc/mystic/ui.conf`, the wallpaper's `name` to `/etc/mystic/wallpaper`, the
+  theme's `name` to `/etc/mystic/current-theme`. Each write reports its real
+  result (a failed `fopen`/`fprintf`/`fclose` shows `strerror(errno)`), and the
+  key/mouse sections of §3.6 apply a change within a second.
 * `store` reads `/usr/share/mystic/apps` with `readdir`, parses each `manifest`
   the way `wmsrv.c` does (`name`/`desc`/`exec`, one `=` per line) and stats the
   real payload file for the size it shows. It never forks; Enter writes the
@@ -1003,12 +1060,13 @@ reaps through the per-frame `waitpid(-1, …, WNOHANG)` loop.
 `image.sh` creates the disk once, and only if it is absent:
 
 ```bash
-dd if=/dev/zero of=build/disk.img bs=1048576 count=64
+dd if=/dev/zero of=build/disk.img bs=1048576 count="${MYSTIC_DISK_MB:-64}"
 ```
 
-64 MB of zeros, attached with `if=virtio`, which the kernel names `/dev/vda`.
-Deleting `build/disk.img` therefore means "give me a new, unformatted disk"; the
-OS formats it on the next boot.
+64 MB of zeros by default (the size is `MYSTIC_DISK_MB`, so an experiment can ask
+for more without editing the script), attached with `if=virtio`, which the kernel
+names `/dev/vda`. Deleting `build/disk.img` therefore means "give me a new,
+unformatted disk"; the OS formats it on the next boot.
 
 ### 5.2 Format on first boot, mount afterwards
 
@@ -1048,10 +1106,20 @@ nowhere to persist.
 
 Because `/init` runs from the initramfs, everything outside `/root` is RAM:
 `/etc/mystic/themes/*.theme`, `/etc/mystic/ui.conf`, `/etc/mystic/wallpaper`
-and `/etc/mystic/passwd` are unpacked from the cpio at boot, and writes to `/etc`
-(the theme request file) disappear on reboot. `/run` and `/tmp` are ordinary directories in that ramfs;
-`/dev/shm` is a tmpfs mounted by `/init`, so a client's shared pixel buffer is
-released when the machine goes down — there is nothing to clean up on the disk.
+and `/etc/mystic/passwd` are unpacked from the cpio at boot. `/run` and `/tmp` are
+ordinary directories in that ramfs; `/dev/shm` is a tmpfs mounted by `/init`, so a
+client's shared pixel buffer is released when the machine goes down — there is
+nothing to clean up on the disk.
+
+A write to `/etc` would die with the boot, so the desktop mirrors the three
+settings files onto the disk: whenever the text scale, the wallpaper or the theme
+changes, `persist_settings()` copies
+`/etc/mystic/{ui.conf,wallpaper,current-theme}` to `/root/mystic-{…}` with
+`fflush`/`fsync`/`fclose` (an unmounted or read-only `/root` is not fatal — the
+setting then lasts until reboot). `stage/init` calls `restore_settings()` right
+after `setup_disk()` and copies them back before the desktop starts, so a choice
+made in Settings survives a reboot. `save_settings()` does the same copy for a
+shell.
 
 ### 5.3 fsync is the difference between saving and losing
 
@@ -1112,8 +1180,9 @@ zig cc -target x86_64-linux-musl -Os -static -fno-sanitize=all -Isrc \
 Sources: the twelve core files — `main.c`, `apps.c`, `term.c`, `sha256.c`,
 `wmsrv.c`, `ui.c`, `wallpaper.c`, `gfx.c`, `font.c`, `fb.c`, `input.c`,
 `theme.c` — plus `apps/sysinfo.c`, and every optional app that exists, each with
-its `-DWITH_*` define (today: files, settings, monitor, notes, store, calc). `-static` plus musl
-means the binary needs nothing but the kernel; `-lutil` is for `forkpty`. The
+its `-DWITH_*` define (today: files, settings, monitor, notes, store, calc).
+`-static` plus musl means the binary needs nothing but the kernel; `-lutil` is for
+`forkpty`. The
 result is copied to `stage/usr/bin/mystic-desktop` (and `chmod +x`), and the font
 files — the three Lato faces, `JetBrainsMono-Regular.ttf` and
 `LICENSE.txt` — are copied from `assets/fonts` to `stage/usr/share/fonts`.
@@ -1144,10 +1213,11 @@ Pipeline inside `mkimage.py`:
    entries overwrite earlier ones, and `stage/` is applied last.
 2. `stage/` is walked and overlaid on top. Modes are decided by path because
    NTFS has no executable bit: a file is `0755` when it is `init`, when it lives
-   under `bin/`, `sbin/`, `usr/bin/`, `usr/sbin/`, `usr/local/bin/`, **or when
-   its name is `bin`** — that last rule is what makes an app bundle's payload
-   (`usr/share/mystic/apps/<id>/bin`) executable. Everything else is `0644`;
-   directories from `stage/` are `0755`.
+   under `bin/`, `sbin/`, `usr/bin/`, `usr/sbin/`, `usr/local/bin/`, when its
+   name is `bin` (an app bundle's payload,
+   `usr/share/mystic/apps/<id>/bin`), or when its name ends in `.script`
+   (`/etc/udhcpc.script`, which `udhcpc` execs directly). Everything else is
+   `0644`; directories from `stage/` are `0755`.
 3. Missing parent directories are synthesised, so the overlay can add
    `stage/sbin/mkfs.ext4` without listing `stage/sbin`.
 4. Entries are emitted sorted by path depth, so a directory always precedes its
@@ -1170,7 +1240,7 @@ can be assembled without root.
 2. Download `alpine-minirootfs-3.24.4-x86_64.tar.gz` into `build/cache` if absent.
 3. `tools/build-desktop.sh` (output suppressed).
 4. `python tools/mkimage.py --base <minirootfs> --stage stage -o build/initramfs.cpio.gz`.
-5. `dd` a 64 MB `build/disk.img` if absent.
+5. `dd` a `build/disk.img` of `${MYSTIC_DISK_MB:-64}` MB if absent.
 6. Boot with the argument array from §1.1, in one of four modes:
    `run` (a window), `probe` (serial facts, then poweroff),
    `shot N` (headless, QEMU monitor `screendump` after N seconds →
@@ -1197,19 +1267,22 @@ rather than testing functions in isolation.
   line printed by `disp_open()`), bound a keyboard (`input: keyboard`, printed by
   `input_open()`) and did not crash.
 * Static checks that need no QEMU (`--quick` runs only these): the text scale
-  (`stage/etc/mystic/ui.conf` exists, parses and is inside 0.8…1.6; `src/ui.c`
-  defines `ui_scale_get`/`ui_scale_load`/`ui_px`; `main.c` loads the file;
-  `font_get()` applies the scale), the monospace terminal (the `.ttf` exists and
-  starts with a real sfnt magic, it is installed into `stage`, `font.c` names it,
-  `term_draw()` is called with `FONT_MONO`), the taskbar (`taskbar_count`,
-  `taskbar_at`, `dock_rect`'s "nothing open" guard, and that `dock_rect()` is used
-  by both the painter and the hit test), and a stale-build guard: the mtime of
-  `stage/usr/bin/mystic-desktop` against every `.c` file that
-  `tools/build-desktop.sh` actually links plus the headers those files
-  `#include`. A source the desktop does not link (a client app, or a module that
-  has landed but is not wired in) is named on a `not part of the desktop build,
-  ignored:` line instead of failing the run, so a pass never hides a stale
-  binary.
+  (`stage/etc/mystic/ui.conf` exists, its `scale` parses to a finite number and is
+  inside 0.8…1.6; `src/ui.c` defines `ui_scale_get`/`ui_scale_load`/`ui_px`;
+  `main.c` loads the file; `font_get()` applies the scale), the monospace terminal
+  (the `.ttf` exists and starts with a real sfnt magic, it is installed into
+  `stage`, `font.c` names it, `term_draw()` is called with the `FONT_MONO` face),
+  the taskbar (`taskbar_count`, `taskbar_at`, `dock_rect`'s "nothing open" guard,
+  and that `dock_rect()` is used by both the painter and the hit test), and a
+  stale-build guard: the mtime of `stage/usr/bin/mystic-desktop` against every `.c`
+  file that `tools/build-desktop.sh` actually links plus the headers those files
+  `#include`, with a second check that every included header's module is linked at
+  all. A source the desktop does not link (a client app, or a module that has
+  landed but is not wired in) is named on a `not part of the desktop build,
+  ignored:` line instead of failing the run, so a pass never hides a stale binary.
+* Build-history checks on the scripts themselves, because each of these went wrong
+  once: `stage/init` has no CRLF line endings, `tools/mkapp.sh` links the SDK
+  objects and `-lm`, and `tools/build-desktop.sh` links `-static -lm -lutil`.
 * Compile checks: every `src/*.c`, `src/apps/*.c`, `src/client/*.c` and
   `src/client/apps/*.c` is compiled with the same `zig cc` flags and must be
   warning-free — the client apps are built by `tools/mkapp.sh`, which `image.sh`
@@ -1262,7 +1335,7 @@ keeps the `.ttf` files (and their OFL licence) as the source of the copies that
 | External apps, one process each | ours | `src/client/apps/*.c` |
 | Procedural wallpapers (four, theme-derived, two animated) | ours | `src/wallpaper.c`, `src/wallpaper.h` |
 | SHA-256, iterated salted password hash, password-file check | ours | `src/sha256.c` |
-| PID 1: mounts, module loading, network, disk setup, fbcon unbind, desktop exec | ours | `stage/init` |
+| PID 1: mounts, module loading, network, disk setup, settings restore, fbcon unbind, desktop exec | ours | `stage/init` |
 | initramfs builder (newc writer) | ours | `tools/mkimage.py` |
 | kernel/module fetcher, desktop build, app packager, boot harness, smoke test | ours | `tools/fetch-kernel.sh`, `tools/build-desktop.sh`, `tools/mkapp.sh`, `image.sh`, `tools/smoke.sh` |
 | Screenshot converter (QEMU PPM → PNG) | ours | `tools/ppm2png.py` |
@@ -1281,20 +1354,24 @@ keeps the `.ttf` files (and their OFL licence) as the source of the copies that
 
 These are behaviours of the current tree, not intentions:
 
-* `title_h()` is `ui_px(40)` and the draw rectangle and the client-window size
-  use it, but `win_open()` still passes an in-desktop app `h-42`, and the
-  drag/snap/maximise/resize paths call `vt->resize(w-2, h-42)` — which is
-  `title_h() + 2` only at scale 1.0. At 1.2 an app is told it has 8 px more height
-  than is drawn (its last rows are clipped); at 0.8 it is told it has 8 px less (a
-  strip is left empty).
+* `win_open()` calls `app_new(app_id, w-2, h-40-2)`, a literal 40, while the
+  content rectangle it will actually be drawn into is `h-title_h()-2`. At scale
+  1.0 they agree; at 1.2 the app is initialised 8 px taller than it is drawn (its
+  last rows are clipped) and at 0.8 8 px shorter (a strip is left empty). Every
+  later resize goes through `window_resized()` and is correct.
 * The drag clamp is still `y >= 34` while the bar it protects is `topbar_h()`, so
   above scale 1.0 a window can be dragged a few pixels into the top bar (the
   maximise path does use `topbar_h()` and leaves the taskbar its space).
-* Everything that does not hold text keeps its 1.0-scale size: the traffic-light
-  dots, the eye's 30×28 target, the 18 px resize corner and the lock panel's inner
-  offsets. At 1.6 the eye sits in the upper half of the taller bar.
+* The snap heights are `disp.h - bar - 90` with a literal 90, while maximise
+  measures the taskbar and adds `ui_px(12)`. With a taskbar on screen the two
+  produce different heights for the same "fill the screen" gesture.
+* Everything that does not hold text keeps its 1.0-scale size: `DOT_SZ` (10 px,
+  centred by `traffic_y()`), the eye's 30×28 target, the 18 px resize corner and
+  the lock panel's inner offsets. At 1.6 the eye sits in the upper half of the
+  taller bar.
 * `/run/mystic/launch.request` is only polled once per wall-clock second, so an
-  Enter in the Apps window can take up to a second to start the app.
+  Enter in the Apps window can take up to a second to start the app. The same
+  delay applies to a theme, text-size or wallpaper change made in Settings.
 * `wms_scan_apps()` runs once at startup, so a bundle packaged while the desktop
   is running needs a reboot before it shows up in the launcher.
 * `src/ipc.h`'s header comment documents `HELLO <id> <title…> <w> <h>`, but the
@@ -1304,18 +1381,20 @@ These are behaviours of the current tree, not intentions:
   literal `\n` (backslash + `n`), which bash turns into an extra argument `n`
   before `-netdev`. `bash -c` on that array shows the stray element, so the boot
   command needs that token removed before `-netdev`/`-device` mean anything.
-* The wallpaper can be changed at runtime by writing `/etc/mystic/wallpaper`, but
-  there is no in-desktop app that does it yet — it is a file and a text editor
-  away, not a Settings row.
 * The README's feature table still says the disk is FAT and that there are three
   themes and a dock; `setup_disk()` formats and mounts ext4, six `.theme` files
   ship, and the bottom bar is the taskbar of §3.11. The `fat`/`vfat` modules are
   loaded but never used.
+* The taskbar's magnification is drawn, not hit-tested: `taskbar_click()` tests
+  the plain `dock_isz()` square at `bx`, while the tile may be painted up to 45 %
+  larger near the pointer. Clicking the edge of a magnified tile can therefore
+  hit nothing, or the neighbouring tile's fixed box.
 * There is no per-window clip rectangle for in-desktop apps, so an app that draws
   outside its rectangle overpaints its neighbours until the next compose (§4.3).
-* Resizing a terminal window does not update the pty `winsize`; the grid simply
-  draws fewer cells than the window could hold.
+  The window *title* is the one string that is clipped by truncation instead
+  (`text_fit()`), because it is drawn by the compositor itself.
 * With `blur = 1.0` every recompose blurs the top bar, every visible window and
   the taskbar, plus a scratch surface per shadow, on one CPU core. Motion is what
   triggers it, so moving the pointer across the screen is the most expensive
-  thing a user can do.
+  thing a user can do; an animated wallpaper (§2.10) adds a full-screen repaint at
+  ~12 fps on top of that.

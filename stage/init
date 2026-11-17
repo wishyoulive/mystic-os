@@ -34,7 +34,7 @@ load_modules() {
     depmod -a "$KV" 2>/dev/null
     for m in drm drm_kms_helper ttm drm_ttm_helper drm_vram_helper \
              drm_shmem_helper drm_client_lib fb_sys_fops sysimgblt sysfillrect \
-             bochs virtio-gpu evdev psmouse              virtio_blk virtio_net net_failover failover crc16 mbcache jbd2 ext4 fat vfat nls_cp437 nls_iso8859-1; do
+             bochs virtio-gpu evdev psmouse              virtio_blk virtio_net net_failover failover af_packet crc16 mbcache jbd2 ext4 fat vfat nls_cp437 nls_iso8859-1; do
         modprobe "$m" 2>/dev/null
     done
 }
@@ -55,6 +55,27 @@ setup_net() {
     else
         echo "net: eth0 present but no lease"
     fi
+}
+
+# Settings live in the RAM rootfs, so a choice only lasts until reboot unless
+# it is also written to the disk. Copy back anything found on /root.
+restore_settings() {
+    [ -d /root ] || return 0
+    for f in ui.conf wallpaper current-theme; do
+        if [ -f "/root/mystic-$f" ]; then
+            cp "/root/mystic-$f" "/etc/mystic/$f" 2>/dev/null
+        fi
+    done
+}
+
+# Called by the desktop's helper path; also useful from a shell.
+save_settings() {
+    [ -d /root ] || return 1
+    mkdir -p /root 2>/dev/null
+    for f in ui.conf wallpaper current-theme; do
+        [ -f "/etc/mystic/$f" ] && cp "/etc/mystic/$f" "/root/mystic-$f" 2>/dev/null
+    done
+    sync
 }
 
 setup_disk() {
@@ -99,6 +120,26 @@ probe() {
         [ -e "$f" ] && echo "  fb name: $(cat "$f")"
     done
 
+    echo "network  :"
+    if [ -d /sys/class/net/eth0 ]; then
+        echo "  link: $(cat /sys/class/net/eth0/operstate 2>/dev/null)"
+        udhcpc -i eth0 -n -t 3 -T 2 -s /etc/udhcpc.script > /tmp/dhcp.log 2>&1
+        echo "  udhcpc rc=$?"
+        while read -r l; do echo "  | $l"; done < /tmp/dhcp.log
+        ip addr show eth0 > /tmp/ip.log 2>&1
+        # real internet, from inside the OS: DNS + TCP + HTTP
+        if [ -x /usr/bin/wget ] || [ -x /bin/wget ]; then
+            if wget -q -T 8 -O /tmp/net.html http://example.com 2>/tmp/net.err; then
+                echo "  http: $(wc -c < /tmp/net.html) bytes from example.com"
+            else
+                echo "  http: failed - $(head -1 /tmp/net.err 2>/dev/null)"
+            fi
+        fi
+        while read -r l; do echo "  > $l"; done < /tmp/ip.log
+    else
+        echo "  no eth0"
+    fi
+
     echo "input    :"
     ls /dev/input 2>/dev/null | sed 's/^/  /' || echo "  none"
     for d in /sys/class/input/event*; do
@@ -127,6 +168,7 @@ probe() {
 load_modules
 setup_net
 setup_disk
+restore_settings
 
 if grep -q 'mystic.probe=1' /proc/cmdline; then
     probe

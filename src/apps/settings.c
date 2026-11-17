@@ -41,10 +41,12 @@
  *  failed write, or a file that was never there.
  *
  *  Every vertical metric is derived from the font that draws in it, at
- *  draw time (font_get() applies the global text scale, src/font.c:125),
- *  and settings_click() asks for the same font, so the row height used
- *  for painting and the one used for hit testing are the same number.
- *  There is no fixed row height anywhere in this file.
+ *  draw time (font_get() applies the global text scale, src/font.c:125).
+ *  One measure pass per frame produces the row offsets, and the painter
+ *  records the exact rectangle it painted for every row; settings_click()
+ *  hit-tests those recorded rectangles and nothing else, so a click lands on
+ *  the row that was drawn there - at any text scale. There is no fixed row
+ *  height anywhere in this file.
  * ============================================================ */
 #include "mystic.h"
 #include "wallpaper.h"
@@ -81,7 +83,7 @@
 static const char  *SIZE_LABEL[SIZE_COUNT] = { "Small", "Normal", "Large", "Larger", "Huge" };
 static const float  SIZE_VALUE[SIZE_COUNT] = { 0.8f, 1.0f, 1.2f, 1.4f, 1.6f };
 
-/* Theme rows, then text-size rows, then wallpaper rows - one flat list. */
+/* One flat list: text-size rows, then wallpaper rows, then theme rows. */
 #define MAX_ROWS (MAX_THEMES + SIZE_COUNT + WALLPAPER_COUNT)
 
 typedef struct {
@@ -125,8 +127,7 @@ static int flat_count(const Settings *s) {
 #define ROW_THEME(i) (SIZE_COUNT + WALLPAPER_COUNT + (i))
 
 /* 0 = Theme, 1 = Text size, 2 = Wallpaper. */
-static int section_of(const Settings *s, int sel) {
-    (void)s;
+static int section_of(int sel) {
     if (sel < SIZE_COUNT) return 1;
     if (sel < SIZE_COUNT + WALLPAPER_COUNT) return 2;
     return 0;
@@ -553,7 +554,8 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h, const 
         if (current) {               /* what the file says, right where it is */
             const char *mk = "now";
             float mk_w = font_width(fr, mk);
-            font_draw(&ls, fr, (float)x + (float)w - 10.0f - mk_w, ry, mk,
+            /* stop short of the scroll triangles in the corner */
+            font_draw(&ls, fr, (float)x + (float)w - 26.0f - mk_w, ry, mk,
                       color_alpha(th->accent, 0.85f));
         }
     }
@@ -625,7 +627,7 @@ static void settings_key(App *a, const char *bytes, int n) {
          * 1..5, Wallpaper 1..4, and the theme list keeps its old 1..9 meaning */
         if (c >= '1' && c <= '9') {
             int idx = c - '1';
-            int sec = section_of(s, s->sel);
+            int sec = section_of(s->sel);
             if (sec == 0) {
                 if (idx < s->count) { s->sel = ROW_THEME(idx); apply_theme(s, idx); }
             } else if (sec == 1) {
@@ -644,10 +646,6 @@ static void settings_click(App *a, int x, int y, int buttons) {
     Settings *s = a->state;
     (void)x; (void)buttons;
     if (!s) return;
-    /* the same font, hence the same row height, the painter used */
-    Font *fr = font_get(FONT_REGULAR, 11);
-    if (!fr) return;
-    float rh = row_h_of(fr);
     int n = flat_count(s);
     if (n > MAX_ROWS) n = MAX_ROWS;
     for (int i = 0; i < n; i++) {
