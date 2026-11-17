@@ -300,6 +300,46 @@ static void persist_settings(void) {
     }
 }
 
+/* An in-desktop app cannot fork, so it asks the desktop to do privileged work
+ * by writing a request file - the same pattern as launch.request. The package
+ * manager is a shell script, so this is a fork+exec of /bin/sh on a command
+ * built from a VALIDATED name: no way to smuggle in a second command. */
+static int pkg_name_ok(const char *n) {
+    if (!n[0] || strlen(n) > 32) return 0;
+    for (const char *c = n; *c; c++)
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '-'))
+            return 0;
+    return 1;
+}
+
+static void run_pkg(const char *verb, const char *name) {
+    if (!pkg_name_ok(name)) {
+        fprintf(stderr, "pkg: refusing suspicious package name\n");
+        return;
+    }
+    pid_t pid = fork();
+    if (pid < 0) return;
+    if (pid == 0) {
+        execl("/bin/sh", "sh", "-c", "pkg", verb, name, (char *)NULL);
+        _exit(127);
+    }
+    fprintf(stderr, "pkg: %s %s started as pid %d\n", verb, name, (int)pid);
+}
+
+/* read a one-word request file, remove it, return 1 if present */
+static int take_request(const char *path, char *out, size_t outsz) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    out[0] = 0;
+    if (fgets(out, (int)outsz, f)) {
+        char *nl = strchr(out, 10);
+        if (nl) *nl = 0;
+    }
+    fclose(f);
+    remove(path);
+    return out[0] ? 1 : 0;
+}
+
 static void win_close(Window *w) {
     if (!w || !w->used) return;
     if (w->term) {
@@ -1589,6 +1629,22 @@ int main(void) {
                         if (idx >= 0 && idx != wall_index) { wall_index = idx; dirty = 1; persist_settings(); }
                     }
                     fclose(wf);
+                }
+            }
+
+            /* Store -> desktop: install a package, or refresh the repo index */
+            {
+                char want[64];
+                if (take_request("/run/mystic/install.request", want, sizeof(want)))
+                    run_pkg("install", want);
+                if (take_request("/run/mystic/repo.refresh", want, sizeof(want))) {
+                    pid_t pid = fork();
+                    if (pid == 0) {
+                        execl("/bin/sh", "sh", "-c",
+                              "wget -q -T 10 -O /run/mystic/repo.index "
+                              "http://10.0.2.2:8000/index.tsv", (char *)NULL);
+                        _exit(127);
+                    }
                 }
             }
 
