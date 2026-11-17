@@ -32,9 +32,28 @@ load_modules() {
     depmod -a "$KV" 2>/dev/null
     for m in drm drm_kms_helper ttm drm_ttm_helper drm_vram_helper \
              drm_shmem_helper drm_client_lib fb_sys_fops sysimgblt sysfillrect \
-             bochs virtio-gpu evdev psmouse; do
+             bochs virtio-gpu evdev psmouse              virtio_blk fat vfat nls_cp437 nls_iso8859-1; do
         modprobe "$m" 2>/dev/null
     done
+}
+
+# The disk is a real block device. On first boot it has no filesystem,
+# so we make one - after that we just mount it. Everything in /root then
+# survives a reboot, which is the difference between a demo and an OS.
+setup_disk() {
+    [ -b /dev/vda ] || { echo "disk: no /dev/vda"; return 0; }
+    mkdir -p /root
+    if mount -t vfat /dev/vda /root 2>/dev/null; then
+        echo "disk: mounted /dev/vda on /root"
+        return 0
+    fi
+    echo "disk: /dev/vda is unformatted, creating FAT filesystem"
+    mkfs.vfat /dev/vda >/dev/null 2>&1
+    if mount -t vfat /dev/vda /root 2>/dev/null; then
+        echo "disk: formatted and mounted on /root"
+    else
+        echo "disk: could not mount"
+    fi
 }
 
 probe() {
@@ -64,10 +83,23 @@ probe() {
         [ -e "$d/device/name" ] && echo "  $(cat "$d/device/name")"
     done
 
+    if [ -d /root ] && mountpoint -q /root 2>/dev/null; then
+        n=$(cat /root/boots.txt 2>/dev/null || echo 0)
+        n=$((n + 1))
+        echo "$n" > /root/boots.txt
+        echo "disk     : mounted, boot counter now $n"
+        echo "          files: $(ls /root | tr '
+' ' ')"
+        sync
+    else
+        echo "disk     : NOT mounted"
+    fi
+
     echo "--- end probe ---"
 }
 
 load_modules
+setup_disk
 
 if grep -q 'mystic.probe=1' /proc/cmdline; then
     probe

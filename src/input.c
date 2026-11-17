@@ -101,7 +101,7 @@ static int key_to_char(int code, int shift) {
     return 0;
 }
 
-static void handle_event(Input *in, struct input_event *ev, int *shift) {
+static void handle_event(Input *in, struct input_event *ev, int *shift, int *ctrl) {
     switch (ev->type) {
         case EV_REL:
             if (ev->code == REL_X) { in->mouse_dx += ev->value; in->mouse_x += ev->value; }
@@ -122,11 +122,18 @@ static void handle_event(Input *in, struct input_event *ev, int *shift) {
                 else                { in->buttons &= ~bit; in->released |= bit; }
             } else if (ev->code == KEY_LEFTSHIFT || ev->code == KEY_RIGHTSHIFT) {
                 *shift = ev->value;
+            } else if (ev->code == KEY_LEFTCTRL || ev->code == KEY_RIGHTCTRL) {
+                *ctrl = ev->value;
             } else {
                 if (ev->value == 1) {
                     in->key = ev->code;
                     in->key_pressed = 1;
                     int ch = key_to_char(ev->code, *shift);
+                    /* Ctrl+letter is a control code: Ctrl+S is 0x13 */
+                    if (ch && *ctrl && ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'))) {
+                        int base = (ch >= 'a') ? ch - 'a' : ch - 'A';
+                        ch = base + 1;
+                    }
                     if (ch && in->text_len < (int)sizeof(in->text) - 1)
                         in->text[in->text_len++] = (char)ch;
                 }
@@ -138,19 +145,19 @@ static void handle_event(Input *in, struct input_event *ev, int *shift) {
 }
 
 int input_poll(Input *in) {
-    static int shift = 0;
+    static int shift = 0, ctrl = 0;
     int any = 0;
     struct input_event ev;
 
     if (mouse_fd >= 0) {
         while (read(mouse_fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
-            handle_event(in, &ev, &shift);
+            handle_event(in, &ev, &shift, &ctrl);
             any = 1;
         }
     }
     if (key_fd >= 0) {
         while (read(key_fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
-            handle_event(in, &ev, &shift);
+            handle_event(in, &ev, &shift, &ctrl);
             any = 1;
         }
     }

@@ -29,6 +29,9 @@ kernel/drivers/gpu
 kernel/drivers/video
 kernel/drivers/i2c
 kernel/drivers/input
+kernel/drivers/block
+kernel/fs/fat
+kernel/fs/nls
 "
 
 mkdir -p "$CACHE"
