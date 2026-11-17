@@ -22,7 +22,16 @@ fi
 [ -n "$ZIG" ] || { echo "error: zig not found" >&2; exit 1; }
 echo "==> compiler: $ZIG ($("$ZIG" version))"
 
-SRC="src/main.c src/gfx.c src/font.c src/fb.c src/input.c src/theme.c"
+SRC="src/main.c src/apps.c src/term.c src/gfx.c src/font.c src/fb.c src/input.c src/theme.c"
+SRC="$SRC src/apps/sysinfo.c"
+DEFS=""
+for app in files settings monitor notes; do
+    if [ -f "src/apps/$app.c" ]; then
+        SRC="$SRC src/apps/$app.c"
+        DEFS="$DEFS -DWITH_$(echo $app | tr a-z A-Z)"
+    fi
+done
+echo "==> apps: $DEFS"
 OUT=build/mystic-desktop
 
 mkdir -p build stage/usr/bin stage/usr/share/fonts
@@ -30,9 +39,9 @@ mkdir -p build stage/usr/bin stage/usr/share/fonts
 echo "==> compiling $OUT"
 # -static so the binary needs nothing but the kernel;
 # -Os keeps the image small; no libc beyond musl.
-"$ZIG" cc -target x86_64-linux-musl -Os -static -fno-sanitize=all \
+"$ZIG" cc -target x86_64-linux-musl -Os -static -fno-sanitize=all -Isrc \
     -Wall -Wextra -Wno-unused-parameter \
-    -o "$OUT" $SRC -lm
+    -o "$OUT" $SRC $DEFS -lm -lutil
 
 size=$(du -h "$OUT" | cut -f1)
 echo "    $size  $(wc -l < /dev/null 2>/dev/null)$OUT"

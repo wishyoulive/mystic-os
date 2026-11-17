@@ -135,4 +135,68 @@ typedef struct {
 int theme_load(Theme *t, const char *path);
 int theme_load_all(Theme *list, int max, const char *dir);
 
+
+/* ------------------------------------------------------------
+ * Apps
+ *
+ * An app is a rectangle of pixels plus event handlers. It draws
+ * only inside the area it is given, and gets clicks in its own
+ * local coordinates. That is the whole contract - which is what
+ * lets an app be written without knowing anything about the
+ * window manager, the theme or the framebuffer.
+ * ------------------------------------------------------------ */
+typedef struct App App;
+
+typedef struct {
+    const char *id;
+    const char *title;
+    void (*init)(App *a, int w, int h);
+    void (*draw)(App *a, Surface *s, int x, int y, int w, int h, const Theme *th);
+    void (*key)(App *a, const char *bytes, int n);
+    void (*click)(App *a, int x, int y, int buttons);
+    void (*resize)(App *a, int w, int h);
+    void (*free)(App *a);
+} AppVT;
+
+struct App {
+    const AppVT *vt;
+    void *state;      /* app private data */
+};
+
+App *app_new(const char *id, int w, int h);
+void app_free(App *a);
+void app_draw(App *a, Surface *s, int x, int y, int w, int h, const Theme *th);
+void app_key(App *a, const char *bytes, int n);
+void app_click(App *a, int x, int y, int buttons);
+const char *app_title(App *a);
+
+/* each app file provides one of these; undefined ones are simply not built */
+#ifdef WITH_FILES
+extern const AppVT app_vt_files;
+#endif
+#ifdef WITH_SETTINGS
+extern const AppVT app_vt_settings;
+#endif
+#ifdef WITH_MONITOR
+extern const AppVT app_vt_monitor;
+#endif
+#ifdef WITH_NOTES
+extern const AppVT app_vt_notes;
+#endif
+extern const AppVT app_vt_sysinfo;
+
+/* ------------------------------------------------------------
+ * Terminal
+ * ------------------------------------------------------------ */
+typedef struct Term Term;
+Term *term_create(int cols, int rows, const char *shell);
+int   term_fd(Term *t);
+int   term_alive(Term *t);
+void  term_pump(Term *t);
+void  term_key(Term *t, const char *bytes, int n);
+void  term_clear_screen(Term *t);
+void  term_draw(Term *t, Surface *s, int x, int y, int w, int h,
+                Font *fr, float cw, float ch);
+
+/* ------------------------------------------------------------ */
 #endif /* MYSTIC_H */

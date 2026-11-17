@@ -45,6 +45,7 @@ int disp_open(Display *d, const char *path) {
     d->mem = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, d->fd, 0);
     if (d->mem == MAP_FAILED) { perror("mmap fb"); return -1; }
 
+    claim_console();
     fprintf(stderr, "display: %dx%d %dbpp stride=%d\n", d->w, d->h, d->bpp, d->stride);
     return 0;
 }
