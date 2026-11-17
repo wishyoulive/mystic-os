@@ -21,7 +21,22 @@
 #  tools/serve-repo.sh serves it from.
 # ============================================================
 
-REPO="${MYSTIC_REPO:-http://10.0.2.2:8000}"
+# The repository URL, highest priority first:
+#   $MYSTIC_REPO            (a shell override)
+#   /etc/mystic/repo.conf   (one URL per line, first line wins - so the GUI or
+#                            the user can point the OS at any public mirror
+#                            without touching this script)
+#   the host as QEMU's user-mode network exposes it (10.0.2.2), for development
+_default_repo() {
+    if [ -f /etc/mystic/repo.conf ]; then
+        line=$(head -1 /etc/mystic/repo.conf 2>/dev/null)
+        case "$line" in
+            http://*|https://*) echo "$line"; return ;;
+        esac
+    fi
+    echo "http://10.0.2.2:8000"
+}
+REPO="${MYSTIC_REPO:-$(_default_repo)}"
 APPS=/root/apps
 CACHE=/tmp/pkg
 INDEX=/tmp/pkg/index.tsv
