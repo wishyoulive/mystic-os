@@ -108,7 +108,9 @@ def main():
                 # an app bundle's payload is called 'bin' and lives under
                 # usr/share/mystic/apps/<id>/ - it must be executable too
                 is_prog = (rel == 'init' or rel.startswith(exec_dirs)
-                           or rel.endswith('/bin'))
+                           or rel.endswith('/bin')
+                           # udhcpc execs its script directly, so it needs +x
+                           or rel.endswith('.script'))
                 mode = 0o755 if is_prog else 0o644
                 add(rel, S_IFREG | mode, int(st.st_mtime), data=open(full, 'rb').read())
 

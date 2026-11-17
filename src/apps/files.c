@@ -59,7 +59,8 @@
 #include <unistd.h>
 
 #define MAX_ENTRIES 512
-#define NAME_LEN    160
+#define NAME_LEN    256   /* ext4 allows 255 bytes; a shorter buffer hides entries */
+#define LINK_LEN    96    /* as much of a symlink target as the footer can use */
 #define PATH_LEN    512
 #define HIST_MAX    24
 #define MAX_CRUMBS  16
@@ -75,11 +76,13 @@ enum { IC_FOLDER, IC_FILE, IC_THEME, IC_CONF, IC_EXEC, IC_IMAGE };
 
 typedef struct {
     char          name[NAME_LEN];
+    char          target[LINK_LEN];  /* readlink() of a symlink, empty otherwise */
     long long     size;
     long long     mtime;
     unsigned      mode;
     unsigned char is_dir;
     unsigned char is_link;
+    unsigned char link_ok;           /* stat() of the link target succeeded */
     unsigned char kind;
 } Entry;
 
@@ -169,8 +172,11 @@ static int ends_with_ci(const char *s, const char *suffix) {
     return 1;
 }
 
-/* Content first (theme/conf/image), then the execute bit, then plain. */
+/* Content first (theme/conf/image), then the execute bit, then plain.
+ * A dangling symlink is just a page: it has no mode of its own to speak of
+ * and must never inherit the 0777 that lstat() reports for a link. */
 static int kind_of(const Entry *e) {
+    if (e->is_link && !e->link_ok) return IC_FILE;
     if (e->is_dir) return IC_FOLDER;
     if (ends_with_ci(e->name, ".theme")) return IC_THEME;
     if (ends_with_ci(e->name, ".conf"))  return IC_CONF;
@@ -343,10 +349,13 @@ static int layout_build(Layout *L, int w, int h) {
         L->size_x = right - L->size_col;
         L->time_x = right - L->time_col;
 
-        /* the modified-time column is dropped below the nominal 380 px
-         * design width - expressed through ui_px() so the rule holds at
-         * every text scale - and whenever it would squeeze the names */
-        L->show_time = (w >= ui_px(380));
+        /* The brief's rule: no modified-time column under 380 px of window.
+         * 380 is a literal window width - the columns it holds are already
+         * measured from the scaled font - so it is not scaled again here.
+         * Whether the column actually fits is decided below by measuring the
+         * name column against ui_px(90); that test is the real guard, and it
+         * keeps the dates in a 480 px window at 1.4x where they still fit. */
+        L->show_time = (w >= 380);
         if (L->show_time) L->size_x = L->time_x - L->pad - L->size_col;
         L->name_w = L->size_x - L->gap - L->name_x;
         if (L->show_time && L->name_w < ui_px(90)) {
@@ -374,9 +383,18 @@ static int crumb_build(const Files *f, const Layout *L, int w, Crumb *out, int *
 
     all[n].target = 1; all[n].ls = 0; all[n].ll = 0; n++;      /* "/" */
     int i = 1;
-    while (f->path[i] && n < MAX_CRUMBS) {
+    while (f->path[i]) {
         int s = i;
         while (f->path[i] && f->path[i] != '/') i++;
+        if (n == MAX_CRUMBS) {
+            /* The window is full. Forget the oldest segment and keep going,
+             * so the last one is always the folder we are actually in - and
+             * say so with the ellipsis, because the first visible segment is
+             * no longer the root. */
+            memmove(&all[0], &all[1], sizeof(all[0]) * (MAX_CRUMBS - 1));
+            n = MAX_CRUMBS - 1;
+            *dots = 1;
+        }
         all[n].target = i;
         all[n].ls = s;
         all[n].ll = i - s;
@@ -490,20 +508,35 @@ static void scan(Files *f) {
         struct stat st;
         if (lstat(full, &st) < 0) continue;              /* vanished: skip it */
 
-        int is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
         int is_link = S_ISLNK(st.st_mode) ? 1 : 0;
+        int is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
+        struct stat tgt;
+        int have_tgt = 0;
+        char target[LINK_LEN];
+        target[0] = 0;
+
         if (is_link) {
-            struct stat t;
-            if (stat(full, &t) == 0 && S_ISDIR(t.st_mode)) is_dir = 1;
+            /* A symlink is a stand-in for something else, so every number we
+             * show for it has to be the target's: lstat() would give the
+             * length of the path it contains and mode 0777, which would make
+             * every symlink look like an executable of a few bytes. */
+            have_tgt = (stat(full, &tgt) == 0);
+            if (have_tgt && S_ISDIR(tgt.st_mode)) is_dir = 1;
+            long r = (long)readlink(full, target, sizeof(target) - 1);
+            if (r < 0) target[0] = 0;
+            else target[r] = 0;
         }
+        const struct stat *shown = (is_link && have_tgt) ? &tgt : &st;
 
         Entry *e = &f->ent[f->count];
         snprintf(e->name, sizeof(e->name), "%s", de->d_name);
+        snprintf(e->target, sizeof(e->target), "%s", target);
         e->is_dir  = (unsigned char)is_dir;
         e->is_link = (unsigned char)is_link;
-        e->size    = (long long)st.st_size;
-        e->mtime   = (long long)st.st_mtime;
-        e->mode    = (unsigned)st.st_mode;
+        e->link_ok = (unsigned char)(is_link ? have_tgt : 0);
+        e->size    = (long long)shown->st_size;
+        e->mtime   = (long long)shown->st_mtime;
+        e->mode    = (unsigned)shown->st_mode;
         e->kind    = (unsigned char)kind_of(e);
         f->count++;
     }
@@ -950,20 +983,28 @@ static void draw_footer(Files *f, Surface *s, int x, int y, int w,
     float maxw = (float)(x + w - L->pad) - rw - (float)ui_px(8) - minfo;
     if (maxw < (float)ui_px(20)) return;
 
-    char info[NAME_LEN + 48];
+    char info[NAME_LEN + LINK_LEN + 64];
     u32 col = color_alpha(th->text, 0.55f);
     if (f->status[0]) {
         snprintf(info, sizeof(info), "%s", f->status);
         col = th->accent;
     } else if (f->sel >= 0 && f->sel < f->count) {
         Entry *e = &f->ent[f->sel];
-        if (e->is_dir)
-            snprintf(info, sizeof(info), "%s/  folder%s", e->name, e->is_link ? " link" : "");
-        else {
-            char sz[24];
-            human_size(e->size, sz, sizeof(sz));
-            snprintf(info, sizeof(info), "%s%s  %s", e->name, e->is_link ? " -> link" : "", sz);
-        }
+        char sz[24];
+        human_size(e->size, sz, sizeof(sz));
+        const char *tgt = e->target[0] ? e->target : "?";
+        if (e->is_link && !e->link_ok)
+            /* nothing to report but the dead pointer itself: the link's own
+             * size is the length of the text in it, not a file size */
+            snprintf(info, sizeof(info), "%s -> %s (broken link)", e->name, tgt);
+        else if (e->is_link && e->is_dir)
+            snprintf(info, sizeof(info), "%s/ -> %s  folder", e->name, tgt);
+        else if (e->is_link)
+            snprintf(info, sizeof(info), "%s -> %s  %s", e->name, tgt, sz);
+        else if (e->is_dir)
+            snprintf(info, sizeof(info), "%s/  folder", e->name);
+        else
+            snprintf(info, sizeof(info), "%s  %s", e->name, sz);
     } else {
         info[0] = 0;
     }

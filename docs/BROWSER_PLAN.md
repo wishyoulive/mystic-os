@@ -32,10 +32,28 @@ That is the point of a plan.
 | **[calc]** | arithmetic on the above, shown so it can be re-checked |
 | **[est]** | estimate. Not measured. Each one says what would settle it |
 
-The package numbers are *installed* sizes resolved transitively by
-`so:`-provides, because that is the number that matters for a disk image and a
-RAM budget. They were produced by resolving `D:` fields in the index, not by
-installing; a real `apk add` may pull a few extra `cmd:` or virtual packages.
+Two different sizes appear below and they are never mixed:
+
+- **package size** — the `.apk` download and the `I:` installed size of *that
+  package alone*.
+- **closure size** — the union of a package and everything it transitively needs,
+  resolved through `so:`/`cmd:`/versioned provides in the index.
+
+Wherever a cost is being argued, it is a **closure**, because a closure is what
+lands on the disk. That distinction is not pedantry: it is the difference
+between "Xvfb costs 268 MB" (wrong) and "Xvfb costs 7.6 MB on top of Chromium"
+(right), and the two answers point at different shortlists. Union closures in
+§5.5 and §7.1 were computed by resolving the *set* of roots together, so shared
+dependencies are counted once.
+
+Closures come from resolving `D:` fields in the index, not from installing; a
+real `apk add` may pull a few extra `cmd:` or virtual packages.
+
+Everything in this repository was re-read against the working tree at commit
+`efd54b2`. Files that other work is actively editing (`src/main.c`, `image.sh`,
+`stage/init`) are cited by symbol with the line number at that commit, because
+their line numbers have already moved twice during this document's own writing —
+the `print` in §1 is exactly that mistake, caught in review.
 
 ---
 
@@ -46,30 +64,39 @@ installing; a real `apk add` may pull a few extra `cmd:` or virtual packages.
 | Guest RAM | **256 MB** | `image.sh:54` → `-m 256` |
 | Disk | **64 MB**, FAT, formatted on first boot | `image.sh:51` → `dd ... count=64`, `stage/init` |
 | Rootfs today | 29 MB staged, 6.5 MB compressed | `du -sh stage`, `README.md` |
+| Machine size is a **knob**, not a constant | `MYSTIC_RAM` (default 256) and `MYSTIC_DISK_MB` (default 64) | `image.sh:50-54` |
 | Screen | 1280×800, 32 bpp, stride from `FBIOGET_FSCREENINFO` | `src/fb.c:29-49`, `README.md` |
 | Pixel format | `0xAARRGGBB` in a `u32`; on little-endian that is byte order **B,G,R,A** | `src/mystic.h:17-21`, `docs/IPC.md` |
-| Compositor buffers | two full-screen `calloc` surfaces (~4.1 MB each at 1280×800) | `src/main.c:967-971` |
+| Compositor buffers | two full-screen `calloc` surfaces (~4.1 MB each at 1280×800) | `src/main.c` `main()`, `screen.px`/`scene.px` (1172/1174 at `efd54b2`) |
 | Window send path | text protocol on `/run/mystic/wm.sock` + shm in `/dev/shm` (tmpfs) | `src/ipc.h`, `src/wmsrv.c`, `stage/init` |
 | Max window | 80..1600 × 60..1200, clamped | `src/wmsrv.c:114-117` |
 | Stride sent to apps | `w` exactly | `src/wmsrv.c:133` |
 | Frame semantics | `FRAME` = whole window, **no damage rectangles** | `src/ipc.h:17`, `docs/IPC.md` |
-| Users | everything runs as root; `stage/init` `exec`s the desktop directly, no login, no `su` | `stage/init:140-151` |
+| Users | everything runs as root; `stage/init` `exec`s the desktop directly, no login, no `su` | `stage/init`, `exec /usr/bin/mystic-desktop` (173-184 at `efd54b2`) |
 | App binaries | static musl, cross-compiled by zig (`-target x86_64-linux-musl -static`) | `tools/build-desktop.sh:42`, `tools/mkapp.sh:37` |
-| Fonts | three TTFs in `/usr/share/fonts`, no fontconfig, no font packages | `stage/usr/share/fonts`, `src/main.c:29` |
+| Fonts | three TTFs in `/usr/share/fonts`, no fontconfig, no font packages | `stage/usr/share/fonts`, `src/main.c` `FONT_DIR` (30 at `efd54b2`) |
 | Network | DHCP via `udhcpc` when `eth0` exists | `stage/init` |
 
 Three consequences that shape every option below:
 
 **(a) Chrome-sized things do not fit. Not yet.** 64 MB of disk and 256 MB of
-RAM is not enough for any Chromium-class engine, at any compression. Section
-6 lists exactly which knobs have to move, with numbers.
+RAM is not enough for any Chromium-class engine, at any compression. That size
+is a knob rather than a constant (`MYSTIC_RAM`, `MYSTIC_DISK_MB`, `image.sh:50-54`),
+but the defaults are what the OS ships with, so §6 says exactly how far they have
+to move and which *non-obvious* prerequisites are missing on top.
 
-**(b) Our app binaries are static.** A Mystic app is `zig cc -static`. It
-cannot link against Alpine's shared `libwebkit2gtk` or `libQt6WebEngineCore`.
-So the browser cannot *be* the app: the app must be a thin static client
-talking to a dynamically-linked engine process. That is a constraint the
-protocol already supports — an app is just a process with a socket and a
-buffer — but it decides the architecture for every candidate.
+**(b) Our build produces static binaries.** `tools/mkapp.sh:37` and
+`tools/build-desktop.sh:42` both say `-target x86_64-linux-musl -Os -static`.
+Musl being the libc is not the obstacle — a *dynamically* linked musl binary
+could link Alpine's `libwebkit2gtk` in principle, and Alpine does build WebKit
+against musl. The obstacles are concrete: (i) the desktop itself is one static
+binary, so no engine can be compiled *into* it; (ii) there are no `-dev`
+packages and no compiler in the image; (iii) the closure is 569-800 MB. So the
+architecture is forced, for practical reasons rather than a law of nature: the
+engine runs as its own dynamically linked process from `apk`, and our app is a
+thin static client that talks to it. The protocol already supports that — an
+app is a process with a socket and a buffer — but it decides the shape of every
+candidate below.
 
 **(c) The pixel format is the friendliest possible accident.** Our shm rows are
 BGRA bytes. Chromium's CEF off-screen buffer is BGRA
@@ -109,9 +136,9 @@ and D, which is exactly what the shortlist in section 7 contains.
 |---|---|
 | Package | `chromium` 156.0.8078.79-r0, community **[pkg]** |
 | Binary | `/usr/lib/chromium/chromium`, wrapper `/usr/bin/chromium-browser` |
-| Download / installed | 152.09 MB / **330.78 MB** **[pkg]** |
+| Package size (`.apk` / installed) | 152.09 MB / **330.78 MB** **[pkg]** |
 | Full runtime closure | **181 packages, 799.5 MB installed, 318.5 MB download** **[pkg]** |
-| Smaller sibling | `chromium-headless-shell` 156.0.8078.79-r0: 89.97 MB apk, 208.17 MB installed, closure **682.0 MB** **[pkg]** |
+| Smaller sibling | `chromium-headless-shell` 156.0.8078.79-r0: package 89.97 MB apk / 208.17 MB installed; closure **682.0 MB** **[pkg]** |
 | What dominates the closure | `llvm22-libs` 190.97 MB + `mesa` 44.18 MB, pulled by the hard dependency `mesa-dri-gallium`; also `icu-data-full` 33.11 MB, `ffmpeg-libavcodec` 20.36 MB, `x265-libs` 21.34 MB **[pkg]** |
 | musl | yes — Alpine builds it, with `musl-*` patches in the APKBUILD **[src]**, and `musl>=1.2.3` is an explicit dependency **[pkg]** |
 | glibc | no |
@@ -129,6 +156,14 @@ this build, with no GPU.
 There is a comment in Alpine's APKBUILD that matters: `# explicit depends for
 --headless` immediately above the dependency list **[src]**. Headless is a
 supported configuration of this package, not an afterthought.
+
+One thing it does **not** ship is a CDM. There is no `widevine` package anywhere
+in the v3.24 index **[pkg]**, and the APKBUILD mentions neither Widevine nor
+`enable_widevine` (it sets only `proprietary_codecs=true` and
+`ffmpeg_branding="Chrome"`) **[src]**. Encrypted Media Extensions therefore fail:
+Netflix, Spotify, HBO, Disney+ and any DRM video will refuse to play with
+`NotSupportedError`, however well H.264 decodes. This is not a detail — it is
+most of what people mean by "multimedia on the web" in 2026.
 
 ### 3.2 Two ways to talk to it
 
@@ -214,8 +249,14 @@ animation.
 `Input.dispatchMouseEvent` takes exactly what we have:
 `type, x, y, modifiers, timestamp, button, buttons, clickCount, force,
 tangentialPressure, tiltX, tiltY, twist, deltaX, deltaY, pointerType` **[src]**.
-Our `MOUSE <x> <y> <buttons>` maps 1:1 (buttons bitmask 1/2/4 is Chromium's
-1/4/2 order — a two-line translation table).
+
+The `buttons` bitmask is **already identical** to ours — the protocol says
+"A number indicating which buttons are pressed ... Left=1, Right=2, Middle=4,
+Back=8, Forward=16, None=0" **[src]**, and `src/input.c:177-179` sets
+`BTN_LEFT → 1`, `BTN_RIGHT → 2`, `BTN_MIDDLE → 4` **[ours]**. So the whole
+translation is: forward `input.buttons` unchanged, and on the press/release edge
+map the *bit* to the `button` **string** enum (`"none" | "left" | "middle" |
+"right" | "back" | "forward"`) **[src]**. No table, no remapping of bits.
 
 `Input.dispatchKeyEvent` takes
 `type, modifiers, timestamp, text, unmodifiedText, keyIdentifier, code, key,
@@ -252,9 +293,12 @@ does not produce kinetic scrolling in Chrome.
   exists and is documented as "Mutes audio sent to the audio device so it is not
   audible during automated testing" (`media_switches.cc`:181-183 **[src]**) —
   which implies the mixer runs and the device sink is a no-op. So video plays at
-  the right speed with silent audio. Real sound would mean either our own ALSA
-  sink in a helper process or `--use-fake-device-for-media-stream`, and that is
-  a separate project.
+  the right speed with silent audio. Real sound means writing an audio sink —
+  our own ALSA device on the guest, or a pipe we drain — and that is a separate
+  project. (`--use-fake-device-for-media-stream` is *not* that: it is documented
+  as "Use fake device for Media Stream to replace actual camera and
+  microphone" (`media_switches.cc`:230-233 **[src]**) — it fakes **capture** and
+  gives you no output path at all.)
 
 **Verify on target** with: a page containing an inline `<video autoplay muted>`,
 `--autoplay-policy=no-user-gesture-required`, screencast on, and check that
@@ -269,9 +313,11 @@ is brutal and entirely in resources: 682 MB of packages for the headless shell,
 ~1 GB of RAM to be comfortable, `--no-sandbox` because we are root, a JPEG
 decode per frame, and no audio.
 
-**Cannot:** fit in 256 MB / 64 MB; provide audio without a sink; give us
-sub-frame latency; run without `--no-sandbox` as root; avoid pulling LLVM (via
-`mesa-dri-gallium`) even with `--disable-gpu`.
+**Cannot:** fit in 256 MB / 64 MB; **play DRM video (no Widevine/CDM exists for
+Alpine's build, so Netflix/Spotify/HBO-class sites fail even though the codecs
+are present)**; provide audio without a sink; give us sub-frame latency; run
+without `--no-sandbox` as root; avoid pulling LLVM (via `mesa-dri-gallium`) even
+with `--disable-gpu`.
 
 ---
 
@@ -365,7 +411,10 @@ vncscreen->kbdAddEvent = vnc_dokey;
 **zero patching**. Our side is a small RFB client (`RFC 6143`): handshake,
 `SetPixelFormat` to 32 bpp `redShift=16/green=8/blue=0`, incremental
 `FramebufferUpdateRequest`, and `Raw` (plus optionally `Hextile`) decoding.
-`libvncserver` is **0.40 MB installed** **[pkg]**.
+`libvncserver` is 0.40 MB installed as a package, and **10.0 MB as a closure**
+(10 packages: `libgcrypt`, `liblzo2`, `libpng`, `libjpeg`, `openssl`) **[pkg]** —
+which is still nothing next to any engine, so the choice survives the corrected
+number.
 
 In other words: NetSurf can be a browser *server* on localhost, and our static
 app is its display. 600–900 lines of RFB client. No X, no Wayland, no GL, no
@@ -434,8 +483,12 @@ literal pixel (`0xaa rr gg bb`), delta-0 run, block reference, solid colour run,
 delta run. A decoder is ~150 lines.
 
 Input: it returns. The app receives input because the server sends
-`BROADWAY_REPLY_EVENT` messages which `_gdk_broadway_events_got_input()`
-converts into GDK events (`gdkdisplay-broadway.c`:320-321 **[src]**).
+`BROADWAY_REPLY_EVENT` replies, and `gdkbroadway-server.c`:320-321 **[src]** turns
+each one into `_gdk_broadway_events_got_input (&reply->event.msg)` — a function
+defined in `gdk/broadway/gdkeventsource.c`:111 **[src]**, which builds real
+`GdkEvent`s out of the `BroadwayInput*Msg` structs in the header above. That is
+the whole input path, and it is why implementing the *server* side of this
+protocol is enough to host a GTK app.
 
 Crucially, `broadwayd` is only a relay. The app connects to it over a Unix
 socket and the browser connects over WebSocket. **We could skip `broadwayd`
@@ -536,26 +589,58 @@ so all of it is a source build.
 **Qt offscreen:** we found no upstream statement that Qt WebEngine runs on the
 `offscreen` QPA plugin — Qt's platform notes say nothing about it, and
 WebEngine's compositor is GL-based. That is an absence of evidence, not evidence
-of impossibility, but it is not worth weeks to disprove when option 1 exists.
+of impossibility, but it is not worth weeks to disprove when §7.2 #1 exists.
 
-### 5.5 The escape hatch nobody likes: Xvfb (shape B, via X11 in a box)
+### 5.5 The option that keeps being the answer: Xvfb (shape B, X11 in a box)
 
-`xvfb` 21.1.26-r0 is 1.45 MB installed **[pkg]**. It is a real X server that
+`xvfb` 21.1.26-r0 is 1.45 MB as a package **[pkg]**. It is a real X server that
 draws into memory and needs no display. Then *any* X11 browser works — Chromium,
 Firefox, Dillo, links -g. Get pixels with `XShmGetImage` on the root window
 (32-bit `ZPixmap`, which on little-endian is BGRA bytes, i.e. **another
 memcpy**), send input with XTEST (`xdotool` is 0.12 MB **[pkg]**).
 
-The bill: `xvfb`'s closure is **54 packages, 268.5 MB**, and 190.97 MB of that
-is `llvm22-libs` pulled in by `mesa-egl`/`mesa` **[pkg]**. Add Chromium's
-682 MB on top. It also means shipping X11 in an OS whose whole pitch is that it
-has no X11 — a positioning problem, not a technical one, and one the owner
-should decide rather than the plan.
+**The cost, corrected.** Quoting `xvfb`'s own closure (54 packages, 268.5 MB) as
+the price of this option double-counts by about 260 MB, and an earlier draft of
+this document did exactly that. 190.97 MB of that closure is `llvm22-libs` and
+44 MB is `mesa`, and Chromium **already** hard-depends on `mesa-dri-gallium`
+**[pkg]**. Resolving the roots together rather than separately:
 
-Its real advantage: **no codec in the frame path.** XShmGetImage gives raw
+| Roots | Packages | Closure |
+|---|---|---|
+| `chromium` | 181 | 799.5 MB |
+| `xvfb` alone | 54 | 268.5 MB |
+| **`chromium` + `xvfb`** | **193** | **807.1 MB** |
+| `chromium-headless-shell` | 182 | 682.0 MB |
+| **`chromium-headless-shell` + `xvfb`** | **194** | **689.6 MB** |
+| `firefox` | 128 | 687.8 MB |
+| **`firefox` + `xvfb`** | **140** | **694.8 MB** |
+
+**[pkg]**, union closures, shared dependencies counted once. So Xvfb costs
+**7.6 MB** on top of Chromium and **7.0 MB** on top of Firefox — not 268 MB.
+The X server itself is nearly free; what is expensive is the browser.
+
+That changes what this option *is*. It is not "250 MB of extra cost to buy
+smooth video". It is "for 7.6 MB of extra packages, get raw pixels at page rate
+instead of a decoded JPEG per frame". The arguments against it are therefore
+**not** cost:
+
+1. It puts X11 in an OS whose pitch is that it has no X11. That is a positioning
+   decision for the owner, not a technical one, and it should be made as such.
+2. It gives us pixels and synthetic input (XTEST) and nothing else. Every browser
+   *function* — URL bar, history, find-in-page, zoom, print, tabs — has to be
+   driven by faking keystrokes into a picture. The CDP path in §3 gives all of
+   that as an API. This is the real reason it does not rank first, and it is a
+   reason about *controllability*, not megabytes.
+3. Firefox does not speak CDP, so the "control API + raw pixels" combination in
+   §7.2 #2 is Chromium-only.
+
+Its real advantage stands: **no codec in the frame path.** XShmGetImage gives raw
 pixels at whatever rate the page produces them, so video at 30 fps costs 3.5 MB
-of memcpy per frame instead of 30 JPEG decodes. If the CDP screencast turns out
-to be too slow to watch a video, this is the fix, and it costs 268 MB.
+of memcpy per frame instead of 30 JPEG decodes. Note also that because we capture
+the *root* window, popups, `<select>` dropdowns and DevTools all land in the same
+image — "window chasing" is not the problem it would be with per-window capture;
+the real cost is that everything the browser puts up appears inside one Mystic
+window.
 
 ### 5.6 Same idea, Wayland flavour
 
@@ -571,16 +656,33 @@ Xvfb except a newer protocol. Not recommended.
 Irrespective of which engine wins, the machine as configured cannot host one.
 These are the knobs, with the arithmetic.
 
-| Knob | Now | Needed for Chromium-class | Where |
+| Knob | Now | Needed for Chromium-class | How |
 |---|---|---|---|
-| Guest RAM | 256 MB | 1024–2048 MB | `image.sh:54` |
-| Disk | 64 MB | 2048 MB (682 MB packages + browser cache/profile + swap) | `image.sh:51` |
-| `/dev/shm` | tmpfs, default 50 % of RAM → 128 MB | same or bigger; Chromium wants it | `stage/init` (`mount -t tmpfs none /dev/shm`) |
-| Root/sandbox | runs as root | `--no-sandbox`, or a non-root `browser` user | `stage/init` |
+| Guest RAM | `MYSTIC_RAM`, default 256 | 1024–2048 | `MYSTIC_RAM=1024 ./image.sh` — already supported, no edit |
+| Disk | `MYSTIC_DISK_MB`, default 64 | 2048 (682 MB packages + profile + swap) | `MYSTIC_DISK_MB=2048 ./image.sh` — **but see the trap below** |
+| `/dev/shm` | tmpfs, default 50 % of RAM | same or bigger; Chromium hammers it | `stage/init:23` (`mount -t tmpfs none /dev/shm`) |
+| Root/sandbox | runs as root | `--no-sandbox`, or a non-root `browser` user | `stage/init`, desktop exec block |
 | Fonts | 3 TTFs, no fontconfig | several font families + a `fonts.conf` | `stage/usr/share/fonts` |
 | Timezone/locale | none | `/etc/localtime` or `TZ`, else TLS and dates misbehave | new files |
 | CA bundle | none in the image | `/etc/ssl/certs/ca-certificates.crt` (**~200 KB**) or every HTTPS site fails | new |
 | DNS | works: the DHCP script writes `/etc/resolv.conf` | nothing — listed only so nobody goes looking | `stage/etc/udhcpc.script:13-14` |
+
+Two of those rows used to be presented here as source edits. They are not: the
+sizes are environment knobs (`image.sh:50-54`), so raising them is a command
+line, not a patch. **The trap:** the disk image is only created when it does not
+exist —
+
+```sh
+DISK=$BUILD/disk.img
+if [ ! -f "$DISK" ]; then
+    dd if=/dev/zero of="$DISK" bs=1048576 count="${MYSTIC_DISK_MB:-64}"
+fi
+```
+
+— so `MYSTIC_DISK_MB=2048` silently does nothing once `build/disk.img` exists.
+Delete it (or `rm -rf build/`) or the browser will be installed onto a 64 MB
+filesystem and the first big download will fail with `ENOSPC` in a way that
+looks like a browser bug.
 
 Two of those are silent-failure traps worth naming: **no CA bundle** means
 `ERR_CERT_AUTHORITY_INVALID` on every page and looks like a browser bug, and **no
@@ -598,95 +700,129 @@ worth more here than anywhere else in the system.
 
 ### 7.1 The comparison the checklist asks for
 
-One row per candidate, one column per question that was asked. Numbers from
-§3-5; "renders all sites" means a real engine, not a subset.
+One row per candidate, one column per question that was asked. **All sizes are
+union closures** resolved together, so nothing is counted twice; "all sites"
+means a real engine, not a subset.
 
-| Candidate | Binary to run | Installed (closure) | musl? | glibc? | dbus? | fontconfig? | All sites? | Video? | Sound? |
+| Candidate | Binary | Closure | libc | dbus | fontconfig | All sites | Video | DRM video | Sound |
 |---|---|---|---|---|---|---|---|---|---|
-| Chromium headless + CDP pipe | `chromium-headless-shell` | 682.0 MB **[pkg]** | yes (Alpine) | no | `dbus-libs` linked; need **unverified** | yes | **yes** | **yes**, software | no sink |
-| Chromium under Xvfb | `chromium` + `xvfb` | 799.5 + 268.5 MB **[pkg]** | yes | no | `dbus-libs` linked | yes | **yes** | **yes** | no sink |
-| X11 Firefox under Xvfb | `firefox` + `xvfb` | 290.5 + 268.5 MB **[pkg]** | yes | no | `dbus-libs` linked | yes | **yes** | **yes** | `libasound`/PulseAudio linked, no sink |
-| WebKitGTK over Broadway | `MiniBrowser` or our own GTK app | 569.1 MB + GStreamer **[pkg]** | yes (Alpine) | no | **yes** (session + `xdg-dbus-proxy`) | yes | yes, minus Chrome-only/DRM | via GStreamer | yes with a GStreamer sink |
-| QtWebEngine + eglfs | any Qt app | 796.1 MB **[pkg]** | yes (Alpine) | upstream says required | `dbus-libs` linked | yes | yes | yes | yes — but it owns the display |
-| NetSurf, RAM or VNC surface | `nsfb` | single-digit MB *[est]* | yes | no | **no** | **no** | **no** | **no** | no |
-| CEF off-screen | our host + `libcef` | 200 MB+ *[est]* | would need a build | official builds are glibc | linked | yes | yes | yes | **yes** (`CefAudioHandler`) |
-| links / dillo / w3m | as packaged | 9.8 / 25.9 / 1.5 MB **[pkg]** | yes | no | no | dillo only (via FLTK) | no | no | no |
+| Chromium headless + CDP pipe | `chromium-headless-shell` | **682.0 MB** **[pkg]** | musl (Alpine) | linked, need unverified | yes | **yes** | **yes**, software | **no** (no CDM) | no sink |
+| Chromium in Xvfb, CDP for control | `chromium` + `xvfb` | **807.1 MB** **[pkg]** | musl | linked | yes | **yes** | **yes** | **no** (no CDM) | no sink |
+| Firefox in Xvfb | `firefox` + `xvfb` | **694.8 MB** **[pkg]** | musl | linked | yes | **yes** | **yes** | no CDM in index | `libasound` linked, no sink |
+| WebKitGTK over Broadway | `MiniBrowser` or own GTK app | **569.1 MB** + GStreamer **[pkg]** | musl | **yes** (session + `xdg-dbus-proxy`) | yes | yes, minus Chrome-only | via GStreamer | **no** | with a GStreamer sink |
+| QtWebEngine + eglfs | any Qt app | **796.1 MB** **[pkg]** | musl (upstream wants glibc) | linked | yes | yes | yes | no | yes — but it owns the display |
+| NetSurf, RAM or VNC surface | `nsfb` | single-digit MB *[est]* | musl | **no** | **no** | **no** | **no** | no | no |
+| CEF off-screen | our host + `libcef` | 200 MB+ *[est]* | would need a build | linked | yes | yes | yes | no | **yes** (`CefAudioHandler`) |
+| links / dillo / w3m | as packaged | 9.8 / 25.9 / 1.5 MB **[pkg]** | musl | no | dillo only (via FLTK) | no | no | no | no |
 
-Three things fall out of that table and they are the whole decision:
+Four things fall out of that table, and they are the whole decision:
 
-1. **Anything that renders every site costs ≥ 570 MB and needs an engine we do
-   not have a display path for yet.**
+1. **Anything that renders every site costs ≥ 569 MB.**
 2. **The one candidate that fits the current machine is the one that cannot
    render modern sites.**
-3. **Only two designs put pixels in our memory without a codec or a protocol
+3. **Nothing on this list plays DRM video**, because no Widevine CDM exists for
+   musl/Alpine at all. "Multimedia" here means open video (H.264/VP9/AV1 in
+   `<video>`, no EME), and the plan should say so to the owner before the work
+   starts rather than after.
+4. **Only two designs put pixels in our memory without a codec or a protocol
    translation in between:** CEF off-screen (no musl build exists) and NetSurf's
    RAM surface (no input, needs a patch). Everything else is a decode or a
-   protocol.
+   protocol — and for Chromium-in-Xvfb, the decode disappears entirely.
 
 ### 7.2 The ranking
 
-Ranked by "does it meet the requirement", then "how much of it is our code",
-then "what it costs".
+The ordering has to be argued, not asserted, because the corrected Xvfb number
+removes the cost argument that used to separate #1 from #2. What actually
+separates them:
+
+| | #1 headless + CDP | #2 Chromium in Xvfb + CDP |
+|---|---|---|
+| Closure | 682.0 MB | 807.1 MB (**+125.1 MB**, of which 7.6 MB is X) |
+| Frame path | browser encodes JPEG → base64 → pipe → we decode | X server writes BGRA → we `memcpy` |
+| Cost per 1280×680 frame | 3.48 MB memcpy **+ a JPEG decode** | 3.48 MB memcpy |
+| Frames in flight | 3, ack-gated (`maxFramesInFlight`) | as many as we ask for |
+| Control API | **yes** — navigate, history, find, zoom, print, cookies, JS eval | none; faking Ctrl+L into a picture |
+| X11 in the image | no | yes |
+| Days to first working window | 8–12 | 6–9 |
+
+So: **#1 if the browser is to be part of the OS** (no X11, and a real API to
+build chrome on); **#2 if frames-per-second is the binding constraint** and X11
+in the image is acceptable. That is an editorial decision about what Mystic OS
+is, not a technical one, and it belongs to the owner. What is *not* a matter of
+taste is that #2 is far cheaper than this document previously claimed: 7.6 MB of
+X, not 268 MB.
+
+They also compose, and that is the useful engineering fact: Chromium under Xvfb
+*still has* `--remote-debugging-pipe`. You can take pixels from `XShmGetImage`
+and control from CDP in the same app, getting raw frames **and** a URL bar that
+is not a keystroke puppet. That is exactly #2 as listed, and it is why #2's day
+estimate is lower than #1's: the pixel path is dumber, and CDP supplies the
+missing half.
 
 #### 1. Chromium headless over `--remote-debugging-pipe` — **8–12 days**
 
-The recommended first attempt, because it is the least invention: a NUL-delimited
-JSON loop, `Page.startScreencast` for frames, `Input.dispatch*` for input,
-libjpeg-turbo straight into `TJPF_BGRX`, `memcpy` into the shm.
+The recommended first attempt if the OS keeps its "no X11" identity. A
+NUL-delimited JSON loop, `Page.startScreencast` for frames, `Input.dispatch*` for
+input, libjpeg-turbo straight into `TJPF_BGRX`, `memcpy` into the shm.
 
-- Needs: 682 MB packages (headless shell) or 799 MB (full chromium), ~1 GB RAM,
-  2 GB disk, `--no-sandbox`, a CA bundle, `--autoplay-policy`, an evdev→
-  (code,key,VK) table.
-- Work: CDP client ~700 lines; key table ~120 lines; window chrome (URL bar,
-  history, tabs if wanted) in our own style, which we get to draw ourselves;
-  ~8–12 days including an honest latency measurement.
-- **Cannot:** be small; play audio without a sink; avoid LLVM in the dependency
-  closure; touch-type reliably in non-Latin scripts without more work on the
-  key table; give <16 ms input-to-photon.
+- Needs: 682.0 MB closure, ~1 GB RAM, 2 GB disk, `--no-sandbox`, a CA bundle,
+  `--autoplay-policy`, and the `button`-string mapping of §3.4.
+- Work: CDP client ~700 lines; window chrome in our own style; ~8–12 days
+  including an honest latency measurement.
+- **Cannot:** fit in 256 MB / 64 MB; **play DRM video (no CDM for Alpine, so
+  Netflix/Spotify/HBO fail)**; provide audio without a sink; give sub-frame
+  latency; run without `--no-sandbox` as root; avoid LLVM via `mesa-dri-gallium`
+  even with `--disable-gpu`; beat a raw-pixel capture on frames-per-second.
 
-#### 2. NetSurf on libnsfb, VNC surface (`-f vnc`) — **8–12 days**
+#### 2. Chromium inside Xvfb — pixels by `XShmGetImage`, control by CDP — **6–9 days**
 
-The only option that fits in the *current* machine, and the only one that needs
-no patch to the browser at all.
+Best frame path available on this OS, and only 7.6 MB of it is X. The X root
+window is the browser's screen; we capture it as BGRA and `memcpy` it into the
+window's shm; CDP does navigation, history, zoom, find and print.
 
-- Needs: build NetSurf + ~12 libraries for musl (or find an Alpine build path);
-  `libvncserver` 0.40 MB; fonts.
-- Work: RFB client ~700 lines (handshake, SetPixelFormat, incremental updates,
-  Raw + Hextile); keysyms; the browser chrome is NetSurf's own fbtk UI, so we
-  get a toolbar for free but it will not look like Mystic.
+- Needs: 807.1 MB closure (`chromium` + `xvfb`), ~1 GB RAM, 2 GB disk,
+  `--no-sandbox`, XTEST or CDP for input, `xdotool` 0.12 MB if we want XTEST.
+- Work: spawn Xvfb on a private display, `XShmGetImage` into our surface, map our
+  window's input to CDP events, and the same CDP chrome as #1 — which is why it
+  is *faster* to a usable browser, not slower.
+- **Cannot:** keep X11 out of the image; play DRM video; give us per-Mystic-window
+  browser dialogs (everything appears inside the one window); run two browsers at
+  different sizes without two X servers.
+
+#### 3. NetSurf on libnsfb, VNC or RAM surface — **8–12 days**
+
+The only option that fits the machine *as it is configured today* (256 MB /
+64 MB), and the only one that needs no patch to the browser at all if we take the
+VNC surface.
+
+- Needs: build NetSurf + ~12 libraries for musl; `libvncserver` closure 10.0 MB;
+  fonts. No glib, no dbus, no fontconfig, no GL.
+- Work: RFB client ~700 lines (handshake, `SetPixelFormat`, incremental updates,
+  Raw + Hextile), or ~150 lines in libnsfb for the RAM surface plus event
+  injection; keysyms; NetSurf's own fbtk UI is the chrome, which will not look
+  like Mystic.
 - **Cannot:** run modern JS (1539 unimplemented bindings, upstream's own count);
-  play video; render CSS Grid; use a GPU. It is a document browser.
-
-#### 3. Chromium or Firefox under Xvfb, `XShmGetImage` + XTEST — **5–8 days**
-
-Fastest to something watchable, because raw pixels at full rate beat a JPEG
-per frame, and every X11 browser already works.
-
-- Needs: `xvfb` closure **268.5 MB** *plus* the browser; 1.5–2 GB RAM.
-- Work: spawn Xvfb, `XOpenDisplay`, `XShmGetImage` into our surface, XTEST for
-  input (or `xdotool`), window management stays ours.
-- **Cannot:** be honest about "no X11"; avoid 191 MB of LLVM; give per-window
-  integration (we composite one X root, so a browser popup is a second X window
-  we must chase).
+  play video; render CSS Grid; do DRM; use a GPU. It is a document browser, and
+  the moment the machine is raised to 1 GB its one advantage evaporates.
 
 #### 4. WebKitGTK + our own Broadway server — **12–18 days**
 
-The biggest prize: one protocol, and then *every GTK application* is a window in
-Mystic — a browser included.
+The biggest prize per line of protocol: implement Broadway once and *every GTK
+application* becomes a Mystic window, a browser included. It is also the
+cheapest "real engine" closure at 569.1 MB.
 
-- Needs: `webkit2gtk-4.1` closure **569.1 MB** + GStreamer plugins for video;
-  D-Bus session; `bubblewrap`/user namespaces (or
-  `WEBKIT_DISABLE_COMPOSITING_MODE=1` and no sandbox); a keymap.
+- Needs: `webkit2gtk-4.1` + GStreamer plugins, a D-Bus session,
+  `bubblewrap`/user namespaces (or `WEBKIT_DISABLE_COMPOSITING_MODE=1` and no
+  sandbox), a keymap.
 - Work: Broadway server ~1200 lines (16 opcodes, 15 event types, the 4-byte
-  buffer encoding, zlib); auth; surface lifetime; then the same browser chrome
-  as option 1.
-- **Cannot:** be small; avoid D-Bus; do GL; avoid GStreamer.
+  buffer encoding, zlib), auth, surface lifetime, then the browser chrome.
+- **Cannot:** be small; avoid D-Bus; do GL; avoid GStreamer; do DRM.
 
 #### 5. CEF off-screen rendering — **20+ days**
 
-Architecturally the best (BGRA into our pointer, dirty rects, audio handler), and
-the worst to start: there is no musl CEF, so the first three weeks are a
-Chromium-class build.
+Architecturally the best (BGRA into our pointer, dirty rectangles, and the only
+documented audio *output* callback), and the worst to start: there is no musl
+CEF, so the first weeks are a Chromium-class build.
 
 - **Cannot:** be attempted before someone has built Chromium for musl once.
 
@@ -695,33 +831,33 @@ Chromium-class build.
 - **QtWebEngine + eglfs** — takes the display; Qt's own docs say it terminates
   when asked to share.
 - **WPE/Cog headless** — EGL frames, no plain buffer, nothing packaged, LLVM.
-- **weston headless + Wayland client** — Xvfb's cost without Xvfb's library of
-  working browsers.
-- **links -g / dillo / hv3 / Ladybird-fb** — no engine worth the name, or not
+- **weston headless + Wayland client** — the Xvfb idea with a newer protocol and
+  no working browser ecosystem to inherit.
+- **links -g / dillo / hv3 / Ladybird** — no engine worth the name, or not
   packaged, or needs X.
-- **w3m/lynx/elinks** — do this *anyway*, in the Terminal, this week; it is not
-  a browser for the desktop but it is 20 minutes of work and it makes the OS
-  useful on the day the engine is still not there.
-
----
+- **w3m/lynx/elinks** — do this *anyway*, in the Terminal, this week; it is 20
+  minutes of work and it makes the OS useful on the day the engine is still not
+  there.
 
 ## 8. What I would do next, in order
 
-1. **Measure before building.** Boot with `-m 1024` and run
+1. **Measure before building.** `rm -f build/disk.img`, then
+   `MYSTIC_RAM=2048 MYSTIC_DISK_MB=4096 ./image.sh`, and run *both* frame paths
+   against the same page with a 40-line driver:
    `chromium-headless-shell --headless --remote-debugging-pipe --no-sandbox`
-   against a local page, with a 30-line C or python driver that turns on the
-   screencast and times `screencastFrame` → ack. That single experiment answers
-   the only question that decides between options 1 and 3: *is JPEG-per-frame
-   fast enough on this CPU?* Everything else in this document is already
-   settled by upstream source.
+   timing `screencastFrame` → ack, then Chromium inside `Xvfb` with
+   `XShmGetImage` on the root. That one comparison answers the only question
+   upstream source cannot settle for us — *is JPEG-per-frame fast enough on this
+   CPU?* — and it is what decides §7.2 #1 vs #2.
 2. **Fix the invisible prerequisites** (CA bundle, `/etc/localtime`, fonts,
    `/dev/shm` size, a `browser` user). Half of them will be needed by whichever
    engine wins, and each one otherwise masquerades as an engine bug.
 3. **Build the pixel path once, properly:** a `surf_import_bgra(Surface *dst,
    const u8 *src, int src_stride)` helper plus the `HELLO`/shm handshake, shared
    by every candidate. All five viable options end in the same `memcpy`.
-4. **Then** option 1. And keep the NetSurf/VNC sketch in a drawer, because it is
-   the answer if the owner ever says "it has to run on the 256 MB machine".
+4. **Then** pick #1 or #2 on that measurement, not on taste, and keep the
+   NetSurf/VNC sketch in a drawer: it is the answer if the owner ever says "it
+   has to run on the 256 MB machine".
 
 ---
 
@@ -729,7 +865,10 @@ Chromium-class build.
 
 Package facts: Alpine v3.24 `APKINDEX` for `main` and `community`, x86_64,
 downloaded from `https://dl-cdn.alpinelinux.org/alpine/v3.24/{main,community}/x86_64/APKINDEX.tar.gz`,
-dependency closures resolved through `so:`/`cmd:` provides. Package versions
+dependency closures resolved through `so:`/`cmd:` provides. Every multi-package
+figure in §5.5 and §7.1 is a **union** closure (roots resolved together, shared
+dependencies counted once), which is why `chromium`+`xvfb` is 807.1 MB and not
+1068 MB. Package versions
 quoted: `chromium 156.0.8078.79-r0`, `chromium-headless-shell 156.0.8078.79-r0`,
 `chromium-swiftshader 156.0.8078.79-r0`, `chromium-angle 156.0.8078.79-r0`,
 `netsurf 3.11-r1`, `dillo 3.3.0-r2`, `webkit2gtk-4.1 2.48.7-r0`,
@@ -765,7 +904,13 @@ libnsfb: `github.com/netsurf-browser/libnsfb` — `include/libnsfb.h`,
 commit `b2bb5654` (2018-07-29) removed the linux framebuffer and ABLE surfaces.
 
 GTK Broadway: `gitlab.gnome.org/GNOME/gtk`, branch `gtk-3-24` —
-`gdk/broadway/{broadway-protocol.h,broadway-output.c,broadway-buffer.c,broadway-server.c,gdkdisplay-broadway.c}`.
+`gdk/broadway/broadway-protocol.h` (16 opcodes, 15 event types, the input message
+structs), `broadway-output.c` (PUT_BUFFER framing), `broadway-buffer.c` (the
+4-byte-symbol encoder, described in the comment at 145-170), `broadway-server.c`
+(WebSocket, `/broadway.js`, `/socket`), `gdkbroadway-server.c:320-321` (a
+`BROADWAY_REPLY_EVENT` becomes `_gdk_broadway_events_got_input`),
+`gdkeventsource.c:111` (that function, which builds the `GdkEvent`s — this is the
+evidence that input returns).
 
 WebKit: `github.com/WebKit/WebKit` —
 `Source/WebKit/UIProcess/gtk/HardwareAccelerationManager.cpp`,

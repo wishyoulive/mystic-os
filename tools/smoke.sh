@@ -691,9 +691,9 @@ else
     note "no way to build an external app"
 fi
 
-# 3) The same class on the desktop side: wmsrv.c needs -lutil for the
-#    socketpair helpers and the maths needs -lm. The link error only shows
-#    at the very end of a long build, which is how it was missed before.
+# 3) The same class on the desktop side: term.c calls forkpty(), which lives
+#    in -lutil, and gfx.c/font.c/wallpaper.c need -lm. The link error only
+#    shows at the very end of a long build, which is how it was missed before.
 if [ -f "$DESKTOP_SH" ]; then
     dk_missing=""
     for need in '-lm' '-lutil' '-static'; do

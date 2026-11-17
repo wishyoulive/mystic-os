@@ -415,10 +415,12 @@ void gfx_shadow(Surface *s, float x, float y, float w, float h, float radius,
     if (tx < -margin) {
         int k = (-margin - tx + F - 1) / F;      /* whole cells only */
         tx += k * F;
+        tw -= k * F;                             /* keep the right edge put */
     }
     if (ty < -margin) {
         int k = (-margin - ty + F - 1) / F;
         ty += k * F;
+        th -= k * F;
     }
     if (tx + tw > s->w + margin) {
         int keep = s->w + margin - tx;
