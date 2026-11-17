@@ -186,6 +186,9 @@ extern const AppVT app_vt_monitor;
 #ifdef WITH_NOTES
 extern const AppVT app_vt_notes;
 #endif
+#ifdef WITH_STORE
+extern const AppVT app_vt_store;
+#endif
 extern const AppVT app_vt_sysinfo;
 
 /* ------------------------------------------------------------

@@ -109,6 +109,14 @@ static void icon_gear(Surface *s, float x, float y, float sz, u32 fg) {
     gfx_rrect_aa(s, cx - sz * 0.19f, cy - sz * 0.19f, sz * 0.38f, sz * 0.38f, sz * 0.19f, 0, fg, sz * 0.08f);
 }
 
+static void icon_grid(Surface *s, float x, float y, float sz, u32 fg) {
+    float q = sz * 0.30f, gap = sz * 0.12f;
+    float ox = x + (sz - 2 * q - gap) / 2, oy = y + (sz - 2 * q - gap) / 2;
+    for (int r = 0; r < 2; r++)
+        for (int c = 0; c < 2; c++)
+            gfx_rrect(s, ox + c * (q + gap), oy + r * (q + gap), q, q, q * 0.22f, fg);
+}
+
 static void icon_bars(Surface *s, float x, float y, float sz, u32 fg) {
     for (int i = 0; i < 3; i++) {
         float hh = sz * (0.22f + i * 0.16f);
@@ -213,6 +221,33 @@ static void dock_rect(int *dx, int *dy, int *dw, int *dh) {
 static void draw_launcher(Surface *s, const Theme *th);
 static void draw_lock_screen(Surface *s, const Theme *th);
 
+/* ------------------------------------------------------------ start button
+ * Our own mark: an "M" drawn as four strokes, not a font glyph, so it is
+ * crisp at any size and belongs to us.
+ */
+#define START_X 12
+#define START_Y 6
+#define START_S 22
+
+static void draw_start_button(Surface *s, const Theme *th) {
+    int hover = (input.mouse_x >= START_X && input.mouse_x < START_X + START_S &&
+                 input.mouse_y >= START_Y && input.mouse_y < START_Y + START_S);
+    u32 bg = (hover || launcher_open) ? color_alpha(th->accent, 0.28f)
+                                      : color_alpha(th->text, 0.10f);
+    u32 edge = (hover || launcher_open) ? th->accent : th->panel_border;
+    gfx_rrect_aa(s, (float)START_X, (float)START_Y, (float)START_S, (float)START_S,
+                 7.0f, bg, edge, 1.0f);
+
+    u32 fg = (hover || launcher_open) ? th->accent : th->text;
+    float lx = (float)START_X + 6.0f, rx = (float)START_X + 16.0f;
+    float top = (float)START_Y + 5.5f, bot = (float)START_Y + 16.5f;
+    float mid = (float)START_Y + 11.5f;
+    gfx_line(s, lx, bot, lx, top, 1.7f, fg);
+    gfx_line(s, rx, bot, rx, top, 1.7f, fg);
+    gfx_line(s, lx, top, (lx + rx) * 0.5f, mid, 1.7f, fg);
+    gfx_line(s, rx, top, (lx + rx) * 0.5f, mid, 1.7f, fg);
+}
+
 /* ------------------------------------------------------------ compose */
 static void draw_desktop(Surface *s, const Theme *th) {
     int W = s->w, H = s->h;
@@ -231,7 +266,8 @@ static void draw_desktop(Surface *s, const Theme *th) {
     Font *f13 = font_get(FONT_MEDIUM, 13);
     Font *f11 = font_get(FONT_REGULAR, 11);
 
-    font_draw(s, f13, 16, 9, "Mystic OS", th->text);
+    draw_start_button(s, th);
+    font_draw(s, f13, 46, 9, "Mystic", th->text);
 
     Window *top = win_top();
     if (top) {
@@ -361,6 +397,7 @@ static const LauncherItem LAUNCHER[] = {
     { "settings", "Settings", icon_gear },
     { "monitor",  "Monitor",  icon_bars },
     { "notes",    "Notes",    icon_pencil },
+    { "store",    "Apps",     icon_grid },
     { "sysinfo",  "System",   icon_gear },
 };
 #define LAUNCHER_N ((int)(sizeof(LAUNCHER) / sizeof(LAUNCHER[0])))
@@ -539,6 +576,13 @@ static void key_bytes(char *out, int *n) {
 
 static int handle_click(void) {
     int mx = input.mouse_x, my = input.mouse_y;
+
+    /* the start button is above everything else in the top bar */
+    if (mx >= START_X && mx < START_X + START_S &&
+        my >= START_Y && my < START_Y + START_S) {
+        launcher_open = !launcher_open;
+        return 1;
+    }
 
     if (launcher_open) {
         for (int i = 0; i < launcher_items(); i++) {
@@ -880,8 +924,7 @@ int main(void) {
             last_tick = now;
             dirty = 1;
             /* another app can ask for a theme by writing this file */
-            FILE *tf = fopen("/etc/mystic/current-theme", "r");
-            if (tf) {
+            FILE *tf = fopen("/etc/mystic/current-theme", "r");            if (tf) {
                 char want[64] = {0};
                 if (fgets(want, sizeof(want), tf)) {
                     char *nl = strchr(want, '\n');
@@ -890,6 +933,26 @@ int main(void) {
                         if (!strcmp(want, themes[i].name)) theme_index = i;
                 }
                 fclose(tf);
+            }
+
+            /* the Apps window cannot fork by itself; it writes the bundle id
+             * here and the desktop does the launch (same trick as the theme). */
+            FILE *lr = fopen("/run/mystic/launch.request", "r");
+            if (lr) {
+                char want[64] = {0};
+                if (fgets(want, sizeof(want), lr)) {
+                    char *nl = strchr(want, 10);
+                    if (nl) *nl = 0;
+                    for (int b = 0; b < bundle_count; b++) {
+                        if (!strcmp(want, bundles[b].id)) {
+                            int pid = wms_launch(&bundles[b], clients, b);
+                            fprintf(stderr, "wms: launcher request -> %s pid %d\n", bundles[b].id, pid);
+                            break;
+                        }
+                    }
+                }
+                fclose(lr);
+                remove("/run/mystic/launch.request");
             }
         }
         if (input.mouse_dx || input.mouse_dy) dirty = 1;

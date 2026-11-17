@@ -24,6 +24,9 @@ static const AppVT *REGISTRY[] = {
 #ifdef WITH_NOTES
     &app_vt_notes,
 #endif
+#ifdef WITH_STORE
+    &app_vt_store,
+#endif
     &app_vt_sysinfo,
 };
 
