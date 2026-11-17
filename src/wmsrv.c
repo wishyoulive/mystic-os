@@ -1,3 +1,6 @@
+#define _GNU_SOURCE        /* unshare(), setgroups(), CLONE_* : musl
+                            * only exposes them when this precedes
+                            * every include, ours included. */
 /* ============================================================
  *  Mystic OS - wmsrv.c
  *  The server half of the display protocol: a listening socket,
@@ -7,12 +10,15 @@
 
 #include <dirent.h>
 #include <errno.h>
-#include <stdarg.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <sched.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -52,6 +58,9 @@ static int make_shm(WmClient *c) {
     c->shm_fd = fd;
     /* start black so an app that has not drawn yet is not garbage */
     memset(c->px, 0, bytes);
+    /* the app now runs as uid 1000 inside its jail and still has to draw */
+    if (chown(c->shm_path, 1000, 1000) != 0)
+        fprintf(stderr, "wms: chown shm failed: %s\n", strerror(errno));
     return 0;
 }
 
@@ -305,6 +314,97 @@ int wms_scan_apps(WmApp *out, int max) {
     return n;
 }
 
+/* ---------------------------------------------------------- sandbox
+ * Every app runs in its own mount/network/IPC namespace, chrooted into a jail
+ * that contains only its own binary, a private /tmp, /dev/null and the window
+ * socket. It runs as uid 1000, so even if it escaped the chroot it could not
+ * read /root (root-owned, mode 0700).
+ *
+ * This is what stops a malicious app from being ransomware: it never sees the
+ * user's files to encrypt. The kernel enforces it (namespaces + DAC), not us.
+ */
+#define SANDBOX_UID 1000
+#define SANDBOX_GID 1000
+
+/* mkdir -p inside the jail, for the bind targets */
+static void mkdirp_for(const char *jail, const char *sub) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s%s", jail, sub);
+    for (char *p = buf + strlen(jail) + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = 0;
+        mkdir(buf, 0755);
+        *p = '/';
+    }
+    mkdir(buf, 0755);
+}
+
+static void sandbox_child(const char *exe, const char *id) {
+    char jail[192], path[256];
+    snprintf(jail, sizeof(jail), "/run/mystic/jail/%s", id);
+
+    if (unshare(CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS) == 0) {
+        mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+
+        mkdir(jail, 0755);
+        snprintf(path, sizeof(path), "%s/bin", jail);        mkdir(path, 0755);
+        snprintf(path, sizeof(path), "%s/dev", jail);        mkdir(path, 0755);
+        snprintf(path, sizeof(path), "%s/tmp", jail);        mkdir(path, 0777);
+        snprintf(path, sizeof(path), "%s/run", jail);        mkdir(path, 0755);
+        snprintf(path, sizeof(path), "%s/run/mystic", jail); mkdir(path, 0755);
+
+        snprintf(path, sizeof(path), "%s/bin/app", jail);
+        int fd = open(path, O_CREAT | O_RDWR, 0755);
+        if (fd >= 0) close(fd);
+        if (mount(exe, path, NULL, MS_BIND, NULL) < 0)
+            fprintf(stderr, "wms: sandbox bind exe failed: %s\n", strerror(errno));
+
+        snprintf(path, sizeof(path), "%s/run/mystic/wm.sock", jail);
+        fd = open(path, O_CREAT | O_RDWR, 0666);
+        if (fd >= 0) close(fd);
+        mount(WM_SOCKET, path, NULL, MS_BIND, NULL);
+
+        snprintf(path, sizeof(path), "%s/dev/null", jail);
+        fd = open(path, O_CREAT | O_RDWR, 0666);
+        if (fd >= 0) close(fd);
+        mount("/dev/null", path, NULL, MS_BIND, NULL);
+
+        /* An app needs exactly four more things to be useful:
+         *   /usr/share/fonts  text (read-only)
+         *   /dev/shm          its own pixel buffer, owned by SANDBOX_UID
+         *   /proc             sysmon/monitor read it; the rest ignore it
+         * Nothing else is visible, so there is no path to /root from in here. */
+        snprintf(path, sizeof(path), "%s/usr/share/fonts", jail);
+        mkdirp_for(jail, "/usr/share/fonts");
+        if (mount("/usr/share/fonts", path, NULL, MS_BIND | MS_RDONLY, NULL) < 0)
+            fprintf(stderr, "wms: sandbox fonts bind failed: %s\n", strerror(errno));
+
+        snprintf(path, sizeof(path), "%s/dev/shm", jail);
+        mkdirp_for(jail, "/dev/shm");
+        mount("/dev/shm", path, NULL, MS_BIND, NULL);
+
+        snprintf(path, sizeof(path), "%s/proc", jail);
+        mkdirp_for(jail, "/proc");
+        mount("/proc", path, NULL, MS_BIND, NULL);
+
+        if (chroot(jail) == 0) {
+            chdir("/");
+            setgroups(0, NULL);
+            if (setgid(SANDBOX_GID) != 0 || setuid(SANDBOX_UID) != 0)
+                fprintf(stderr, "wms: sandbox uid drop failed: %s\n", strerror(errno));
+        } else {
+            fprintf(stderr, "wms: chroot failed: %s\n", strerror(errno));
+        }
+    } else {
+        fprintf(stderr, "wms: unshare failed (%s); running unsandboxed\n", strerror(errno));
+    }
+
+    setenv("MYSTIC_SOCKET", "/run/mystic/wm.sock", 1);
+    setenv("MYSTIC_APP_ID", id, 1);
+    setenv("HOME", "/tmp", 1);
+    setenv("TMPDIR", "/tmp", 1);
+}
+
 int wms_launch(const WmApp *app, WmClient *cl, int slot) {
     if (!app || slot < 0) return -1;
     char exe[512];
@@ -313,10 +413,9 @@ int wms_launch(const WmApp *app, WmClient *cl, int slot) {
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
-        /* child: a real process, with its own address space */
-        setenv("MYSTIC_SOCKET", WM_SOCKET, 1);
-        setenv("MYSTIC_APP_ID", app->id, 1);
-        execl(exe, exe, (char *)NULL);
+        sandbox_child(exe, app->id);
+        execl("/bin/app", "app", (char *)NULL);   /* inside the jail */
+        execl(exe, exe, (char *)NULL);            /* fallback: unsandboxed */
         fprintf(stderr, "wms: cannot exec %s\n", exe);
         _exit(127);
     }

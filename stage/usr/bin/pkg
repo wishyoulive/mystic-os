@@ -1,0 +1,126 @@
+#!/bin/sh
+# ============================================================
+#  pkg - the Mystic OS package manager
+#
+#  Nothing large ships in the image. This fetches packages over
+#  plain HTTP from a repository index and unpacks them onto the
+#  ext4 disk, where the launcher finds them.
+#
+#      pkg list                  what the repo offers
+#      pkg installed             what is on the disk
+#      pkg install <name>        download, verify, unpack
+#      pkg remove <name>         delete it
+#      pkg update                refresh the cached index
+#
+#  Repository = a URL whose directory holds index.tsv and one
+#  .tar.gz per package:
+#      name<TAB>version<TAB>size<TAB>sha256<TAB>file<TAB>description
+#
+#  The default repository is the host machine as seen by QEMU's
+#  user-mode networking (10.0.2.2), which is where
+#  tools/serve-repo.sh serves it from.
+# ============================================================
+
+REPO="${MYSTIC_REPO:-http://10.0.2.2:8000}"
+APPS=/root/apps
+CACHE=/tmp/pkg
+INDEX=/tmp/pkg/index.tsv
+
+say()  { echo "$*"; }
+fail() { echo "pkg: $*" >&2; exit 1; }
+
+need_tools() {
+    for t in wget tar sha256sum; do
+        command -v "$t" >/dev/null 2>&1 || fail "missing tool: $t"
+    done
+}
+
+fetch_index() {
+    mkdir -p "$CACHE" "$APPS" 2>/dev/null
+    say "fetching index from $REPO"
+    wget -q -T 10 -O "$INDEX.tmp" "$REPO/index.tsv" || fail "cannot reach $REPO (is tools/serve-repo.sh running?)"
+    mv "$INDEX.tmp" "$INDEX"
+    say "$(wc -l < "$INDEX") packages"
+}
+
+# index row for a package name (first match)
+row_for() {
+    [ -f "$INDEX" ] || fetch_index
+    awk -F'\t' -v n="$1" '$1==n {print; exit}' "$INDEX"
+}
+
+cmd_list() {
+    [ -f "$INDEX" ] || fetch_index
+    printf '%-22s %-10s %-9s %s\n' NAME VERSION SIZE DESCRIPTION
+    awk -F'\t' '{
+        sz=$3+0;
+        if (sz > 1048576) s=sprintf("%.0f MB", sz/1048576);
+        else s=sprintf("%.0f KB", sz/1024);
+        printf "%-22s %-10s %-9s %s\n", $1, $2, s, $6
+    }' "$INDEX"
+}
+
+cmd_installed() {
+    say "installed in $APPS:"
+    n=0
+    for d in "$APPS"/*; do
+        [ -d "$d" ] || continue
+        name=$(basename "$d")
+        if [ -f "$d/manifest" ]; then
+            desc=$(awk -F'=' '/^name/{gsub(/^ +| +$/,"",$2); print $2; exit}' "$d/manifest")
+            say "  $name  $desc"
+        else
+            say "  $name"
+        fi
+        n=$((n + 1))
+    done
+    [ "$n" -eq 0 ] && say "  (nothing installed yet)"
+    return 0
+}
+
+cmd_install() {
+    name="$1"
+    [ -n "$name" ] || fail "usage: pkg install <name>"
+    need_tools
+    row=$(row_for "$name")
+    [ -n "$row" ] || fail "no such package: $name"
+    file=$(echo "$row" | cut -f5)
+    want=$(echo "$row" | cut -f4)
+    size=$(echo "$row" | cut -f3)
+    say "installing $name ($file, $((size / 1048576)) MB)"
+
+    mkdir -p "$CACHE"
+    tar_path="$CACHE/$file"
+    if [ ! -f "$tar_path" ]; then
+        wget -q -T 300 -O "$tar_path.part" "$REPO/$file" || fail "download failed"
+        mv "$tar_path.part" "$tar_path"
+    fi
+
+    got=$(sha256sum "$tar_path" | cut -d' ' -f1)
+    [ "$got" = "$want" ] || { rm -f "$tar_path"; fail "checksum mismatch (expected $want, got $got)"; }
+    say "checksum ok"
+
+    mkdir -p "$APPS/$name"
+    tar -xzf "$tar_path" -C "$APPS/$name" || fail "unpack failed"
+    [ -f "$APPS/$name/manifest" ] || printf 'name = %s\ndesc = installed by pkg\nexec = bin\n' "$name" > "$APPS/$name/manifest"
+    [ -f "$APPS/$name/bin" ] && chmod +x "$APPS/$name/bin"
+    say "installed $name to $APPS/$name"
+    say "open the launcher (eye or Super) - it rescans the disk"
+}
+
+cmd_remove() {
+    name="$1"
+    [ -n "$name" ] || fail "usage: pkg remove <name>"
+    [ -d "$APPS/$name" ] || fail "not installed: $name"
+    rm -rf "$APPS/$name"
+    say "removed $name"
+}
+
+case "${1:-list}" in
+    list)      cmd_list ;;
+    installed) cmd_installed ;;
+    install)   cmd_install "$2" ;;
+    remove)    cmd_remove "$2" ;;
+    update)    fetch_index ;;
+    *)         echo "usage: pkg [list|installed|install <name>|remove <name>|update]" >&2; exit 1 ;;
+esac
