@@ -14,6 +14,10 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+/* ui.c provides this; the SDK keeps no dependency on mystic.h, which drags
+ * in the whole desktop header set */
+void ui_scale_set_effective(float v);
+
 static int write_all(int fd, const char *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -60,6 +64,13 @@ static int mc_open_fail(MClient *c) {
 }
 
 int mc_open(MClient *c, const char *id, const char *title, int w, int h) {
+    /* The desktop's text scale, exported by the window server: an app cannot
+     * read ui.conf from inside its jail, and without this its fonts ignored
+     * the setting entirely. */
+    {
+        const char *s = getenv("MYSTIC_UI_SCALE");
+        if (s && *s) ui_scale_set_effective((float)atof(s));
+    }
     memset(c, 0, sizeof(*c));
     c->fd = -1;
     c->w = w;
@@ -183,6 +194,11 @@ int mc_poll(MClient *c, MEvent *ev) {
                 ev->text[k++] = (*q == 1) ? 10 : *q;
             ev->text[k] = 0;
         }
+        return 1;
+    }
+    if (!strncmp(line, "WHEEL ", 6)) {
+        ev->type = MC_WHEEL;
+        ev->wheel = atoi(line + 6);
         return 1;
     }
     if (!strncmp(line, "MOUSE ", 6)) {

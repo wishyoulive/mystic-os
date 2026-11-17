@@ -13,12 +13,13 @@
 #define MC_MOUSE  3
 #define MC_RESIZE 4
 #define MC_CLOSE  5
+#define MC_WHEEL  6   /* x = notches, positive is up */
 
 typedef struct {
     int  type;
     int  key, mods, press;
     char text[32];
-    int  x, y, buttons;
+    int  x, y, buttons, wheel;
     int  w, h;
 } MEvent;
 

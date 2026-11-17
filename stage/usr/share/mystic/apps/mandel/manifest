@@ -1,3 +1,0 @@
-name = Mandelbrot
-desc = Interactive fractal explorer, its own process
-exec = bin

@@ -51,8 +51,22 @@ int disp_open(Display *d, const char *path) {
 }
 
 void disp_present(Display *d, Surface *s) {
-    int w = s->w < d->w ? s->w : d->w;
-    int h = s->h < d->h ? s->h : d->h;
-    for (int y = 0; y < h; y++)
-        memcpy(d->mem + (size_t)y * d->stride, s->px + (size_t)y * s->stride, (size_t)w * 4);
+    disp_present_rect(d, s, 0, 0, s->w, s->h);
+}
+
+/* Push only one rectangle to the screen. Moving the pointer used to copy all
+ * 1280x800 pixels because there was no way to say "just this box"; the cursor
+ * needs about 26x28 of them. Costs are proportional to what changed. */
+void disp_present_rect(Display *d, Surface *s, int x, int y, int w, int h) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > d->w) w = d->w - x;
+    if (y + h > d->h) h = d->h - y;
+    if (x + w > s->w) w = s->w - x;
+    if (y + h > s->h) h = s->h - y;
+    if (w <= 0 || h <= 0) return;
+    for (int row = y; row < y + h; row++)
+        memcpy(d->mem + (size_t)row * d->stride + x,
+               s->px + (size_t)row * s->stride + x,
+               (size_t)w * 4);
 }

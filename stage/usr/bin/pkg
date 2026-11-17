@@ -101,8 +101,18 @@ cmd_install() {
     [ -n "$row" ] || fail "no such package: $name"
     file=$(echo "$row" | cut -f5)
     want=$(echo "$row" | cut -f4)
-    size=$(echo "$row" | cut -f3)
-    say "installing $name ($file, $((size / 1048576)) MB)"
+    # The size field is untrusted input from an HTTP index: a row without a
+    # third field used to abort the whole install with "arithmetic syntax
+    # error" before anything was downloaded. Coerce it; a wrong MB figure is
+    # cosmetic, a dead install is not.
+    size=$(echo "$row" | cut -f3 | tr -cd '0-9')
+    [ -n "$size" ] || size=0
+    if [ "$size" -ge 1048576 ]; then
+        mb=$((size / 1048576))
+    else
+        mb=$((size / 1024))k
+    fi
+    say "installing $name ($file, ${mb} MB)"
 
     mkdir -p "$CACHE"
     tar_path="$CACHE/$file"

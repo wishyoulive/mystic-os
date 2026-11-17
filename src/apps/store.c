@@ -91,7 +91,10 @@
  * running (pkg's own wget timeout is 300 s; a local repo answers in
  * seconds, so a minute and a half of silence means it did not happen) */
 #ifndef STORE_INSTALL_TIMEOUT_SEC
-#define STORE_INSTALL_TIMEOUT_SEC 90.0
+/* pkg allows 300 s per network read (stage/usr/bin/pkg) and the
+ * browser package is 573 MB, so a shorter deadline would declare a
+ * healthy download dead and offer the row again mid-transfer. */
+#define STORE_INSTALL_TIMEOUT_SEC 900.0
 #endif
 
 #define DESC_LINE 256
@@ -112,7 +115,7 @@ typedef struct {
 } StoreApp;
 
 typedef struct {
-    char name[32];
+    char name[33];   /* pkg names may be 32 chars + NUL */
     char version[24];
     char desc[DESC_LINE];
     long size;          /* bytes, the index's size column */
@@ -532,9 +535,12 @@ static void poll_install(Store *s) {
     char path[512];
     struct stat st;
     for (int i = 0; i < 2; i++) {
-        snprintf(path, sizeof(path), "%s/%s", roots[i], s->pending);
-        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
-            char done[32];
+        /* pkg creates the directory BEFORE it untars into it, so a bare
+         * directory means "download in progress", not "installed". Wait for
+         * the manifest, which is what makes the bundle launchable. */
+        snprintf(path, sizeof(path), "%s/%s/manifest", roots[i], s->pending);
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+            char done[sizeof(s->pending)];
             snprintf(done, sizeof(done), "%s", s->pending);
             s->pending[0] = 0;
             s->pending_since = 0.0;
@@ -842,19 +848,9 @@ static void activate(Store *s) {
 
     if (d->kind == D_APP) {
         StoreApp *a = &s->inst[d->idx];
-        if (a->from_root) {
-            /* pkg unpacked it into its own root, and the desktop launcher
-             * reads WM_APP_DIR only (wms_scan_apps() in src/wmsrv.c and the
-             * launch lookup in src/main.c). A launch request for this id
-             * would be dropped without a word, so the row says where the
-             * bundle is instead of promising to start it. When pkg installs
-             * into the shared root - or the launcher learns to scan
-             * /root/apps - this branch and its hint can simply go. */
-            snprintf(s->status, sizeof(s->status),
-                     "%s is in %s - the launcher reads %s",
-                     a->id, STORE_ROOT_APPS, STORE_APP_DIR);
-            return;
-        }
+        /* Both roots are launchable: wms_scan_apps() reads the image root
+         * AND /root/apps, which is where pkg unpacks. (It used to read only
+         * the first, so a package installed here could not be started.) */
         char err[128];
         if (!write_line(STORE_LAUNCH_REQUEST, a->id, err, sizeof(err))) {
             snprintf(s->status, sizeof(s->status), "%s", err);
@@ -869,6 +865,14 @@ static void activate(Store *s) {
         Pkg *k = &s->avail[d->idx];
         if (is_installed(s, k->name)) {
             snprintf(s->status, sizeof(s->status), "already installed: %s", k->name);
+            return;
+        }
+        /* One install at a time. Enter repeats (input.c pushes autorepeat),
+         * so without this, holding the key forks a pkg per repeat and they
+         * all write the same download file. */
+        if (s->pending[0]) {
+            snprintf(s->status, sizeof(s->status),
+                     "already installing %s - wait for it", s->pending);
             return;
         }
         if (!pkg_name_ok(k->name)) {      /* belt and braces: load_index filtered */
