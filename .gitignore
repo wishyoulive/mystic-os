@@ -7,3 +7,6 @@ build/
 *.ppm
 *.png
 .DS_Store
+
+# needs the workflow OAuth scope to push: gh auth refresh -s workflow
+.github/workflows/

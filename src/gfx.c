@@ -330,7 +330,11 @@ void gfx_shadow(Surface *s, float x, float y, float w, float h, float radius,
     tmp.w = rw; tmp.h = rh; tmp.stride = rw;
     tmp.px = calloc((size_t)rw * rh, 4);
     if (!tmp.px) return;
-    gfx_rrect_aa(&tmp, pad, pad, w, h, radius, 0xFF000000u, 0, 0);
+    /* white, not black: the blur of a white shape is the shadow mask we
+     * read back from the red channel. Painting black made every
+     * alpha 0, so this function drew nothing while still costing
+     * a calloc and a 3-pass blur per window per frame. */
+    gfx_rrect_aa(&tmp, pad, pad, w, h, radius, 0xFFFFFFFFu, 0, 0);
     gfx_blur_region(&tmp, 0, 0, rw, rh, (int)spread);
     for (int yy = 0; yy < rh; yy++) {
         int dy = ry + yy;

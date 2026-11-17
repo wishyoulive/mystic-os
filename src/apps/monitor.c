@@ -57,6 +57,7 @@ typedef struct {
     Sample snap[MAX_PROC];         /* previous sample, read for deltas */
     Sample next[MAX_PROC];         /* the sample being taken now */
     int    count;
+    int    seen;                   /* pids in /proc, including ones not stored */
     int    snap_count;
     double snap_t;                 /* CLOCK_MONOTONIC time of the sample */
     int    sort;
@@ -240,6 +241,7 @@ static void scan(Monitor *m) {
     double dt = t - m->snap_t;
 
     m->count = 0;
+    m->seen = 0;
     int nn = 0;
 
     DIR *d = opendir("/proc");
@@ -249,10 +251,12 @@ static void scan(Monitor *m) {
     if (page <= 0) page = 4;
 
     struct dirent *e;
-    while ((e = readdir(d)) != NULL && m->count < MAX_PROC) {
+    while ((e = readdir(d)) != NULL) {
         if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
         int pid = atoi(e->d_name);
         if (pid <= 0) continue;
+        m->seen++;                     /* every pid, stored or not */
+        if (m->count >= MAX_PROC) continue;   /* list full: keep counting */
 
         char name[64] = "?";
         unsigned long long ticks = 0;
@@ -352,6 +356,19 @@ static void monitor_draw(App *a, Surface *s, int x, int y, int w, int h, const T
     if (!m) return;
     m->w = w;
     m->h = h;
+
+    /* Keep every pixel inside the rect: the WM hands over the whole scene
+     * surface (main.c:434). The rows already derive from h, so this only
+     * bites when the rect is shorter than BODY_Y + FOOT_H, where rows is
+     * clamped to 1 and that row would otherwise land past the bottom edge. */
+    Surface clip = *s;
+    int clip_r = x + w, clip_b = y + h;
+    if (clip_r < 0) clip_r = 0;
+    if (clip_b < 0) clip_b = 0;
+    if (clip_r < clip.w) clip.w = clip_r;
+    if (clip_b < clip.h) clip.h = clip_b;
+    s = &clip;
+
     scan(m);
     sort_procs(m);
 
@@ -390,7 +407,13 @@ static void monitor_draw(App *a, Surface *s, int x, int y, int w, int h, const T
     snprintf(head, sizeof(head), "sort: %s", sort_name(m->sort));
     font_draw(s, fh, (float)x + 6, (float)y + 4, head, th->text);
 
-    snprintf(right, sizeof(right), "%d proc   %d thr", m->count, threads);
+    /* The list holds at most MAX_PROC; say so instead of silently showing
+     * a smaller "N proc" than /proc really has. */
+    if (m->seen > m->count)
+        snprintf(right, sizeof(right), "%d/%d proc   %d thr",
+                 m->count, m->seen, threads);
+    else
+        snprintf(right, sizeof(right), "%d proc   %d thr", m->count, threads);
     float rw = font_width(fd, right);
     if (font_width(fh, head) + rw + 28.0f < (float)w)
         font_draw(s, fd, (float)(x + w) - rw - 6, (float)y + 7, right,

@@ -36,9 +36,10 @@
 #define WIN_W 420
 #define WIN_H 320
 
-/* Cell pitch in window pixels. The grid size is computed from the
- * window; these two maxima are the largest grid the window could
- * ever ask for, and the bitsets below are sized for them. */
+/* Preferred cell pitch in window pixels. The real pitch is derived
+ * from the size the server gave us (see layout_for); these two maxima
+ * are the largest grid the window could ever ask for, and the bitsets
+ * below are sized for them. */
 #define CELL 6
 #define MAX_COLS 128
 #define MAX_ROWS 96
@@ -90,6 +91,7 @@ typedef struct {
 
 typedef struct {
     int gx, gy, gw, gh;  /* the grid's pixel rect inside the window */
+    int pitch;           /* pixels per cell, chosen from the window size */
     int title_y, foot_y, hint_y;
 } Layout;
 
@@ -230,25 +232,36 @@ static void layout_for(int vw, int vh, Layout *L, int *cols, int *rows) {
     int avail_h = bot - top;
     if (avail_w > vw) avail_w = vw;
     if (avail_h > vh) avail_h = vh;
-    if (avail_w < CELL) avail_w = CELL;
-    if (avail_h < CELL) avail_h = CELL;
+    if (avail_w < 3) avail_w = 3;
+    if (avail_h < 3) avail_h = 3;
 
-    int c = avail_w / CELL;
-    int r = avail_h / CELL;
+    /* The cell size comes from the window, not from a constant: start
+     * at 6px, shrink towards 3 when the window is too narrow for a
+     * usable board, and grow when the window is big enough that the
+     * 128x96 limit would otherwise leave the grid stranded in the
+     * middle of a wide screen. */
+    int pitch = CELL;
+    while (pitch > 3 && avail_w / pitch < 24) pitch--;
+    while (pitch < 16 && (avail_w / pitch > MAX_COLS || avail_h / pitch > MAX_ROWS))
+        pitch++;
+
+    int c = avail_w / pitch;
+    int r = avail_h / pitch;
 
     /* The band between the header and the footer can be taller than a
      * very short window; the grid must still land inside the pixels we
      * were actually given, so cap it by the window itself. */
-    if (c * CELL > vw && vw >= CELL) c = vw / CELL;
-    if (r * CELL > vh && vh >= CELL) r = vh / CELL;
+    if (c * pitch > vw && vw >= pitch) c = vw / pitch;
+    if (r * pitch > vh && vh >= pitch) r = vh / pitch;
 
     if (c > MAX_COLS) c = MAX_COLS;
     if (r > MAX_ROWS) r = MAX_ROWS;
     if (c < 1) c = 1;
     if (r < 1) r = 1;
 
-    L->gw = c * CELL;
-    L->gh = r * CELL;
+    L->pitch = pitch;
+    L->gw = c * pitch;
+    L->gh = r * pitch;
     L->gx = (vw - L->gw) / 2;
     L->gy = top + (avail_h - L->gh) / 2;
     if (L->gx + L->gw > vw) L->gx = vw - L->gw;
@@ -277,14 +290,15 @@ static void draw(MClient *c, int vw, int vh, const Layout *L,
                      0, COL_GRID_EDGE, 1.0f);
 
         /* one filled rounded rect per live cell */
+        int p = L->pitch;
         for (int y = 0; y < grows; y++) {
-            float cy = (float)(L->gy + y * CELL) + 0.75f;
+            float cy = (float)(L->gy + y * p) + 0.6f;
             if (cy > (float)L->gy + (float)L->gh) break;
             for (int x = 0; x < gcols; x++) {
                 if (!bit_get(cells, gcols, x, y)) continue;
-                float cx = (float)(L->gx + x * CELL) + 0.75f;
+                float cx = (float)(L->gx + x * p) + 0.6f;
                 gfx_rrect_aa(&s, cx, cy,
-                             (float)CELL - 1.5f, (float)CELL - 1.5f, 1.7f,
+                             (float)p - 1.2f, (float)p - 1.2f, (float)p * 0.28f,
                              COL_CELL, 0, 0);
             }
         }
@@ -431,8 +445,8 @@ int main(void) {
             case MC_MOUSE: {
                 int down = ev.buttons & 1;
                 if (down && !was_down) {
-                    int gx = (ev.x - L.gx) / CELL;
-                    int gy = (ev.y - L.gy) / CELL;
+                    int gx = (ev.x - L.gx) / L.pitch;
+                    int gy = (ev.y - L.gy) / L.pitch;
                     if (ev.x >= L.gx && ev.y >= L.gy &&
                         gx >= 0 && gx < gcols && gy >= 0 && gy < grows) {
                         int alive = bit_get(cells, gcols, gx, gy);

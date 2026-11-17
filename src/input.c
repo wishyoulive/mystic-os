@@ -154,6 +154,11 @@ static void handle_event(Input *in, struct input_event *ev, int *shift, int *ctr
                     in->key = ev->code;
                     if (in->nkeys < (int)(sizeof(in->keys) / sizeof(in->keys[0])))
                         in->keys[in->nkeys++] = ev->code;
+                } else if (ev->value == 0) {
+                    /* releases matter: a client that never sees KEY ... 0
+                     * thinks the key is still held */
+                    if (in->nkeys_up < (int)(sizeof(in->keys_up) / sizeof(in->keys_up[0])))
+                        in->keys_up[in->nkeys_up++] = ev->code;
                     in->shift = *shift;
                     in->ctrl = *ctrl;
                     in->key_pressed = 1;
@@ -202,6 +207,7 @@ void input_frame(Input *in) {
     in->key = 0;
     in->key_pressed = 0;
     in->nkeys = 0;
+    in->nkeys_up = 0;
     in->mouse_dx = 0;
     in->mouse_dy = 0;
     in->text_len = 0;
