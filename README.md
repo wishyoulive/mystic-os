@@ -1,110 +1,145 @@
-# MYSTIC OS
+# Mystic OS
 
-A small, fast desktop operating system for old PCs.
-Runs Linux apps natively; Windows through Wine is the next step.
+**A desktop operating system written from the framebuffer up.**
+Own compositor, own window manager, own font rasteriser, own terminal, own
+browser, own package manager, own app sandbox — running on a Linux kernel.
 
-Not a distro remix: the desktop is ours — our compositor, our renderer, our
-window manager, our themes, our browser, our package format, our sandbox.
-Everything below was built and booted on this machine.
+26 MB bootable image · boots in under a second · ~70 MB of RAM idle ·
+runs on a framebuffer, no GPU, no X11, no Wayland.
 
-![Obsidian](docs/screenshots/obsidian.png)
+[![Release](https://img.shields.io/github/v/release/wishyoulive/mystic-os?label=release&color=6f7bff)](https://github.com/wishyoulive/mystic-os/releases)
+[![Lines](https://img.shields.io/badge/own%20code-120k%20lines-8a6cff)](#size-and-scope)
+[![Boot](https://img.shields.io/badge/boot-0.9%20s-4fd1c5)](#what-it-does)
+[![Image](https://img.shields.io/badge/image-26%20MB-e879c8)](#what-it-does)
 
-## What works today
+![Mystic OS with the black hole wallpaper](docs/screenshots/black-hole.png)
 
-A real desktop, drawn pixel by pixel by our own compositor on a bare
-framebuffer. No X11, no Wayland, no GPU driver.
+---
+
+## What it does
 
 | | |
 |---|---|
-| Boot | 0.9 s to the desktop (hardware accelerated in a VM) |
-| Disk | virtio disk, ext4, formatted on first boot; `/root` and installed apps persist |
-| Memory | ~175 MB used of 1 GB, including kernel + rootfs |
-| Image | 12.8 MB rootfs + 13 MB kernel (everything else installs at runtime) |
-| Graphics | bochs/simpledrm framebuffer, 1280×800, 32bpp |
-| Text | real TrueType rasterising (Lato + JetBrains Mono), antialiased, one global scale |
-| Themes | six, switched live; four wallpapers, two animated |
-| Input | evdev keyboard + mouse, wheel, drag / resize / snap, Alt+Tab, Super launcher |
-| Apps | Terminal (real pty), Files, Settings, Monitor, Notes, Apps store, Calculator |
-| App bundles | Clock, Files, Paint, Life, Mandelbrot, Sysmon, 2048, Browser |
-| Browser | our own HTTP client and HTML renderer: real pages over plain HTTP |
-| Packages | `pkg` + the Apps store: install from a repository at runtime, sha256-checked |
+| **Desktop** | Our compositor paints every pixel: rounded windows with real shadows, six themes with per-theme icon styles and animation kinds, four wallpapers plus a **procedural, animated, draggable black hole** |
+| **Window manager** | Drag, resize, snap to edges, maximise, minimise, Alt+Tab, 60+ keyboard shortcuts with an on-screen reference (`Super+/`) |
+| **Launcher** | Grid of every app, or **type to search** — filters on name then bundle id, `Enter` runs the best match, `:` switches theme |
+| **Apps** | Terminal with a real pty and scrollback, Files, Settings, Monitor, Notes, Calculator (scientific, portrait), Store, System, Clock, Paint, 2048, Life, Mandelbrot (unbounded zoom), Sysmon, Viewer, Documents, Browser |
+| **Browser** | Our own HTTP/1.1 + **TLS 1.2** client and our own HTML/CSS renderer: text, headings, links, images (PNG + JPEG), the CSS box model (margins, padding, borders, backgrounds, centred `max-width` columns, `text-align`, `line-height`), text selection and copy |
+| **Packages** | `pkg` + the Apps Store: index with sizes and SHA-256, **resumable** transfers, size and hash verification before unpacking, install to `/root/apps`, launch without a reboot |
+| **Sandbox** | Every bundle runs as its own process in its own mount/network/IPC/UTS namespace, chrooted, uid-dropped, with all inherited descriptors closed and only the files it needs bound in |
+| **Files** | 75-format registry driving per-type icons, create a file of any format, open-with by type, right-click menus, a **file picker** for open/save |
+| **Sound** | Direct ALSA `hw_params`/`writei`/`drain` from userspace, no sound library: the Clock's alarm and timer ring, `beep` plays tones and WAVs |
 
-Press `Super` (or Esc) for the launcher. `1`–`6` switch theme.
-Ctrl+Alt+L locks.
+## Screenshots
 
-### The browser
+| Launcher search | Files | Paint |
+|---|---|---|
+| ![search](docs/screenshots/launcher-search.png) | ![files](docs/screenshots/files.png) | ![paint](docs/screenshots/paint.png) |
 
-`src/client/apps/web.c` is a browser written here: its own HTTP client
-(DNS, TCP, Content-Length and chunked bodies, redirects), its own HTML
-tokeniser and text renderer (headings, lists, numbered links, entities,
-metric wrapping) and its own scrollback UI. It renders
-`http://example.com/` as `HTTP 200 · 577 bytes · 65 ms`.
+| Clock | Settings | Terminal |
+|---|---|---|
+| ![clock](docs/screenshots/clock.png) | ![settings](docs/screenshots/settings-live.png) | ![terminal](docs/screenshots/terminal.png) |
 
-It is honest about its limits: plain HTTP only, no JavaScript, no CSS, no
-images. A real engine is an installable package, not part of the image —
-see `docs/BROWSER_PLAN.md`.
-
-### Security model
-
-Apps are separate processes, launched into a jail: `unshare` of mount, IPC,
-UTS and network namespaces, a chroot, and `setuid(1000)`. The jail contains
-only the app's own binary, the window socket, `/dev/null`, `/dev/urandom`,
-the fonts (read-only) and a private `/dev/shm`. All inherited descriptors are
-closed, so a jailed app cannot see the framebuffer or the keyboard. An app
-that needs the network must say `network = host` in its manifest — the
-Browser does, the games do not.
-
-Privileged actions are request files the desktop polls, so a sandboxed app
-never needs to fork: `/run/mystic/{launch,install}.request`, `repo.refresh`,
-`current-theme`.
-
-## Build and run
+## Run it
 
 ```bash
-./image.sh            # build and boot the desktop in a window
-./image.sh probe      # boot headless, print machine facts, power off
-./image.sh shot 10    # boot headless, screenshot after 10 s
-./image.sh themes     # boot once, screenshot the themes
-./tools/serve-repo.sh # serve the package repository to the VM
+# the release contains a bootable ISO and a QEMU bundle
+unzip mystic-os-v1.zip
+./run.sh                 # or: qemu-system-x86_64 -cdrom mystic-os.iso -m 1024
 ```
 
-Nothing needs to be installed except QEMU and zig — the builder fetches the
-kernel and the base rootfs itself.
+From source:
 
-## Layout
-
-```
-src/              the desktop: C, no dependencies
-  main.c          the desktop itself: layout, dock, windows, event loop
-  wmsrv.c         window server + app sandbox
-  gfx.c           CPU drawing: gradients, rounded rects, real blur, polygons
-  font.c          TrueType rasterising via stb_truetype, LRU glyph cache
-  fb.c            /dev/fb0, full-frame and rectangle present
-  input.c         /dev/input/event* (evdev)
-  term.c          our terminal: pty, grid, scrollback, TIOCSWINSZ
-  apps/           in-desktop apps (files, settings, monitor, notes, store, calc)
-  client/         the SDK, the protocol, and the out-of-process apps
-stage/            our userspace - the only files that are "us"
-  init            PID 1
-  usr/bin/pkg     the package manager
-  etc/mystic/     themes, ui.conf, repo.conf
-tools/            fetch-kernel, build-desktop, mkapp, mkimage, serve-repo, release
-docs/             CONTEXT-DUMP.md is the state of the world; read that first
+```bash
+./image.sh               # build the image and boot it in QEMU
+./image.sh probe         # boot headless and print what the machine reports
+./image.sh --hw          # hardware kernel variant (webcam, USB audio, Wi-Fi)
+./tools/serve-repo.sh    # serve packages to the VM
 ```
 
-## Design targets
+Needs QEMU and `zig` — the builder fetches the kernel and base rootfs itself.
+No compiler toolchain beyond that, no cross-distro setup, works from Windows.
 
-| | Target | Now |
-|---|---|---|
-| Idle RAM | under 128 MB | ~62 MB idle, ~175 MB with the desktop and a browser |
-| Boot to desktop | under 2 s | 0.9 s in a VM |
-| Apps | Linux native, Windows via Wine | Linux native yes, Wine in progress |
-| Security | sandbox, signed packages, disk encryption | sandbox yes; signed packages yes (`pkg` verifies an Ed25519 index signature, see `docs/SIGNING.md`); disk encryption next |
+## How it is built
+
+```
+src/                    the desktop (C, no dependencies beyond musl)
+  main.c                compositor, window manager, launcher, chrome
+  wmsrv.c               window server + app sandbox
+  gfx.c font.c fb.c     rasteriser, TrueType, framebuffer
+  input.c               evdev, including multitouch trackpad gestures
+  term.c                our terminal: pty, grid, scrollback, selection
+  ui.c theme.c          one global text scale, theme parser
+  audio.c               ALSA PCM from userspace
+  img.c css.c filetypes.c clipboard.c notify.c   libraries
+  apps/                 in-desktop apps
+  client/               the SDK, the IPC protocol, out-of-process apps
+stage/                  our userspace: init, pkg, themes, the archive root
+tools/                  kernel fetch, image builder, package repo, ISO
+docs/                   architecture, security, hardware, context dump
+```
+
+**The bargain:** a Linux kernel does hardware, scheduling and filesystems;
+everything a user *sees and touches* is ours. Same trade Android and ChromeOS
+made, at 1/1000th the size.
+
+### Size and scope
+
+| | |
+|---|---|
+| Own code | ~120,000 lines (78k excluding the vendored TLS and TrueType libraries) |
+| Bootable image | 26 MB ISO · 15.9 MB rootfs · 13 MB kernel |
+| Idle RAM | ~70 MB, ~190 MB with a browser and ten windows |
+| Boot to desktop | 0.9 s in a VM |
+| Kernel modules in the image | 222 (virt); the `--hw` variant carries 1,909 |
+| Packages | installable at runtime, never in the image |
+
+### Security model, stated plainly
+
+Apps launched from a bundle are sandboxed: `unshare` of mount, network, IPC and
+UTS namespaces, a chroot containing only what the app needs, a dedicated uid,
+and every inherited file descriptor closed — so a jailed app cannot see the
+framebuffer or the keyboard. A bundle that needs the network says
+`network = host`; one that needs sound says `audio = yes`; one that reads other
+processes says `procs = yes`. Privileged actions travel as request files the
+desktop polls, so a sandboxed app never forks.
+
+**Not done, and not claimed:** the in-desktop apps and the terminal are not
+sandboxed (they run inside the compositor), disk encryption is designed but not
+in the image, packages are SHA-256 verified but not yet signed end-to-end, and
+there is no multi-user support. See [docs/SECURITY.md](docs/SECURITY.md).
+
+### What does not work yet
+
+Being explicit is cheaper than being trusted less:
+
+- **Video playback** — the `vlc` package builds (libVLC + 27 plugins, 38.8 MB)
+  and the player links, but no frame has been decoded in the VM yet.
+- **TLS 1.3** — sites that require it fail with alert 70; our TLS is 1.2.
+- **Full HTML/CSS/JS** — our renderer is a real CSS box engine, not a browser
+  engine. Tables and form controls are still missing; a real engine belongs in
+  an installable package ([docs/ENGINE.md](docs/ENGINE.md)).
+- **Encryption, package signing, Wine, webcam apps** — designed or partly
+  built, not shipped.
+- **Real hardware breadth** — `amdgpu`, Wi-Fi and USB audio need the `--hw`
+  kernel variant; firmware for AMD GPUs is not packaged yet.
+
+## Documentation
+
+| | |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | how the desktop, IPC and boot fit together |
+| [docs/SECURITY.md](docs/SECURITY.md) | the sandbox, what it stops, what it does not |
+| [docs/HARDWARE.md](docs/HARDWARE.md) | which kernel supports which hardware |
+| [docs/GESTURES.md](docs/GESTURES.md) | trackpad protocol, thresholds, mapping |
+| [docs/THEMES.md](docs/THEMES.md) | the theme format, icon styles, animation kinds |
+| [docs/CONTEXT-DUMP.md](docs/CONTEXT-DUMP.md) | the state of the world, for whoever picks it up next |
 
 ## Rules this project keeps
 
-1. Nothing is "done" until it has been built and booted here.
-2. No file grows by copy-paste. Duplication gets deleted.
-3. Claim nothing that was not measured on this machine.
-4. No placeholder assets. The fonts are real fonts, the numbers are real
-   numbers read from `/proc`, the screenshots are real screenshots.
+1. Nothing is "done" until it is built and booted here.
+2. No invented numbers, no placeholder data, no fake success — if something
+   cannot work it fails loudly with the real error.
+3. No file grows by copy-paste. Duplication gets deleted.
+4. Anything over 40 MB ships as a package, never in the image.
+5. Every claim in the docs is one somebody measured.
