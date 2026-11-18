@@ -99,6 +99,10 @@
 #ifndef WEB_HOST_TEST
 #include <signal.h>
 #include <unistd.h>
+/* The clipboard as a sandboxed app sees it: one socket the desktop binds into
+ * this process's jail. Header-only, because a bundle is built from its own .c
+ * file and cannot add a library to the link line. */
+#include "clipbridge.h"
 #ifndef WEB_DRAW_ONLY            /* the socket layer's headers */
 #include <fcntl.h>
 #include <netdb.h>
@@ -198,6 +202,9 @@
 #define K_HOME    102
 #define K_END     107
 #define K_R       19
+#define K_A       30
+#define K_C       46
+#define K_V       47
 
 /* ------------------------------------------------------------
  * An address.
@@ -3165,6 +3172,23 @@ typedef struct {
 
     int  w, h, maxw, maxh;
     int  dirty, last_buttons;
+
+    /* Text selection over the rendered page. A position is (line, segment,
+     * byte) in the document the painter walks; byte offsets inside a segment
+     * are what make the highlight land between glyphs instead of between
+     * words. Both ends are stored unordered. */
+    int  sel;                  /* 1 when a range exists */
+    int  sl, ss, so;           /* start line / segment / offset */
+    int  el, es, eo;           /* end, exclusive of eo */
+    int  sel_drag;             /* the press became a selection */
+    int  sel_moved;            /* the pointer really moved since the press */
+    int  link_hit;             /* a link under the press, followed on release */
+    int  press_x, press_y;     /* where the press landed, page px */
+
+    /* One short line of feedback ("copied 214 bytes"), drawn over the page
+     * for a moment. Time is CLOCK_MONOTONIC milliseconds. */
+    char note[96];
+    long note_at;
 } Web;
 
 /* ------------------------------------------------------------ geometry
@@ -3642,6 +3666,11 @@ static void draw_page_boxes(Surface *v, Web *w) {
     }
 }
 
+/* The selection, resolved for the painter. The model itself lives with the
+ * input handlers further down; these two queries are all the painter needs. */
+static int web_measure(const Atom *a, const Seg *sg, int upto);
+static int web_sel_span(const Web *w, int line, int seg, int *b0, int *b1);
+
 static void draw_page_lines(Surface *v, Web *w) {
     Doc *d = &w->doc;
     draw_page_boxes(v, w);
@@ -3696,8 +3725,53 @@ static void draw_page_lines(Surface *v, Web *w) {
             else if (a->level) col = w->col_head ? w->col_head : C_HEAD;
             else col = w->col_text ? w->col_text : C_TEXT;
 
+            /* The selection sits behind the glyphs of the very run that is
+             * about to be drawn, and is measured with the same face, so the
+             * highlight starts and ends between the letters the user picked. */
+            {
+                int b0 = 0, b1 = 0;
+                if (web_sel_span(w, i, (int)(ln->first + j), &b0, &b1)) {
+                    int hx0 = (int)sg->x + web_measure(a, sg, b0);
+                    int hx1 = (int)sg->x + web_measure(a, sg, b1);
+                    int band = ly + ((int)ln->h - (int)ln->th) / 2;
+                    if (hx1 <= hx0) hx1 = hx0 + 1;
+                    surf_blend(v, hx0, band, hx1 - hx0, (int)ln->th,
+                               color_alpha(0xFF4FD1C5u, 0.32f));
+                }
+            }
             draw_run(v, f, a, tmp, (float)sg->x, (float)ty, col);
             draw_decoration(v, f, a, sg, ty, col);
+        }
+    }
+
+    /* One short line of feedback ("copied 214 bytes") for two and a half
+     * seconds, in the corner of the page it is about: a copy with no visible
+     * answer looks like a copy that did nothing. */
+    if (w->note[0]) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        long now = (long)ts.tv_sec * 1000L + (long)(ts.tv_nsec / 1000000L);
+        if (now - w->note_at > 2500) {
+            w->note[0] = 0;
+        } else {
+            Font *fd = field_font();
+            if (fd) {
+                int pad = ui_px(6);
+                int tw = (int)(font_width(fd, w->note) + 0.5f);
+                int th = (int)(font_height(fd) + 0.5f);
+                int bw = tw + 2 * pad, bh = th + pad;
+                int bx = v->w - bw - ui_px(8);
+                int by = v->h - bh - ui_px(8);
+                if (bx < ui_px(4)) { bx = ui_px(4); bw = v->w - 2 * ui_px(4); }
+                if (bw < 1) bw = 1;
+                if (bh < 1) bh = 1;
+                if (by < 0) by = 0;
+                gfx_rrect_aa(v, (float)bx, (float)by, (float)bw, (float)bh,
+                             (float)ui_px(3), 0xE61A1D23u, 0, 0);
+                draw_fit(v, fd, (float)(bx + pad), (float)(by + pad / 2),
+                         (float)(bw - 2 * pad), w->note, C_TEXT);
+            }
+            w->dirty = 1;
         }
     }
 }
@@ -4439,6 +4513,10 @@ static void web_load(Web *w) {
     w->scroll = 0;
     w->laid_w = 0;                 /* force a fresh layout at this width */
     w->state = ST_PAGE;
+    /* the old page's selection is not this page's text */
+    w->sel = 0;
+    w->sel_drag = 0;
+    w->link_hit = -1;
     load_images(w, &net_transport);
 }
 
@@ -4537,7 +4615,306 @@ static int link_at(Web *w, int lx, int ly) {
     return -1;
 }
 
+/* ------------------------------------------------------------ selection
+ *
+ * The page is atoms, segments and lines; a selection is two positions in that
+ * structure, so it costs no copy of the text and it survives a repaint at a
+ * different width (the layout moves, the offsets do not). Copying walks the
+ * same segments the painter draws and reconstructs the plain text: spaces
+ * where the layout left a gap, a newline at the end of each line.
+ *
+ * Everything here is compiled in the WEB_DRAW_ONLY host build too, so a
+ * harness can press, drag and copy against real rendered pages.
+ * ------------------------------------------------------------ */
+
+static int web_pos_cmp(int l1, int s1, int o1, int l2, int s2, int o2) {
+    if (l1 != l2) return l1 < l2 ? -1 : 1;
+    if (s1 != s2) return s1 < s2 ? -1 : 1;
+    if (o1 != o2) return o1 < o2 ? -1 : 1;
+    return 0;
+}
+
+/* Where inside one segment a page x lands. Measured with the face the run is
+ * painted in, on real prefixes, and only at UTF-8 boundaries. */
+static int web_off_in_seg(const Doc *d, const Seg *sg, int dx) {
+    const Atom *a = &d->atom[sg->atom];
+    if (sg->len == 0) return 0;
+    Font *f = font_for_atom(a);
+    if (!f) return 0;
+    char tmp[WEB_ATOM_TEXT + 4];
+    int len = sg->len;
+    if (len > WEB_ATOM_TEXT) len = WEB_ATOM_TEXT;
+    memcpy(tmp, a->text + sg->start, (size_t)len);
+    tmp[len] = 0;
+    float prev = 0.0f;
+    int i = 0;
+    while (i < len) {
+        int gl = utf8_len((unsigned char)tmp[i]);
+        if (gl < 1 || i + gl > len) break;
+        char save = tmp[i + gl];
+        tmp[i + gl] = 0;
+        float pre = font_width(f, tmp);
+        tmp[i + gl] = save;
+        if ((float)dx < (prev + pre) * 0.5f) return i;
+        prev = pre;
+        i += gl;
+    }
+    return len;
+}
+
+/* The document position under a page-space point. Clamped to the document,
+ * so a drag past the edge selects up to the edge rather than nowhere. */
+static void web_pos_at(Web *w, int lx, int ly, int *line, int *seg, int *off) {
+    Doc *d = &w->doc;
+    *line = 0; *seg = 0; *off = 0;
+    if (d->nline <= 0) return;
+    int y = ly + w->scroll;
+    int li = d->nline - 1;
+    for (int i = 0; i < d->nline; i++) {
+        int top = (int)d->line[i].y;
+        int bot = top + (int)d->line[i].h;
+        if (y < bot) { li = i; break; }
+    }
+    if (y < (int)d->line[0].y) li = 0;
+    Line *ln = &d->line[li];
+    int n = (int)ln->n;
+    *line = li;
+    if (n <= 0) { *seg = (int)ln->first; *off = 0; return; }
+    for (int j = 0; j < n; j++) {
+        Seg *sg = &d->seg[ln->first + j];
+        int x0 = (int)sg->x, x1 = x0 + (int)sg->w;
+        if (lx < x0) { *seg = (int)(ln->first + j); *off = 0; return; }
+        if (lx <= x1) {
+            *seg = (int)(ln->first + j);
+            *off = web_off_in_seg(d, sg, lx - x0);
+            return;
+        }
+    }
+    Seg *last = &d->seg[ln->first + n - 1];
+    *seg = (int)(ln->first + n - 1);
+    *off = (int)last->len;
+}
+
+/* Point the selection at one position (both ends, i.e. an empty range). */
+static void web_sel_set(Web *w, int line, int seg, int off) {
+    w->sel = 1;
+    w->sl = w->el = line;
+    w->ss = w->es = seg;
+    w->so = w->eo = off;
+    w->dirty = 1;
+}
+
+/* Begin a press: remember where it landed, so a drag can tell movement from
+ * a click and a click can still follow a link. */
+static void web_sel_press(Web *w, int lx, int ly) {
+    int l, sg, o;
+    web_pos_at(w, lx, ly, &l, &sg, &o);
+    web_sel_set(w, l, sg, o);
+    w->sel_drag = 1;
+    w->sel_moved = 0;
+    w->press_x = lx;
+    w->press_y = ly;
+    w->link_hit = link_at(w, lx, ly);
+}
+
+static void web_sel_extend(Web *w, int lx, int ly) {
+    int l, sg, o;
+    if (!w->sel) return;
+    if (lx != w->press_x || ly != w->press_y) w->sel_moved = 1;
+    web_pos_at(w, lx, ly, &l, &sg, &o);
+    if (l == w->el && sg == w->es && o == w->eo) return;
+    w->el = l;
+    w->es = sg;
+    w->eo = o;
+    w->dirty = 1;
+}
+
+static void web_sel_clear(Web *w) {
+    if (!w->sel) return;
+    w->sel = 0;
+    w->dirty = 1;
+}
+
+/* The whole document, first text run to last. */
+static void web_sel_all(Web *w) {
+    Doc *d = &w->doc;
+    if (d->nline <= 0) { web_sel_clear(w); return; }
+    int l0 = 0, s0 = (int)d->line[0].first, o0 = 0;
+    for (int i = 0; i < d->nline; i++) {
+        Line *ln = &d->line[i];
+        if (ln->n > 0) { l0 = i; s0 = (int)ln->first; break; }
+    }
+    int l1 = d->nline - 1, s1 = (int)(d->line[l1].first + (d->line[l1].n ? d->line[l1].n - 1 : 0));
+    int o1 = d->nseg > s1 ? (int)d->seg[s1].len : 0;
+    w->sel = 1;
+    w->sl = l0; w->ss = s0; w->so = o0;
+    w->el = l1; w->es = s1; w->eo = o1;
+    w->dirty = 1;
+}
+
+/* The selected text, plain UTF-8, malloc'ed. NULL when the range is empty. */
+static char *web_sel_text(Web *w, int *out_len) {
+    if (out_len) *out_len = 0;
+    Doc *d = &w->doc;
+    if (!w->sel || d->nline <= 0) return NULL;
+    int l0 = w->sl, s0 = w->ss, o0 = w->so;
+    int l1 = w->el, s1 = w->es, o1 = w->eo;
+    if (web_pos_cmp(l0, s0, o0, l1, s1, o1) > 0) {
+        int tl = l0, ts = s0, to = o0;
+        l0 = l1; s0 = s1; o0 = o1;
+        l1 = tl; s1 = ts; o1 = to;
+    }
+    if (l0 < 0) l0 = 0;
+    if (l1 >= d->nline) l1 = d->nline - 1;
+    if (l1 < l0) return NULL;
+
+    size_t cap = (size_t)(l1 - l0 + 1) * 2u;
+    for (int line = l0; line <= l1; line++) {
+        Line *ln = &d->line[line];
+        int first = (line == l0 && s0 > (int)ln->first) ? s0 : (int)ln->first;
+        int last = (line == l1 && s1 < (int)(ln->first + ln->n))
+                   ? s1 : (int)(ln->first + ln->n) - 1;
+        for (int si = first; si <= last && si < d->nseg; si++)
+            cap += (size_t)d->seg[si].len + 2u;
+    }
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    size_t o = 0;
+    int wrote = 0;
+
+    for (int line = l0; line <= l1; line++) {
+        Line *ln = &d->line[line];
+        int first = (line == l0 && s0 > (int)ln->first) ? s0 : (int)ln->first;
+        int last = (line == l1 && s1 < (int)(ln->first + ln->n))
+                   ? s1 : (int)(ln->first + ln->n) - 1;
+        if (last >= (int)d->nseg) last = (int)d->nseg - 1;
+        int prev_right = -1;
+        int wrote_line = 0;
+        for (int si = first; si <= last; si++) {
+            Seg *sg = &d->seg[si];
+            const Atom *a = &d->atom[sg->atom];
+            if (a->flags & AF_IMAGE) continue;
+            int x0 = (int)sg->x;
+            int x1 = x0 + (int)sg->w;
+            int b0 = (si == s0) ? o0 : 0;
+            int b1 = (si == s1) ? o1 : (int)sg->len;
+            if (b0 < 0) b0 = 0;
+            if (b1 > (int)sg->len) b1 = (int)sg->len;
+            if (b1 <= b0) { prev_right = x1; continue; }
+            /* A gap between two runs is a space, however CSS produced it. */
+            if (prev_right >= 0 && x0 > prev_right + 1 && o + 1 < cap) {
+                out[o++] = ' ';
+            }
+            if (!wrote_line && wrote) {
+                if (o + 1 < cap) out[o++] = '\n';
+            }
+            wrote_line = 1;
+            wrote = 1;
+            memcpy(out + o, a->text + sg->start + b0, (size_t)(b1 - b0));
+            o += (size_t)(b1 - b0);
+            prev_right = x1;
+        }
+        if (!wrote_line && wrote) {
+            /* an empty line inside the range is a real blank line */
+            if (o + 1 < cap) out[o++] = '\n';
+        }
+    }
+    while (o > 0 && out[o - 1] == '\n') o--;
+    out[o] = 0;
+    if (o == 0) { free(out); return NULL; }
+    if (out_len) *out_len = (int)o;
+    return out;
+}
+
+/* How wide the first `upto` bytes of a segment are in its own face. */
+static int web_measure(const Atom *a, const Seg *sg, int upto) {
+    Font *f = font_for_atom(a);
+    if (!f || upto <= 0) return 0;
+    if (upto > (int)sg->len) upto = (int)sg->len;
+    char tmp[WEB_ATOM_TEXT + 4];
+    memcpy(tmp, a->text + sg->start, (size_t)upto);
+    tmp[upto] = 0;
+    return (int)(font_width(f, tmp) + 0.5f);
+}
+
+/* The part of segment `seg` on line `line` that the selection covers, as
+ * byte offsets inside the segment. Returns 0 when that segment is outside
+ * the range. */
+static int web_sel_span(const Web *w, int line, int seg, int *b0, int *b1) {
+    const Doc *d = &w->doc;
+    if (!w->sel) return 0;
+    int l0 = w->sl, s0 = w->ss, o0 = w->so;
+    int l1 = w->el, s1 = w->es, o1 = w->eo;
+    if (web_pos_cmp(l0, s0, o0, l1, s1, o1) > 0) {
+        int tl = l0, ts = s0, to = o0;
+        l0 = l1; s0 = s1; o0 = o1;
+        l1 = tl; s1 = ts; o1 = to;
+    }
+    if (line < l0 || line > l1) return 0;
+    if (seg < s0 || seg > s1) return 0;
+    *b0 = (seg == s0) ? o0 : 0;
+    *b1 = (seg == s1) ? o1 : (int)d->seg[seg].len;
+    if (*b0 < 0) *b0 = 0;
+    if (*b1 > (int)d->seg[seg].len) *b1 = (int)d->seg[seg].len;
+    return *b1 > *b0;
+}
+
+static void web_note(Web *w, const char *text) {
+    snprintf(w->note, sizeof(w->note), "%s", text);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    w->note_at = (long)ts.tv_sec * 1000L + (long)(ts.tv_nsec / 1000000L);
+    w->dirty = 1;
+}
+
+/* Ctrl+C: put the selection on the clipboard through the bridge. The bytes
+ * that cross are the plain text web_sel_text() built - never the atoms. */
+static void web_copy(Web *w) {
+    int len = 0;
+    char *text = web_sel_text(w, &len);
+    if (!text) { web_note(w, "no text is selected"); return; }
+    int rc = clip_bridge_set_text(text, len);
+    free(text);
+    char msg[96];
+    if (rc == 0) snprintf(msg, sizeof(msg), "copied %d bytes", len);
+    else         snprintf(msg, sizeof(msg), "copy failed: %s", clip_bridge_strerror(rc));
+    web_note(w, msg);
+}
+
+/* Ctrl+V in the address bar: append the clipboard's text, with line breaks
+ * turned into spaces (a URL field is one line). */
+static void web_paste_address(Web *w) {
+    char *text = NULL;
+    int len = 0;
+    int rc = clip_bridge_get_text(&text, &len);
+    if (rc != 0) { web_note(w, "paste: the clipboard holds no text"); return; }
+    char *one = malloc((size_t)len + 1);
+    if (!one) { free(text); web_note(w, "paste: out of memory"); return; }
+    int o = 0;
+    for (int i = 0; i < len; i++) {
+        char c = text[i];
+        if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+        if ((unsigned char)c < 0x20) continue;
+        one[o++] = c;
+    }
+    one[o] = 0;
+    edit_put(w, one);
+    free(one);
+    free(text);
+    web_note(w, "pasted into the address bar");
+}
+
 static void handle_key(Web *w, int key, int mods) {
+    /* Clipboard chords first: they must work whether or not the address bar
+     * has the focus, because the page is what the user is looking at. */
+    if (mods & 2) {
+        if (key == K_C) { web_copy(w); return; }            /* Ctrl+C */
+        if (key == K_A) { web_sel_all(w); return; }         /* Ctrl+A */
+        if (key == K_V) {                                   /* Ctrl+V */
+            if (w->edit_focus) web_paste_address(w);
+            return;
+        }
+    }
     if (key == K_R && (mods & 2)) {                 /* Ctrl+R: reload */
         if (w->url[0]) {
             snprintf(w->pending, sizeof(w->pending), "%s", w->url);
@@ -4602,8 +4979,19 @@ static int handle_text(Web *w, const char *t) {
 static void handle_mouse(Web *w, int x, int y, int buttons) {
     int prev = w->last_buttons;
     w->last_buttons = buttons;
-    if (!(buttons & 1)) return;
-    if (prev & 1) return;                     /* only the press edge acts */
+
+    /* Release: the desktop sends it so a drag can end. A press that never
+     * moved is a click, and a click on a link follows it; a drag selects. */
+    if (!(buttons & 1)) {
+        if (prev & 1) {
+            if (w->sel_drag && !w->sel_moved && w->link_hit >= 0)
+                follow_link(w, w->link_hit);
+            w->sel_drag = 0;
+            w->link_hit = -1;
+            w->dirty = 1;
+        }
+        return;
+    }
 
     /* In a window too short for the header there is nothing to click: the
      * single line render() draws there is a message, not a control. */
@@ -4635,8 +5023,15 @@ static void handle_mouse(Web *w, int x, int y, int buttons) {
         return;
     }
 
-    int link = link_at(w, lx, ly);
-    if (link >= 0) follow_link(w, link);
+    /* A press in the page takes the keyboard away from the address bar (so
+     * Ctrl+C copies the page, not the URL) and starts a selection. The drag
+     * itself arrives as further MOUSE events with the button still down. */
+    w->edit_focus = 0;
+    if (prev & 1) {
+        web_sel_extend(w, lx, ly);
+        return;
+    }
+    web_sel_press(w, lx, ly);
 }
 
 /* The wheel, in notches, positive when the user scrolled up. One notch is

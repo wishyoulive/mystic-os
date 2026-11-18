@@ -693,6 +693,31 @@ fi
 # If there is a screen, start the desktop. Otherwise drop to a shell
 # (this is what a headless probe boot does).
 if [ -x /usr/bin/mystic-desktop ] && [ -e /dev/fb0 ]; then
+    # Clipboard: the daemon owns /root/clipboard and the socket every copy
+    # and paste goes through. Start it BEFORE the desktop so the first
+    # Ctrl+V already has somewhere to go; clipd takes an flock on
+    # /root/clipboard/clipd.lock, so a second instance exits by itself
+    # instead of corrupting the store. Both spellings are the same code:
+    # the standalone binary if the image carries one, otherwise the
+    # desktop's own --clipd entry point.
+    if [ -x /usr/bin/mystic-clipboardd ]; then
+        /usr/bin/mystic-clipboardd &
+        echo "clipboard: started /usr/bin/mystic-clipboardd"
+    else
+        /usr/bin/mystic-desktop --clipd &
+        echo "clipboard: started mystic-desktop --clipd"
+    fi
+    tries=0
+    while [ ! -S /run/mystic/clipboard.sock ] && [ "$tries" -lt 20 ]; do
+        sleep 0.05
+        tries=$((tries + 1))
+    done
+    if [ -S /run/mystic/clipboard.sock ]; then
+        echo "clipboard: ready on /run/mystic/clipboard.sock"
+    else
+        echo "clipboard: daemon did not open its socket; the desktop will host it"
+    fi
+
     # Unbind the kernel's framebuffer console first. It keeps painting its
     # text cursor on top of whatever we draw, so it has to go before the
     # desktop takes the screen.

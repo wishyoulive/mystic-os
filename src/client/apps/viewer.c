@@ -39,7 +39,9 @@
  *  the decoder.
  * ============================================================ */
 #include "../mystic_client.h"
+#include "clipbridge.h"
 #include "../../mystic.h"
+#include "../../i18n.h"   /* font_cell_width / UTF-8 helpers, shared with font.c */
 
 #include <ctype.h>
 #include <errno.h>
@@ -194,6 +196,21 @@ typedef struct {
     int        info_scroll;
     char       encoding[16];       /* scanned from the loaded bytes */
     char       eol[24];            /* scanned from the loaded bytes */
+
+    /* Measured once, when the file is loaded: how many codepoints of the text
+     * the mono face could not draw and another installed face supplied, and how
+     * many no installed face has at all (the ones drawn as .notdef boxes).
+     * font_coverage() walks the whole file, so it is NOT called from a draw
+     * path; the 'i' sheet prints these two numbers for the text on screen. */
+    int        glyph_fallback;
+    int        glyph_missing;
+
+    /* Ctrl+A marks every line currently on screen; Ctrl+C copies the marked
+     * range, or the visible lines when nothing is marked. Both are ranges of
+     * the loaded file, not a second copy of it. */
+    int        sel_all;            /* 1 = the visible lines are selected */
+    char       note[96];           /* "copied 214 bytes" for a moment */
+    long       note_at;
 } Viewer;
 
 static void viewer_free(Viewer *v) {
@@ -1245,12 +1262,21 @@ static int pnm_decode(const u8 *d, size_t n, VImage *im, char *err, size_t esz) 
  * bytes take none (the lead byte already counted the glyph). */
 static int line_cols(const u8 *s, size_t len) {
     int col = 0;
-    for (size_t i = 0; i < len; i++) {
+    for (size_t i = 0; i < len; ) {
         u8 c = s[i];
-        if (c == '\t') col += 8 - (col % 8);
-        else if (c == '\r') continue;
-        else if ((c & 0xC0u) == 0x80u) continue;
-        else col++;
+        if (c == '\t') { col += 8 - (col % 8); i++; continue; }
+        if (c == '\r') { i++; continue; }
+        if (c < 0x20) { i++; continue; }            /* control: drawn as nothing */
+        int step = 1;
+        int cp = font_utf8_next((const char *)s + i, len - i, &step);
+        if (step < 1) step = 1;
+        if (cp < 0) { col += 1; i += 1; continue; }
+        /* East Asian Wide is two columns and a combining mark is zero, exactly
+         * as in the terminal: a Japanese line measured one column per codepoint
+         * fitted half as many glyphs as the mono face draws, so it ran into the
+         * line-number gutter and past the reading column. */
+        col += font_cell_width((u32)cp);
+        i += (size_t)step;
     }
     return col;
 }
@@ -1258,12 +1284,19 @@ static int line_cols(const u8 *s, size_t len) {
 /* Build the part of a line that starts at column col_off into out[].
  * Tabs are expanded, control bytes become spaces, UTF-8 sequences are kept
  * whole (a glyph that begins before col_off is skipped entirely so the
- * output is never a broken encoding). Returns the bytes written. */
+ * output is never a broken encoding). Returns the bytes written.
+ *
+ * A column is a CELL, not a codepoint: a CJK ideograph takes two and a
+ * combining mark takes none, the same widths the terminal grid uses. The
+ * horizontal scroll offset is therefore in the units the mono face really
+ * draws, and a wide glyph is never emitted in the last column it does not fit
+ * in. */
 static size_t build_display(const u8 *s, size_t len, int col_off, int maxcols,
                             char *out, size_t outsz) {
     size_t o = 0;
     int col = 0;
     size_t i = 0;
+    if (outsz == 0) return 0;
     while (i < len && col - col_off < maxcols) {
         u8 c = s[i];
         if (c == '\r') { i++; continue; }
@@ -1290,27 +1323,33 @@ static size_t build_display(const u8 *s, size_t len, int col_off, int maxcols,
             continue;
         }
         /* UTF-8: keep the whole sequence together. */
-        size_t need = 1;
-        if ((c & 0xE0u) == 0xC0u) need = 2;
-        else if ((c & 0xF0u) == 0xE0u) need = 3;
-        else if ((c & 0xF8u) == 0xF0u) need = 4;
-        if (i + need > len) need = 1;
-        else if (need > 1) {
-            for (size_t k = 1; k < need; k++)
-                if ((s[i + k] & 0xC0u) != 0x80u) { need = 1; break; }
-        }
-        if (need == 1) {
+        int step = 1;
+        int cp = font_utf8_next((const char *)s + i, len - i, &step);
+        if (step < 1) step = 1;
+        if (cp < 0) {                       /* not a valid sequence: one '?' */
             if (col >= col_off && o + 1u < outsz) out[o++] = '?';
             col++;
-            i++;
-        } else {
-            if (col >= col_off && o + need < outsz) {
-                memcpy(out + o, s + i, need);
-                o += need;
-            }
-            col++;
-            i += need;
+            i += 1;
+            continue;
         }
+        int w = font_cell_width((u32)cp);
+        if (w == 0) {
+            /* a combining mark rides on the cell before it: copy it when that
+             * cell is visible, and never advance the column */
+            if (col > col_off && o + (size_t)step < outsz) {
+                memcpy(out + o, s + i, (size_t)step);
+                o += (size_t)step;
+            }
+            i += (size_t)step;
+            continue;
+        }
+        if (col - col_off + w > maxcols) break;      /* a wide glyph cannot be split */
+        if (col >= col_off && o + (size_t)step < outsz) {
+            memcpy(out + o, s + i, (size_t)step);
+            o += (size_t)step;
+        }
+        col += w;
+        i += (size_t)step;
     }
     out[o] = 0;
     return o;
@@ -1415,6 +1454,14 @@ static int load_text_file(Viewer *v, char *err, size_t esz) {
     v->nlines = nl;
     v->max_cols = max_cols;
     scan_encoding(v);
+    /* Which glyphs of this file the installed faces can draw. Measured here,
+     * once, with the face the reading column is drawn in. */
+    {
+        Font *fm = font_get(FONT_MONO, 11);   /* the face the reading column uses */
+        v->glyph_fallback = 0;
+        v->glyph_missing = 0;
+        if (fm) font_coverage(fm, (const char *)buf, &v->glyph_fallback, &v->glyph_missing);
+    }
     return 0;
 }
 
@@ -1960,8 +2007,9 @@ static float image_effective_zoom(const Viewer *v, int cw, int ch) {
 #define UI_UNIT 8
 static int SP(int n) { return ui_px(n * UI_UNIT); }
 
-static int vceil(float v) { int i = (int)v; return (v > (float)i) ? i + 1 : i; }
-
+/* vceil() moved into the text block below, where the fitting code that owns
+ * it lives (and where the i18n host harness compiles the same definition).
+ * Keeping a second copy here made the file stop compiling. */
 typedef struct { Font *title, *body, *small, *mono; } VFonts;
 
 static VFonts vfonts(void) {
@@ -2023,6 +2071,8 @@ static void fmt_time(char *out, size_t n, time_t t) {
 
 /* ------------------------------------------------------------ text */
 
+/* @utf8-fit-begin  (the host harness in .work/i18n compiles exactly this text) */
+static int vceil(float v) { int i = (int)v; return (v > (float)i) ? i + 1 : i; }
 /* Test builds: strings that were still wider than their column after
  * tx_fit(). The harness reads this and fails if it is not zero. */
 static int vw_overflow;
@@ -2033,46 +2083,37 @@ static int tx_w(Font *f, const char *t) {
 }
 
 /* Copy t into out, shortened with ".." until it fits in maxw pixels.
- * Every cut is measured; nothing is estimated from a character count. */
+ * Every cut is measured; nothing is estimated from a character count.
+ *
+ * Every cut also lands on a CODEPOINT boundary. Two cuts used to be able to
+ * split a character: the initial copy into a fixed buffer (sized by bytes, and
+ * only shortened further if the result did not fit) and the shorten loop (one
+ * byte at a time). A Cyrillic or Japanese name left a bare lead byte before the
+ * dots, and font_draw() read that lead byte plus the first '.' as one 2-byte
+ * sequence - so the dots vanished and a wrong glyph took their place. */
 static void tx_fit(char *out, size_t osz, Font *f, const char *t, int maxw) {
     if (!out || osz < 4) return;
     out[0] = 0;
     if (!f || !t || !t[0] || maxw < 1) return;
     {
-        size_t len = strlen(t);
-        size_t cut;
+        size_t total = strlen(t);
+        size_t len = total;
         int dots, budget;
-        if (len > osz - 1) len = osz - 1;
+        if (len > osz - 1) len = font_utf8_boundary(t, osz - 1);
         memcpy(out, t, len);
         out[len] = 0;
         if (font_width(f, out) <= (float)maxw + 0.5f) return;
         dots = tx_w(f, "..");
         if (maxw <= dots) { out[0] = 0; return; }
         budget = maxw - dots;
-        cut = len;
-        while (cut > 0) {
-            out[cut] = 0;
+        while (len > 0) {
+            len = font_utf8_prev(t, len);
+            memcpy(out, t, len);
+            out[len] = 0;
             if (font_width(f, out) <= (float)budget) break;
-            cut--;
         }
-        /* never end in the middle of a UTF-8 sequence: drop the partial
-         * codepoint, including a lead byte whose tail was just cut. A
-         * Cyrillic/Japanese name used to leave a bare lead byte before the
-         * dots, and font_draw() then ate the dots as one codepoint. */
-        {
-            size_t i = cut;
-            while (i > 0 && ((unsigned char)out[i - 1] & 0xC0u) == 0x80u) i--;
-            if (i > 0) {
-                unsigned char c = (unsigned char)out[i - 1];
-                int need = 1;
-                if (c >= 0xC2u && c <= 0xDFu) need = 2;
-                else if (c >= 0xE0u && c <= 0xEFu) need = 3;
-                else if (c >= 0xF0u && c <= 0xF4u) need = 4;
-                if (cut - (i - 1) < (size_t)need) cut = i - 1;
-            }
-        }
-        if (cut + 2 >= osz) cut = osz - 3;
-        memcpy(out + cut, "..", 3);
+        if (len + 2 >= osz) return;      /* cannot happen: len <= osz-3 above */
+        memcpy(out + len, "..", 3);
     }
 }
 
@@ -2082,22 +2123,31 @@ static void tx_fit_tail(char *out, size_t osz, Font *f, const char *t, int maxw)
     out[0] = 0;
     if (!f || !t || !t[0] || maxw < 1) return;
     snprintf(out, osz, "%s", t);
+    size_t n = font_utf8_boundary(out, strlen(out));   /* the copy may have cut one */
+    out[n] = 0;
     if (font_width(f, out) <= (float)maxw + 0.5f) return;
     {
         int dots = tx_w(f, "..");
         int budget = maxw - dots;
-        size_t len = strlen(out);
-        size_t s = 1;
-        char tail[600];
         if (budget < 1) { out[0] = 0; return; }
-        for (; s < len; s++)
-            if (font_width(f, out + s) <= (float)budget) break;
-        while (s < len && ((unsigned char)out[s] & 0xC0u) == 0x80u) s++;
-        if (s >= len) { out[0] = 0; return; }
-        snprintf(tail, sizeof(tail), "..%s", out + s);
-        snprintf(out, osz, "%s", tail);
+        size_t s = 0;
+        while (s < n) {
+            int step = 1;
+            font_utf8_next(out + s, n - s, &step);   /* whole characters only */
+            if (step < 1) step = 1;
+            s += (size_t)step;
+            if (s < n && font_width(f, out + s) <= (float)budget) {
+                char tail[600];
+                snprintf(tail, sizeof(tail), "..%s", out + s);
+                snprintf(out, osz, "%s", tail);
+                return;
+            }
+        }
+        out[0] = 0;              /* not even the last character fits */
     }
 }
+
+/* @utf8-fit-end */
 
 #if defined(VIEWER_LAYOUT_TEST)
 /* The width a string will really have after fitting. Only the layout
@@ -2345,6 +2395,17 @@ static void info_rows_build(VLayout *L, const Viewer *v) {
         info_add(L, "Lines", a);
         snprintf(a, sizeof(a), "%s · %s", v->encoding, v->eol);
         info_add(L, "Encoding", a);
+        /* Only when something really came from another face, or could not be
+         * drawn at all: a line of Latin needs no note. The counts are the ones
+         * font_coverage() returned for this file, not an estimate. */
+        if (v->glyph_fallback > 0 || v->glyph_missing > 0) {
+            char fb[64] = "none missing";
+            if (v->glyph_missing > 0)
+                snprintf(fb, sizeof(fb), "%d missing", v->glyph_missing);
+            snprintf(a, sizeof(a), "%d from another face · %s",
+                     v->glyph_fallback, fb);
+            info_add(L, "Glyphs", a);
+        }
     }
 }
 
@@ -2937,6 +2998,13 @@ static void draw_text_view(Surface *s, const Viewer *v, const VLayout *L) {
         if (end > start && v->text[end - 1] == '\n') end--;
         build_display(v->text + start, end - start, v->col_off, L->text_cols,
                       disp, (size_t)L->text_cols * 4u + 8u);
+        /* Ctrl+A marks the lines on screen; the band goes down before the
+         * glyphs so the text stays readable over it. */
+        if (v->sel_all) {
+            int band = L->text_y + i * L->line_h;
+            tint(s, L->text_x, band, L->text_w, L->line_h,
+                 color_alpha(C_ACCENT, 0.22f));
+        }
         tx_at(s, L->f.mono, L->text_x, y, L->text_w, disp, C_TEXT);
     }
     free(disp);
@@ -3094,6 +3162,8 @@ static void draw_all(MClient *c, Viewer *v, int vw, int vh) {
 #define KEY_Q       16
 #define KEY_I       23
 #define KEY_F       33
+#define KEY_A       30
+#define KEY_C       46
 #define KEY_HOME   102
 #define KEY_UP     103
 #define KEY_PAGEUP 104
@@ -3139,9 +3209,81 @@ static void zoom_around(Viewer *v, VRect pic, int mx, int my, float factor) {
     image_clamp_pan(v, nz, pic.w, pic.h);
 }
 
+/* The plain text of the lines the window is showing: `first` through
+ * `first+rows-1`, clipped to the file. The bytes come straight out of
+ * text[] by the line_off[] table the painter uses, so what is copied is
+ * exactly what is on screen - no atoms, no re-wrapping. */
+static char *viewer_visible_text(Viewer *v, const VLayout *L, int *out_len) {
+    *out_len = 0;
+    if (v->kind != DOC_TEXT || !v->text || v->nlines <= 0) return NULL;
+    int first = v->first_line;
+    int last = v->first_line + L->text_rows - 1;
+    if (first < 0) first = 0;
+    if (last >= v->nlines) last = v->nlines - 1;
+    if (last < first) return NULL;
+
+    size_t cap = 1;
+    for (int i = first; i <= last; i++) {
+        size_t a = v->line_off[i];
+        size_t b = v->line_off[i + 1];
+        if (b > a) cap += b - a;
+        cap += 1;
+    }
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    size_t o = 0;
+    for (int i = first; i <= last; i++) {
+        size_t a = v->line_off[i];
+        size_t b = v->line_off[i + 1];
+        if (b > a && v->text[b - 1] == '\n') b--;
+        if (b > a) {
+            memcpy(out + o, v->text + a, b - a);
+            o += b - a;
+        }
+        if (i != last) out[o++] = '\n';
+    }
+    out[o] = 0;
+    if (o == 0) { free(out); return NULL; }
+    *out_len = (int)o;
+    return out;
+}
+
+static void viewer_copy(Viewer *v, int vw, int vh) {
+    VLayout L;
+    layout_build(&L, v, vw, vh);
+    int len = 0;
+    char *text = viewer_visible_text(v, &L, &len);
+    if (!text) { snprintf(v->note, sizeof(v->note), "nothing visible to copy"); }
+    else {
+        int rc = clip_bridge_set_text(text, len);
+        free(text);
+        if (rc == 0) snprintf(v->note, sizeof(v->note), "copied %d bytes", len);
+        else snprintf(v->note, sizeof(v->note), "copy failed: %s",
+                      clip_bridge_strerror(rc));
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    v->note_at = (long)ts.tv_sec * 1000L + (long)(ts.tv_nsec / 1000000L);
+}
+
 static void handle_key(Viewer *v, int vw, int vh, int key, int mods, int *quit) {
     VLayout L;
     layout_build(&L, v, vw, vh);
+
+    /* Ctrl+A / Ctrl+C work on the text view whether or not the details sheet
+     * is up, because the selection is the document, not the sheet. */
+    if ((mods & 2) && key == KEY_A) {
+        v->sel_all = 1;
+        snprintf(v->note, sizeof(v->note), "copied with Ctrl+C");
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        v->note_at = (long)ts.tv_sec * 1000L + (long)(ts.tv_nsec / 1000000L);
+        return;
+    }
+    if ((mods & 2) && key == KEY_C) {
+        viewer_copy(v, vw, vh);
+        return;
+    }
 
     if (key == KEY_I) {
         v->info_open = !v->info_open;
@@ -3213,6 +3355,7 @@ static void handle_key(Viewer *v, int vw, int vh, int key, int mods, int *quit) 
         default: break;
         }
         text_clamp(v, &L);
+        v->sel_all = 0;          /* the visible range moved */
     }
 }
 

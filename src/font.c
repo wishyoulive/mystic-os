@@ -181,6 +181,8 @@ static int has_font_ext(const char *name) {
  *  even in a face that draws it narrower, because that is what the
  *  column grid in a terminal means.
  * ------------------------------------------------------------ */
+/* @utf8-only-begin (pure Unicode/UTF-8 code; the Files render harness compiles
+ * exactly this text, with no font files and no face list involved) */
 typedef struct { u32 lo, hi; } CpRange;
 
 static const CpRange CP_WIDE[] = {
@@ -406,6 +408,7 @@ size_t font_utf8_prev(const char *s, size_t n) {
     while (i > 0 && ((unsigned char)s[i] & 0xC0u) == 0x80u) i--;
     return i;
 }
+/* @utf8-only-end */
 
 static void tag_str(const u8 *p, char out[5]) {
     for (int i = 0; i < 4; i++) out[i] = (p[i] >= 32 && p[i] < 127) ? (char)p[i] : '?';
@@ -1582,40 +1585,40 @@ static Glyph *glyph_get(Font *f, int cp) {
         slot->used = 0;
     }
 
-    glyph_rasterise(f, slot, cp, face_pick(f, cp));
+    int src = face_pick(f, cp);
+    glyph_rasterise(f, slot, cp, src);   /* src < 0 rasterises the primary .notdef */
+    slot->src = src;
     slot->last_use = next_use(f);
     return slot;
 }
 
-static int utf8_next(const unsigned char *p, int *len) {
-    int c = p[0];
-    *len = 1;
-    if (c < 0x80) return c;
-    if ((c & 0xE0) == 0xC0 && p[1]) { *len = 2; return ((c & 0x1F) << 6) | (p[1] & 0x3F); }
-    if ((c & 0xF0) == 0xE0 && p[1] && p[2]) {
-        *len = 3;
-        return ((c & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
-    }
-    if ((c & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) {
-        *len = 4;
-        return ((c & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F);
-    }
-    return c;
-}
+/* Every walk of a string below uses font_utf8_next(), which rejects a broken
+ * sequence instead of inventing a codepoint out of the bytes after a name that
+ * was cut mid-character. */
 
 float font_height(Font *f) { return f ? f->size * 1.4f : 0.0f; }
 float font_ascent(Font *f) { return f ? f->ascent : 0.0f; }
+
+/* Walk one codepoint of a NUL-terminated string. A broken byte is consumed as
+ * one byte and returned as U+FFFD, so a consumer that draws it shows the same
+ * replacement character the terminal uses for a broken sequence. */
+static int next_cp(const unsigned char **pp) {
+    const char *s = (const char *)*pp;
+    int step = 1;
+    int cp = font_utf8_next(s, strlen(s), &step);
+    if (step < 1) step = 1;
+    *pp += step;
+    return cp < 0 ? 0xFFFD : cp;
+}
 
 float font_width(Font *f, const char *text) {
     if (!f || !text) return 0;
     float w = 0;
     const unsigned char *p = (const unsigned char *)text;
     while (*p) {
-        int len;
-        int cp = utf8_next(p, &len);
+        int cp = next_cp(&p);
         Glyph *g = glyph_get(f, cp);
         if (g) w += g->advance;
-        p += len;
     }
     return w;
 }
@@ -1629,10 +1632,9 @@ float font_draw(Surface *s, Font *f, float x, float y, const char *text, u32 col
 
     const unsigned char *p = (const unsigned char *)text;
     while (*p) {
-        int len;
-        int cp = utf8_next(p, &len);
+        int cp = next_cp(&p);
         Glyph *g = glyph_get(f, cp);
-        if (!g) { p += len; continue; }
+        if (!g) continue;
 
         if (g->bitmap) {
             int gx = (int)(pen + g->xoff);
@@ -1666,9 +1668,55 @@ float font_draw(Surface *s, Font *f, float x, float y, const char *text, u32 col
             }
         }
         pen += g->advance;
-        p += len;
     }
     return pen;
+}
+
+/* Is this codepoint drawn at all? C0/C1 controls, the zero-width formatting
+ * characters and the space separators never put ink on a surface, so counting
+ * them as "glyphs the faces are missing" would make every text file with a
+ * newline look broken. A combining mark IS drawn (it sits on the cell before
+ * it), so a missing accent is reported - it really is missing. */
+static int cp_is_drawn(int cp) {
+    if (cp < 0x20 || (cp >= 0x7F && cp < 0xA0)) return 0;   /* controls      */
+    if (cp == 0x20 || cp == 0xA0 || cp == 0x1680) return 0; /* spaces        */
+    if (cp >= 0x2000 && cp <= 0x200A) return 0;
+    if (cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F) return 0;
+    if (cp == 0x3000) return 0;                             /* ideographic space */
+    if (cp >= 0x200B && cp <= 0x200F) return 0;             /* ZWSP..RLM     */
+    if (cp >= 0x202A && cp <= 0x202E) return 0;             /* bidi controls */
+    if (cp >= 0x2060 && cp <= 0x2064) return 0;
+    if (cp >= 0x2066 && cp <= 0x206F) return 0;
+    if (cp >= 0xFE00 && cp <= 0xFE0F) return 0;             /* var selectors */
+    if (cp == 0xFEFF) return 0;                             /* BOM/ZWNBSP    */
+    return 1;
+}
+
+/* ------------------------------------------------------------
+ *  Coverage: how much of a string the installed faces can draw
+ *
+ *  Counted from the same face list and the same stbtt_FindGlyphIndex()
+ *  answer glyph_get() uses, so the number a caller prints is the number
+ *  of codepoints that really came from another face - not an estimate
+ *  from the string's length. "missing" counts the codepoints no installed
+ *  face has at all: those are the ones that end up as .notdef boxes.
+ *  Controls and space separators are skipped: they are never glyphs.
+ * ------------------------------------------------------------ */
+void font_coverage(Font *f, const char *text, int *fallback, int *missing) {
+    if (fallback) *fallback = 0;
+    if (missing) *missing = 0;
+    if (!f || !text) return;
+    const unsigned char *p = (const unsigned char *)text;
+    while (*p) {
+        int cp = next_cp(&p);
+        if (!cp_is_drawn(cp)) continue;
+        if (face_has_cp(f->source, cp)) continue;
+        int found = 0;
+        for (int i = 0; i < face_count; i++)
+            if (i != f->source && face_has_cp(i, cp)) { found = 1; break; }
+        if (found) { if (fallback) (*fallback)++; }
+        else       { if (missing)  (*missing)++; }
+    }
 }
 
 /* ------------------------------------------------------------

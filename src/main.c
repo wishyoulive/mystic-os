@@ -48,6 +48,17 @@
  * because they are functions of the text they hold - not of a pixel count
  * someone guessed. They are declared here rather than in mystic.h, which is
  * the app ABI: an app does not own the desktop's title bar. */
+/* src/term.c: text selection. mystic.h is the app ABI and is owned by the
+ * orchestrator, so the terminal's selection entry points are declared where
+ * they are used. */
+void term_sel_begin(Term *t, int col, int row, int kind);
+void term_sel_extend(Term *t, int col, int row);
+void term_sel_clear(Term *t);
+int  term_sel_active(Term *t);
+void term_sel_all(Term *t);
+char *term_sel_text(Term *t, int *out_len);
+int  term_sel_copy(Term *t, int *copied);
+
 int  ui_line_h(int face, float size);
 int  ui_title_h(void);
 int  ui_topbar_h(void);
@@ -2034,23 +2045,51 @@ static void draw_cursor_at(Surface *s, int x, int y) {
 }
 
 /* ------------------------------------------------------------ input routing */
-static void key_bytes_for(int code, char *out, int *n) {
+/* The navigation keys a window can receive, as xterm bytes. `mods` is 1 for
+ * shift, 2 for alt, 4 for ctrl (0 = none): a modified cursor key travels as
+ * CSI 1 ; (1+mods) <letter>, which is what a real terminal sends and what
+ * Notes needs to see a Shift+End at all. Before this the modifier was dropped
+ * here, so Shift+Left was indistinguishable from Left in every app. */
+static void key_bytes_for(int code, char *out, int *n, int mods) {
     *n = 0;
-    switch (code) {
-        case SC_KEY_ESC:
-            /* Esc is a cancel key, but an app that owns its own modal needs
-             * the byte: cancel_action() forwards it through here */
-            out[(*n)++] = 0x1B; return;
-        case 103: out[(*n)++] = 0x1B; out[(*n)++] = '['; out[(*n)++] = 'A'; return;   /* up */
-        case 108: out[(*n)++] = 0x1B; out[(*n)++] = '['; out[(*n)++] = 'B'; return;   /* down */
-        case 106: out[(*n)++] = 0x1B; out[(*n)++] = '['; out[(*n)++] = 'C'; return;   /* right */
-        case 105: out[(*n)++] = 0x1B; out[(*n)++] = '['; out[(*n)++] = 'D'; return;   /* left */
-        case 102: out[(*n)++] = 0x1B; out[(*n)++] = '['; out[(*n)++] = 'H'; return;   /* home */
-        case 107: out[(*n)++] = 0x1B; out[(*n)++] = '['; out[(*n)++] = 'F'; return;   /* end */
-        case 104: out[(*n)++] = 0x1B; out[(*n)++] = '['; out[(*n)++] = '5'; out[(*n)++] = '~'; return;
-        case 109: out[(*n)++] = 0x1B; out[(*n)++] = '['; out[(*n)++] = '6'; out[(*n)++] = '~'; return;
-        case 111: out[(*n)++] = 0x1B; out[(*n)++] = '['; out[(*n)++] = '3'; out[(*n)++] = '~'; return;
-        default: return;
+    static const struct { int code; char final; char tilde; } NAV[] = {
+        { 103, 'A', 0 }, { 108, 'B', 0 }, { 106, 'C', 0 }, { 105, 'D', 0 },
+        { 102, 'H', 0 }, { 107, 'F', 0 },
+        { 104, 0, '5' }, { 109, 0, '6' }, { 111, 0, '3' }
+    };
+    if (code == SC_KEY_ESC) {
+        /* Esc is a cancel key, but an app that owns its own modal needs
+         * the byte: cancel_action() forwards it through here */
+        out[(*n)++] = 0x1B;
+        return;
+    }
+    for (size_t i = 0; i < sizeof(NAV) / sizeof(NAV[0]); i++) {
+        if (NAV[i].code != code) continue;
+        out[(*n)++] = 0x1B;
+        out[(*n)++] = '[';
+        int m = 1 + mods;
+        if (NAV[i].final) {
+            /* CSI 1 ; m <letter> for the cursor block */
+            if (mods > 0) {
+                out[(*n)++] = '1';
+                out[(*n)++] = ';';
+                if (m >= 10) out[(*n)++] = (char)('0' + m / 10);
+                out[(*n)++] = (char)('0' + m % 10);
+            }
+            out[(*n)++] = NAV[i].final;
+        } else {
+            /* CSI <number> ; m ~ for Insert/Delete/PageUp/PageDown: the key's
+             * own number comes FIRST, then the modifier - ESC[5;2~ is
+             * Shift+PageUp, not ESC[1;25~. */
+            out[(*n)++] = NAV[i].tilde;
+            if (mods > 0) {
+                out[(*n)++] = ';';
+                if (m >= 10) out[(*n)++] = (char)('0' + m / 10);
+                out[(*n)++] = (char)('0' + m % 10);
+            }
+            out[(*n)++] = '~';
+        }
+        return;
     }
 }
 
@@ -2593,12 +2632,372 @@ static void wallpaper_apply(int idx) {
     dirty = 1;
 }
 
+/* ------------------------------------------------------------ clipboard
+ *
+ * Two kinds of app live on this desktop and they reach the clipboard by two
+ * different roads, on purpose:
+ *
+ *   - the in-desktop apps (terminal, Notes, Files) are compiled into this
+ *     binary and call clip_*() from src/clipboard.c directly;
+ *   - the sandboxed apps (Browser, Viewer) run chrooted, as uid 1000, with
+ *     no access to /root or to the real clipboard socket. Each of them gets
+ *     ONE socket bound into its own jail at
+ *     /run/mystic/jail/<id>/run/mystic/clipboard.sock, and this process
+ *     serves it: the request is executed with clip_*() here, as root, and
+ *     only the text crosses the boundary. The real
+ *     /run/mystic/clipboard.sock is never exposed.
+ *
+ * The protocol on the bridge is the daemon's own (clipboard.h, "SOCKET
+ * PROTOCOL"), so src/client/apps/clipbridge.h is one client for both: inside
+ * a jail it reaches the bridge, outside it reaches clipd.
+ */
+#define CLIP_BRIDGE_MAX 8
+
+typedef struct {
+    int  used;
+    int  fd;
+    char id[32];
+} ClipBridge;
+
+static ClipBridge clip_bridges[CLIP_BRIDGE_MAX];
+
+/* mkdir -p. The jail's run directory is normally made by the sandbox before
+ * exec, but the bridge is bound as soon as the client says HELLO and the two
+ * can race; EEXIST is success for both. */
+static int clip_mkpath(const char *path) {
+    char buf[256];
+    size_t n = strlen(path);
+    if (n == 0 || n >= sizeof(buf)) return -1;
+    memcpy(buf, path, n + 1);
+    for (char *p = buf + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = 0;
+        if (mkdir(buf, 0755) != 0 && errno != EEXIST) return -1;
+        *p = '/';
+    }
+    if (mkdir(buf, 0755) != 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+static void clip_bridge_close(ClipBridge *b) {
+    if (b->fd >= 0) close(b->fd);
+    b->fd = -1;
+    b->used = 0;
+    b->id[0] = 0;
+}
+
+/* Bind the bridge for one client id, once. Returns the bridge or NULL. */
+static ClipBridge *clip_bridge_ensure(const char *id) {
+    if (!id || !id[0]) return NULL;
+    /* The id becomes a path component (twice) and a socket name. A client
+     * chooses its own HELLO id, so anything that could climb out of the jail
+     * directory is refused here instead of being used to create paths. */
+    for (const char *p = id; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                 (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        if (!ok) return NULL;
+    }
+    if (strstr(id, "..")) return NULL;
+    for (int i = 0; i < CLIP_BRIDGE_MAX; i++)
+        if (clip_bridges[i].used && strcmp(clip_bridges[i].id, id) == 0)
+            return &clip_bridges[i];
+
+    int slot = -1;
+    for (int i = 0; i < CLIP_BRIDGE_MAX; i++)
+        if (!clip_bridges[i].used) { slot = i; break; }
+    if (slot < 0) return NULL;
+
+    char dir[192], path[256];
+    snprintf(dir, sizeof(dir), "/run/mystic/jail/%s/run/mystic", id);
+    if (clip_mkpath(dir) != 0) {
+        fprintf(stderr, "clipboard: no jail directory for %s: %s\n", id, strerror(errno));
+        return NULL;
+    }
+    snprintf(path, sizeof(path), "%s/clipboard.sock", dir);
+
+    ClipBridge *b = &clip_bridges[slot];
+    memset(b, 0, sizeof(*b));
+    b->fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (b->fd < 0) return NULL;
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof(a.sun_path)) { close(b->fd); b->fd = -1; return NULL; }
+    memcpy(a.sun_path, path, strlen(path) + 1);
+    unlink(path);                       /* a stale socket from a dead client */
+    if (bind(b->fd, (struct sockaddr *)&a, sizeof(a)) != 0 ||
+        listen(b->fd, 4) != 0) {
+        fprintf(stderr, "clipboard: cannot bind %s: %s\n", path, strerror(errno));
+        close(b->fd);
+        b->fd = -1;
+        return NULL;
+    }
+    chmod(path, 0666);                  /* the app in the jail is uid 1000 */
+    fcntl(b->fd, F_SETFL, fcntl(b->fd, F_GETFL, 0) | O_NONBLOCK);
+    b->used = 1;
+    snprintf(b->id, sizeof(b->id), "%s", id);
+    fprintf(stderr, "clipboard: bridge for %s at %s\n", id, path);
+    return b;
+}
+
+/* Read one '\n'-terminated line. Returns the length without the newline, or
+ * -1 on a closed / timed-out socket. */
+static int clip_bridge_line(int fd, char *out, int cap) {
+    int n = 0;
+    while (n + 1 < cap) {
+        char c;
+        ssize_t r = recv(fd, &c, 1, 0);
+        if (r == 0) return -1;
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (c == '\n') { out[n] = 0; return n; }
+        out[n++] = c;
+    }
+    out[n] = 0;
+    return n;
+}
+
+static int clip_bridge_exact(int fd, void *buf, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = recv(fd, (char *)buf + got, n - got, 0);
+        if (r <= 0) { if (r < 0 && errno == EINTR) continue; return -1; }
+        got += (size_t)r;
+    }
+    return 0;
+}
+
+static void clip_bridge_send(int fd, const char *p, size_t n) {
+    while (n > 0) {
+        ssize_t w = send(fd, p, n, 0);
+        if (w > 0) { p += w; n -= (size_t)w; continue; }
+        if (w < 0 && errno == EINTR) continue;
+        break;
+    }
+}
+
+static void clip_bridge_err(int fd, int code, const char *word) {
+    char b[96];
+    int n = snprintf(b, sizeof(b), "ERR %d %s\n", code, word);
+    clip_bridge_send(fd, b, (size_t)n);
+}
+
+/* The real number of entries, so PING answers with a fact. */
+static int clip_entries(void) {
+    ClipEntry *e = NULL;
+    int n = clip_history(&e, CLIP_MAX_ENTRIES);
+    if (n > 0) clip_history_free(e, n);
+    return n > 0 ? n : 0;
+}
+
+/* Serve one request. The payload caps are the clipboard's own, so a bridge
+ * cannot be used to make the desktop allocate more than the store would. */
+static void clip_bridge_serve(int fd) {
+    /* A client writes its request immediately after connect(); this only has
+     * to cover that round trip, and it must not freeze a frame if a process
+     * connects and says nothing. */
+    struct timeval tv = { 0, 300 * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    char line[256];
+    if (clip_bridge_line(fd, line, sizeof(line)) < 0) return;
+
+    if (strncmp(line, "PING", 4) == 0) {
+        char b[64];
+        int n = snprintf(b, sizeof(b), "OK PONG %d\n", clip_entries());
+        clip_bridge_send(fd, b, (size_t)n);
+        return;
+    }
+    if (strncmp(line, "SET TEXT ", 9) == 0) {
+        long want = strtol(line + 9, NULL, 10);
+        if (want <= 0 || want > (long)CLIP_MAX_TEXT) { clip_bridge_err(fd, CLIP_ERR_TOOBIG, "text"); return; }
+        char *text = malloc((size_t)want + 1);
+        if (!text) { clip_bridge_err(fd, CLIP_ERR_IO, "memory"); return; }
+        if (clip_bridge_exact(fd, text, (size_t)want) != 0) { free(text); return; }
+        text[want] = 0;
+        int rc = clip_set_text(text);
+        free(text);
+        if (rc == CLIP_OK) {
+            char b[64];
+            int n = snprintf(b, sizeof(b), "OK SET %d\n", clip_entries());
+            clip_bridge_send(fd, b, (size_t)n);
+        } else {
+            clip_bridge_err(fd, rc, "set");
+        }
+        return;
+    }
+    if (strncmp(line, "GET TEXT", 8) == 0) {
+        ClipEntry *e = clip_get_current(CLIP_TYPE_TEXT);
+        if (!e || e->type != CLIP_TYPE_TEXT || !e->text) {
+            clip_entry_free(e);
+            clip_bridge_err(fd, CLIP_ERR_EMPTY, "empty");
+            return;
+        }
+        char head[192];
+        int n = snprintf(head, sizeof(head),
+                         "OK GET TEXT 0 %llu %d %llu 0 0 0 %u\n",
+                         (unsigned long long)e->id, e->pinned,
+                         (unsigned long long)e->stamp, (unsigned)e->text_len);
+        clip_bridge_send(fd, head, (size_t)n);
+        clip_bridge_send(fd, e->text, e->text_len);
+        clip_bridge_send(fd, "\n", 1);
+        clip_entry_free(e);
+        return;
+    }
+    clip_bridge_err(fd, CLIP_ERR_PROTO, "command");
+}
+
+/* Called once per frame. Connections are tiny and the client writes its
+ * request immediately, so one request is served on accept and the socket is
+ * closed: no per-client state to leak. */
+static void clip_bridge_poll(void) {
+    for (int i = 0; i < CLIP_BRIDGE_MAX; i++) {
+        ClipBridge *b = &clip_bridges[i];
+        if (!b->used || b->fd < 0) continue;
+        for (;;) {
+            int fd = accept(b->fd, NULL, NULL);
+            if (fd < 0) {
+                if (errno == EBADF || errno == ENOTSOCK || errno == EINVAL)
+                    clip_bridge_close(b);      /* the jail went away */
+                break;
+            }
+            clip_bridge_serve(fd);
+            close(fd);
+        }
+    }
+}
+
+/* Start clipd in this process tree when nobody else did. src/clipd is the
+ * whole service; the flock makes a second instance exit instead of fighting
+ * for the store, so calling this on every boot is safe. */
+static void ensure_clipd(void) {
+    if (clip_running()) return;
+    pid_t pid = fork();
+    if (pid == 0) {
+        char *av[2] = { (char *)"clipd", NULL };
+        _exit(clipd_main(1, av));
+    }
+    if (pid < 0) {
+        fprintf(stderr, "clipboard: cannot fork clipd: %s\n", strerror(errno));
+        return;
+    }
+    for (int i = 0; i < 20; i++) {
+        if (clip_running()) return;
+        struct timespec ts = { 0, 50 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    fprintf(stderr, "clipboard: clipd did not answer; the library uses the store\n");
+}
+
 /* ------------------------------------------------------------ terminal
  *
  * The terminal chords act on the terminal wherever it is in the stack:
  * they are chords for the terminal, and the focused window may well be
  * the browser whose page you are copying from.
  */
+
+/* ---- selecting text in a terminal ----
+ *
+ * term.c owns the grid and the model; this file owns the pointer. The cell a
+ * position names is measured from the same mono font (and the same floor)
+ * that the paint uses, so a click lands on the glyph under it at every text
+ * scale.
+ */
+static int    term_sel_win = -1;
+static unsigned term_sel_gen;
+static int    term_drag_x = -1, term_drag_y = -1;
+static int    term_click_n;
+static double term_click_t;
+static int    term_click_x, term_click_y;
+
+/* evdev KEY_A. shortcuts.h is not this file's to extend, and Ctrl+Shift+A is
+ * a terminal-only chord, so the code is named here. */
+#define TERM_KEY_A 30
+
+/* The client window that owns the left button, so a drag and the release are
+ * delivered to it (the WM protocol reports presses, not motion). */
+static int    cli_drag_win = -1;
+static unsigned cli_drag_gen;
+static int    cli_drag_x, cli_drag_y;
+
+static void term_cell_metrics(Window *w, float *cw, float *ch) {
+    Font *fm = font_get(FONT_MONO, w->term_size > 0 ? w->term_size : 12);
+    *cw = fm ? font_width(fm, "M") : 8.0f;
+    *ch = fm ? font_height(fm) : 16.0f;
+    if (*cw < 4.0f) *cw = 4.0f;
+    if (*ch < 8.0f) *ch = 8.0f;
+}
+
+/* A press inside a terminal body starts a selection. The third press in the
+ * same place within half a second is a line, the second a word - counted from
+ * real event times, not from a guessed double-click flag, because the desktop
+ * needs a triple click as well. */
+static void term_select_press(Window *w, int bx, int by) {
+    if (!w || !w->term || bx < 0 || by < 0) return;
+    float cw, ch;
+    term_cell_metrics(w, &cw, &ch);
+    int col = (int)((float)bx / cw);
+    int row = (int)((float)by / ch);
+
+    double t = now_sec();
+    int near = (bx - term_click_x < 6 && term_click_x - bx < 6 &&
+                by - term_click_y < 6 && term_click_y - by < 6);
+    if (near && t - term_click_t < 0.5) term_click_n++;
+    else                                 term_click_n = 1;
+    term_click_t = t;
+    term_click_x = bx;
+    term_click_y = by;
+
+    int kind = 0;
+    if (term_click_n >= 3) { kind = 2; term_click_n = 0; }
+    else if (term_click_n == 2) kind = 1;
+
+    term_sel_begin(w->term, col, row, kind);
+    term_sel_win = (int)(w - wins);
+    term_sel_gen = w->gen;
+    term_drag_x = bx;
+    term_drag_y = by;
+    dirty = 1;
+}
+
+/* Called every frame while the left button is held: the free end follows the
+ * pointer, and a pointer pulled past the top or bottom edge scrolls the view
+ * (which is what makes selecting more than a screenful possible). */
+static void term_select_drag(void) {
+    if (term_sel_win < 0) return;
+    Window *w = &wins[term_sel_win];
+    if (!w->used || w->gen != term_sel_gen || !w->term) { term_sel_win = -1; return; }
+
+    int bx = input.mouse_x - w->x - 1;
+    int by = input.mouse_y - w->y - title_h() - 1;
+    if (bx == term_drag_x && by == term_drag_y) return;
+    term_drag_x = bx;
+    term_drag_y = by;
+
+    int body_h = w->h - title_h() - 2;
+    if (by < 0)                    term_scroll(w->term, 1);
+    else if (by >= body_h)         term_scroll(w->term, -1);
+
+    float cw, ch;
+    term_cell_metrics(w, &cw, &ch);
+    int col = (int)((float)bx / cw);
+    int row = (int)((float)by / ch);
+    term_sel_extend(w->term, col, row);
+    dirty = 1;
+}
+
+/* The terminal that owns the selection (the topmost one, if somehow two). */
+static Window *term_sel_window(void) {
+    Window *best = NULL;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window *w = &wins[i];
+        if (!w->used || w->hidden || !w->term) continue;
+        if (!term_sel_active(w->term)) continue;
+        if (!best || win_rank(w) > win_rank(best)) best = w;
+    }
+    return best;
+}
 static Window *term_window(void) {
     Window *best = NULL;
     for (int i = 0; i < MAX_WINDOWS; i++) {
@@ -2648,10 +3047,23 @@ static void term_clear(void) {
 }
 
 static void term_copy(void) {
+    /* A real selection wins: that is the thing the owner asked for. With no
+     * selection the old behaviour (the line typed since the last Enter) is
+     * still here, so the chord never does nothing. */
+    Window *selw = term_sel_window();
+    if (selw) {
+        int n = 0;
+        int rc = term_sel_copy(selw->term, &n);
+        if (rc == CLIP_OK)
+            set_status("Copied %d bytes from the terminal selection", n);
+        else
+            set_status("Clipboard: %s", clip_strerror(rc));
+        return;
+    }
     Window *w = term_window();
     if (!w) { set_status("No terminal open"); return; }
     if (w->input_len <= 0) {
-        set_status("Terminal: nothing typed to copy");
+        set_status("Terminal: select text with the mouse, then Ctrl+Shift+C");
         return;
     }
     int rc = clip_set_text(w->input_line);
@@ -3210,6 +3622,11 @@ static const ShortcutActions SHORTCUTS = { shortcut_action, NULL };
         static int handle_click(void) {
     int mx = input.mouse_x, my = input.mouse_y;
 
+    /* A new press ends any drag that was extending something: the press
+     * below either starts a new selection on a terminal or nothing at all. */
+    term_sel_win = -1;
+    cli_drag_win = -1;
+
     /* the shortcut panel is modal: a click dismisses it and does nothing
      * else, so a half-seen key cannot be clicked "through" by accident */
     if (help_open) { help_open = 0; help_page = 0; dirty = 1; return 1; }
@@ -3314,11 +3731,28 @@ int dot_y = traffic_y(tb);
             return 1;
         }
         /* body */
-        if (hit->app) {
+        if (hit->term) {
+            /* A terminal body is text: a press selects, a drag extends it,
+             * and two or three presses take a word or a line. Nothing else in
+             * the body is clickable, so this is the whole handler. */
+            if (input.buttons & 1) term_select_press(hit, lx - 1, ly - tb - 1);
+        } else if (hit->app) {
             app_click(hit->app, lx - 1, ly - tb - 1, input.buttons);
         } else if (hit->kind == WIN_CLIENT && hit->client >= 0) {
             WmClient *cl = &clients[hit->client];
-            if (cl->used) wms_notify_mouse(cl, lx - 1, ly - tb - 1, input.buttons);
+            if (cl->used) {
+                wms_notify_mouse(cl, lx - 1, ly - tb - 1, input.buttons);
+                /* Remember that this client owns the left button, so the
+                 * pointer's own movement reaches it: a sandboxed app has no
+                 * other way to see a drag (the protocol carries positions,
+                 * not deltas) and text selection in the browser is a drag. */
+                if (input.buttons & 1) {
+                    cli_drag_win = (int)(hit - wins);
+                    cli_drag_gen = hit->gen;
+                    cli_drag_x = lx - 1;
+                    cli_drag_y = ly - tb - 1;
+                }
+            }
         }
         return 1;
     }
@@ -3573,7 +4007,18 @@ static void display_choose_logical(Display *d) {
 /* MYSTIC_DISPLAY_CONF_SECTION_END */
 
 /* ------------------------------------------------------------ main */
-int main(void) {
+int main(int argc, char **argv) {
+    /* One binary, two jobs: this is what stage/init runs for the clipboard
+     * daemon, so the daemon is a real process started before the desktop
+     * without a second build rule. */
+    if (argc > 1 && strcmp(argv[1], "--clipd") == 0) {
+        char *av[2] = { (char *)"clipd", NULL };
+        return clipd_main(1, av);
+    }
+    /* Started without one (a shell, a hand-run desktop): host the daemon
+     * here. clip_running() is a real PING over the socket, not a guess. */
+    ensure_clipd();
+
     install_fatal_handlers();
     if (disp_open(&disp, "/dev/fb0") < 0) return 1;
     /* Ask the device what it can do before anything asks for a mode. */
@@ -3900,10 +4345,21 @@ int main(void) {
             if (top->term) {
                 char buf[64];
                 int n = 0;
-                if (input.shift && (k == 104 || k == 109)) {
+                if (input.ctrl && input.shift && k == TERM_KEY_A) {
+                    /* Ctrl+Shift+A: select the whole scrollback. The 0x01
+                     * this chord also produces must not reach the shell (it
+                     * would move readline's cursor to column 0). */
+                    term_sel_all(top->term);
+                    input.text_len = 0;
+                    input.text[0] = 0;
+                    set_status("Terminal: selected all - Ctrl+Shift+C copies");
+                    dirty = 1;
+                } else if (input.shift && (k == 104 || k == 109)) {
                     term_scroll(top->term, k == 104 ? 8 : -8);
                 } else {
-                    key_bytes_for(k, buf, &n);
+                    int m = (input.shift ? 1 : 0) | (input.alt ? 2 : 0) |
+                            (input.ctrl ? 4 : 0);
+                    key_bytes_for(k, buf, &n, m);
                     if (n) term_key(top->term, buf, n);
                 }
             } else if (top->kind == WIN_CLIENT && top->client >= 0) {
@@ -3914,7 +4370,9 @@ int main(void) {
             } else if (top->app) {
                 char kb[64];
                 int kn = 0;
-                key_bytes_for(k, kb, &kn);
+                int m = (input.shift ? 1 : 0) | (input.alt ? 2 : 0) |
+                        (input.ctrl ? 4 : 0);
+                key_bytes_for(k, kb, &kn, m);
                 if (kn) { app_key(top->app, kb, kn); dirty = 1; }
             }
         }
@@ -4005,6 +4463,34 @@ int main(void) {
          * BTN_RIGHT to it). Only the left button used to be dispatched, so a
          * right click did nothing anywhere in the system. */
         if (input.clicked & 3) { if (handle_click()) dirty = 1; }
+
+        /* A button that is still held keeps talking to whoever got the press:
+         * a terminal selection extends, a client gets the pointer positions
+         * and, on release, the button-up event it could never see before. */
+        if (input.buttons & 1) term_select_drag();
+        if (cli_drag_win >= 0) {
+            Window *w = &wins[cli_drag_win];
+            if (!w->used || w->gen != cli_drag_gen ||
+                w->kind != WIN_CLIENT || w->client < 0 || !clients[w->client].used) {
+                cli_drag_win = -1;
+            } else {
+                WmClient *cl = &clients[w->client];
+                int bx = input.mouse_x - w->x - 1;
+                int by = input.mouse_y - w->y - title_h() - 1;
+                if ((input.buttons & 1) && (bx != cli_drag_x || by != cli_drag_y)) {
+                    wms_notify_mouse(cl, bx, by, 1);
+                    cli_drag_x = bx;
+                    cli_drag_y = by;
+                    dirty = 1;
+                }
+                if (input.released & 1) {
+                    wms_notify_mouse(cl, bx, by, 0);
+                    cli_drag_win = -1;
+                    dirty = 1;
+                }
+            }
+        }
+        if (input.released & 1) term_sel_win = -1;
         if (input.released & 1) {
             if (drag_win >= 0 && wins[drag_win].used && wins[drag_win].gen == drag_gen) {
                 Window *w = &wins[drag_win];
@@ -4083,6 +4569,9 @@ int main(void) {
         /* window server: accept connections, bind windows, mark frames dirty */
         wms_poll(clients, WM_MAX_CLIENTS);
 
+        /* the sandboxed apps' clipboard requests, if any arrived */
+        clip_bridge_poll();
+
         /* A client that exited leaves its slot free; the window that was bound
          * to that slot must close with it, or the next client to take the slot
          * renders into the ghost and closing the ghost kills the newcomer. */
@@ -4099,6 +4588,11 @@ int main(void) {
         for (int i = 0; i < WM_MAX_CLIENTS; i++) {
             WmClient *cl = &clients[i];
             if (!cl->used) continue;
+            /* Give the sandboxed app a clipboard socket inside its own jail.
+             * Binding it here (not inside the sandbox) is the whole point:
+             * the app never touches the real clipboard socket, and this
+             * process performs the copy as root. */
+            if (cl->id[0]) clip_bridge_ensure(cl->id);
             if (cl->win < 0 && cl->px) {
                 Window *w = NULL;
                 for (int k = 0; k < MAX_WINDOWS; k++) if (!wins[k].used) { w = &wins[k]; break; }
