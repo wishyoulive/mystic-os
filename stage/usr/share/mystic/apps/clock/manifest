@@ -1,3 +1,4 @@
 name = Clock
 desc = Live clock, its own process
 exec = bin
+audio = yes

@@ -226,6 +226,18 @@ typedef struct {
     int  a_rings;             /* it fired; the banner is up           */
     long a_prev_sec;          /* last seconds-of-day we saw, -1 = none */
     u64  a_flash_until;
+
+    /* ---- tone: one PCM stream shared by the alarm and the timer.
+     * tone_note is what the window shows: the device path that is really
+     * making the sound, or the exact reason there is none. */
+    int  tone_on;             /* the PCM is open and being fed          */
+    int  tone_ok;             /* tone_note describes a working device  */
+    int  tone_tried;          /* an open was attempted for this ring   */
+    int  tone_ch;
+    int  tone_rate;
+    u64  tone_last_ns;        /* monotonic time of the last chunk      */
+    u64  tone_frames;         /* frames generated since this ring      */
+    char tone_note[224];
 } ClockState;
 
 /* ------------------------------------------------------------ actions */
@@ -330,6 +342,13 @@ static void tick(ClockState *K, u64 now, long sec_of_day) {
 /* ---- end of the pure arithmetic ------------------------------------ */
 
 #if !defined(CLOCK_HOST_TEST)
+
+/* The offscreen layout harness (CLOCK_LAYOUT_TEST) renders the real
+ * drawing code but has no audio device and no host poll()/ioctl(); the
+ * tone code is only reached from main(), which that build excludes. */
+#if !defined(CLOCK_LAYOUT_TEST)
+#include "../../audio.h"
+#endif
 
 /* ------------------------------------------------------------ colour */
 
@@ -440,6 +459,18 @@ static void font_box(Surface *s, Font *f, Rect r, const char *txt, u32 col, int 
     if (align == 2) x = (float)r.x + (float)r.w - w;
     float y = (float)r.y + ((float)r.h - font_height(f)) * 0.5f;
     font_draw(s, f, x, y, txt, col);
+}
+
+/* A status line that is more important than the layout: the device path
+ * that is actually making the sound, or the errno behind its absence. It
+ * is measured first (so it fits whenever it can), and if even 8 pt does
+ * not fit it is clipped by the Surface rather than hidden - the same
+ * choice draw_hint() already makes for a long key hint. */
+static void status_line(Surface *s, Rect r, const char *txt, u32 col) {
+    if (!txt || !*txt || !rect_has(r)) return;
+    Font *f = fit_font_box(FONT_REGULAR, txt, (float)r.w, (float)r.h);
+    if (!f) f = font_get(FONT_REGULAR, 8);
+    if (f) font_box(s, f, r, txt, col, 1);
 }
 
 /* The gap between bands: a third of a cell, never less than 3px. */
@@ -1014,7 +1045,11 @@ static void draw_banner(DC *d) {
     if (!alarm && !timer) return;
 
     Rect c = d->L->content;
-    int h = 3 * d->C->cell_h;
+    /* Four rows while there is a tone line: title, the honest device
+     * status, and the dismissal hint. Three without one. */
+    int rows = 3;
+    if (K->tone_note[0] && c.h >= 4 * d->C->cell_h) rows = 4;
+    int h = rows * d->C->cell_h;
     if (h > c.h) h = c.h;
     if (h < d->C->cell_h) return;
     Rect r;
@@ -1040,15 +1075,25 @@ static void draw_banner(DC *d) {
         /* the duration that ran out is real data, not a guess */
         char dur[16];
         fmt_mmss(dur, sizeof(dur), K->t_dur_ms);
-        snprintf(sub, sizeof(sub), "%s timer finished", dur);
+        snprintf(sub, sizeof(sub), "%s timer finished - space", dur);
     }
 
-    Rect top = r, bot = r;
-    top.h = r.h / 2;
-    bot.y = r.y + r.h / 2;
-    bot.h = r.h - r.h / 2;
+    Rect top = r, mid = r, bot = r;
+    top.y = r.y;
+    top.h = r.h * 2 / rows;
+    mid.y = top.y + top.h;
+    mid.h = K->tone_note[0] ? d->C->cell_h : 0;
+    bot.y = r.y + r.h - (r.h * 1 / rows);
+    bot.h = r.y + r.h - bot.y;
     text_box(d->s, FONT_SEMIBOLD, top, line, lit ? COL_HOT_TX : edge);
-    text_box(d->s, FONT_REGULAR, bot, sub, COL_TEXT);
+    if (mid.h > 0)
+        status_line(d->s, mid, K->tone_note,
+                    K->tone_ok ? COL_ACCENT : COL_WARN);
+    else if (K->tone_note[0])
+        status_line(d->s, bot, K->tone_note,
+                    K->tone_ok ? COL_ACCENT : COL_WARN);
+    else
+        text_box(d->s, FONT_REGULAR, bot, sub, COL_TEXT);
 }
 
 static void draw_hint(DC *d) {
@@ -1061,6 +1106,18 @@ static void draw_hint(DC *d) {
     default:            hint = "arrows: field/value   space: arm/disarm"; break;
     }
     if (!rect_has(d->L->hint)) return;
+
+    /* When the banner cannot be drawn - this is the tab that owns the
+     * event - the hint band carries the tone status instead, so the
+     * device path or the real error is on screen here too. */
+    int tone_here = K->tone_note[0] &&
+                    ((K->a_rings && K->tab == TAB_ALARM) ||
+                     (K->t_done && K->tab == TAB_TIMER));
+    if (tone_here) {
+        status_line(d->s, d->L->hint, K->tone_note,
+                    K->tone_ok ? COL_ACCENT : COL_WARN);
+        return;
+    }
 
     Font *f = fit_font_box(FONT_REGULAR, hint, (float)d->L->hint.w,
                            (float)d->L->hint.h);
@@ -1085,6 +1142,107 @@ static void draw_hint(DC *d) {
                  K->w_laps >= LAP_MAX ? COL_WARN : COL_DIM);
     }
 }
+
+/* ------------------------------------------------------------ tone */
+#if !defined(CLOCK_LAYOUT_TEST)
+
+/* The alarm and the timer share one PCM stream. The pattern is three
+ * short pips on a 900 ms cycle: enough to carry across a room without
+ * being a solid, annoying tone, and every pip has its own 5 ms fade so
+ * the start and the stop do not click. The phase is computed from the
+ * absolute frame number, so a late frame cannot restart a pip. */
+#define TONE_RATE    48000
+#define TONE_CYCLE   0.9
+#define TONE_SLOT    0.15
+#define TONE_PIP     0.12
+#define TONE_FADE    0.005
+#define TONE_CHUNK   2048
+
+static short tone_sample(u64 frame, int rate, int which) {
+    if (rate <= 0) return 0;
+    double t = (double)frame / (double)rate;
+    double cyc = fmod(t, TONE_CYCLE);
+    int slot = (int)(cyc / TONE_SLOT);
+    if (slot < 0 || slot > 5 || (slot & 1)) return 0;   /* pips in 0,2,4 */
+    double local = cyc - (double)slot * TONE_SLOT;
+    if (local >= TONE_PIP) return 0;
+    double env = 1.0;
+    if (local < TONE_FADE) env = local / TONE_FADE;
+    else if (local > TONE_PIP - TONE_FADE) env = (TONE_PIP - local) / TONE_FADE;
+    if (env < 0.0) env = 0.0;
+    double f = which == 0 ? 880.0 : 660.0;     /* alarm / timer */
+    return (short)(sin(TAU * f * t) * env * 0.25 * 32767.0);
+}
+
+/* Stop feeding the tone and let the card finish what is queued. */
+static void tone_stop(ClockState *K) {
+    if (K->tone_on) {
+        audio_close();
+        K->tone_on = 0;
+    }
+    K->tone_tried = 0;
+    K->tone_ok = 0;
+    K->tone_last_ns = 0;
+    K->tone_frames = 0;
+    K->tone_note[0] = 0;
+}
+
+/* One service call per loop: open once when a ring starts, then generate
+ * exactly the frames the monotonic clock says are due. Nothing here waits
+ * for the card - audio_write() does the poll(POLLOUT) when the ring is
+ * full - so a slow disk or a redraw cannot freeze the window. */
+static void tone_service(ClockState *K, u64 now) {
+    if (!K->a_rings && !K->t_done) {
+        tone_stop(K);
+        return;
+    }
+
+    if (!K->tone_on) {
+        if (K->tone_tried) return;      /* failed: keep the real error */
+        K->tone_tried = 1;
+        if (audio_open(TONE_RATE, 2) != 0) {
+            snprintf(K->tone_note, sizeof K->tone_note,
+                     "no tone: %s", audio_error());
+            K->tone_ok = 0;
+            return;
+        }
+        K->tone_on = 1;
+        K->tone_ok = 1;
+        K->tone_rate = audio_rate() > 0 ? audio_rate() : TONE_RATE;
+        K->tone_ch = audio_channels() > 0 ? audio_channels() : 1;
+        K->tone_frames = 0;
+        K->tone_last_ns = 0;
+        snprintf(K->tone_note, sizeof K->tone_note,
+                 "playing a tone on %s", audio_device());
+    }
+
+    if (!K->tone_last_ns) { K->tone_last_ns = now; return; }
+    long ms = span_ms(K->tone_last_ns, now);
+    if (ms < 5) return;
+    long n = (long)((unsigned long long)ms * (unsigned)K->tone_rate / 1000ull);
+    if (n <= 0) return;
+    if (n > TONE_CHUNK) n = TONE_CHUNK;
+
+    short buf[TONE_CHUNK * 2];
+    int which = K->a_rings ? 0 : 1;
+    for (int i = 0; i < n; i++) {
+        short s = tone_sample(K->tone_frames + (u64)i, K->tone_rate, which);
+        for (int c = 0; c < K->tone_ch; c++) buf[i * K->tone_ch + c] = s;
+    }
+
+    int wrote = audio_write(buf, (int)n);
+    if (wrote < 0) {
+        snprintf(K->tone_note, sizeof K->tone_note,
+                 "no tone: %s", audio_error());
+        K->tone_ok = 0;
+        audio_close();
+        K->tone_on = 0;
+        return;
+    }
+    K->tone_frames += (u64)wrote;
+    K->tone_last_ns = now;
+}
+#endif /* !CLOCK_LAYOUT_TEST */
 
 static void draw_all(MClient *c, int vw, int vh, ClockState *K, const Chrome *C,
                      const Wall *w, u64 now) {
@@ -1235,6 +1393,7 @@ int main(void) {
         Wall w;
         read_wall(&w);
         tick(&K, now, w.sec_of_day);
+        tone_service(&K, now);
 
         /* Redraw only when something that is on screen changed. The
          * signature is built from the same values the drawing uses, so a
@@ -1250,7 +1409,8 @@ int main(void) {
                : (long)K.a_armed * 100000L + alarm_left_s(&K, w.sec_of_day) / 60;
         sig[2] = flash_on(now, K.t_flash_until) + 2 * flash_on(now, K.a_flash_until);
         sig[3] = K.t_done + 2 * K.t_run + 4 * K.w_run + 8 * K.a_rings +
-                 16 * K.w_laps + 32 * K.t_field + 64 * K.a_field;
+                 16 * K.w_laps + 32 * K.t_field + 64 * K.a_field +
+                 128 * K.tone_on + 256 * K.tone_ok;
         sig[4] = K.t_dur_ms / 1000;
         sig[5] = (long)K.a_h * 60 + K.a_m;
 
@@ -1299,6 +1459,15 @@ int main(void) {
                  * so it cannot be missed and cannot leak into a control. */
                 if (K.a_rings && ev.key != KEY_SPACE) {
                     K.a_rings = 0;
+                    dirty = 1;
+                    break;
+                }
+                /* A finished timer belongs to whichever tab is showing:
+                 * space silences it there instead of forcing a trip back
+                 * to the Timer tab. */
+                if (!K.a_rings && K.t_done && K.tab != TAB_TIMER && ev.key == KEY_SPACE) {
+                    K.t_done = 0;
+                    K.t_flash_until = 0;
                     dirty = 1;
                     break;
                 }
@@ -1359,8 +1528,10 @@ int main(void) {
                     if (K.tab == TAB_TIMER) timer_click(&K, &u, ev.x, ev.y, now);
                     if (K.tab == TAB_STOPWATCH) sw_click(&K, &u, ev.x, ev.y, now);
                     if (K.tab == TAB_ALARM) alarm_click(&K, &u, ev.x, ev.y, w.sec_of_day);
-                    /* a click anywhere else dismisses a ringing alarm */
+                    /* a click anywhere else dismisses a ringing alarm,
+                     * and a finished timer that is following the user */
                     if (K.tab != TAB_ALARM) K.a_rings = 0;
+                    if (K.tab != TAB_TIMER) K.t_done = 0;
                 }
                 was_down = ev.buttons & 1;
                 break;
@@ -1374,13 +1545,14 @@ int main(void) {
         /* Wake up often enough for the fastest thing that is running, and
          * lazily when nothing is. There is no frame clock here. */
         int delay = 150;
-        if (K.t_run || K.w_run) delay = 30;
+        if (K.t_run || K.w_run || K.tone_on) delay = 30;
         else if (flash_on(now, K.t_flash_until) || flash_on(now, K.a_flash_until) ||
                  now < K.t_flash_until || now < K.a_flash_until) delay = 60;
         else if (K.tab == TAB_CLOCK) delay = 120;
         usleep((useconds_t)delay * 1000);
     }
 
+    tone_stop(&K);
     mc_close(&c);
     return 0;
 }

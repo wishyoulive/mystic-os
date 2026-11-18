@@ -1801,6 +1801,483 @@ static void launcher_geom(int idx, int *tx, int *ty, int *tw, int *th) {
                      idx, tx, ty, tw, th);
 }
 
+/* --- the catalogue the search may look at -------------------------------
+ * Only these answers leave the search model below; everything else it needs
+ * it derives from them. The host harness (.work/spotlight/harness.c) gives
+ * the same answers for a fake catalogue, so the block it compiles is the
+ * exact shipping filter - not a second copy of the rules.
+ */
+static int launcher_builtin_count(void) { return LAUNCHER_N; }
+static int launcher_item_count(void) { return launcher_items(); }
+static int launcher_item_builtin(int i) { return i >= 0 && i < LAUNCHER_N; }
+static const char *launcher_item_name(int i) {
+    if (i < 0 || i >= launcher_items()) return NULL;
+    if (i < LAUNCHER_N) return LAUNCHER[i].label;
+    int b = i - LAUNCHER_N;
+    return (b < bundle_count) ? bundles[b].name : NULL;
+}
+static const char *launcher_item_id(int i) {
+    if (i < 0 || i >= launcher_items()) return NULL;
+    if (i < LAUNCHER_N) return LAUNCHER[i].app_id;     /* NULL = Terminal */
+    int b = i - LAUNCHER_N;
+    return (b < bundle_count) ? bundles[b].id : NULL;
+}
+/* The theme names a ':' query matches. Accessors for the same reason: the
+ * model never reaches into themes[] itself. */
+static int launcher_theme_count(void) { return theme_count; }
+static const char *launcher_theme_name(int i) {
+    return (i >= 0 && i < theme_count) ? themes[i].name : NULL;
+}
+
+/* ---- MYSTIC_LAUNCHER_SEARCH_BEGIN -------------------------------------
+ *
+ * Spotlight, without the network: while the launcher is open a printable
+ * character goes into a query, and the query filters the catalogue.
+ *
+ *   matches   case-insensitive; name first, bundle/app id second;
+ *             score 6 name equals, 5 name prefix, 4 name substring,
+ *             3 id equals, 2 id prefix, 1 id substring.
+ *   order     score, then catalogue order - which is why a built-in app
+ *             comes before a bundle with the same score.
+ *   Enter     runs row 0 of the filtered set, i.e. the best match.
+ *   Esc       clears a non-empty query, then closes the launcher.
+ *   Up/Down   move only inside the matches, clamped to the end.
+ *
+ * Commands in the same field (all honest, no shell bridge exists):
+ *   settings | files   open the built-in app
+ *   browser            launch the installed bundle with id "web"
+ *   :<theme>           apply the theme by name (exact or prefix)
+ *   >...               refused, with the reason on screen
+ *
+ * The block is geometry-free on purpose: no Surface, no Font, no window.
+ * That is what lets the host harness drive this very key handler.
+ */
+#define LAUNCHER_QUERY_MAX 48
+#define LAUNCHER_ROWS_MAX  64
+
+enum { LAUNCHER_ROW_APP = 0, LAUNCHER_ROW_BUNDLE, LAUNCHER_ROW_THEME };
+enum { LAUNCHER_GO_NONE = 0, LAUNCHER_GO_TERM, LAUNCHER_GO_APP,
+       LAUNCHER_GO_BUNDLE, LAUNCHER_GO_THEME };
+enum { LAUNCHER_KEY_IGNORED = 0, LAUNCHER_KEY_DIRTY,
+       LAUNCHER_KEY_RUN, LAUNCHER_KEY_CLOSE };
+
+typedef struct {
+    int kind;         /* LAUNCHER_GO_* */
+    int index;        /* catalogue index for GO_APP/GO_BUNDLE */
+    int theme;        /* theme index for GO_THEME */
+} LauncherGo;
+
+typedef struct {
+    int kind;         /* LAUNCHER_ROW_* */
+    int item;         /* catalogue index, or theme index for THEME */
+    int score;        /* 0 = no name/id match (command row) */
+    int hl_at;        /* first highlighted byte, -1 = none */
+    int hl_len;
+    int hl_id;        /* 1 = the span is in the id, not the name */
+    int cmd;          /* 1 = promoted by a command word */
+} LauncherRow;
+
+static char launcher_query[LAUNCHER_QUERY_MAX + 1];
+static int  launcher_query_len;
+static int  launcher_hit;                 /* index into launcher_rows[] */
+static LauncherRow launcher_rows[LAUNCHER_ROWS_MAX];
+static int  launcher_row_n;
+static char launcher_status[128];
+static unsigned launcher_query_rev;       /* bumped on every edit */
+static unsigned launcher_filter_rev = 1;  /* 0 is a valid revision: seed 1 */
+static int  launcher_filter_napps = -1;
+
+/* Command words. Their targets are looked up in the catalogue, so
+ * "browser" only becomes a row when the web bundle is really installed. */
+typedef struct { const char *word; const char *target; int bundle; } LauncherCmd;
+static const LauncherCmd LAUNCHER_CMDS[] = {
+    { "settings", "settings", 0 },
+    { "files",    "files",    0 },
+    { "browser",  "web",      1 },
+};
+
+static int launcher_lc(int c) {
+    return (c >= 'A' && c <= 'Z') ? c + ('a' - 'A') : c;
+}
+/* case-insensitive equality of the first n bytes; `a` must hold n bytes */
+static int launcher_ci_eq_n(const char *a, const char *b, int n) {
+    for (int i = 0; i < n; i++)
+        if (launcher_lc((unsigned char)a[i]) != launcher_lc((unsigned char)b[i]))
+            return 0;
+    return 1;
+}
+static int launcher_ci_find(const char *hay, const char *needle, int *at) {
+    int nl = (int)strlen(needle);
+    if (!hay || nl <= 0) return 0;
+    for (int i = 0; hay[i]; i++) {
+        int k = 0;
+        while (hay[i + k] && k < nl &&
+               launcher_lc((unsigned char)hay[i + k]) ==
+               launcher_lc((unsigned char)needle[k]))
+            k++;
+        if (k == nl) { *at = i; return 1; }
+    }
+    return 0;
+}
+
+/* 0 = no match, 1..6 = the score documented above. `*hl_at`/`*hl_id` say
+ * which bytes the list should paint in the accent colour. */
+static int launcher_score(const char *name, const char *id,
+                          int *hl_at, int *hl_id) {
+    const char *q = launcher_query;
+    int ql = launcher_query_len, nlen = name ? (int)strlen(name) : 0;
+    int ilen = id ? (int)strlen(id) : 0;
+    int at = -1;
+    if (!ql) return 0;
+    if (nlen == ql && launcher_ci_eq_n(name, q, ql)) {
+        *hl_at = 0; *hl_id = 0; return 6;
+    }
+    if (nlen >= ql && launcher_ci_eq_n(name, q, ql)) {
+        *hl_at = 0; *hl_id = 0; return 5;
+    }
+    if (launcher_ci_find(name, q, &at)) {
+        *hl_at = at; *hl_id = 0; return 4;
+    }
+    if (ilen == ql && launcher_ci_eq_n(id, q, ql)) {
+        *hl_at = 0; *hl_id = 1; return 3;
+    }
+    if (ilen >= ql && launcher_ci_eq_n(id, q, ql)) {
+        *hl_at = 0; *hl_id = 1; return 2;
+    }
+    if (launcher_ci_find(id, q, &at)) {
+        *hl_at = at; *hl_id = 1; return 1;
+    }
+    return 0;
+}
+
+/* -1 = not a command word, -2 = it is a command but its target is not
+ * installed, otherwise the catalogue index of the target. */
+static int launcher_command_item(const char **word) {
+    if (word) *word = NULL;
+    if (!launcher_query_len) return -1;
+    for (unsigned c = 0; c < sizeof LAUNCHER_CMDS / sizeof LAUNCHER_CMDS[0]; c++) {
+        int wl = (int)strlen(LAUNCHER_CMDS[c].word);
+        if (wl != launcher_query_len ||
+            !launcher_ci_eq_n(launcher_query, LAUNCHER_CMDS[c].word, wl))
+            continue;
+        if (word) *word = LAUNCHER_CMDS[c].word;
+        for (int i = 0; i < launcher_item_count(); i++) {
+            if (launcher_item_builtin(i) != !LAUNCHER_CMDS[c].bundle) continue;
+            const char *id = launcher_item_id(i);
+            if (id && !strcmp(id, LAUNCHER_CMDS[c].target)) return i;
+        }
+        return -2;
+    }
+    return -1;
+}
+
+static void launcher_query_clear(void) {
+    launcher_query[0] = '\0';
+    launcher_query_len = 0;
+    launcher_query_rev++;
+    launcher_hit = 0;
+}
+
+static void launcher_text_input(const char *bytes, int n) {
+    int changed = 0;
+    for (int i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)bytes[i];
+        if (c < 0x20 || c == 0x7f) continue;       /* Enter/Backspace are keys */
+        if (launcher_query_len >= LAUNCHER_QUERY_MAX) break;
+        launcher_query[launcher_query_len++] = (char)c;
+        launcher_query[launcher_query_len] = '\0';
+        changed = 1;
+    }
+    if (changed) {
+        launcher_query_rev++;
+        launcher_hit = 0;            /* the best match is what Enter runs */
+    }
+}
+
+static void launcher_query_backspace(void) {
+    if (launcher_query_len == 0) return;
+    while (launcher_query_len > 0) {
+        launcher_query_len--;
+        /* never split a UTF-8 codepoint */
+        if (((unsigned char)launcher_query[launcher_query_len] & 0xC0) != 0x80)
+            break;
+    }
+    launcher_query[launcher_query_len] = '\0';
+    launcher_query_rev++;
+    launcher_hit = 0;
+}
+
+static int launcher_query_active(void) { return launcher_query_len > 0; }
+
+/* Recompute the filtered set only when something changed: the query (a
+ * revision counter) or the catalogue size (an app installed/removed). The
+ * draw path calls this every frame; the string work happens on an edit. */
+static void launcher_filter_refresh(void) {
+    int napps = launcher_item_count();
+    if (launcher_query_rev == launcher_filter_rev && napps == launcher_filter_napps) {
+        if (launcher_hit >= launcher_row_n)
+            launcher_hit = launcher_row_n > 0 ? launcher_row_n - 1 : 0;
+        return;
+    }
+    launcher_filter_rev = launcher_query_rev;
+    launcher_filter_napps = napps;
+    launcher_row_n = 0;
+    launcher_status[0] = '\0';
+
+    if (launcher_query_len == 0) {
+        snprintf(launcher_status, sizeof launcher_status, "Type to search");
+        launcher_hit = 0;
+        return;
+    }
+
+    if (launcher_query[0] == '>') {
+        snprintf(launcher_status, sizeof launcher_status,
+                 "no shell here - open Terminal to run a command");
+        launcher_hit = 0;
+        return;
+    }
+
+    if (launcher_query[0] == ':') {
+        int wl = launcher_query_len - 1;
+        const char *want = launcher_query + 1;
+        if (wl == 0) {
+            snprintf(launcher_status, sizeof launcher_status,
+                     "type a theme name after ':'");
+        } else {
+            int exact = -1, n = 0;
+            for (int i = 0; i < launcher_theme_count() && n < LAUNCHER_ROWS_MAX; i++) {
+                const char *tn = launcher_theme_name(i);
+                int tlen = tn ? (int)strlen(tn) : 0;
+                int rank = 0;
+                if (tlen == wl && launcher_ci_eq_n(tn, want, wl)) rank = 2;
+                else if (tlen >= wl && launcher_ci_eq_n(tn, want, wl)) rank = 1;
+                if (!rank) continue;
+                if (rank == 2) exact = n;
+                LauncherRow *r = &launcher_rows[n++];
+                r->kind = LAUNCHER_ROW_THEME;
+                r->item = i;
+                r->score = rank;
+                r->hl_at = 0;
+                r->hl_len = wl;
+                r->hl_id = 0;
+                r->cmd = 1;
+            }
+            launcher_row_n = n;
+            if (exact > 0) {           /* the one exact name is what Enter runs */
+                LauncherRow t = launcher_rows[exact];
+                memmove(&launcher_rows[1], &launcher_rows[0],
+                        sizeof launcher_rows[0] * (size_t)exact);
+                launcher_rows[0] = t;
+            }
+            if (launcher_row_n == 0)
+                snprintf(launcher_status, sizeof launcher_status,
+                         "no theme named \"%.32s\"", want);
+            else
+                snprintf(launcher_status, sizeof launcher_status, "%d theme%s",
+                         launcher_row_n, launcher_row_n == 1 ? "" : "s");
+        }
+        launcher_hit = 0;
+        return;
+    }
+
+    const char *cmd_word = NULL;
+    int cmd_item = launcher_command_item(&cmd_word);
+    if (cmd_item == -2) {
+        snprintf(launcher_status, sizeof launcher_status,
+                 "%.24s is not installed", cmd_word ? cmd_word : "that app");
+        launcher_hit = 0;
+        return;
+    }
+
+    LauncherRow tmp[LAUNCHER_ROWS_MAX];
+    int cand = 0;
+    for (int i = 0; i < napps && cand < LAUNCHER_ROWS_MAX; i++) {
+        int at = -1, hl_id = 0;
+        int sc = launcher_score(launcher_item_name(i), launcher_item_id(i),
+                                &at, &hl_id);
+        if (sc <= 0) continue;
+        tmp[cand].kind = launcher_item_builtin(i) ? LAUNCHER_ROW_APP
+                                                  : LAUNCHER_ROW_BUNDLE;
+        tmp[cand].item = i;
+        tmp[cand].score = sc;
+        tmp[cand].hl_at = at;
+        tmp[cand].hl_len = launcher_query_len;
+        tmp[cand].hl_id = hl_id;
+        tmp[cand].cmd = 0;
+        cand++;
+    }
+    /* insertion sort, stable: equal scores keep catalogue order, which puts
+     * every built-in app before every bundle of the same rank */
+    for (int i = 1; i < cand; i++) {
+        LauncherRow key = tmp[i];
+        int j = i - 1;
+        while (j >= 0 && tmp[j].score < key.score) { tmp[j + 1] = tmp[j]; j--; }
+        tmp[j + 1] = key;
+    }
+    if (cmd_item >= 0) {
+        int found = -1;
+        for (int i = 0; i < cand; i++)
+            if (tmp[i].item == cmd_item) { found = i; break; }
+        if (found < 0 && cand < LAUNCHER_ROWS_MAX) {
+            tmp[cand].kind = launcher_item_builtin(cmd_item) ? LAUNCHER_ROW_APP
+                                                             : LAUNCHER_ROW_BUNDLE;
+            tmp[cand].item = cmd_item;
+            tmp[cand].score = 0;
+            tmp[cand].hl_at = -1;
+            tmp[cand].hl_len = 0;
+            tmp[cand].hl_id = 0;
+            tmp[cand].cmd = 1;
+            found = cand++;
+        }
+        if (found >= 0) {
+            tmp[found].cmd = 1;
+            if (found > 0) {           /* the command target is row 0 */
+                LauncherRow c = tmp[found];
+                memmove(&tmp[1], &tmp[0], sizeof tmp[0] * (size_t)found);
+                tmp[0] = c;
+            }
+        }
+    }
+    memcpy(launcher_rows, tmp, sizeof tmp[0] * (size_t)cand);
+    launcher_row_n = cand;
+    if (launcher_row_n == 0)
+        snprintf(launcher_status, sizeof launcher_status, "no apps match");
+    else
+        snprintf(launcher_status, sizeof launcher_status, "%d match%s",
+                 launcher_row_n, launcher_row_n == 1 ? "" : "es");
+    if (launcher_hit >= launcher_row_n)
+        launcher_hit = launcher_row_n > 0 ? launcher_row_n - 1 : 0;
+    if (launcher_hit < 0) launcher_hit = 0;
+}
+
+static void launcher_hit_move(int delta) {
+    launcher_filter_refresh();
+    if (launcher_row_n <= 0) { launcher_hit = 0; return; }
+    int h = launcher_hit + delta;
+    if (h < 0) h = 0;
+    if (h >= launcher_row_n) h = launcher_row_n - 1;
+    launcher_hit = h;
+}
+
+/* The intent a row stands for. Returns 1 when there is one. */
+static int launcher_row_go(int row, LauncherGo *go) {
+    memset(go, 0, sizeof *go);
+    if (row < 0 || row >= launcher_row_n) return 0;
+    const LauncherRow *r = &launcher_rows[row];
+    if (r->kind == LAUNCHER_ROW_THEME) {
+        go->kind = LAUNCHER_GO_THEME;
+        go->theme = r->item;
+        return 1;
+    }
+    if (r->kind == LAUNCHER_ROW_APP) {
+        if (!launcher_item_id(r->item)) { go->kind = LAUNCHER_GO_TERM; return 1; }
+        go->kind = LAUNCHER_GO_APP;
+        go->index = r->item;
+        return 1;
+    }
+    go->kind = LAUNCHER_GO_BUNDLE;
+    go->index = r->item - launcher_builtin_count();
+    return go->index >= 0;
+}
+
+/* One key, one answer. `go` is filled only for LAUNCHER_KEY_RUN. Enter on a
+ * query with no rows returns IGNORED: the launcher stays open on the visible
+ * "no apps match" line instead of closing over a guess. */
+static int launcher_key(int key, LauncherGo *go) {
+    memset(go, 0, sizeof *go);
+    launcher_filter_refresh();
+
+    if (key == SC_KEY_ESC) {
+        if (launcher_query_len) {
+            launcher_query_clear();
+            launcher_filter_refresh();      /* the model is consistent on return */
+            return LAUNCHER_KEY_DIRTY;       /* clear first... */
+        }
+        launcher_query_clear();
+        launcher_filter_refresh();
+        return LAUNCHER_KEY_CLOSE;           /* ...then close */
+    }
+
+    if (launcher_query_len == 0) {
+        if (key != SC_KEY_ENTER) return LAUNCHER_KEY_IGNORED;
+        /* the grid's own selection, exactly as before the field existed */
+        if (launcher_sel < 0 || launcher_sel >= launcher_item_count())
+            return LAUNCHER_KEY_IGNORED;
+        int i = launcher_sel;
+        if (launcher_item_builtin(i)) {
+            if (!launcher_item_id(i)) go->kind = LAUNCHER_GO_TERM;
+            else { go->kind = LAUNCHER_GO_APP; go->index = i; }
+        } else {
+            go->kind = LAUNCHER_GO_BUNDLE;
+            go->index = i - launcher_builtin_count();
+        }
+        return LAUNCHER_KEY_RUN;
+    }
+
+    if (key == 14) {                          /* Backspace */
+        launcher_query_backspace();
+        launcher_filter_refresh();
+        return LAUNCHER_KEY_DIRTY;
+    }
+    if (key == SC_KEY_ENTER) {
+        if (launcher_row_n <= 0) return LAUNCHER_KEY_IGNORED;
+        return launcher_row_go(launcher_hit, go) ? LAUNCHER_KEY_RUN
+                                                 : LAUNCHER_KEY_IGNORED;
+    }
+    if (key == SC_KEY_UP)   { launcher_hit_move(-1); return LAUNCHER_KEY_DIRTY; }
+    if (key == SC_KEY_DOWN) { launcher_hit_move(1);  return LAUNCHER_KEY_DIRTY; }
+    return LAUNCHER_KEY_IGNORED;               /* Left/Right do not edit */
+}
+
+/* A query belongs to one visit: opening starts empty, and every way of
+ * closing (Esc, Enter, a click outside, Super, a gesture) forgets it. One
+ * call per frame keeps all five paths in sync. */
+static void launcher_focus_sync(int open) {
+    static int was_open = 0;
+    if (open != was_open) {
+        launcher_query_clear();
+        launcher_hit = 0;
+        launcher_filter_refresh();
+        was_open = open;
+    }
+}
+/* ---- MYSTIC_LAUNCHER_SEARCH_END --------------------------------------- */
+
+static void theme_apply(int idx);   /* defined with the theme writes */
+
+/* Run the intent the model produced. The only place in the search that
+ * touches a window, a bundle or a theme. */
+static void launcher_run(const LauncherGo *go) {
+    if (!go) return;
+    switch (go->kind) {
+    case LAUNCHER_GO_TERM:
+        win_open(WIN_TERM, NULL);
+        break;
+    case LAUNCHER_GO_APP: {
+        const char *id = launcher_item_id(go->index);
+        if (id) win_open(WIN_APP, id);
+        else    win_open(WIN_TERM, NULL);
+        break;
+    }
+    case LAUNCHER_GO_BUNDLE: {
+        int b = go->index;
+        if (b >= 0 && b < bundle_count) {
+            int pid = wms_launch(&bundles[b], clients, b);
+            fprintf(stderr, "spotlight: launch %s pid %d\n", bundles[b].id, pid);
+        } else {
+            fprintf(stderr, "spotlight: no installed bundle at index %d\n", b);
+        }
+        break;
+    }
+    case LAUNCHER_GO_THEME:
+        theme_apply(go->theme);
+        break;
+    default:
+        fprintf(stderr, "spotlight: nothing to run\n");
+        break;
+    }
+}
+
 /* True while a theme-animated item is active: a hovered dock icon, a hovered
  * launcher tile, or the launcher's keyboard selection. Those are the only
  * three conditions anim_gate() accepts. A still desktop never asks for a frame
@@ -1840,9 +2317,342 @@ static int anim_item_under_pointer(void) {
                      dock_item, tile, selected_tile);
 }
 
+/* ------------------------------------------------- the search field and list
+ *
+ * One measured rectangle for the field, one for the list, and one row pitch
+ * derived from the line the row really draws - so text scale 1.6 cannot put
+ * two rows on top of each other. The field is above the grid when the screen
+ * has room for it and in the old hint line's place when it does not; the grid
+ * itself is never moved, which is why the empty-query screen is unchanged.
+ */
+static int launcher_field_h(void) {
+    return ui_line_h(FONT_MEDIUM, 12) + ui_px(8);
+}
+
+static void launcher_field_rect(const Surface *s, int *x, int *y, int *w, int *h,
+                                int *below) {
+    const int total = launcher_items();
+    int px, py, pw, ph;
+    ui_launcher_panel(total, s->w, s->h, launcher_label_w(), &px, &py, &pw, &ph);
+    int fh = launcher_field_h();
+    int top = topbar_h() + ui_px(4);
+    *below = 0;
+    int fy = py - ui_px(7) - fh;
+    if (fy >= top) {
+        *x = px; *y = fy; *w = pw; *h = fh;
+        return;
+    }
+    fy = py + ph + ui_px(6);
+    if (fy + fh <= s->h - ui_px(2)) {
+        *x = px; *y = fy; *w = pw; *h = fh; *below = 1;
+        return;
+    }
+    /* no room either side: pin it to the bottom edge, still on screen */
+    fy = s->h - fh - ui_px(2);
+    if (fy < top) fy = top;
+    *x = px; *y = fy; *w = pw; *h = fh; *below = 1;
+}
+
+/* A field shows the TAIL of an overlong query: text_fit() would cut the end,
+ * which is exactly the character the user just typed. */
+static void launcher_fit_tail(Font *f, const char *src, char *dst, size_t cap,
+                              float avail) {
+    if (!dst || cap < 4) return;
+    dst[0] = '\0';
+    if (!f || !src || !*src) return;
+    if (font_width(f, src) <= avail) { snprintf(dst, cap, "%s", src); return; }
+    const char *ell = "\xE2\x80\xA6";
+    float ew = font_width(f, ell);
+    if (ew <= 0.0f) { ell = "..."; ew = font_width(f, ell); }
+    if (ew > avail) return;
+    const char *p = src + strlen(src);
+    while (p > src) {
+        const char *q = p - 1;
+        while (q > src && ((unsigned char)*q & 0xC0) == 0x80) q--;
+        p = q;
+        if (font_width(f, p) + ew <= avail) break;
+    }
+    snprintf(dst, cap, "%s%s", ell, p);
+}
+
+/* Draw `str`, painting bytes [at, at+len) in `hi`. Falls back to one plain
+ * draw when the span is not inside the string, so a stale index can never
+ * paint past its buffer. */
+static void launcher_draw_hilite(Surface *s, Font *f, float x, float y,
+                                 const char *str, int at, int len,
+                                 u32 base, u32 hi) {
+    size_t n = str ? strlen(str) : 0;
+    if (!str || at < 0 || len <= 0 || (size_t)(at + len) > n) {
+        if (str) font_draw(s, f, x, y, str, base);
+        return;
+    }
+    char a[96], b[96], c[96];
+    snprintf(a, sizeof a, "%.*s", at, str);
+    snprintf(b, sizeof b, "%.*s", len, str + at);
+    snprintf(c, sizeof c, "%s", str + at + len);
+    float x1 = x + font_draw(s, f, x, y, a, base);
+    float x2 = x1 + font_draw(s, f, x1, y, b, hi);
+    font_draw(s, f, x2, y, c, base);
+}
+
+static void launcher_draw_field(Surface *s, const Theme *th,
+                                int x, int y, int w, int h) {
+    Font *f = font_get(FONT_MEDIUM, 12);
+    const int r = ui_px(10);
+    gfx_shadow(s, (float)x, (float)y, (float)w, (float)h, (float)r, ui_px(10), 0.35f);
+    gfx_rrect_aa(s, (float)x, (float)y, (float)w, (float)h, (float)r,
+                 th->panel, th->panel_border, 1.0f);
+
+    /* magnifier: a ring and a handle, sized from the line it sits beside */
+    int gsz = (int)(font_height(f) * 0.5f);
+    if (gsz < ui_px(6)) gsz = ui_px(6);
+    float gx = (float)x + ui_px(12);
+    float gy = (float)y + ((float)h - gsz) * 0.5f;
+    u32 gcol = color_alpha(th->text, 0.45f);
+    gfx_rrect_aa(s, gx, gy, (float)gsz, (float)gsz, gsz * 0.5f, 0, gcol, 1.5f);
+    gfx_line(s, gx + gsz * 0.76f, gy + gsz * 0.76f,
+             gx + gsz * 1.15f, gy + gsz * 1.15f, 1.5f, gcol);
+
+    float tx = gx + gsz + ui_px(10);
+    float ty = (float)y + ((float)h - font_height(f)) * 0.5f;
+    float avail = (float)(x + w) - ui_px(12) - tx - ui_px(3);
+    if (avail < 0) avail = 0;
+    if (!launcher_query_len) {
+        char ph[64];
+        text_fit(f, "Search apps", ph, sizeof ph, avail);
+        font_draw(s, f, tx, ty, ph, color_alpha(th->text, 0.45f));
+        return;
+    }
+    char shown[LAUNCHER_QUERY_MAX * 2 + 4];
+    launcher_fit_tail(f, launcher_query, shown, sizeof shown, avail);
+    font_draw(s, f, tx, ty, shown, th->text);
+    /* caret after the real text, clamped inside the pill */
+    float cx = tx + font_width(f, shown);
+    if (cx > x + w - ui_px(8)) cx = (float)(x + w - ui_px(8));
+    float ch = font_height(f) * 0.82f;
+    gfx_rrect_aa(s, cx, (float)y + ((float)h - ch) * 0.5f, 1.5f, ch, 0.75f,
+                 color_alpha(th->accent, 0.9f), 0, 0);
+}
+
+typedef struct {
+    int px, py, pw, ph;      /* the pill behind field + rows + count */
+    int fx, fy, fw, fh;      /* the field inside it */
+    int rx, ry, rw, row_h;   /* the row column */
+    int rows, first;         /* visible rows, first visible row index */
+    int foot_y;
+} LauncherList;
+
+static void launcher_list_layout(const Surface *s, LauncherList *L) {
+    Font *f12 = font_get(FONT_MEDIUM, 12);
+    Font *fd  = font_get(FONT_REGULAR, 10);
+    const int margin = ui_px(20);
+    int pw = ui_px(560);
+    if (pw > s->w - 2 * margin) pw = s->w - 2 * margin;
+    if (pw < ui_px(240)) pw = s->w - 2 * ui_px(8);
+    if (pw > s->w) pw = s->w;
+    if (pw < 1) pw = s->w;
+    int px = (s->w - pw) / 2;
+    if (px < 0) { px = 0; pw = s->w; }
+
+    const int inset = ui_px(10);
+    const int gap = ui_px(6);
+    const int fh = launcher_field_h();
+    const int row_h = (int)(font_height(f12) + 0.5f) + ui_px(12);
+    const int foot_h = (int)(font_height(fd) + 0.5f) + ui_px(4);
+
+    int top = topbar_h() + ui_px(28);
+    int need = inset + fh + gap + row_h + gap + foot_h + inset;
+    if (top + need > s->h - ui_px(6)) top = topbar_h() + ui_px(6);
+    if (top + need > s->h - ui_px(2)) top = s->h - ui_px(2) - need;
+    if (top < topbar_h() + ui_px(2)) top = topbar_h() + ui_px(2);
+
+    int avail = s->h - ui_px(6) - (top + inset + fh + gap) - gap - foot_h - inset;
+    int rows = avail / row_h;
+    if (rows < 1) rows = 1;
+    if (launcher_row_n > 0 && rows > launcher_row_n) rows = launcher_row_n;
+    if (rows > LAUNCHER_ROWS_MAX) rows = LAUNCHER_ROWS_MAX;
+
+    L->pw = pw;
+    L->ph = inset * 2 + fh + gap + rows * row_h + gap + foot_h;
+    L->px = px;
+    L->py = top;
+    if (L->py + L->ph > s->h - ui_px(2)) L->py = s->h - ui_px(2) - L->ph;
+    if (L->py < topbar_h() + ui_px(2)) L->py = topbar_h() + ui_px(2);
+    L->fx = L->px + inset;
+    L->fy = L->py + inset;
+    L->fw = L->pw - 2 * inset;
+    L->fh = fh;
+    L->rx = L->px + ui_px(6);
+    L->rw = L->pw - 2 * ui_px(6);
+    L->ry = L->py + inset + fh + gap;
+    L->row_h = row_h;
+    L->rows = rows;
+    L->foot_y = L->py + L->ph - inset - foot_h + ui_px(2);
+
+    int first = 0;
+    if (launcher_hit >= rows) first = launcher_hit - rows + 1;
+    if (launcher_row_n > 0 && first > launcher_row_n - rows)
+        first = launcher_row_n - rows;
+    if (first < 0) first = 0;
+    L->first = first;
+}
+
+/* One row: icon (or a theme's accent swatch), the name with its matched
+ * characters in the accent colour, and the bundle id right-aligned on the
+ * same column for every row. */
+static void launcher_draw_row(Surface *s, const Theme *th, int row,
+                              int x, int y, int w, int h,
+                              int hovered, int selected) {
+    const LauncherRow *r = &launcher_rows[row];
+    Font *f12 = font_get(FONT_MEDIUM, 12);
+    Font *fd  = font_get(FONT_REGULAR, 10);
+    if (selected || hovered) {
+        u32 bg = color_alpha(th->accent, selected ? 0.30f : 0.18f);
+        gfx_rrect_aa(s, (float)x, (float)y, (float)w, (float)h, (float)ui_px(8),
+                     bg, selected ? th->accent : 0, selected ? 1.0f : 0.0f);
+    }
+
+    int isz = h - 2 * ui_px(4);
+    if (isz > ui_px(26)) isz = ui_px(26);
+    if (isz < 10) isz = 10;
+    int ix = x + ui_px(9), iy = y + (h - isz) / 2;
+    const char *name = (r->kind == LAUNCHER_ROW_THEME)
+                     ? launcher_theme_name(r->item)
+                     : launcher_item_name(r->item);
+    const char *id = (r->kind == LAUNCHER_ROW_THEME)
+                   ? "theme"
+                   : launcher_item_id(r->item);
+
+    if (r->kind == LAUNCHER_ROW_THEME) {
+        gfx_rrect_aa(s, (float)ix, (float)iy, (float)isz, (float)isz,
+                     isz * 0.34f, themes[r->item].accent, 0, 0);
+    } else {
+        IconFn fn = (r->kind == LAUNCHER_ROW_APP) ? launcher_icon(r->item)
+                                                  : icon_for_bundle(id ? id : "");
+        if (fn) {
+            IconPair pair = theme_icon_pair(th, th->text, selected);
+            icon_draw(fn, s, (float)ix, (float)iy, (float)isz,
+                      pair.body, pair.hi, th, now_sec(), selected);
+        } else {
+            gfx_rrect_aa(s, (float)ix, (float)iy, (float)isz, (float)isz,
+                         isz * 0.34f, color_alpha(th->text, 0.10f), 0, 0);
+            char initial[2] = { (char)(name && name[0] ? name[0] : '?'), 0 };
+            Font *fi = initial_font(isz);
+            float iw = font_width(fi, initial);
+            font_draw(s, fi, (float)ix + ((float)isz - iw) * 0.5f,
+                      (float)iy + ((float)isz - font_height(fi)) * 0.5f,
+                      initial, th->text);
+        }
+    }
+
+    /* ONE left inset and ONE value column: the id is right-aligned on it in
+     * every row, and the name is fitted into what is left, so no two strings
+     * can meet in the middle. */
+    float left  = (float)ix + (float)isz + ui_px(10);
+    float right = (float)(x + w) - ui_px(10);
+    float id_w = id ? font_width(fd, id) : 0.0f;
+    float max_id = (right - left) * 0.45f;
+    if (max_id < 0) max_id = 0;
+    if (id_w > max_id) id_w = max_id;
+    float id_x = right - id_w;
+    float name_avail = id_x - ui_px(10) - left;
+    if (name_avail < 0) name_avail = 0;
+    float base = (float)y + ((float)h - font_height(f12)) * 0.5f;
+    u32 name_col = selected ? th->text : th->text_dim;
+    char fitted[128];
+    text_fit(f12, name ? name : "", fitted, sizeof fitted, name_avail);
+    if (r->hl_len > 0 && !r->hl_id && name &&
+        font_width(f12, name) <= name_avail) {
+        launcher_draw_hilite(s, f12, left, base, name,
+                             r->hl_at, r->hl_len, name_col, th->accent);
+    } else {
+        font_draw(s, f12, left, base, fitted, name_col);
+    }
+    if (id && id_w > 2) {
+        u32 id_col = color_alpha(th->text, 0.45f);
+        float idy = (float)y + ((float)h - font_height(fd)) * 0.5f;
+        char idfit[64];
+        text_fit(fd, id, idfit, sizeof idfit, id_w);
+        if (r->hl_len > 0 && r->hl_id && font_width(fd, id) <= id_w)
+            launcher_draw_hilite(s, fd, id_x, idy, id,
+                                 r->hl_at, r->hl_len, id_col, th->accent);
+        else
+            font_draw(s, fd, id_x, idy, idfit, id_col);
+    }
+}
+
+static void draw_launcher_results(Surface *s, const Theme *th) {
+    launcher_filter_refresh();
+    LauncherList L;
+    launcher_list_layout(s, &L);
+
+    gfx_shadow(s, (float)L.px, (float)L.py, (float)L.pw, (float)L.ph,
+               20, 26, 0.55f);
+    gfx_rrect_aa(s, (float)L.px, (float)L.py, (float)L.pw, (float)L.ph, 20,
+                 color_alpha(th->window_bg, 0.97f), th->window_border, 1.0f);
+    launcher_draw_field(s, th, L.fx, L.fy, L.fw, L.fh);
+
+    Font *fd = font_get(FONT_REGULAR, 10);
+    if (launcher_row_n == 0) {
+        /* the visible reason there is nothing to open, in the space the rows
+         * would have used */
+        char shown[160];
+        float avail = (float)(L.rw - 2 * ui_px(10));
+        text_fit(fd, launcher_status, shown, sizeof shown, avail);
+        float tw = font_width(fd, shown);
+        font_draw(s, fd, (float)L.px + ((float)L.pw - tw) * 0.5f,
+                  (float)L.ry + ((float)L.row_h - font_height(fd)) * 0.5f,
+                  shown, color_alpha(th->text, 0.55f));
+    } else {
+        for (int i = 0; i < L.rows; i++) {
+            int row = L.first + i;
+            if (row >= launcher_row_n) break;
+            int ry = L.ry + i * L.row_h;
+            int hovered = (input.mouse_x >= L.rx && input.mouse_x < L.rx + L.rw &&
+                           input.mouse_y >= ry && input.mouse_y < ry + L.row_h);
+            launcher_draw_row(s, th, row, L.rx, ry, L.rw, L.row_h,
+                              hovered, row == launcher_hit);
+        }
+    }
+
+    /* One footer line: the count on the left (the model's own words), the
+     * key hint on the right only when both are measured to fit. */
+    const char *hint = "Esc clears";
+    if (launcher_row_n > 0) {
+        hint = (launcher_rows[launcher_hit].kind == LAUNCHER_ROW_THEME)
+             ? "Enter applies \xC2\xB7 Esc clears"
+             : "Enter opens \xC2\xB7 Esc clears";
+    }
+    if (launcher_row_n > 0) {
+        char count[64];
+        text_fit(fd, launcher_status, count, sizeof count,
+                 (float)L.rw * 0.6f);
+        float hw2 = font_width(fd, hint);
+        float cw = font_width(fd, count);
+        font_draw(s, fd, (float)L.rx, (float)L.foot_y, count,
+                  color_alpha(th->text, 0.55f));
+        if (cw + ui_px(12) + hw2 <= (float)L.rw)
+            font_draw(s, fd, (float)(L.rx + L.rw) - hw2, (float)L.foot_y, hint,
+                      color_alpha(th->text, 0.38f));
+    } else {
+        float hw2 = font_width(fd, hint);
+        font_draw(s, fd, (float)(L.rx + L.rw) - hw2, (float)L.foot_y, hint,
+                  color_alpha(th->text, 0.38f));
+    }
+}
+
 static void draw_launcher(Surface *s, const Theme *th) {
     /* dim everything behind */
     surf_blend(s, 0, 0, s->w, s->h, 0xAA000000u);
+    launcher_filter_refresh();
+    if (launcher_query_active()) {
+        /* One column of matches. A tile is an icon and a fitted label; a
+         * match also has to show the bundle id and which characters matched,
+         * and at 1.6 those three things cannot share a 200 px tile. The list
+         * gives every string its own measured column. */
+        draw_launcher_results(s, th);
+        return;
+    }
 
     const int total = launcher_items();
     const int label_w = launcher_label_w();
@@ -1924,9 +2734,19 @@ static void draw_launcher(Surface *s, const Theme *th) {
                   hovered ? th->text : th->text_dim);
     }
 
-    float hw = font_width(fd, "Super or Esc closes");
-    font_draw(s, fd, (float)(s->w - hw) / 2, (float)(py + ph + ui_px(7)),
-              "Super or Esc closes", color_alpha(th->text, 0.55f));
+    int fx, fy, fw, fh, below;
+    launcher_field_rect(s, &fx, &fy, &fw, &fh, &below);
+    launcher_draw_field(s, th, fx, fy, fw, fh);
+    if (!below) {
+        const char *hint = "Type to search \xC2\xB7 Super or Esc closes";
+        float hw = font_width(fd, hint);
+        if (hw > (float)s->w - 2.0f * ui_px(8)) {
+            hint = "Type to search";
+            hw = font_width(fd, hint);
+        }
+        font_draw(s, fd, (float)(s->w - hw) / 2, (float)(py + ph + ui_px(7)),
+                  hint, color_alpha(th->text, 0.55f));
+    }
 }
 
 /* ------------------------------------------------------------ lock screen
@@ -3647,6 +4467,45 @@ static const ShortcutActions SHORTCUTS = { shortcut_action, NULL };
     }
 
     if (launcher_open) {
+        if (launcher_query_active()) {
+            /* A query is a Spotlight list: a click selects a row and a second
+             * click on the selected row runs it. Anywhere outside the panel
+             * dismisses the launcher, exactly like the grid. */
+            LauncherList L;
+            launcher_filter_refresh();
+            launcher_list_layout(&screen, &L);
+            for (int i = 0; i < L.rows; i++) {
+                int row = L.first + i;
+                if (row >= launcher_row_n) break;
+                int ry = L.ry + i * L.row_h;
+                if (mx < L.rx || mx >= L.rx + L.rw ||
+                    my < ry || my >= ry + L.row_h) continue;
+                LauncherGo go;
+                if (row == launcher_hit) {
+                    if (launcher_row_go(row, &go)) {
+                        launcher_run(&go);
+                        launcher_open = 0;
+                    }
+                } else {
+                    launcher_hit = row;
+                }
+                dirty = 1;
+                return 1;
+            }
+            if (mx >= L.px && mx < L.px + L.pw &&
+                my >= L.py && my < L.py + L.ph) {
+                dirty = 1;              /* the field/panel is modal */
+                return 1;
+            }
+            launcher_open = 0;
+            return 1;
+        }
+        int fx, fy, fw, fh, below;
+        launcher_field_rect(&screen, &fx, &fy, &fw, &fh, &below);
+        if (mx >= fx && mx < fx + fw && my >= fy && my < fy + fh) {
+            dirty = 1;                  /* the field is always focused */
+            return 1;
+        }
         for (int i = 0; i < launcher_items(); i++) {
             int tx, ty, tw, th2;
             launcher_geom(i, &tx, &ty, &tw, &th2);
@@ -3737,7 +4596,18 @@ int dot_y = traffic_y(tb);
              * the body is clickable, so this is the whole handler. */
             if (input.buttons & 1) term_select_press(hit, lx - 1, ly - tb - 1);
         } else if (hit->app) {
-            app_click(hit->app, lx - 1, ly - tb - 1, input.buttons);
+            /* An app sees the pointer's buttons AND the modifiers held at the
+             * same time. input.buttons carries only the three mouse bits (1, 2,
+             * 4), so a Ctrl+click used to arrive as a plain click and Files'
+             * multi-select code (src/apps/files.c: MOD_SHIFT 0x100, MOD_CTRL
+             * 0x200) could never run in the shipped desktop - the harness
+             * proved the handler, the desktop never delivered the gesture.
+             * The high bits are additive and no app treats them as buttons. */
+            int click_buttons = input.buttons;
+            if (input.shift) click_buttons |= 0x100;
+            if (input.ctrl)  click_buttons |= 0x200;
+            if (input.alt)   click_buttons |= 0x400;
+            app_click(hit->app, lx - 1, ly - tb - 1, click_buttons);
         } else if (hit->kind == WIN_CLIENT && hit->client >= 0) {
             WmClient *cl = &clients[hit->client];
             if (cl->used) {
@@ -4007,6 +4877,311 @@ static void display_choose_logical(Display *d) {
 /* MYSTIC_DISPLAY_CONF_SECTION_END */
 
 /* ------------------------------------------------------------ main */
+/* ------------------------------------------------------------ gestures
+ *
+ * Trackpad gestures, handled next to the wheel because they are the same kind
+ * of input: the pointer's window is the target, and nothing is focused by a
+ * scroll. src/input.c has already classified and LATCHED the gesture - it
+ * refuses to name one until the contacts have travelled past a threshold, so
+ * nothing here has to filter jitter, and a tap cannot arrive as a swipe.
+ *
+ * What each gesture does, and what it cannot do:
+ *   two-finger vertical     scroll the window under the pointer. The pixel
+ *                           delta becomes text lines (the desktop's own line
+ *                           height), the difference between that and the
+ *                           wheel's notch is accumulated, and fast reports
+ *                           are accelerated the way a trackpad is.
+ *   two-finger horizontal   consumed and not delivered: Input has no
+ *                           horizontal wheel, WM_WHEEL carries one number and
+ *                           no app in this tree draws a sideways-scrolling
+ *                           list. Because src/input.c locked the axis, the
+ *                           same travel can never also move the list up and
+ *                           down - that jitter would be worse than nothing.
+ *   pinch                   the global text scale, live, held between 0.8 and
+ *                           1.6 of ui.conf's number, with a 3 % dead zone.
+ *                           It is committed to ui.conf on release, through
+ *                           the same writer Ctrl+= uses.
+ *   three-finger up         the launcher
+ *   three-finger down       show the desktop: minimise every window
+ *   three-finger left/right previous / next window, the Alt+Tab order
+ *   two-finger tap          right click at the pointer
+ *   three-finger tap        the shortcuts panel (F1's action)
+ *
+ * On a machine whose pointing device is a plain mouse or a PS/2 one, every
+ * Input.gesture field stays zero, so gestures_apply() is never called and the
+ * wheel path is exactly what it was before this existed.
+ * ------------------------------------------------------------ */
+
+/* MYSTIC_GESTURES_BEGIN
+ * The arithmetic of a gesture: no globals, no desktop state, so a host harness
+ * can extract this section (sed, the same way main.c's display.conf reader is
+ * extracted) and check the numbers against the ones the report quotes. Keep
+ * it free of statics. */
+#define GEST_LINES_PER_NOTCH 3    /* one notch, as input.wheel * 3 defines it  */
+#define GEST_ACCEL_PX        8    /* px in one frame before acceleration starts */
+#define GEST_ACCEL_MAX       1.5f /* ... and the most it ever adds               */
+#define GEST_PINCH_DEAD      0.03f/* 3 % of the pinch is dead zone               */
+
+/* Finger travel in pixels, accelerated the way a trackpad is: below
+ * GEST_ACCEL_PX in one frame the content moves exactly with the finger, and
+ * at three times that a flick moves it GEST_ACCEL_MAX times as far. Signed. */
+static int gest_accelerate(int dy) {
+    int ady = dy < 0 ? -dy : dy;
+    float gain = 1.0f;
+    if (ady > GEST_ACCEL_PX) {
+        gain += (float)(ady - GEST_ACCEL_PX) /
+                (float)(2 * GEST_ACCEL_PX) * (GEST_ACCEL_MAX - 1.0f);
+        if (gain > GEST_ACCEL_MAX) gain = GEST_ACCEL_MAX;
+    }
+    return (int)((float)dy * gain);
+}
+
+/* Whole lines out of a pixel delta, carrying the sub-line remainder in *carry
+ * so a scroll slower than one line per frame still moves; the sign follows
+ * the finger (content follows the finger, which is what natural scrolling
+ * is). */
+static int gest_lines(int px, int line, int *carry) {
+    if (line < 1) line = 1;
+    *carry += px;
+    int lines = *carry / line;
+    *carry -= lines * line;
+    return lines;
+}
+
+/* The user's ui.conf scale a pinch ratio asks for: `user0` is the scale the
+ * pinch started from and `base` is UI_BASE (what 1.0 in the file means). The
+ * dead zone is subtracted rather than swallowed, so the text does not jump on
+ * the first frame that moves, and the result stays inside the shipped
+ * 0.8..1.6. */
+static float gest_pinch_value(float ratio, float user0, float base) {
+    float d = ratio - 1.0f;          /* how far the two fingers moved apart */
+    float k;
+    if (d > GEST_PINCH_DEAD)       k = d - GEST_PINCH_DEAD;   /* apart      */
+    else if (d < -GEST_PINCH_DEAD) k = d + GEST_PINCH_DEAD;   /* together   */
+    else                           k = 0.0f;                  /* dead zone  */
+    float user = user0 * (1.0f + k);
+    if (user < 0.8f * base) user = 0.8f * base;
+    if (user > 1.6f * base) user = 1.6f * base;
+    return user;
+}
+/* What a swipe means, as an action rather than a branch: the harness walks
+ * every direction. Left and right are the Alt+Tab order, so a swipe to the
+ * right is "next" exactly like Alt+Tab is. */
+enum { GEST_DO_NONE = 0, GEST_DO_LAUNCHER, GEST_DO_DESKTOP, GEST_DO_NEXT, GEST_DO_PREV };
+static int gest_swipe_action(int dx, int dy) {
+    int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+    if (adx == 0 && ady == 0) return GEST_DO_NONE;   /* cannot happen: 30 px */
+    if (ady >= adx) return dy < 0 ? GEST_DO_LAUNCHER : GEST_DO_DESKTOP;
+    return dx > 0 ? GEST_DO_NEXT : GEST_DO_PREV;
+}
+
+/* A tap is not a gesture: it has no travel, and what it means depends only on
+ * how many fingers touched. Two fingers are the right button; three open the
+ * shortcuts panel (the same action F1 has). One finger is the pointer and four
+ * are nothing, deliberately: a resting hand must not minimise the desktop. */
+enum { GEST_TAP_NONE = 0, GEST_TAP_RIGHT, GEST_TAP_HELP };
+static int gest_tap_action(int fingers) {
+    if (fingers == 2) return GEST_TAP_RIGHT;
+    if (fingers == 3) return GEST_TAP_HELP;
+    return GEST_TAP_NONE;
+}
+/* MYSTIC_GESTURES_END */
+
+/* Scroll remainders, in pixels and in lines. A slow scroll arrives as 2-3 px
+ * a frame; without carrying the remainder it would ask for a fraction of a
+ * line every frame and move nothing at all. */
+static int   gest_acc_px;
+static int   gest_acc_line;
+static int   gest_swipe_id;     /* the swipe already acted on, by gesture_id */
+static int   gest_text_live;    /* a pinch is holding the text scale          */
+static float gest_text_abs;     /* ... at this ui_scale_get() value           */
+static float gest_pinch_user;   /* the user's own scale when it started       */
+static float gest_base;         /* UI_BASE, read out of ui.conf once          */
+
+/* ui_conf_baseline() opens the file, and a pinch would ask for it on every
+ * frame it is alive - the one place in this block that could become per-frame
+ * I/O. The baseline is written once at boot and never changes at runtime, so
+ * it is read once here and kept. */
+static float gest_ui_base(void) {
+    if (gest_base <= 0.0f) gest_base = ui_conf_baseline();
+    return gest_base;
+}
+
+/* The window under the pointer, topmost first. The wheel has always gone to
+ * it - "any window, not just terminals, and not only the focused one" - and a
+ * trackpad scroll is the same gesture with a different origin. */
+static Window *window_under_pointer(void) {
+    Window *under = NULL;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window *w = &wins[i];
+        if (!w->used || w->hidden) continue;
+        if (input.mouse_x < w->x || input.mouse_x >= w->x + w->w) continue;
+        if (input.mouse_y < w->y || input.mouse_y >= w->y + w->h) continue;
+        if (!under || win_rank(w) > win_rank(under)) under = w;
+    }
+    return under;
+}
+
+/* Scroll one window. `lines` is what a terminal scrolls in; `notches` is what
+ * the wheel and WM_WHEEL count, three lines to a notch. */
+static void scroll_window(Window *w, int lines, int notches) {
+    if (!w) return;
+    if (w->term) {
+        if (lines) { term_scroll(w->term, lines); dirty = 1; }
+    } else if (w->kind == WIN_CLIENT && w->client >= 0 &&
+               w->client < WM_MAX_CLIENTS && clients[w->client].used) {
+        if (notches) { wms_notify_wheel(&clients[w->client], notches); dirty = 1; }
+    } else if (w->app) {
+        if (notches) { app_wheel(w->app, notches); dirty = 1; }
+    }
+}
+
+/* Write the text scale where Ctrl+= / Ctrl+- write it: the same file, the
+ * same two lines, the same units. `baseline` is UI_BASE read back from the
+ * file (never a third copy of the constant) and `scale` is the number
+ * RELATIVE to it, so `abs / base` is the inverse of ui_scale_get(). */
+static void text_scale_store(float abs) {
+    float base = gest_ui_base();
+    if (base <= 0.0f) return;
+    float rel = abs / base;
+    if (rel < 0.8f) rel = 0.8f;
+    if (rel > 1.6f) rel = 1.6f;
+    char text[96];
+    snprintf(text, sizeof(text), "baseline = %.1f\nscale = %.2f\n",
+             (double)base, (double)rel);
+    FILE *f = fopen("/etc/mystic/ui.conf", "w");
+    if (!f) {
+        fprintf(stderr, "gesture: ui.conf: %s\n", strerror(errno));
+        return;
+    }
+    int ok = fputs(text, f) != EOF;
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) {
+        fprintf(stderr, "gesture: ui.conf not written\n");
+        return;
+    }
+    apply_text_scale();
+    persist_settings();
+    fprintf(stderr, "gesture: text scale %.2fx\n", (double)rel);
+    dirty = 1;
+}
+
+static void gestures_apply(void) {
+    int modal = launcher_open || help_open || menu_open;
+
+    if (input.gesture_release) {
+        /* The end of a gesture. The scroll remainders belonged to the gesture
+         * that just ended, and a pinch commits the scale it was showing:
+         * nothing is written to ui.conf while the fingers are down, because a
+         * file write per frame would cost more than the gesture. gest_text_live
+         * is only ever set by a pinch, so it - not input.gesture - is what says
+         * there is a scale to commit; the two reports that end a pinch and
+         * start the next gesture can land in one frame. */
+        gest_acc_px = 0;
+        gest_acc_line = 0;
+        if (gest_text_live) {
+            gest_text_live = 0;
+            text_scale_store(ui_scale_get() / theme_text_scale());
+        }
+    }
+
+    if (input.gesture_tap) {
+        switch (gest_tap_action(input.gesture_tap_fingers)) {
+        case GEST_TAP_RIGHT:
+            if (modal) break;
+            /* A two-finger tap is the trackpad's right click, at the pointer,
+             * which does not move: that is exactly what BTN_RIGHT does, so it
+             * is dispatched as one and then withdrawn (the device never
+             * reported a held button). */
+            {
+                int held = input.buttons & 2;
+                input.buttons |= 2;
+                if (handle_click()) dirty = 1;
+                if (!held) input.buttons &= ~2;
+            }
+            break;
+        case GEST_TAP_HELP:
+            /* The panel toggles: a second three-finger tap closes it, which is
+             * why the modal guard below lets it through when the panel itself
+             * is the thing that is open. */
+            if (modal && !help_open) break;
+            shortcut_action(NULL, SC_ACT_HELP, 0, 0);
+            dirty = 1;
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+
+    switch (input.gesture) {
+    case GESTURE_SCROLL: {
+        Window *under = window_under_pointer();
+        int dy = input.gesture_dy;          /* dx is consumed: see the note above */
+        if (dy) {
+            int lines = gest_lines(gest_accelerate(dy),
+                                   ui_line_h(FONT_REGULAR, 11), &gest_acc_px);
+            if (lines) {
+                gest_acc_line += lines;
+                int notches = gest_acc_line / GEST_LINES_PER_NOTCH;
+                gest_acc_line -= notches * GEST_LINES_PER_NOTCH;
+                if (under) {
+                    scroll_window(under, lines, notches);
+                } else if (wall_view_active() &&
+                           !over_chrome_at(input.mouse_x, input.mouse_y) &&
+                           !modal) {
+                    /* Over the wallpaper the wheel shears the black hole's
+                     * disk; a two-finger scroll does the same, continuously. */
+                    wallpaper_blackhole_spin((float)lines /
+                                             (float)GEST_LINES_PER_NOTCH *
+                                             WALLPAPER_BH_SPIN_PER_NOTCH);
+                    dirty = 1;
+                }
+            }
+        }
+        break;
+    }
+    case GESTURE_PINCH: {
+        float r = input.gesture_scale;
+        float base = gest_ui_base();
+        if (r <= 0.0f || base <= 0.0f) break;
+        if (!gest_text_live) {
+            /* Start from the USER's number, not from the effective one: the
+             * theme's own font_scale is multiplied in below, and starting
+             * from the product would compound the theme on every pinch. */
+            gest_text_live = 1;
+            gest_pinch_user = ui_scale_get() / theme_text_scale();
+            gest_text_abs = ui_scale_get();
+        }
+        /* Dead zone with the offset taken out (gest_pinch_value does that),
+         * so there is no jump when the scale starts moving, and the value
+         * stays inside the 0.8..1.6 ui.conf understands. */
+        float user = gest_pinch_value(r, gest_pinch_user, base);
+        ui_scale_set_effective(user * theme_text_scale());
+        gest_text_abs = ui_scale_get();
+        dirty = 1;
+        break;
+    }
+    case GESTURE_SWIPE:
+        if (modal) break;
+        if (input.gesture_id == gest_swipe_id) break;  /* fires once */
+        gest_swipe_id = input.gesture_id;
+        switch (gest_swipe_action(input.gesture_dx, input.gesture_dy)) {
+        case GEST_DO_LAUNCHER: launcher_open = 1; break;
+        /* down: show the desktop. The same action as its shortcut, so there is
+         * one implementation of "minimise everything". */
+        case GEST_DO_DESKTOP:  shortcut_action(NULL, SC_ACT_WIN_MIN_ALL, 0, 0); break;
+        case GEST_DO_NEXT:     shortcut_action(NULL, SC_ACT_WIN_NEXT, 0, 0); break;
+        case GEST_DO_PREV:     shortcut_action(NULL, SC_ACT_WIN_PREV, 0, 0); break;
+        default: break;
+        }
+        dirty = 1;
+        break;
+    default:
+        break;
+    }
+}
+
 int main(int argc, char **argv) {
     /* One binary, two jobs: this is what stage/init runs for the clipboard
      * daemon, so the daemon is a real process started before the desktop
@@ -4222,6 +5397,21 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* Spotlight: a query belongs to one visit to the launcher, and the
+         * character queue is what the keyboard really typed (the keycode
+         * alone loses the layout). Both are consumed here, before any key can
+         * reach an overlay or a window. */
+        launcher_focus_sync(launcher_open);
+        if (launcher_open) {
+            /* Chords are not text: Ctrl/Alt/Super belong to the shortcut
+             * table, so their (control or layout) bytes never reach the
+             * field. Shift is allowed - it is how capitals are typed. */
+            if (!input.ctrl && !input.alt && !super_down)
+                launcher_text_input(input.text, input.text_len);
+            input.text_len = 0;
+            input.text[0] = 0;
+        }
+
         /* Every key pressed this frame, in order. Handling only the last one
          * collapsed fast bursts: five arrow presses registered as one. */
         for (int ki = 0; ki < input.nkeys; ki++) {
@@ -4243,6 +5433,20 @@ int main(int argc, char **argv) {
                                      (super_down  ? SC_MOD_SUPER : 0u);
             const unsigned sc_cond = win_focused() ? SC_WHEN_WINDOW : SC_WHEN_NO_WINDOW;
             const unsigned sc_modals = keyboard_modals();
+
+            /* Spotlight: Esc clears a non-empty query first and closes the
+             * launcher only when the field is already empty. This must run
+             * before the table, whose Esc row is SC_ALWAYS and would close
+             * the whole overlay in one press. It is the same launcher_key()
+             * the harness drives. */
+            if (launcher_open && k == SC_KEY_ESC && launcher_query_active()) {
+                LauncherGo go;
+                (void)launcher_key(k, &go);
+                input.text_len = 0;
+                input.text[0] = 0;
+                dirty = 1;
+                continue;
+            }
 
             /* One table decides every desktop binding (src/shortcuts.c). It
              * runs before every overlay and before the focused window gets
@@ -4290,7 +5494,12 @@ int main(int argc, char **argv) {
             }
 
             if (launcher_open) {
-                if (k == 105 || k == 106 || k == 103 || k == 108) {
+                /* Empty query: the grid's own arrow navigation, unchanged.
+                 * It stays here rather than in launcher_key() so the search
+                 * model has no surface geometry in it and can be compiled on
+                 * the host - the harness drives that exact handler. */
+                if (!launcher_query_active() &&
+                    (k == 105 || k == 106 || k == 103 || k == 108)) {
                     int cols = ui_launcher_cols(launcher_items(), screen.w, screen.h,
                                                 launcher_label_w());
                     int total = launcher_items(), step = 0;
@@ -4305,40 +5514,25 @@ int main(int argc, char **argv) {
                     dirty = 1;
                     continue;
                 }
-                if (k == 28) {               /* Enter launches the selection */
-                    /* Enter arrives twice in one frame: as a key here and as
-                     * the '
-' character in the text queue. The launcher
-                     * consumes the key, so the text must go too - otherwise
-                     * the app it just opened receives a newline and activates
-                     * its own selected row (opening the launcher and starting
-                     * an app with one press). */
-                    input.text_len = 0;
-                    input.text[0] = 0;
-                    int idx = launcher_sel;
-                    if (idx < LAUNCHER_N) {
-                        if (LAUNCHER[idx].app_id) win_open(WIN_APP, LAUNCHER[idx].app_id);
-                        else                      win_open(WIN_TERM, NULL);
-                    } else {
-                        int b = idx - LAUNCHER_N;
-                        if (b >= 0 && b < bundle_count) {
-                            int pid = wms_launch(&bundles[b], clients, b);
-                            fprintf(stderr, "wms: launch %s pid %d", bundles[b].id, pid);
-                            fputc(10, stderr);
-                        }
-                    }
+                LauncherGo go;
+                int lk = launcher_key(k, &go);
+                if (lk == LAUNCHER_KEY_RUN) {
+                    launcher_run(&go);
                     launcher_open = 0;
                     dirty = 1;
-                    continue;
+                } else if (lk == LAUNCHER_KEY_CLOSE) {
+                    launcher_open = 0;
+                    dirty = 1;
+                } else if (lk == LAUNCHER_KEY_DIRTY) {
+                    dirty = 1;
                 }
-
                 /* modal overlay: nothing may leak to the window behind it.
                  * Alt+Tab (an SC_ALWAYS row) already had its chance above. */
                 input.text_len = 0;
+                input.text[0] = 0;
                 dirty = 1;
                 continue;
             }
-
             /* the focused window gets the key */
             Window *top = win_focused();
             if (!top) continue;
@@ -4427,26 +5621,9 @@ int main(int argc, char **argv) {
         if (input.wheel) {
             /* The wheel goes to whatever the pointer is over - any window,
              * not just terminals, and not only the focused one. */
-            Window *under = NULL;
-            for (int i = 0; i < MAX_WINDOWS; i++) {
-                Window *w = &wins[i];
-                if (!w->used || w->hidden) continue;
-                if (input.mouse_x < w->x || input.mouse_x >= w->x + w->w) continue;
-                if (input.mouse_y < w->y || input.mouse_y >= w->y + w->h) continue;
-                if (!under || win_rank(w) > win_rank(under)) under = w;
-            }
+            Window *under = window_under_pointer();
             if (under) {
-                if (under->term) {
-                    term_scroll(under->term, input.wheel * 3);
-                    dirty = 1;
-                } else if (under->kind == WIN_CLIENT && under->client >= 0 &&
-                           clients[under->client].used) {
-                    wms_notify_wheel(&clients[under->client], input.wheel);
-                    dirty = 1;
-                } else if (under->app) {
-                    app_wheel(under->app, input.wheel);
-                    dirty = 1;
-                }
+                scroll_window(under, input.wheel * GEST_LINES_PER_NOTCH, input.wheel);
             } else if (wall_view_active() &&
                        !over_chrome_at(input.mouse_x, input.mouse_y) &&
                        !launcher_open && !menu_open && !help_open) {
@@ -4459,6 +5636,11 @@ int main(int argc, char **argv) {
                 dirty = 1;
             }
         }
+        /* Trackpad gestures, dispatched next to the wheel for the reason the
+         * block above gives. With no multitouch device every field is zero
+         * and this does nothing at all. */
+        if (input.gesture != GESTURE_NONE || input.gesture_tap)
+            gestures_apply();
         /* bit 1 is the left button, bit 2 the right (src/input.c maps
          * BTN_RIGHT to it). Only the left button used to be dispatched, so a
          * right click did nothing anywhere in the system. */
@@ -4692,6 +5874,10 @@ int main(int argc, char **argv) {
                 float before = ui_scale_get();
                 ui_scale_load("/etc/mystic/ui.conf");
                 ui_scale_set_effective(ui_scale_get() * theme_text_scale());
+                /* A pinch holds the text scale while its fingers are down and
+                 * writes ui.conf only when it ends, so this reload must put
+                 * the live value back instead of fighting it. */
+                if (gest_text_live) ui_scale_set_effective(gest_text_abs);
                 if (ui_scale_get() != before) {
                     fprintf(stderr, "ui: scale %.2f -> %.2f", before, ui_scale_get());
                     fputc(10, stderr);

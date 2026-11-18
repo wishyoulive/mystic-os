@@ -162,6 +162,30 @@ static u32 cell_bg(const Cell *c) {
     return 0xFF10131Au;
 }
 
+/* The selection band.
+ *
+ * A selected cell used to be painted by swapping its foreground and
+ * background. That is not a highlight: it throws away the cell's own
+ * colours, so on a light theme "selected" is dark text, and on a dark theme
+ * a cell whose text already used the accent became an accent block with the
+ * background colour for a glyph. It also changed every glyph's colour, which
+ * is the opposite of what a selection means - the text has not changed, only
+ * what is behind it has.
+ *
+ * What the other apps in this tree do (Notes: accent at 0.30, the browser:
+ * accent at 0.32) is paint a low-alpha accent rectangle BEHIND the glyph and
+ * leave the glyph exactly as it was. This file has no Theme handle - a
+ * terminal is handed a font and a rectangle, not colours - so the accent
+ * comes from the terminal's own palette, whose slot 4 is the blue every
+ * shipped palette uses for SGR 34 (and which the shell already uses for
+ * directories, so the band is in the same colour family as the text on
+ * screen). The glyph keeps its own palette colour on top of it. */
+#define TERM_SEL_ALPHA 0.38f
+
+static u32 term_sel_tint(void) {
+    return color_alpha(PALETTE[4], TERM_SEL_ALPHA);
+}
+
 /* A cell can never be zero wide or tall: the division that turns a window
  * rectangle into a column count would be 0 or inf and the cast below would be
  * undefined. These are the same floors the desktop applies to the metrics it
@@ -1478,16 +1502,33 @@ void term_draw(Term *t, Surface *s, int x, int y, int w, int h,
             if (c->span == 2) continue;
             float px = x + rx * cw;
             float py = y + ry * ch;
-            int inv = t->sel_active && sel_has_cell(sl0, sc0, sl1, sc1, line, rx);
-            u32 bg = inv ? cell_fg(c) : cell_bg(c);
-            u32 fg = inv ? cell_bg(c) : cell_fg(c);
-            /* An inverted cell whose foreground and background are the same
-             * colour would vanish, so a selected blank block falls back to the
-             * palette's selection grey. */
-            if (inv && bg == fg) bg = PALETTE[8];
+            int sel = t->sel_active && sel_has_cell(sl0, sc0, sl1, sc1, line, rx);
+            u32 bg = cell_bg(c);
+            u32 fg = cell_fg(c);
             float cellw = (c->span == 1) ? cw * 2.0f : cw;
             if (bg != PALETTE[0])
                 surf_fill(s, (int)px, (int)py, (int)cellw + 1, (int)ch + 1, bg);
+            /* The band goes down BEFORE the glyph so the glyph colour is
+             * untouched: a selection is a rectangle behind the text, not a
+             * different way of drawing the text. surf_blend() composites the
+             * accent over whatever this cell's background is, so a cell with
+             * its own SGR background keeps that background under the tint.
+             *
+             * The rectangle is the cell's exact integer edges, shared with
+             * its neighbours ((int)(x+(rx+1)*cw) is both this cell's right
+             * edge and the next cell's left edge). A +1 like the opaque
+             * background fill below would overlap the neighbour and, because
+             * this pass is translucent, draw a darker line down every cell
+             * boundary. */
+            if (sel) {
+                int sx0 = (int)(x + (float)rx * cw);
+                int sy0 = (int)(y + (float)ry * ch);
+                int sx1 = (int)(x + (float)(rx + (c->span == 1 ? 2 : 1)) * cw);
+                int sy1 = (int)(y + (float)(ry + 1) * ch);
+                if (sx1 > sx0 && sy1 > sy0)
+                    surf_blend(s, sx0, sy0, sx1 - sx0, sy1 - sy0,
+                               term_sel_tint());
+            }
             if (c->ch && c->ch != ' ') {
                 char utf[8];
                 cp_encode(c->ch, utf);

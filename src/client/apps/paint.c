@@ -57,6 +57,9 @@
 #include <dirent.h>
 #include <errno.h>
 #include <math.h>
+#ifndef PAINT_HOST_TEST
+#  include <poll.h>              /* the event loop waits here; host tests do not */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2068,6 +2071,69 @@ static void canvas_map(const Layout *L, int x, int y, int *cx, int *cy) {
 }
 
 /* ------------------------------------------------------------
+ *  The frame the server gets
+ * ------------------------------------------------------------
+ *
+ *  The server hands an app one shared pixel buffer and reads it whenever it
+ *  composites. It composites on our FRAME and, while the pointer is moving,
+ *  on every mouse move as well (src/main.c marks the desktop dirty for each
+ *  one), and nothing on either side locks the buffer while that happens.
+ *
+ *  Drawing the window straight into that buffer therefore shows the
+ *  compositor a half-finished frame: at 640x520 a frame is 6.7-9.0 ms of
+ *  scattered writes (measured on a host build of this file: sheet blit
+ *  4.4-5.6 ms, 1px sheet border 1.2-1.9 ms, the rest ~0.8 ms) while the
+ *  compositor's read of it, src/main.c's row loop, is 0.53-0.69 ms for the
+ *  same 1.33 MB - so the top of the sheet was the stroke you were dragging
+ *  and the bottom was the one from the frame before: the flicker the owner
+ *  kept seeing. No amount of care inside the rasterisers can fix that; the
+ *  raster is already exact (two renders of one state are byte-identical).
+ *
+ *  So the window is drawn into `frame` - memory nothing else reads - and
+ *  only the pixels that actually changed are copied across, in one burst,
+ *  after the frame is complete. The compositor can then only ever catch a
+ *  seam inside a span that is being copied, never the whole window, and
+ *  the burst is a flat memcpy rather than milliseconds of drawing.
+ *
+ *  The same diff answers the other half of the complaint: a frame that
+ *  changed nothing - the pointer crossing the sheet with no button down, a
+ *  keypress that moved no pixel, the same state drawn again - copies zero
+ *  bytes and sends no FRAME at all. It used to rewrite 1.33 MB of shared
+ *  memory and make the desktop recompose itself (blur, shadows and all)
+ *  for a picture identical to the one already on screen. */
+#define FRAME_W WIN_W
+#define FRAME_H WIN_H
+static u32 frame[FRAME_W * FRAME_H];
+
+/* Copy the changed part of frame[] (stride == w) into the client's shared
+ * surface and return how many pixels were copied; 0 means the server
+ * already has this exact frame. One contiguous span per changed row, top
+ * down, so a seam can only ever fall inside the span being written.
+ *
+ * The comparison is a plain word loop rather than memcmp: it finds the
+ * first changed column in the same pass, so a row that did not change costs
+ * one read of each buffer and nothing else, and a row that did needs no
+ * second scan to find where to start. */
+static long frame_present(MClient *c, int w, int h) {
+    long copied = 0;
+
+    if (!c || !c->px || w <= 0 || h <= 0) return 0;
+    if (w > c->maxw) w = c->maxw;
+    if (h > c->maxh) h = c->maxh;
+    for (int y = 0; y < h; y++) {
+        const u32 *src = frame + (size_t)y * (size_t)w;
+        u32 *dst = c->px + (size_t)y * (size_t)c->stride;
+        int x0 = 0, x1;
+        while (x0 < w && src[x0] == dst[x0]) x0++;
+        if (x0 == w) continue;                   /* the row is the same */
+        for (x1 = w - 1; x1 > x0 && src[x1] == dst[x1]; x1--) { }
+        memcpy(dst + x0, src + x0, (size_t)(x1 + 1 - x0) * sizeof(u32));
+        copied += x1 + 1 - x0;
+    }
+    return copied;
+}
+
+/* ------------------------------------------------------------
  *  Draw
  * ------------------------------------------------------------ */
 
@@ -2091,17 +2157,19 @@ static void mixer_draw(Surface *s, const Layout *L, const Fonts *F,
     }
 }
 
-static void draw_ui(MClient *c, const Layout *L, const Fonts *F,
+/* Draw the whole window into `dst`. What `dst` points at is the caller's
+ * business: the shipped app points it at frame[] and presents the diff,
+ * the host tests point it straight at a buffer of their own. */
+static void draw_ui(Surface *dst, const Layout *L, const Fonts *F,
                     const PaintState *st, const char *msg, int msg_warn) {
     int vw = L->vw, vh = L->vh;
-    Surface s;
+    Surface s = *dst;
     u32 cur = RGB(st->r, st->g, st->b);
 
     if (vw <= 0 || vh <= 0) return;
-    s.px = c->px;
+    if (!s.px) return;
     s.w = vw;
     s.h = vh;
-    s.stride = c->stride;
     s.cx0 = s.cy0 = s.cx1 = s.cy1 = 0;
     surf_fill(&s, 0, 0, vw, vh, C_BG);
 
@@ -2272,6 +2340,31 @@ static void draw_ui(MClient *c, const Layout *L, const Fonts *F,
                       r->w, 2, "Clear", C_TEXT);
         }
     }
+}
+
+/* One frame, end to end: draw it off to the side, hand the server only the
+ * pixels that changed, and tell it once - or not at all when the picture is
+ * the one it already has. Returns 1 when the server was told to look. */
+static int paint_commit(MClient *c, int vw, int vh, const Layout *L,
+                        const Fonts *F, const PaintState *st,
+                        const char *msg, int msg_warn) {
+    Surface s;
+    long copied;
+
+    if (vw < 1) vw = 1;
+    if (vh < 1) vh = 1;
+    if (vw > FRAME_W) vw = FRAME_W;      /* the window is capped at open time */
+    if (vh > FRAME_H) vh = FRAME_H;
+    s.px = frame;
+    s.w = vw;
+    s.h = vh;
+    s.stride = vw;                       /* rows packed: the diff walks them */
+    s.cx0 = s.cy0 = s.cx1 = s.cy1 = 0;
+    draw_ui(&s, L, F, st, msg, msg_warn);
+    copied = frame_present(c, vw, vh);
+    if (copied <= 0) return 0;
+    mc_present(c);
+    return 1;
 }
 
 /* ============================================================
@@ -2528,6 +2621,11 @@ static void drag_at(PaintState *st, int x, int y, char *msg, size_t n, int *dirt
 }
 
 static void release_at(PaintState *st, char *msg, size_t n, int *dirty) {
+    if (st->slider >= 0) {
+        /* the slider's ring changes when the drag stops */
+        st->slider = -1;
+        *dirty = 1;
+    }
     if (st->drag) {
         int x1 = st->px, y1 = st->py;
         int x0 = st->sx, y0 = st->sy;
@@ -2555,11 +2653,11 @@ static void release_at(PaintState *st, char *msg, size_t n, int *dirty) {
         st->drag = 0;
         st->px = x1;
         st->py = y1;
-        if (k.hits) {
-            if (hist_commit() != 0)
-                snprintf(msg, n, "drawn; history is now unavailable");
-            *dirty = 1;
-        }
+        if (k.hits && hist_commit() != 0)
+            snprintf(msg, n, "drawn; history is now unavailable");
+        /* the preview is gone from the frame whether or not it committed
+         * anything, so the frame is new even when k.hits is 0 */
+        *dirty = 1;
         return;
     }
     if (st->down) {
@@ -2569,14 +2667,17 @@ static void release_at(PaintState *st, char *msg, size_t n, int *dirty) {
         if (hist_commit() != 0) snprintf(msg, n, "stroke done; history is now unavailable");
         *dirty = 1;
     }
-    st->slider = -1;
 }
 
 /* ============================================================
- *  main
- * ============================================================ */
-
-#ifndef PAINT_HOST_TEST
+ *  One frame, one event
+ * ============================================================
+ *
+ *  These two are the app's whole loop body, as functions rather than as
+ *  inline code in main(), so the host harness can drive the real thing and
+ *  count what actually reaches the server. main() below is then only the
+ *  wait/read/quit plumbing.
+ */
 
 /* Monotonic milliseconds: how long a message stays on screen. */
 static u64 now_ms(void) {
@@ -2584,6 +2685,159 @@ static u64 now_ms(void) {
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
     return (u64)ts.tv_sec * 1000u + (u64)(ts.tv_nsec / 1000000);
 }
+
+typedef struct {
+    MClient   *c;
+    Fonts      F;
+    PaintState st;
+    Layout     L;
+    char       msg[200];
+    char       shown[200];
+    u64        msg_until;
+    int        vw, vh;              /* the window we draw, capped at open */
+    int        cap_w, cap_h;
+    int        dirty;               /* the state changed: draw before reading */
+    int        quit;
+    int        was_down;
+    long       frames;              /* frames handed to the server */
+} PaintApp;
+
+static void paint_app_init(PaintApp *A, MClient *c) {
+    memset(A, 0, sizeof(*A));
+    A->c = c;
+    A->vw = A->cap_w = c->w > 0 ? c->w : 1;
+    A->vh = A->cap_h = c->h > 0 ? c->h : 1;
+    A->st.tool = T_PENCIL;
+    A->st.brush = 3;
+    A->st.r = GET_R(PALETTE[0]);
+    A->st.g = GET_G(PALETTE[0]);
+    A->st.b = GET_B(PALETTE[0]);
+    A->st.slider = -1;
+    A->st.hot = H_NONE;
+    A->dirty = 1;
+}
+
+/* Layout, message expiry, and - only when something changed - one frame. */
+static void paint_frame(PaintApp *A) {
+    layout_build(A->vw, A->vh, &A->F, &A->st, &A->L);
+
+    /* A message appears when it changes and leaves on its own; it is not
+     * part of the layout, so it can never push a row around. */
+    if (strcmp(A->msg, A->shown) != 0) {
+        snprintf(A->shown, sizeof(A->shown), "%s", A->msg);
+        A->msg_until = now_ms() + 3200u;
+        A->dirty = 1;
+    }
+    if (A->msg[0] && now_ms() > A->msg_until) {
+        A->msg[0] = 0;
+        A->shown[0] = 0;
+        A->msg_until = 0;
+        A->dirty = 1;
+    }
+    if (!A->dirty) return;
+    /* Draw off to the side and hand over only what changed: the frame is
+     * the one the server can see only once it is finished, and an unchanged
+     * frame (a hover, a key that moved nothing) is not presented at all. */
+    if (paint_commit(A->c, A->vw, A->vh, &A->L, &A->F, &A->st,
+                     A->msg, g_msg_bad))
+        A->frames++;
+    A->dirty = 0;
+}
+
+static void paint_event(PaintApp *A, const MEvent *ev) {
+    PaintState *st = &A->st;
+    const Layout *L = &A->L;         /* the layout this event lands in */
+    char *msg = A->msg;
+    size_t n = sizeof(A->msg);
+    int *dirty = &A->dirty;
+
+    switch (ev->type) {
+    case MC_CLOSE:
+        A->quit = 1;
+        break;
+
+    case MC_RESIZE:
+        A->vw = ev->w < A->cap_w ? ev->w : A->cap_w;
+        A->vh = ev->h < A->cap_h ? ev->h : A->cap_h;
+        if (A->vw < 1) A->vw = 1;
+        if (A->vh < 1) A->vh = 1;
+        *dirty = 1;
+        break;
+
+    case MC_KEY: {
+        int was_shift = st->shift;
+        st->shift = ev->mods & 1;
+        /* shift changes the shape a drag is constrained to, so the preview
+         * has to be redrawn even if the pointer has not moved */
+        if (st->drag && st->shift != was_shift) *dirty = 1;
+        if (ev->press) {
+            if (ev->key == 1) {                        /* KEY_ESC */
+                if (st->dialog || st->drag || st->down || st->mixer) {
+                    st->dialog = 0;
+                    st->drag = 0;
+                    st->down = 0;
+                    st->mixer = 0;
+                    snprintf(msg, n, "cancelled");
+                    *dirty = 1;
+                }
+            } else if (ev->key == 28) {                /* KEY_ENTER */
+                if (st->dialog) do_clear(L, st, msg, n, dirty);
+            }
+        }
+        break;
+    }
+
+    case MC_TEXT:
+        handle_text(st, ev->text, msg, n, L, dirty, &A->quit);
+        break;
+
+    case MC_MOUSE: {
+        int x = ev->x, y = ev->y;
+        int down = ev->buttons & 1;
+        int hot = hit_code(L, st, x, y);
+        int cx, cy;
+        if (hot != st->hot) { st->hot = hot; *dirty = 1; }
+        st->cursor_in = rect_hit(&L->canvas, x, y) && !L->pop_on;
+        if (st->cursor_in) canvas_map(L, x, y, &st->px, &st->py);
+
+        if (down && !A->was_down) {
+            press_at(st, L, x, y, msg, n, dirty);
+        } else if (down && A->was_down) {
+            if (st->slider >= 0) {
+                slider_set(st, &L->sl[st->slider], x, st->slider);
+                *dirty = 1;
+            } else if (st->drag) {
+                canvas_map(L, x, y, &st->px, &st->py);
+                *dirty = 1;
+            } else if (st->down) {
+                canvas_map(L, x, y, &cx, &cy);
+                drag_at(st, cx, cy, msg, n, dirty);
+            }
+        } else if (!down && A->was_down) {
+            release_at(st, msg, n, dirty);
+        }
+        A->was_down = down;
+        /* No unconditional redraw here: a bare hover changes no pixel (the
+         * diff in paint_commit proves it - the frame is byte-identical), so
+         * it must not cost a frame. Everything that does change the picture
+         * - the hover code above, the drag, a stroke, the slider, a press or
+         * a release - sets *dirty itself. */
+        break;
+    }
+
+    case MC_WHEEL:
+        if (st->brush + ev->wheel >= 1 && st->brush + ev->wheel <= MAX_BRUSH) {
+            st->brush += ev->wheel;
+            *dirty = 1;
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+#ifndef PAINT_HOST_TEST
 
 int main(void) {
     MClient c;
@@ -2608,146 +2862,38 @@ int main(void) {
     canvas_reset();
     hist_init();
 
-    int cap_w = c.w, cap_h = c.h;
-    int vw = c.w, vh = c.h;
-
-    PaintState st;
-    memset(&st, 0, sizeof(st));
-    st.tool = T_PENCIL;
-    st.brush = 3;
-    st.r = GET_R(PALETTE[0]);
-    st.g = GET_G(PALETTE[0]);
-    st.b = GET_B(PALETTE[0]);
-    st.slider = -1;
-    st.hot = H_NONE;
-
-    char msg[200];
-    char shown[sizeof(msg)];
-    msg[0] = 0;
-    shown[0] = 0;
-    u64 msg_until = 0;
-
-    Layout L;
-    int dirty = 1;
-    int was_down = 0;
+    PaintApp A;
+    paint_app_init(&A, &c);
+    A.F = F;
 
     for (;;) {
-        layout_build(vw, vh, &F, &st, &L);
-
-        /* A message appears when it changes and leaves on its own; it is
-         * not part of the layout, so it can never push a row around. */
-        if (strcmp(msg, shown) != 0) {
-            snprintf(shown, sizeof(shown), "%s", msg);
-            msg_until = now_ms() + 3200u;
-            dirty = 1;
-        }
-        if (msg[0] && now_ms() > msg_until) {
-            msg[0] = 0;
-            shown[0] = 0;
-            msg_until = 0;
-            dirty = 1;
-        }
-
-        if (dirty) {
-            draw_ui(&c, &L, &F, &st, msg, g_msg_bad);
-            mc_present(&c);
-            dirty = 0;
-        }
+        paint_frame(&A);
 
         int got = 0;
         MEvent ev;
         while (mc_poll(&c, &ev)) {
             got = 1;
-            int quit = 0;
-
-            switch (ev.type) {
-            case MC_CLOSE:
-                quit = 1;
-                break;
-
-            case MC_RESIZE:
-                vw = ev.w < cap_w ? ev.w : cap_w;
-                vh = ev.h < cap_h ? ev.h : cap_h;
-                if (vw < 1) vw = 1;
-                if (vh < 1) vh = 1;
-                dirty = 1;
-                break;
-
-            case MC_KEY:
-                if (ev.press) {
-                    st.shift = ev.mods & 1;
-                    if (ev.key == 1) {                        /* KEY_ESC */
-                        if (st.dialog || st.drag || st.down || st.mixer) {
-                            st.dialog = 0;
-                            st.drag = 0;
-                            st.down = 0;
-                            st.mixer = 0;
-                            snprintf(msg, sizeof(msg), "cancelled");
-                            dirty = 1;
-                        }
-                    } else if (ev.key == 28) {                /* KEY_ENTER */
-                        if (st.dialog) do_clear(&L, &st, msg, sizeof(msg), &dirty);
-                    }
-                } else {
-                    st.shift = ev.mods & 1;
-                }
-                break;
-
-            case MC_TEXT:
-                handle_text(&st, ev.text, msg, sizeof(msg), &L, &dirty, &quit);
-                break;
-
-            case MC_MOUSE: {
-                int x = ev.x, y = ev.y;
-                int down = ev.buttons & 1;
-                int hot = hit_code(&L, &st, x, y);
-                int cx, cy;
-                if (hot != st.hot) { st.hot = hot; dirty = 1; }
-                st.cursor_in = rect_hit(&L.canvas, x, y) && !L.pop_on;
-                if (st.cursor_in) {
-                    canvas_map(&L, x, y, &st.px, &st.py);
-                }
-
-                if (down && !was_down) {
-                    press_at(&st, &L, x, y, msg, sizeof(msg), &dirty);
-                } else if (down && was_down) {
-                    if (st.slider >= 0) {
-                        slider_set(&st, &L.sl[st.slider], x, st.slider);
-                        dirty = 1;
-                    } else if (st.drag) {
-                        canvas_map(&L, x, y, &st.px, &st.py);
-                        dirty = 1;
-                    } else if (st.down) {
-                        canvas_map(&L, x, y, &cx, &cy);
-                        drag_at(&st, cx, cy, msg, sizeof(msg), &dirty);
-                    }
-                } else if (!down && was_down) {
-                    release_at(&st, msg, sizeof(msg), &dirty);
-                }
-                was_down = down;
-                dirty = 1;
-                break;
-            }
-
-            case MC_WHEEL:
-                if (st.brush + ev.wheel >= 1 && st.brush + ev.wheel <= MAX_BRUSH) {
-                    st.brush += ev.wheel;
-                    dirty = 1;
-                }
-                break;
-
-            default:
-                break;
-            }
-
-            if (quit) {
+            paint_event(&A, &ev);
+            if (A.quit) {
                 hist_done();
                 mc_close(&c);
                 return 0;
             }
         }
 
-        if (!got && !dirty) usleep(20 * 1000);
+        /* Nothing to do: sleep until the server has something for us
+         * rather than for a flat 20 ms. The pointer reports at about
+         * 100 Hz, and a frame here is 6.7 ms, so a blind 20 ms nap landed in
+         * the gap after almost every frame and the drag preview then moved
+         * two or three pointer samples at a time - the jump the owner saw.
+         * poll() on the socket wakes on the first byte instead. */
+        if (!got && !A.dirty) {
+            struct pollfd p;
+            p.fd = c.fd;
+            p.events = POLLIN;
+            p.revents = 0;
+            while (poll(&p, 1, 20) < 0 && errno == EINTR) { }
+        }
     }
 }
 
@@ -3106,7 +3252,6 @@ static void layout_audit(const Layout *L) {
 static int render_scene(float scale, int vw, int vh, int scene,
                         const char *png, const char *bmp) {
     u32 *px;
-    MClient c;
     Layout L;
     PaintState st;
     Fonts F;
@@ -3130,11 +3275,6 @@ static int render_scene(float scale, int vw, int vh, int scene,
 
     px = calloc((size_t)vw * (size_t)vh, sizeof(u32));
     if (!px) return 2;
-    memset(&c, 0, sizeof(c));
-    c.px = px;
-    c.w = vw;
-    c.h = vh;
-    c.stride = vw;
 
     /* The render must not touch the filesystem, but the footer must show
      * the folder this build actually saves to - so the probe is marked as
@@ -3173,7 +3313,15 @@ static int render_scene(float scale, int vw, int vh, int scene,
            L.panel_on ? ", mixer panel" : (L.pop_on ? ", mixer popover" : ""));
     layout_audit(&L);
 
-    draw_ui(&c, &L, &F, &st, msg, 0);
+    {
+        Surface dst;
+        dst.px = px;
+        dst.w = vw;
+        dst.h = vh;
+        dst.stride = vw;
+        dst.cx0 = dst.cy0 = dst.cx1 = dst.cy1 = 0;
+        draw_ui(&dst, &L, &F, &st, msg, 0);
+    }
     audit(g_text_over == 0, "every drawn string fits its box");
 
     if (png) {

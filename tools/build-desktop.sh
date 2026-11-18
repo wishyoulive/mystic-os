@@ -72,4 +72,17 @@ echo "==> compiling ed25519-verify"
 cp build/ed25519-verify stage/usr/bin/ed25519-verify
 chmod +x stage/usr/bin/ed25519-verify
 
+# ---- beep: the smallest real audio client ---------------------------
+# src/audio.c speaks the ALSA UAPI to /dev/snd/pcmC0D0p directly (no
+# libasound, no ALSA headers). beep is both the proof that the path
+# works and the tool the owner can run from the shell:
+#     beep 440 500
+# It is built here so it is in the image, not in a worker's scratch dir.
+echo "==> compiling beep"
+"$ZIG" cc -target x86_64-linux-musl -Os -static -Isrc \
+    -Wall -Wextra -Wno-unused-parameter \
+    -o build/beep src/tools/beep.c src/audio.c -lm
+cp build/beep stage/usr/bin/beep
+chmod +x stage/usr/bin/beep
+
 echo "==> installed into stage/usr/bin + stage/usr/share/fonts"

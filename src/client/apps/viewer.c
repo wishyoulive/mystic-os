@@ -3273,8 +3273,27 @@ static void handle_key(Viewer *v, int vw, int vh, int key, int mods, int *quit) 
     /* Ctrl+A / Ctrl+C work on the text view whether or not the details sheet
      * is up, because the selection is the document, not the sheet. */
     if ((mods & 2) && key == KEY_A) {
-        v->sel_all = 1;
-        snprintf(v->note, sizeof(v->note), "copied with Ctrl+C");
+        /* Say what actually happened. The old note claimed Ctrl+C had already
+         * run while the chord had only painted the band - a user who read it
+         * and switched apps found an empty clipboard. The count is the lines
+         * the band covers: the same first_line/text_rows run the painter uses,
+         * so the sentence and the highlight cannot disagree. */
+        if (v->kind == DOC_TEXT) {
+            v->sel_all = 1;
+            int first = v->first_line < 0 ? 0 : v->first_line;
+            int last = first + L.text_rows;
+            if (last > v->nlines) last = v->nlines;
+            int n = last - first;
+            if (n < 0) n = 0;
+            snprintf(v->note, sizeof(v->note),
+                     "selected %d line%s - Ctrl+C copies",
+                     n, n == 1 ? "" : "s");
+        } else {
+            /* An image has no lines to band; leaving sel_all set would make
+             * the next text document open already selected. */
+            v->sel_all = 0;
+            snprintf(v->note, sizeof(v->note), "nothing to select in this file");
+        }
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
         v->note_at = (long)ts.tv_sec * 1000L + (long)(ts.tv_nsec / 1000000L);

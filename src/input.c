@@ -8,6 +8,7 @@
  * ============================================================ */
 #include "mystic.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <linux/input.h>
 #include <stdio.h>
@@ -56,6 +57,348 @@ static int has_bit(int fd, int ev_type, int code) {
     return (bits[word] >> bit) & 1;
 }
 
+/* ------------------------------------------------------------
+ *  Touchpad gestures
+ *
+ *  A multitouch touchpad does not report motion, it reports CONTACTS. Under
+ *  evdev's protocol B each contact owns a slot:
+ *
+ *      EV_ABS ABS_MT_SLOT          which slot the next values belong to
+ *      EV_ABS ABS_MT_TRACKING_ID   a new id opens the slot, -1 closes it
+ *      EV_ABS ABS_MT_POSITION_X/Y  that slot's position, in device units
+ *
+ *  and a packet ends at EV_SYN/SYN_REPORT. Everything a gesture needs is
+ *  computed at the end of a packet, never per event: the second finger's
+ *  position in the same packet may still be in flight when the first one is
+ *  read.
+ *
+ *  The older reporting style has no slots at all: it says how many fingers
+ *  are down with BTN_TOOL_FINGER, BTN_TOOL_DOUBLETAP, BTN_TOOL_TRIPLETAP,
+ *  BTN_TOOL_QUADTAP and BTN_TOOL_QUINTTAP (the kernel's names, and its
+ *  documented contact counts), with BTN_TOUCH saying a finger is on the pad.
+ *  Those are EV_KEY codes - the BTN range lives inside EV_KEY - which is why
+ *  they used to fall through this file's key branch and get queued as if the
+ *  user had typed them. Both styles are accepted here and neither reaches
+ *  keys[]. That style has a finger COUNT but no positions, so it can report
+ *  how many fingers are down and cannot make a gesture out of them; the
+ *  gestures themselves need protocol B's slots. A pad like that already gets
+ *  its scrolling from the REL_WHEEL its driver emits, which this file has
+ *  read all along.
+ *
+ *  The numbers below are POLICY, not measurements: they are the thresholds a
+ *  gesture has to pass before it is allowed to do anything. Positions are
+ *  delivered as pixels - this file already treats an absolute touch position
+ *  (ABS_X) as a logical pixel - so a delta here is a distance on screen at
+ *  1:1, and the desktop turns it into lines with its own font height.
+ * ------------------------------------------------------------ */
+#define MT_SLOTS      10     /* slots this parser tracks                      */
+
+#define MT_TAP_SLOP     8    /* px a contact may wander and still be a tap    */
+#define MT_TAP_MS     350    /* ms first contact -> last lift; the same window
+                              * the double-click test above uses             */
+#define MT_SCROLL_MIN   4    /* px of centroid travel to latch a scroll       */
+#define MT_SWIPE_MIN   30    /* px to latch a three-finger swipe              */
+#define MT_PINCH_MIN    4    /* px of gap change to latch a pinch             */
+#define MT_PINCH_RATIO 0.04f /* ... or 4 % of the starting gap                */
+#define MT_AXIS_LOCK  115    /* an axis is dominant past 1.15x the other      */
+
+/* One contact. `fresh` marks a slot opened in the current packet: its first
+ * position is the contact's origin, not a move from wherever the previous
+ * finger left the slot, so its delta is zero by definition. */
+typedef struct {
+    int used;                /* a contact owns this slot right now. The
+                              * tracking id itself is not kept: a value of 0
+                              * is a legal id, so "empty" cannot be spelled
+                              * with it, and every packet that matters (a new
+                              * contact) is marked by `fresh` below.        */
+    int x, y;                /* latest position                            */
+    int px, py;              /* position at the previous packet            */
+    int fresh;               /* opened since the previous packet            */
+} MtSlot;
+
+static struct {
+    /* 0 until input_open() finds the touchpad; then its fd, or -1 when the
+     * machine has none. Accepting MT codes while it is 0 is what lets a host
+     * harness drive this parser directly, and fd 0 is never an evdev node:
+     * input_open() assigns the touchpad's fd before any event is read. */
+    int fd;
+    int cur;                 /* ABS_MT_SLOT in force                        */
+    MtSlot slot[MT_SLOTS];
+    unsigned tool;           /* BTN_TOOL_* contact-count bits down          */
+
+    /* the run of contacts currently on the pad */
+    int  down;               /* contacts were down at the previous packet   */
+    int  fingers;            /* how many of them                            */
+    int  no_tap;             /* this run may not end as a tap: its fingers
+                              * are the tail of a gesture, or of a tap that
+                              * was already reported                         */
+    long start_ms;           /* when the first one landed                    */
+    int  sx, sy;             /* centroid then                               */
+    int  lx, ly;             /* centroid at the previous packet             */
+    int  travel;             /* furthest the centroid has been from (sx,sy) */
+    int  dist0;              /* two-finger gap then, px                     */
+    int  kind;               /* GESTURE_* latched, or GESTURE_NONE          */
+    int  axis;               /* 1 = horizontal, 2 = vertical                */
+    int  gid;                /* sequence number of the last latch           */
+    float last_scale;        /* ratio to report on the release frame        */
+} mt;
+
+/* MT codes are only accepted from the touchpad - a second pointing device
+ * must not be able to move a gesture that the first one started. */
+static int mt_accept(int fd) {
+    return mt.fd == 0 || fd == mt.fd;
+}
+
+/* Integer square root: no libm in the event path, and the answer must not
+ * depend on the host's floating point. */
+static int mt_isqrt(unsigned long long v) {
+    unsigned long long r = 0, bit = 1ull << 62;
+    while (bit > v) bit >>= 2;
+    while (bit) {
+        if (v >= r + bit) { v -= r + bit; r = (r >> 1) + bit; }
+        else              { r >>= 1; }
+        bit >>= 2;
+    }
+    return (int)r;
+}
+
+static int mt_gap(int ax, int ay, int bx, int by) {
+    long long dx = (long long)ax - bx, dy = (long long)ay - by;
+    return mt_isqrt((unsigned long long)(dx * dx + dy * dy));
+}
+
+/* The kernel's contact-count codes, ordered by the number of fingers they
+ * mean: BTN_TOOL_QUINTTAP is 0x148 while BTN_TOOL_DOUBLETAP is 0x14d, so the
+ * numeric order of the codes says nothing about the number of fingers. The
+ * bit mt.tool keeps for code i is (1u << i). */
+static const int MT_TOOL[5] = { BTN_TOOL_FINGER, BTN_TOOL_DOUBLETAP,
+                                BTN_TOOL_TRIPLETAP, BTN_TOOL_QUADTAP,
+                                BTN_TOOL_QUINTTAP };
+
+/* The classic report's finger count: the highest BTN_TOOL_* bit that is down
+ * is the number of contacts (that is how the kernel documents them). */
+static int mt_tool_fingers(void) {
+    int n = 0;
+    for (int i = 0; i < 5; i++)
+        if (mt.tool & (1u << i)) n = i + 1;
+    return n;
+}
+
+/* EV_KEY codes that belong to the touchpad rather than the keyboard. Returns
+ * 1 when the code was consumed. */
+static int mt_tool_event(int code, int value) {
+    for (int i = 0; i < 5; i++) {
+        if (code != MT_TOOL[i]) continue;
+        if (value) mt.tool |= 1u << i;
+        else       mt.tool &= ~(1u << i);
+        return 1;
+    }
+    if (code == BTN_TOUCH) {
+        /* "a finger is on the pad". The count bits mean nothing once it
+         * lifts, so they go with it. */
+        if (!value) mt.tool = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static long mt_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000L + (long)(ts.tv_nsec / 1000000L);
+}
+
+/* A run of contacts starts: this is where the tap timer, the centroid the
+ * deltas are measured from and the pinch ratio all begin, which is why a tap
+ * produces no travel and a pinch ratio of exactly 1.0. */
+static void mt_start(int n, int cx, int cy, int gap) {
+    mt.down = 1;
+    mt.fingers = n;
+    mt.start_ms = mt_now_ms();
+    mt.sx = cx;  mt.sy = cy;
+    mt.lx = cx;  mt.ly = cy;
+    mt.travel = 0;
+    mt.dist0 = gap;
+    mt.kind = GESTURE_NONE;
+    mt.axis = 0;
+    mt.last_scale = 1.0f;
+}
+
+/* A device that was unplugged mid-gesture leaves its contacts standing, and a
+ * gesture whose device is gone can never end - which would leave the desktop
+ * holding a text scale nobody can release. Forgetting them makes the next
+ * packet report the release edge, and no_tap stops an unplug from looking like
+ * a click. */
+static void mt_forget(void) {
+    for (int s = 0; s < MT_SLOTS; s++) mt.slot[s].used = 0;
+    mt.tool = 0;
+    mt.no_tap = 1;
+}
+
+/* The gesture in progress is over. It is named ONE more time, on the frame it
+ * ends, so whoever acted on it can commit what it changed; after that every
+ * field is zero and nothing fires again. */
+static void mt_end(Input *in) {
+    if (mt.kind == GESTURE_NONE) return;
+    in->gesture = mt.kind;
+    in->gesture_fingers = mt.fingers;
+    in->gesture_scale = (mt.kind == GESTURE_PINCH) ? mt.last_scale : 0.0f;
+    in->gesture_release = 1;
+    mt.kind = GESTURE_NONE;
+}
+
+/* One kernel packet worth of contacts. Called at SYN_REPORT and once more
+ * after draining a device, so a report that was cut off still settles instead
+ * of waiting for a SYN that is not coming. */
+static void mt_packet(Input *in) {
+    int n = 0, sx = 0, sy = 0;
+    int px[MT_SLOTS], py[MT_SLOTS], fdx[MT_SLOTS], fdy[MT_SLOTS];
+
+    for (int s = 0; s < MT_SLOTS; s++) {
+        MtSlot *sl = &mt.slot[s];
+        if (!sl->used) continue;
+        fdx[n] = sl->fresh ? 0 : sl->x - sl->px;
+        fdy[n] = sl->fresh ? 0 : sl->y - sl->py;
+        px[n] = sl->x; py[n] = sl->y;
+        sx += sl->x; sy += sl->y;
+        sl->px = sl->x; sl->py = sl->y; sl->fresh = 0;
+        n++;
+    }
+    /* Protocol B is authoritative when it reports slots; the BTN_TOOL_* count
+     * is what a pad without slots can say. */
+    in->finger_n = n ? n : mt_tool_fingers();
+    for (int i = 0; i < MT_MAX_FINGERS; i++) {
+        in->finger_dx[i] = i < n ? fdx[i] : 0;
+        in->finger_dy[i] = i < n ? fdy[i] : 0;
+    }
+
+    if (n == 0) {
+        /* Every contact has lifted. */
+        if (mt.kind != GESTURE_NONE) {
+            mt_end(in);                          /* exactly one release edge */
+        } else if (mt.down && !mt.no_tap) {
+            long held = mt_now_ms() - mt.start_ms;
+            if (mt.travel <= MT_TAP_SLOP && held <= MT_TAP_MS) {
+                in->gesture_tap = 1;
+                in->gesture_tap_fingers = mt.fingers;
+            }
+        }
+        mt.no_tap = 0;
+        mt.down = 0;
+        mt.fingers = 0;
+        mt.kind = GESTURE_NONE;
+        mt.axis = 0;
+        return;
+    }
+
+    int cx = sx / n, cy = sy / n;
+    int gap = (n == 2) ? mt_gap(px[0], py[0], px[1], py[1]) : 0;
+
+    if (!mt.down) { mt.no_tap = 0; mt_start(n, cx, cy, gap); return; }
+    if (n != mt.fingers) {
+        /* The contact count changed mid-run: a finger landed or lifted. What
+         * was in progress ends here and the new count gets its own gesture, so
+         * a three-finger swipe is not a scroll plus one finger.
+         *
+         * Two things about real hands live in this branch. People lift the
+         * fingers of a two-finger tap a few milliseconds apart, so the tap is
+         * reported HERE, at the first lift, with the number of fingers it
+         * started with - waiting for the last finger would lose almost every
+         * tap. And the fingers left over from a gesture that has just ended
+         * are its tail, not a new tap: a three-finger swipe that ends with the
+         * fingers coming up one at a time must not turn the last two into a
+         * two-finger tap, which would open a context menu at the end of every
+         * swipe. */
+        if (mt.kind != GESTURE_NONE) {
+            mt_end(in);
+            mt.no_tap = 1;      /* the fingers left over are the tail       */
+        } else if (n < mt.fingers) {
+            if (!mt.no_tap) {
+                long held = mt_now_ms() - mt.start_ms;
+                if (mt.travel <= MT_TAP_SLOP && held <= MT_TAP_MS) {
+                    in->gesture_tap = 1;
+                    in->gesture_tap_fingers = mt.fingers;
+                }
+            }
+            mt.no_tap = 1;      /* a tap is reported once                   */
+        }
+        /* n > mt.fingers with nothing latched is fingers still arriving, so
+         * the run may yet be the tap it looks like: no_tap is left alone. */
+        mt_start(n, cx, cy, gap);
+        return;
+    }
+
+    int dx = cx - mt.lx, dy = cy - mt.ly;
+    mt.lx = cx; mt.ly = cy;
+
+    int ex = cx - mt.sx, ey = cy - mt.sy;
+    if (ex < 0) ex = -ex;
+    if (ey < 0) ey = -ey;
+    if (ex > mt.travel) mt.travel = ex;
+    if (ey > mt.travel) mt.travel = ey;
+
+    int latched = 0;
+    if (mt.kind == GESTURE_NONE) {
+        if (n >= 3) {
+            if (ex >= MT_SWIPE_MIN || ey >= MT_SWIPE_MIN) {
+                mt.kind = GESTURE_SWIPE;
+                mt.axis = (ex * 100 >= ey * MT_AXIS_LOCK) ? 1 :
+                          (ey * 100 >= ex * MT_AXIS_LOCK) ? 2 : (ex > ey ? 1 : 2);
+                latched = 1;
+            }
+        } else if (n == 2) {
+            int change = gap - mt.dist0;
+            if (change < 0) change = -change;
+            int travel = ex > ey ? ex : ey;
+            int pinch_px = (int)((float)mt.dist0 * MT_PINCH_RATIO + 0.5f);
+            if (pinch_px < MT_PINCH_MIN) pinch_px = MT_PINCH_MIN;
+            if (gap > 0 && mt.dist0 > 0 &&
+                change >= pinch_px && change >= travel) {
+                mt.kind = GESTURE_PINCH;
+                latched = 1;
+            } else if (travel >= MT_SCROLL_MIN) {
+                mt.kind = GESTURE_SCROLL;
+                mt.axis = (ex * 100 >= ey * MT_AXIS_LOCK) ? 1 :
+                          (ey * 100 >= ex * MT_AXIS_LOCK) ? 2 : (ex > ey ? 1 : 2);
+                latched = 1;
+            }
+        }
+        /* one finger is the pointer, not a gesture */
+        if (latched) { mt.gid++; in->gesture_id = mt.gid; }
+    }
+
+    switch (mt.kind) {
+    case GESTURE_SCROLL:
+        /* The travel up to the latch is delivered on the latch packet too, so
+         * no part of a scroll is lost to the threshold. */
+        if (latched) { in->gesture_dx += cx - mt.sx; in->gesture_dy += cy - mt.sy; }
+        else         { in->gesture_dx += dx;          in->gesture_dy += dy; }
+        /* Axis lock: only the axis the gesture latched on is delivered. The
+         * other is consumed HERE, which is what stops a mostly-vertical
+         * scroll from jittering a list sideways. */
+        if (mt.axis == 1) in->gesture_dy = 0;
+        else              in->gesture_dx = 0;
+        break;
+    case GESTURE_PINCH:
+        if (mt.dist0 > 0 && gap > 0) {
+            mt.last_scale = (float)gap / (float)mt.dist0;
+            in->gesture_scale = mt.last_scale;
+        } else {
+            mt.last_scale = 1.0f;
+            in->gesture_scale = 1.0f;
+        }
+        break;
+    case GESTURE_SWIPE:
+        if (latched) { in->gesture_dx += cx - mt.sx; in->gesture_dy += cy - mt.sy; }
+        else         { in->gesture_dx += dx;          in->gesture_dy += dy; }
+        break;
+    default:
+        return;                       /* nothing latched: no gesture to report */
+    }
+    in->gesture = mt.kind;
+    in->gesture_fingers = mt.fingers;
+}
+
 int input_open(Input *in) {
     memset(in, 0, sizeof(*in));
     in->mouse_x = 640;
@@ -75,7 +418,12 @@ int input_open(Input *in) {
         char name[128] = "?";
         ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name);
 
-        int is_mouse = has_bit(fd, EV_REL, REL_X) || has_bit(fd, EV_ABS, ABS_X);
+        /* A touchpad may report nothing but ABS_MT_*: it is still the
+         * pointing device, and it is the one that carries gestures. */
+        int is_mt = has_bit(fd, EV_ABS, ABS_MT_SLOT) ||
+                    has_bit(fd, EV_ABS, ABS_MT_POSITION_X) ||
+                    has_bit(fd, EV_ABS, ABS_MT_POSITION_Y);
+        int is_mouse = has_bit(fd, EV_REL, REL_X) || has_bit(fd, EV_ABS, ABS_X) || is_mt;
         int is_key   = has_bit(fd, EV_KEY, KEY_A) || has_bit(fd, EV_KEY, KEY_SPACE);
         int kept = 0;
 
@@ -85,6 +433,13 @@ int input_open(Input *in) {
                 snprintf(mouse_name, sizeof(mouse_name), "%s", name);
             fprintf(stderr, "input: pointer  %s (%s)\n", path, name);
             kept = 1;
+        }
+        /* The first multitouch device is the gesture source. Only the address
+         * is remembered: a device that failed to be kept (no pointer slot
+         * left) must not become one, or the parser would read a closed fd. */
+        if (is_mt && kept && mt.fd == 0) {
+            mt.fd = fd;
+            fprintf(stderr, "input: touchpad %s (%s, multitouch)\n", path, name);
         }
         if (is_key && nkeybd < MAX_KEYB) {
             key_fd[nkeybd++] = fd;
@@ -107,8 +462,13 @@ int input_open(Input *in) {
             close(fd);
         }
     }
-    fprintf(stderr, "input: mouse=%s keyboard=%s (%d pointer, %d keyboard)\n",
-            mouse_name, key_name, nmouse, nkeybd);
+    /* No touchpad was found: say so once, so every MT code from here on is
+     * known not to be ours. On such a machine the desktop keeps the plain
+     * mouse and wheel path it always had. */
+    if (mt.fd == 0) mt.fd = -1;
+    fprintf(stderr, "input: mouse=%s keyboard=%s (%d pointer, %d keyboard%s)\n",
+            mouse_name, key_name, nmouse, nkeybd,
+            mt.fd > 0 ? ", multitouch" : ", no touchpad");
     return (nmouse || nkeybd) ? 0 : -1;
 }
 
@@ -284,11 +644,15 @@ static void caps_led(int on) {
     if (write(led_fd, &led, sizeof(led)) != (ssize_t)sizeof(led)) led_fd = -1;
 }
 
-static void handle_event(Input *in, struct input_event *ev, int *shift, int *ctrl) {
+static void handle_event(Input *in, int fd, struct input_event *ev,
+                         int *shift, int *ctrl) {
     switch (ev->type) {
         case EV_SYN:
-            /* end of one kernel report: settle the wheel */
-            if (ev->code == SYN_REPORT) wheel_report(in);
+            /* end of one kernel report: settle the wheel and the contacts */
+            if (ev->code == SYN_REPORT) {
+                wheel_report(in);
+                if (mt_accept(fd)) mt_packet(in);
+            }
             break;
         case EV_REL:
             if (ev->code == REL_X) { in->mouse_dx += ev->value; in->mouse_x += ev->value; }
@@ -298,7 +662,32 @@ static void handle_event(Input *in, struct input_event *ev, int *shift, int *ctr
             break;
         case EV_ABS:
             if (ev->code == ABS_X) in->mouse_x = ev->value;
-            if (ev->code == ABS_Y) in->mouse_y = ev->value;
+            else if (ev->code == ABS_Y) in->mouse_y = ev->value;
+            else if (mt_accept(fd)) {
+                /* Protocol B. A value is stored, not acted on: the packet is
+                 * not complete until SYN_REPORT, and acting per event would
+                 * compute a centroid from half a frame's contacts. */
+                switch (ev->code) {
+                case ABS_MT_SLOT:
+                    mt.cur = ev->value;
+                    if (mt.cur < 0) mt.cur = 0;
+                    if (mt.cur >= MT_SLOTS) mt.cur = MT_SLOTS - 1;
+                    break;
+                case ABS_MT_TRACKING_ID:
+                    /* -1 closes the slot; any other value is a new contact,
+                     * which is what `fresh` tells the packet pass. */
+                    if (ev->value < 0) {
+                        mt.slot[mt.cur].used = 0;
+                    } else {
+                        mt.slot[mt.cur].used = 1;
+                        mt.slot[mt.cur].fresh = 1;
+                    }
+                    break;
+                case ABS_MT_POSITION_X: mt.slot[mt.cur].x = ev->value; break;
+                case ABS_MT_POSITION_Y: mt.slot[mt.cur].y = ev->value; break;
+                default: break;   /* pressure, touch size, orientation */
+                }
+            }
             break;
         case EV_KEY:
             if (ev->code == BTN_LEFT || ev->code == BTN_RIGHT || ev->code == BTN_MIDDLE) {
@@ -333,6 +722,11 @@ static void handle_event(Input *in, struct input_event *ev, int *shift, int *ctr
                 in->ctrl = ev->value;
             } else if (ev->code == KEY_LEFTALT || ev->code == KEY_RIGHTALT) {
                 in->alt = ev->value;
+            } else if (mt_accept(fd) && ev->value != 2 &&
+                       mt_tool_event(ev->code, ev->value)) {
+                /* A touchpad's BTN_TOOL_* is a contact count or a tap signal,
+                 * not something the user typed: consumed, never queued. */
+                break;
             } else if (ev->code == KEY_CAPSLOCK) {
                 /* A lock, not a character: it flips on the press edge, it is
                  * not put in keys[] (nothing may treat it as a shortcut) and
@@ -387,14 +781,24 @@ int input_poll(Input *in) {
     struct input_event ev;
 
     for (int i = 0; i < nmouse; i++) {
-        while (read(mouse_fd[i], &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
-            handle_event(in, &ev, &shift, &ctrl);
+        ssize_t got;
+        /* EAGAIN is the normal end of the queue. ENODEV and EIO mean the
+         * device was unplugged, which is the one way a finger can go on
+         * being "down" for ever. */
+        while ((got = read(mouse_fd[i], &ev, sizeof(ev))) == (ssize_t)sizeof(ev)) {
+            handle_event(in, mouse_fd[i], &ev, &shift, &ctrl);
             any = 1;
         }
+        if (got < 0 && (errno == ENODEV || errno == EIO) &&
+            mouse_fd[i] == mt.fd)
+            mt_forget();
         /* Settle the wheel for THIS device before reading the next one: the
          * pending raw/hi-res figures belong to the stream just drained, and a
-         * device that vanished mid-report never sends its SYN_REPORT. */
+         * device that vanished mid-report never sends its SYN_REPORT. The
+         * same is true of a half-delivered contact, so the packet is closed
+         * here as well. */
         wheel_report(in);
+        if (mt_accept(mouse_fd[i])) mt_packet(in);
     }
     for (int i = 0; i < nkeybd; i++) {
         /* A combo device sits in both lists; draining it twice would replay
@@ -404,10 +808,11 @@ int input_poll(Input *in) {
             if (mouse_fd[j] == key_fd[i]) already = 1;
         if (already) continue;
         while (read(key_fd[i], &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
-            handle_event(in, &ev, &shift, &ctrl);
+            handle_event(in, key_fd[i], &ev, &shift, &ctrl);
             any = 1;
         }
         wheel_report(in);
+        if (mt_accept(key_fd[i])) mt_packet(in);
     }
     in->text[in->text_len] = 0;
     return any;
@@ -426,4 +831,20 @@ void input_frame(Input *in) {
     in->mouse_dy = 0;
     in->text_len = 0;
     in->text[0] = 0;
+    /* Gesture OUTPUT is per frame; the gesture itself (mt.kind, mt.gid) lives
+     * in the parser, so a slow frame does not restart what the fingers are
+     * doing. gesture_id is not cleared: it only ever counts up. */
+    in->gesture = GESTURE_NONE;
+    in->gesture_fingers = 0;
+    in->gesture_dx = 0;
+    in->gesture_dy = 0;
+    in->gesture_scale = 0.0f;
+    in->gesture_release = 0;
+    in->gesture_tap = 0;
+    in->gesture_tap_fingers = 0;
+    in->finger_n = 0;
+    for (int i = 0; i < MT_MAX_FINGERS; i++) {
+        in->finger_dx[i] = 0;
+        in->finger_dy[i] = 0;
+    }
 }
