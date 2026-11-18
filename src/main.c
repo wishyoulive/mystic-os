@@ -6137,10 +6137,32 @@ int main(int argc, char **argv) {
     /* With no saved choice the design is fitted to the panel, not left in a
      * corner at 1:1: that is the behaviour this desktop is for. display.conf,
      * when it exists, overrides this below. */
-    disp_set_scale(&disp, DISP_FIT);
-    display_restore_saved();
-    display_load_conf(&disp);
-    display_choose_logical(&disp);
+    /* SAFE MODE. A saved canvas larger than the panel routes every frame
+     * through the box filter (10-18 ms measured) and misplaces the pointer, so
+     * a single Settings change could leave the machine unbootable-in-practice.
+     * 'mystic.safe=1' on the kernel command line ignores the saved display
+     * choice entirely: canvas = panel, 1:1, the fast copy path. */
+    int safe_display = 0;
+    {
+        FILE *cf = fopen("/proc/cmdline", "r");
+        if (cf) {
+            char cl[512] = {0};
+            if (fgets(cl, sizeof(cl), cf)) safe_display = strstr(cl, "mystic.safe=1") != NULL;
+            fclose(cf);
+        }
+    }
+    if (safe_display) {
+        fprintf(stderr, "display: SAFE MODE - ignoring display.conf\n");
+        disp_set_scale(&disp, DISP_ONE_TO_ONE);
+        /* canvas = the panel itself: no scaling, so the copy path and the
+         * pointer mapping are both exact. */
+        disp_set_logical_size(&disp, disp.modes[0].w, disp.modes[0].h);
+    } else {
+        disp_set_scale(&disp, DISP_FIT);
+        display_restore_saved();
+        display_load_conf(&disp);
+        display_choose_logical(&disp);
+    }
 
     int logical_w = disp.w, logical_h = disp.h;
     wms_set_screen(logical_w, logical_h);  /* client buffers are screen sized */
