@@ -38,7 +38,8 @@ reports, and a jailed client's buffer is created inside that uid's tmpfs. A
 `HELLO` that names another app is logged and ignored — the bundle id used for
 paths is the one recorded at launch.
 
-*Released* when the bundle has no process left. Two facts are tracked per
+*Released* when the bundle has no process left (checked whenever the pool is
+swept: on a launch or a disconnect). Two facts are tracked per
 entry: the launch's pid (the keeper below) and the pid of each connected
 client. `sbx_cred_gc()` drops the ones the kernel says are gone and frees the
 slot — and with it, unmounts the two tmpfs instances. A bundle that dies before
@@ -141,13 +142,14 @@ They have to be the *same instances* on both sides of the jail:
   app's `/dev/shm/<leaf>` only because the tmpfs was mounted before the fork.
 
 Both are unmounted when the bundle's last process is gone
-(`sbx_jail_forget`), and a leftover from a crash is replaced on the next
-launch (`umount2(MNT_DETACH)` first).
+(`sbx_jail_forget`, from the pool sweep), and a leftover from a crash is
+replaced on the next launch (`umount2(MNT_DETACH)` first).
 
 ### The jail root is not writable by the app
 
 Every directory in the skeleton is created `root:root 0755`; the only writable
-places are the appdata bind (`/root`) and the two tmpfs mounts. That is a DAC
+places are the appdata bind (`/root`), the two tmpfs mounts, and the device
+nodes bound over `/dev` (`/dev/null`, `/dev/urandom`, `/dev/snd`). That is a DAC
 fact, and it is **checked at launch** rather than assumed: after the credential
 drop, the app itself runs
 
@@ -288,7 +290,11 @@ desktop from an app, not the app from a compromised kernel.
    is gone when the app exits. Persistent state belongs in `/root` (the
    appdata bind), and that app should be moved there. The same is true of
    anything else that treated `/dev/shm` as storage.
-8. **Two bridges deliberately cross the boundary**: the file picker (files in
+8. **A desktop that dies without cleaning up leaves that bundle's tmpfs
+   mounted** until the bundle is launched again or the machine reboots
+   (mounts live in the desktop's namespace). It is bounded - two per bundle,
+   at most 9 MiB each at 1280x800 - and the next launch detaches it.
+9. **Two bridges deliberately cross the boundary**: the file picker (files in
    `<jail>/tmp`) and the clipboard (`<jail>/run/mystic/clipboard.sock`, served
    by the desktop). Both are one-way or text-only, and both are the reason the
    app can be useful at all. They are the first place to look if this sandbox
@@ -308,7 +314,7 @@ $ zig cc -target x86_64-linux-musl -Os -static -Isrc \
 
 $ zig cc -Wall -Wextra -Isrc .work/sandbox/plan_harness.c -o .work/sandbox/plan.exe
 $ ./.work/sandbox/plan.exe
-        ... 39 checks, 0 failure(s)   (exit 0)
+        ... 44 checks, 0 failure(s)   (exit 0)
 ```
 
 The harness `#define MYSTIC_SANDBOX_PLAN` and `#include`s the **real**

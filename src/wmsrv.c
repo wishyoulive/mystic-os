@@ -479,7 +479,7 @@ static void sbx_plan_print(const SbxPlan *p, FILE *f) {
             break;
         }
         case SBX_CHOWN:
-            fprintf(f, "  %2d %s chown -R %s %d:%d (only if the user differs), mode %04o\n",
+            fprintf(f, "  %2d %s chown -R %s %d:%d (only if the owner differs), mode %04o\n",
                     i + 1, who, s->dst, s->uid, s->uid, s->mode);
             break;
         case SBX_BIND:
@@ -526,6 +526,53 @@ static int sbx_target_verdict(int lstat_err, int type, int want_dir) {
     if (want_dir) return type == SBX_TYPE_DIR ? SBX_T_DIR : SBX_T_NO_TYPE;
     return type == SBX_TYPE_FILE ? SBX_T_FILE : SBX_T_NO_TYPE;
 }
+
+/* One "key = value" line of a bundle manifest, pure text -> WmApp, so the host
+ * harness can prove what a manifest means without a filesystem.
+ *
+ * The one line that WEAKENS the sandbox is spelled out here and in
+ * docs/SECURITY.md:
+ *
+ *   default (no line): unshare(CLONE_NEWPID) + a fresh procfs, so the app sees
+ *     itself and its own children only, and cannot signal the desktop or any
+ *     other app.
+ *   procs = yes: no pid namespace; the host /proc is bound read-only instead,
+ *     so the app can see every process name and command line on the machine
+ *     (it still cannot read another uid's environ/mem/fd, cannot signal another
+ *     uid, and still has its own mount namespace, tmpfs and appdata, and no
+ *     network).
+ *
+ * Only an app whose purpose is to read other processes needs it - sysmon today.
+ * A value other than "yes" is ignored rather than guessed at.
+ */
+static void sbx_manifest_line(WmApp *a, const char *line) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", line ? line : "");
+    char *nl = strchr(buf, '\n');
+    if (nl) *nl = 0;
+    char *cr = strchr(buf, '\r');
+    if (cr) *cr = 0;
+    char *eq = strchr(buf, '=');
+    if (!eq) return;
+    *eq = 0;
+    char *k = buf, *v = eq + 1;
+    while (*k == ' ') k++;
+    while (*v == ' ') v++;
+    char *ke = k + strlen(k);
+    while (ke > k && ke[-1] == ' ') *--ke = 0;
+    /* trailing whitespace in the value is a typo, not part of a name: strip it
+     * so a manifest saved with CRLF still means what it says */
+    char *ve = v + strlen(v);
+    while (ve > v && (ve[-1] == ' ' || ve[-1] == '\t')) *--ve = 0;
+
+    if (!strcmp(k, "name")) snprintf(a->name, sizeof(a->name), "%s", v);
+    else if (!strcmp(k, "desc")) snprintf(a->desc, sizeof(a->desc), "%s", v);
+    else if (!strcmp(k, "exec")) snprintf(a->exe, sizeof(a->exe), "%s", v);
+    else if (!strcmp(k, "network") && !strcmp(v, "host")) a->net = 1;
+    else if (!strcmp(k, "audio") && !strcmp(v, "yes")) a->audio = 1;
+    else if (!strcmp(k, "procs") && !strcmp(v, "yes")) a->procs = 1;
+}
+
 
 /* Everything below this line is the server: Linux only. */
 #ifndef MYSTIC_SANDBOX_PLAN
@@ -624,21 +671,22 @@ static int make_shm(WmClient *c) {
     }
 
     size_t bytes = (size_t)c->stride * (size_t)c->maxh * 4;
-    /* A jailed buffer lives in a tmpfs that is smaller than the machine: read
-     * the free space before touching a page. ftruncate() beyond a tmpfs limit
-     * succeeds and the SIGBUS only arrives on the first write - which would be
-     * this memset, in the desktop. Fail the client instead. The size is
+    /* A buffer lives on a tmpfs that is smaller than the machine (9.2 MiB per
+     * app inside the jail, 128 MiB for the host's /dev/shm). Read the free
+     * space before touching a page: ftruncate() beyond a tmpfs limit succeeds
+     * and the SIGBUS only arrives on the first write - which would be this
+     * memset, in the desktop. Fail the client instead. The per-app size is
      * 2 buffers + 1 MiB, so a second window of the same app fits and a third
      * gets one honest line rather than a dead compositor. */
-    if (c->jailed) {
+    {
         struct statfs sfs;
         if (statfs(c->shm_host, &sfs) == 0) {
             unsigned long long free_b = (unsigned long long)sfs.f_bsize *
                                         (unsigned long long)sfs.f_bfree;
             if ((unsigned long long)bytes > free_b) {
                 fprintf(stderr, "wms: %s: a %zu B buffer does not fit in the "
-                                "%llu B left in its /dev/shm\n",
-                        c->id[0] ? c->id : "client", bytes, free_b);
+                                "%llu B left in %s\n",
+                        c->id[0] ? c->id : "client", bytes, free_b, c->shm_host);
                 close(fd);
                 unlink(c->shm_host);
                 c->shm_path[0] = 0;
@@ -818,10 +866,11 @@ int wms_start(void) {
         return -1;
     }
     listen(listen_fd, 8);
-    /* connect() needs write permission on the socket inode, and apps now run as
-     * uid 1000. This is a single-tenant system - every local process is one of
-     * our sandboxed apps - so the socket is connectable, while what is behind
-     * it (the filesystem) is not: see the jail. */
+    /* connect() needs write permission on the socket inode, and apps run as
+     * their own sandbox uids (2000.., see the plan above). This is a
+     * single-tenant system - every local process is one of our sandboxed apps -
+     * so the socket is connectable, while what is behind it (the filesystem,
+     * every other app's pixels) is not: see docs/SECURITY.md. */
     chmod(WM_SOCKET, 0666);
     fcntl(listen_fd, F_SETFL, fcntl(listen_fd, F_GETFL, 0) | O_NONBLOCK);
     fprintf(stderr, "wms: listening on %s\n", WM_SOCKET);
@@ -1105,37 +1154,7 @@ static int scan_root(WmApp *out, int n, int max, const char *root, int from_imag
 
         char line[256];
         while (fgets(line, sizeof(line), f)) {
-            char *nl = strchr(line, '\n');
-            if (nl) *nl = 0;
-            char *eq = strchr(line, '=');
-            if (!eq) continue;
-            *eq = 0;
-            char *k = line, *v = eq + 1;
-            while (*k == ' ') k++;
-            while (*v == ' ') v++;
-            char *ke = k + strlen(k);
-            while (ke > k && ke[-1] == ' ') *--ke = 0;
-            if (!strcmp(k, "name")) snprintf(a->name, sizeof(a->name), "%s", v);
-            else if (!strcmp(k, "desc")) snprintf(a->desc, sizeof(a->desc), "%s", v);
-            else if (!strcmp(k, "exec")) snprintf(a->exe, sizeof(a->exe), "%s", v);
-            else if (!strcmp(k, "network") && !strcmp(v, "host")) a->net = 1;
-            else if (!strcmp(k, "audio") && !strcmp(v, "yes")) a->audio = 1;
-            /* 'procs = yes' is the one manifest line that WEAKENS the sandbox,
-             * so it is spelled out here and in docs/SECURITY.md:
-             *
-             *   default (no line): unshare(CLONE_NEWPID) + a fresh procfs, so
-             *     the app sees itself and its own children only, and cannot
-             *     signal the desktop or any other app.
-             *   procs = yes: no pid namespace; the host /proc is bound
-             *     read-only instead, so the app can see every process name and
-             *     command line on the machine (it still cannot read another
-             *     uid's environ/mem/fd, cannot signal another uid, and still
-             *     has its own mount namespace, tmpfs, appdata and no network).
-             *
-             * Only an app whose purpose is to read other processes needs it -
-             * sysmon today. A value other than 'yes' is ignored rather than
-             * guessed at, and the rest of the line's spelling must match. */
-            else if (!strcmp(k, "procs") && !strcmp(v, "yes")) a->procs = 1;
+            sbx_manifest_line(a, line);
         }
         fclose(f);
         if (!a->name[0]) snprintf(a->name, sizeof(a->name), "%s", a->id);

@@ -14,6 +14,9 @@ runs on a framebuffer, no GPU, no X11, no Wayland.
 
 ![Mystic OS with the black hole wallpaper](docs/screenshots/black-hole.png)
 
+*The Eclipse theme on the black hole wallpaper. The eye in the top-left corner
+opens the launcher — it is more alive than it looks.*
+
 ---
 
 ## What it does
