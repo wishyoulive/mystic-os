@@ -66,6 +66,7 @@ typedef struct {
     char desc[160];
     char exe[128];
     int  from_image;   /* 1 = shipped bundle, 0 = installed under /root/apps */
+    int  audio;        /* manifest says 'audio = yes': bind /dev/snd */
     int  net;          /* manifest says 'network = host': keep the host netns,
                         * and give the jail a resolv.conf so lookups work */
 } WmApp;
