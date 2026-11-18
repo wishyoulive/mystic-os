@@ -9823,11 +9823,11 @@ extern "C" {
 #define BR_ERR_BAD_STATE               2
 
 /** \brief SSL status: incoming protocol or record version is unsupported. */
-#define BR_ERR_UNSUPPORTED_VEreviewON     3
+#define BR_ERR_UNSUPPORTED_VERSION     3
 
 /** \brief SSL status: incoming record version does not match the expected
     version. */
-#define BR_ERR_BAD_VEreviewON             4
+#define BR_ERR_BAD_VERSION             4
 
 /** \brief SSL status: incoming record length is invalid. */
 #define BR_ERR_BAD_LENGTH              5
@@ -9864,7 +9864,7 @@ extern "C" {
 
 /** \brief SSL status: ServerHello contains a session ID which is larger
     than 32 bytes. */
-#define BR_ERR_OVEreviewZED_ID           15
+#define BR_ERR_OVERSIZED_ID           15
 
 /** \brief SSL status: server wants to use a cipher suite that we did
     not claim to support. This is also reported if we tried to advertise
@@ -13997,7 +13997,7 @@ int br_sslio_close(br_sslio_context *cc);
 #define BR_ALERT_ACCESS_DENIED              49
 #define BR_ALERT_DECODE_ERROR               50
 #define BR_ALERT_DECRYPT_ERROR              51
-#define BR_ALERT_PROTOCOL_VEreviewON           70
+#define BR_ALERT_PROTOCOL_VERSION           70
 #define BR_ALERT_INSUFFICIENT_SECURITY      71
 #define BR_ALERT_INTERNAL_ERROR             80
 #define BR_ALERT_USER_CANCELED              90
@@ -15071,8 +15071,8 @@ static const char *br_error_text(int e, const char *host, char *buf, size_t sz) 
     }
     switch (e) {
         case BR_ERR_OK: return "";
-        case BR_ERR_BAD_VEreviewON:
-        case BR_ERR_UNSUPPORTED_VEreviewON:
+        case BR_ERR_BAD_VERSION:
+        case BR_ERR_UNSUPPORTED_VERSION:
             snprintf(buf, sz, "%s does not speak TLS 1.2 (the version this browser requires)", host);
             return buf;
         case BR_ERR_NO_RANDOM:
@@ -29477,7 +29477,7 @@ recvrec_ack(br_ssl_engine_context *rc, size_t len)
 		rc->record_type_in = rc->ibuf[0];
 		version = br_dec16be(rc->ibuf + 1);
 		if ((version >> 8) != 3) {
-			br_ssl_engine_fail(rc, BR_ERR_UNSUPPORTED_VEreviewON);
+			br_ssl_engine_fail(rc, BR_ERR_UNSUPPORTED_VERSION);
 			return;
 		}
 
@@ -29488,7 +29488,7 @@ recvrec_ack(br_ssl_engine_context *rc, size_t len)
 		 * negotiation details.
 		 */
 		if (rc->version_in != 0 && rc->version_in != version) {
-			br_ssl_engine_fail(rc, BR_ERR_BAD_VEreviewON);
+			br_ssl_engine_fail(rc, BR_ERR_BAD_VERSION);
 			return;
 		}
 		rc->version_in = version;
@@ -30881,14 +30881,14 @@ static const unsigned char t0_codeblock[] = {
 	T0_INT1(BR_ERR_BAD_HELLO_DONE), 0x00, 0x00, 0x01,
 	T0_INT1(BR_ERR_BAD_PARAM), 0x00, 0x00, 0x01,
 	T0_INT1(BR_ERR_BAD_SECRENEG), 0x00, 0x00, 0x01,
-	T0_INT1(BR_ERR_BAD_SNI), 0x00, 0x00, 0x01, T0_INT1(BR_ERR_BAD_VEreviewON),
+	T0_INT1(BR_ERR_BAD_SNI), 0x00, 0x00, 0x01, T0_INT1(BR_ERR_BAD_VERSION),
 	0x00, 0x00, 0x01, T0_INT1(BR_ERR_EXTRA_EXTENSION), 0x00, 0x00, 0x01,
 	T0_INT1(BR_ERR_INVALID_ALGORITHM), 0x00, 0x00, 0x01,
 	T0_INT1(BR_ERR_LIMIT_EXCEEDED), 0x00, 0x00, 0x01, T0_INT1(BR_ERR_OK),
-	0x00, 0x00, 0x01, T0_INT1(BR_ERR_OVEreviewZED_ID), 0x00, 0x00, 0x01,
+	0x00, 0x00, 0x01, T0_INT1(BR_ERR_OVERSIZED_ID), 0x00, 0x00, 0x01,
 	T0_INT1(BR_ERR_RESUME_MISMATCH), 0x00, 0x00, 0x01,
 	T0_INT1(BR_ERR_UNEXPECTED), 0x00, 0x00, 0x01,
-	T0_INT1(BR_ERR_UNSUPPORTED_VEreviewON), 0x00, 0x00, 0x01,
+	T0_INT1(BR_ERR_UNSUPPORTED_VERSION), 0x00, 0x00, 0x01,
 	T0_INT1(BR_ERR_WRONG_KEY_USAGE), 0x00, 0x00, 0x01,
 	T0_INT2(offsetof(br_ssl_engine_context, action)), 0x00, 0x00, 0x01,
 	T0_INT2(offsetof(br_ssl_engine_context, alert)), 0x00, 0x00, 0x01,
@@ -32747,7 +32747,7 @@ br_sslio_close(br_sslio_context *ctx)
 
 #define SESSION_ID_OFF        0
 #define MASTER_SECRET_OFF    32
-#define VEreviewON_OFF          80
+#define VERSION_OFF          80
 #define CIPHER_SUITE_OFF     82
 #define LIST_PREV_OFF        84
 #define LIST_NEXT_OFF        88
@@ -33086,7 +33086,7 @@ lru_save(const br_ssl_session_cache_class **ctx,
 	memcpy(cc->store + x + SESSION_ID_OFF, id, SESSION_ID_LEN);
 	memcpy(cc->store + x + MASTER_SECRET_OFF,
 		params->master_secret, MASTER_SECRET_LEN);
-	br_enc16be(cc->store + x + VEreviewON_OFF, params->version);
+	br_enc16be(cc->store + x + VERSION_OFF, params->version);
 	br_enc16be(cc->store + x + CIPHER_SUITE_OFF, params->cipher_suite);
 }
 
@@ -33109,7 +33109,7 @@ lru_load(const br_ssl_session_cache_class **ctx,
 	if (x != ADDR_NULL) {
 		unsigned version;
 
-		version = br_dec16be(cc->store + x + VEreviewON_OFF);
+		version = br_dec16be(cc->store + x + VERSION_OFF);
 		if (version == 0) {
 			/*
 			 * Entry is disabled, we pretend we did not find it.
@@ -33198,7 +33198,7 @@ void br_ssl_session_cache_lru_forget(
 	mask_id(cc, id, mid);
 	addr = find_node(cc, mid, NULL);
 	if (addr != ADDR_NULL) {
-		br_enc16be(cc->store + addr + VEreviewON_OFF, 0);
+		br_enc16be(cc->store + addr + VERSION_OFF, 0);
 	}
 }
 #undef ADDR_NULL
@@ -33213,7 +33213,7 @@ void br_ssl_session_cache_lru_forget(
 #undef SESSION_ID_OFF
 #undef TREE_LEFT_OFF
 #undef TREE_RIGHT_OFF
-#undef VEreviewON_OFF
+#undef VERSION_OFF
 /* ===== src/ssl/ssl_rec_chapol.c ===== */
 /*
  * Copyright (c) 2016 Thomas Pornin <pornin@bolet.org>

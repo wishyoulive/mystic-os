@@ -1120,6 +1120,22 @@ static int scan_root(WmApp *out, int n, int max, const char *root, int from_imag
             else if (!strcmp(k, "exec")) snprintf(a->exe, sizeof(a->exe), "%s", v);
             else if (!strcmp(k, "network") && !strcmp(v, "host")) a->net = 1;
             else if (!strcmp(k, "audio") && !strcmp(v, "yes")) a->audio = 1;
+            /* 'procs = yes' is the one manifest line that WEAKENS the sandbox,
+             * so it is spelled out here and in docs/SECURITY.md:
+             *
+             *   default (no line): unshare(CLONE_NEWPID) + a fresh procfs, so
+             *     the app sees itself and its own children only, and cannot
+             *     signal the desktop or any other app.
+             *   procs = yes: no pid namespace; the host /proc is bound
+             *     read-only instead, so the app can see every process name and
+             *     command line on the machine (it still cannot read another
+             *     uid's environ/mem/fd, cannot signal another uid, and still
+             *     has its own mount namespace, tmpfs, appdata and no network).
+             *
+             * Only an app whose purpose is to read other processes needs it -
+             * sysmon today. A value other than 'yes' is ignored rather than
+             * guessed at, and the rest of the line's spelling must match. */
+            else if (!strcmp(k, "procs") && !strcmp(v, "yes")) a->procs = 1;
         }
         fclose(f);
         if (!a->name[0]) snprintf(a->name, sizeof(a->name), "%s", a->id);

@@ -43,7 +43,7 @@
  *  both roots, so the removed tile disappears from the launcher instead
  *  of staying listed and dead until the next boot.
  *
- *  VEreviewONS - the installed version is the manifest's "version =" line.
+ *  VERSIONS - the installed version is the manifest's "version =" line.
  *  A bundle pkg installed under a different id than the package records
  *  the package in <bundle>/.pkg-name; that is how a package whose
  *  directory name differs from its index name is matched to its row. The
@@ -130,7 +130,7 @@
  *  single line written to install.request can only ever be a name the
  *  desktop accepts.
  *
- *  MANIFEST VEreviewON LINE - this file only READS "version =" and
+ *  MANIFEST VERSION LINE - this file only READS "version =" and
  *  "placeholder ="; it writes neither. stage/usr/share/mystic/apps/vlc/
  *  manifest carries 'version = 3.0.23' (equal to the index row, kept in
  *  step by tools/fetch-vlc.py, which refuses to pack if they disagree)
@@ -248,7 +248,7 @@
  * uninstall walk refuses anything with a slash or a dot-dot, so the only
  * path it can ever remove is STORE_ROOT_APPS/<one safe segment>. */
 #define SEG_MAX 32
-#define VEreviewON_MAX 24
+#define VERSION_MAX 24
 
 /* Rows the wheel moves per notch. A count, not a pixel size: it moves
  * whole entries, so it follows the text scale for free. */
@@ -260,7 +260,7 @@ typedef struct {
     char name[64];
     char desc[DESC_LINE];
     char exe[128];
-    char version[VEreviewON_MAX];   /* manifest "version =", "" when absent */
+    char version[VERSION_MAX];   /* manifest "version =", "" when absent */
     long long total;             /* bytes of the ACTIVE bundle tree */
     long long root_total;        /* bytes under /root/apps/<id>, 0 if none */
     int  nfiles;                 /* regular files in the active tree */
@@ -272,7 +272,7 @@ typedef struct {
 
 typedef struct {
     char name[SEG_MAX + 1];      /* pkg names may be 32 chars + NUL */
-    char version[VEreviewON_MAX];
+    char version[VERSION_MAX];
     char desc[DESC_LINE];
     char file[64];               /* index column 5: tarball basename */
     long long size;              /* bytes, the index's size column */
@@ -333,7 +333,7 @@ typedef struct {
     char     error[128];     /* why the bundle directory could not be read */
     char     status[192];    /* result of the last request, or progress */
     char     pending[SEG_MAX + 1];/* package asked for, until its bundle proves it */
-    char     pending_version[VEreviewON_MAX]; /* index version at request time */
+    char     pending_version[VERSION_MAX]; /* index version at request time */
     char     pending_bundle[SEG_MAX];      /* bundle found when the request was written */
     char     pending_file[64];    /* tarball name from the index row */
     long long pending_total;      /* index bytes, -1 when the row has none */
@@ -1110,7 +1110,7 @@ static void poll_install(Store *s) {
     int found = pkg_manifest(s->pending, bundle, sizeof(bundle),
                              man, sizeof(man), &man_mtime);
 
-    char seen[VEreviewON_MAX] = "";
+    char seen[VERSION_MAX] = "";
     if (found)
         manifest_version(man, seen, sizeof(seen));
 
@@ -1123,7 +1123,7 @@ static void poll_install(Store *s) {
         snprintf(done, sizeof(done), "%s", s->pending);
         char got[SEG_MAX];
         snprintf(got, sizeof(got), "%s", bundle[0] ? bundle : done);
-        char gotver[VEreviewON_MAX];
+        char gotver[VERSION_MAX];
         snprintf(gotver, sizeof(gotver), "%s", seen);
 
         pending_clear(s);

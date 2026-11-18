@@ -133,4 +133,3 @@ Being explicit is cheaper than being trusted less:
 | [docs/HARDWARE.md](docs/HARDWARE.md) | which kernel supports which hardware |
 | [docs/GESTURES.md](docs/GESTURES.md) | trackpad protocol, thresholds, mapping |
 | [docs/THEMES.md](docs/THEMES.md) | the theme format, icon styles, animation kinds |
-| [docs/CONTEXT-DUMP.md](docs/CONTEXT-DUMP.md) | the state of the world, for whoever picks it up next |

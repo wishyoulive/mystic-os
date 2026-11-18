@@ -58,7 +58,7 @@
 //       Neil Bickford              Matthias Dorfelt
 //       Isaac "Atridas" Serrano
 //
-// VEreviewON HISTORY
+// VERSION HISTORY
 //
 //   1.28 (2026-11-12) several fixes
 //   1.27 (2026-11-08) many fixes, support vertical layout, underlines, font name
@@ -138,7 +138,7 @@
 //   where multiple shapes overlap, in which case it overestimates the AA pixel
 //   coverage. Thus, anti-aliasing of intersecting shapes may look wrong. If
 //   this turns out to be a problem, you can re-enable the old rasterizer with
-//        #define STBTT_RASTERIZER_VEreviewON 1
+//        #define STBTT_RASTERIZER_VERSION 1
 //   which will incur about a 15% speed hit.
 //
 // ADDITIONAL DOCUMENTATION
@@ -585,7 +585,7 @@ typedef struct
 
 typedef struct stbtt_pack_context stbtt_pack_context;
 typedef struct stbtt_fontinfo stbtt_fontinfo;
-#ifndef STB_RECT_PACK_VEreviewON
+#ifndef STB_RECT_PACK_VERSION
 typedef struct stbrp_rect stbrp_rect;
 #endif
 
@@ -744,7 +744,7 @@ STBTT_DEF int stbtt_InitFont(stbtt_fontinfo *info, const unsigned char *data, in
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// CHARACTER TO GLYPH-INDEX CONVEreviewON
+// CHARACTER TO GLYPH-INDEX CONVERSION
 
 STBTT_DEF int stbtt_FindGlyphIndex(const stbtt_fontinfo *info, int unicode_codepoint);
 // If you're going to perform multiple operations on the same character
@@ -1135,8 +1135,8 @@ enum { // languageID for STBTT_PLATFORM_ID_MAC
 
 typedef int stbtt__test_oversample_pow2[(STBTT_MAX_OVERSAMPLE & (STBTT_MAX_OVERSAMPLE-1)) == 0 ? 1 : -1];
 
-#ifndef STBTT_RASTERIZER_VEreviewON
-#define STBTT_RASTERIZER_VEreviewON 2
+#ifndef STBTT_RASTERIZER_VERSION
+#define STBTT_RASTERIZER_VERSION 2
 #endif
 
 #ifdef _MSC_VER
@@ -2926,21 +2926,21 @@ typedef struct stbtt__edge {
 typedef struct stbtt__active_edge
 {
    struct stbtt__active_edge *next;
-   #if STBTT_RASTERIZER_VEreviewON==1
+   #if STBTT_RASTERIZER_VERSION==1
    int x,dx;
    float ey;
    int direction;
-   #elif STBTT_RASTERIZER_VEreviewON==2
+   #elif STBTT_RASTERIZER_VERSION==2
    float fx,fdx,fdy;
    float direction;
    float sy;
    float ey;
    #else
-   #error "Unrecognized value of STBTT_RASTERIZER_VEreviewON"
+   #error "Unrecognized value of STBTT_RASTERIZER_VERSION"
    #endif
 } stbtt__active_edge;
 
-#if STBTT_RASTERIZER_VEreviewON == 1
+#if STBTT_RASTERIZER_VERSION == 1
 #define STBTT_FIXSHIFT   10
 #define STBTT_FIX        (1 << STBTT_FIXSHIFT)
 #define STBTT_FIXMASK    (STBTT_FIX-1)
@@ -2966,7 +2966,7 @@ static stbtt__active_edge *stbtt__new_active(stbtt__hheap *hh, stbtt__edge *e, i
    z->direction = e->invert ? 1 : -1;
    return z;
 }
-#elif STBTT_RASTERIZER_VEreviewON == 2
+#elif STBTT_RASTERIZER_VERSION == 2
 static stbtt__active_edge *stbtt__new_active(stbtt__hheap *hh, stbtt__edge *e, int off_x, float start_point, void *userdata)
 {
    stbtt__active_edge *z = (stbtt__active_edge *) stbtt__hheap_alloc(hh, sizeof(*z), userdata);
@@ -2985,10 +2985,10 @@ static stbtt__active_edge *stbtt__new_active(stbtt__hheap *hh, stbtt__edge *e, i
    return z;
 }
 #else
-#error "Unrecognized value of STBTT_RASTERIZER_VEreviewON"
+#error "Unrecognized value of STBTT_RASTERIZER_VERSION"
 #endif
 
-#if STBTT_RASTERIZER_VEreviewON == 1
+#if STBTT_RASTERIZER_VERSION == 1
 // note: this routine clips fills that extend off the edges... ideally this
 // wouldn't happen, but it could happen if the truetype glyph bounding boxes
 // are wrong, or if the user supplies a too-small bitmap
@@ -3134,7 +3134,7 @@ static void stbtt__rasterize_sorted_edges(stbtt__bitmap *result, stbtt__edge *e,
       STBTT_free(scanline, userdata);
 }
 
-#elif STBTT_RASTERIZER_VEreviewON == 2
+#elif STBTT_RASTERIZER_VERSION == 2
 
 // the edge passed in here does not cross the vertical line at x or the vertical line at x+1
 // (i.e. it has already been clipped to those)
@@ -3506,7 +3506,7 @@ static void stbtt__rasterize_sorted_edges(stbtt__bitmap *result, stbtt__edge *e,
       STBTT_free(scanline, userdata);
 }
 #else
-#error "Unrecognized value of STBTT_RASTERIZER_VEreviewON"
+#error "Unrecognized value of STBTT_RASTERIZER_VERSION"
 #endif
 
 #define STBTT__COMPARE(a,b)  ((a)->y0 < (b)->y0)
@@ -3607,12 +3607,12 @@ static void stbtt__rasterize(stbtt__bitmap *result, stbtt__point *pts, int *wcou
    float y_scale_inv = invert ? -scale_y : scale_y;
    stbtt__edge *e;
    int n,i,j,k,m;
-#if STBTT_RASTERIZER_VEreviewON == 1
+#if STBTT_RASTERIZER_VERSION == 1
    int vsubsample = result->h < 8 ? 15 : 5;
-#elif STBTT_RASTERIZER_VEreviewON == 2
+#elif STBTT_RASTERIZER_VERSION == 2
    int vsubsample = 1;
 #else
-   #error "Unrecognized value of STBTT_RASTERIZER_VEreviewON"
+   #error "Unrecognized value of STBTT_RASTERIZER_VERSION"
 #endif
    // vsubsample should divide 255 evenly; otherwise we won't reach full opacity
 
@@ -3997,7 +3997,7 @@ STBTT_DEF void stbtt_GetBakedQuad(const stbtt_bakedchar *chardata, int pw, int p
 // rectangle packing replacement routines if you don't have stb_rect_pack.h
 //
 
-#ifndef STB_RECT_PACK_VEreviewON
+#ifndef STB_RECT_PACK_VERSION
 
 typedef int stbrp_coord;
 
@@ -5215,7 +5215,7 @@ STBTT_DEF int stbtt_CompareUTF8toUTF16_bigendian(const char *s1, int len1, const
 #endif // STB_TRUETYPE_IMPLEMENTATION
 
 
-// FULL VEreviewON HISTORY
+// FULL VERSION HISTORY
 //
 //   1.25 (2021-07-11) many fixes
 //   1.24 (2020-02-05) fix warning
