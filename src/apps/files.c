@@ -129,13 +129,14 @@
  *  its old place, so it is undoable too.
  *
  *  MULTI-SELECTION  the cursor (f->sel) and the marked set are separate.
- *  Buttons only carry left/right/middle, so the modifier gestures the
- *  brief asks for are wired to the bits a window server with modifiers
- *  would set (0x100 shift, 0x200 ctrl) *and* to gestures that work with
- *  the protocol as it stands: middle click toggles a row, Space toggles
- *  the cursor row, Ctrl+A marks everything, and 'v' enters a range mode
- *  in which j/k extend the range from the anchor (the keyboard equivalent
- *  of Shift+click). The footer prints the real count.
+ *  A click carries left/right/middle plus the modifier bits the desktop
+ *  ORs in (0x100 shift, 0x200 ctrl, src/main.c's app_click call), so
+ *  Ctrl+click adds or removes one row and Shift+click marks a range from
+ *  the anchor; middle click toggles a row, Space toggles the cursor row,
+ *  Ctrl+A marks everything, and 'v' enters a range mode in which j/k
+ *  extend the range (the keyboard equivalent of Shift+click). The footer
+ *  prints the real count. Every marked row is painted with the accent
+ *  pill, and the cursor row with a stronger one - see draw_list().
  *
  *  RENAME / NEW FOLDER edit in place: the row itself turns into a text
  *  field (Enter commits with rename(2)/mkdir(2), Esc cancels); errors
@@ -202,11 +203,12 @@
 #define LAUNCH_REQ   "/run/mystic/launch.request"
 #endif
 
-/* the buttons mask, as src/input.c builds it, plus the modifier bits a
- * window server that knew about modifiers would OR in. The app accepts
- * both: when main.c starts passing 0x100/0x200, Ctrl+click and Shift+click
- * work as labelled; until then middle click / Space / Ctrl+A / 'v' are the
- * gestures that reach the same code. */
+/* the buttons mask, as src/input.c builds it, plus the modifier bits the
+ * desktop ORs into it at the app_click() call site (src/main.c). Before
+ * that the bits never arrived, so Ctrl+click and Shift+click could not
+ * work in the shipped desktop even though this file handled them; the
+ * keyboard and middle-click paths below stay, because they are the ones
+ * that work over the client IPC protocol too. */
 #define BTN_LEFT    1
 #define BTN_RIGHT   2
 #define BTN_MIDDLE  4

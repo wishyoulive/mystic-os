@@ -62,6 +62,20 @@ load_modules() {
         pcm=$(ls /dev/snd/ 2>/dev/null | grep -c '^pcmC')
         echo "sound: $cards card(s), $pcm pcm device(s)"
         grep -E '^ *[0-9]' /proc/asound/cards 2>/dev/null | head -2 | sed 's/^/sound: /' 
+        # devtmpfs makes the PCM nodes 0600 root:root: there is no udev here
+        # to apply the usual 0660 root:audio. The window server's app jail
+        # runs as uid 1000, so without this the Clock's alarm opens
+        # /dev/snd/pcmC0D0p and gets EACCES even though the card is there.
+        # Playback nodes only (names end in 'p'); capture stays root-only.
+        for node in /dev/snd/pcmC*D*p; do
+            [ -c "$node" ] || continue
+            oldmode=$(ls -ld "$node" 2>/dev/null | cut -d' ' -f1)
+            if chmod 0666 "$node" 2>/dev/null; then
+                echo "sound: playback open to apps: $node (was $oldmode)"
+            else
+                echo "sound: cannot chmod $node (was $oldmode)"
+            fi
+        done
     else
         echo "sound: no /proc/asound - kernel sound support not loaded"
     fi

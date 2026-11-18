@@ -1,12 +1,19 @@
 /* ============================================================
  *  Mystic OS - wallpaper.c
- *  Six backgrounds, painted by the CPU, straight into the
- *  framebuffer surface. No image files, no GPU.
+ *  Eight backgrounds, painted by the CPU, straight into the
+ *  framebuffer surface, plus one picture decoded from a file.
+ *  No GPU.
  *
- *  Every pixel is a pure function of:
- *      - the theme (so all six work with every theme),
+ *  Every procedural pixel is a pure function of:
+ *      - the theme (so all eight work with every theme),
  *      - the wallpaper index,
  *      - `seconds`, and only for the animated ones.
+ *
+ *  The eighth choice, a custom image, is the exception and is kept
+ *  narrow on purpose: the file is read and decoded when the setting
+ *  changes, cover-scaled once to the surface size and cached, and
+ *  every later frame is one blit of that cache. See wp_setting_sync(),
+ *  wp_image_build() and wp_image_blit().
  *
  *  Cost is what makes this usable on old hardware, so the expensive
  *  work is amortised: a 256 entry sine table does the sin work for
@@ -24,6 +31,11 @@
  *
  *      Dusk 5.1 ms   Mesh 3.5 ms   Waves 3.7 ms   Orbits 0.5 ms
  *      Black Hole 6.5 ms         Nebula 44 ms
+ *      Synthwave 2.9 ms          Dunes 3.3 ms
+ *
+ *  A cached custom image is a full-screen row memcpy: 0.34 ms at
+ *  1280x800. The decode and the cover scale happen once per picture
+ *  (and once more if the surface size changes), never per frame.
  *
  *  In one quiet 30-frame block the black hole measured 7.4 ms best, 8.0 ms
  *  mean; of that, 2.0 ms is the q = 2 upscale, 1.3 ms the sky / star / grain
@@ -39,10 +51,30 @@
  *  / wp_upscale().
  * ============================================================ */
 #include "wallpaper.h"
+#include "img.h"
 
+#include <errno.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+
+/* The desktop build lists the sources it links (tools/build-desktop.sh) and
+ * src/img.c is not one of them; the browser has always compiled the decoder
+ * into its own translation unit for the same reason. img.c has no global
+ * state and every internal symbol is static and starts with ic_, so this is
+ * the documented way to use it (see the end of img.h). The custom-image
+ * wallpaper therefore costs the desktop one extra decoder, not one extra
+ * decoder per image format. */
+#include "img.c"
+
+/* The setting file main.c already reads. A host harness can point this at a
+ * scratch path. */
+#ifndef MYSTIC_WALLPAPER_FILE
+#define MYSTIC_WALLPAPER_FILE "/etc/mystic/wallpaper"
+#endif
 
 /* one wave period, in 16.16 fixed point over a 256 entry sine table */
 #define WP_SINE_N     256
@@ -52,20 +84,28 @@
 /* ------------------------------------------------------------ names */
 
 static const char *const WP_NAMES[WALLPAPER_COUNT] = {
-    "Dusk", "Mesh", "Waves", "Orbits", "Black Hole", "Nebula"
+    "Dusk", "Mesh", "Waves", "Orbits", "Black Hole", "Nebula",
+    "Synthwave", "Dunes"
 };
 
 const char *wallpaper_name(int index) {
+    if (index == WALLPAPER_IMAGE) return "Custom image";
     if (index < 0 || index >= WALLPAPER_COUNT) return NULL;
     return WP_NAMES[index];
 }
 
 int wallpaper_animated(int index) {
-    /* Dusk, Mesh and Nebula are still pictures: the desktop can paint them
-       once and then leave the framebuffer alone. Waves, Orbits and the
-       Black Hole use `seconds`, so they have to be repainted - the black
-       hole turns its disk, which is the whole point of it. */
-    return (index == 2 || index == 3 || index == 4) ? 1 : 0;
+    /* Dusk, Mesh, Nebula and Dunes are still pictures: the desktop can paint
+       them once and then leave the framebuffer alone. Waves, Orbits, the
+       Black Hole and Synthwave use `seconds`, so they have to be repainted -
+       the black hole turns its disk and Synthwave's grid scrolls. A custom
+       image answers 1 while it is active, for EVERY index: wallpaper_draw
+       then paints the picture instead of the index's background, and the
+       desktop's static cache is keyed on the index alone, so serving that
+       cache after a picture changed would show the previous wallpaper. */
+    if (wallpaper_image_active()) return 1;
+    if (index == WALLPAPER_IMAGE) return 0;
+    return (index == 2 || index == 3 || index == 4 || index == 6) ? 1 : 0;
 }
 
 static int wp_lower(int c) {
@@ -90,8 +130,22 @@ static int wp_name_is(const char *user, const char *literal) {
     return 1;
 }
 
+/* Is `user` the word `prefix` (lowercase), ignoring leading whitespace and
+ * case? Used for the "image:" tag, which is followed by a path. */
+static int wp_name_prefix_is(const char *user, const char *prefix) {
+    while (*user == ' ' || *user == '\t' || *user == '\r' || *user == '\n') user++;
+    for (size_t i = 0; prefix[i]; i++) {
+        if (wp_lower((unsigned char)user[i]) != prefix[i]) return 0;
+    }
+    return 1;
+}
+
 int wallpaper_from_name(const char *name) {
     if (!name) return -1;
+    /* "image:<path>" - a custom picture. Only the tag is needed here: the
+     * path is read from the setting file by wp_setting_sync(), so a caller
+     * whose line buffer is shorter than the path still resolves it. */
+    if (wp_name_prefix_is(name, "image:")) return WALLPAPER_IMAGE;
     for (int i = 0; i < WALLPAPER_COUNT; i++) {
         /* the literals are lowercase copies of WP_NAMES, so the compare
          * stays allocation free and case-insensitive */
@@ -1508,10 +1562,943 @@ static void wp_draw_nebula(Surface *s, const Theme *th) {
     }
 }
 
+/* ---------------------------------------------------------- 6. Synthwave
+ * The eighties poster: a deep purple sky, a big banded sun sinking into a
+ * hard horizon, and a neon grid in perspective running toward it. The grid
+ * is real perspective, not a set of drawn wedges: with the camera at height
+ * 1 and a pinhole of focal length fh, a ground point at depth Z lands on
+ * row t = fh/Z below the horizon, and a line of constant lateral offset
+ * X = k*sw lands at x = W/2 + k*sw*t. So the vertical lines are
+ * x(y) = W/2 + k*sw*t (a fan through the vanishing point) and the
+ * horizontal ones sit at the depths Z = m*step - phase, where `phase`
+ * advances with `seconds` so the rows slide toward the viewer and are
+ * respawned at the horizon. Nothing is drawn as a polygon: every pixel
+ * asks how far it is from the nearest line of each family, in pixels, and
+ * that distance is a 1.3 px antialiased ramp. Both families fade out at
+ * the horizon so the fan cannot saturate into a white band.
+ *
+ * Per row the work is a handful of float ops (one divide); per pixel it is
+ * one multiply, one round, one subtract and one multiply for the vertical
+ * family, plus an add for the horizontal term the row already computed.
+ * Measured 2.9 ms at 1280x800. */
+static inline float wp_clampf(float v, float lo, float hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/* Hermite ramp from 0 at e0 to 1 at e1 (e0 may be greater than e1). */
+static inline float wp_smoothf(float e0, float e1, float x) {
+    if (e0 == e1) return x < e0 ? 0.0f : 1.0f;
+    float t = wp_clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+/* floor()/round() without a libm call: on a baseline x86-64 build these are
+ * calls, and the grid asks for one per pixel. Valid for |v| < 2^23. */
+static inline float wp_floorf(float v) {
+    int i = (int)v;
+    return (v < (float)i) ? (float)(i - 1) : (float)i;
+}
+
+static inline int wp_iround(float v) {
+    return (int)(v < 0.0f ? v - 0.5f : v + 0.5f);
+}
+
+static void wp_draw_synthwave(Surface *s, const Theme *th, double seconds) {
+    const int W = s->w, H = s->h;
+
+    /* the horizon: a little below the middle, so the sky (and the sun) owns
+       the larger half of the picture */
+    int hy = (int)((float)H * 0.615f);
+    if (hy < 2) hy = 2;
+    if (hy > H - 3) hy = H - 3;
+
+    /* Fixed synthwave hues pulled a little toward the theme: a dark theme
+       keeps the poster look, a light one stays legible, and every theme's
+       accent still appears in the grid. */
+    float tmix = th->dark ? 0.15f : 0.30f;
+    u32 sky_top = color_mix(RGB(0x12, 0x05, 0x2C), th->bg_top, tmix);
+    u32 sky_mid = color_mix(RGB(0x3C, 0x0B, 0x66), th->bg_bottom, tmix);
+    u32 hz_col  = color_mix(RGB(0xFF, 0x2D, 0x8A), th->accent, 0.28f);
+    u32 sun_hi  = color_mix(RGB(0xFF, 0xE2, 0x84), th->glow, 0.18f);
+    u32 sun_lo  = color_mix(RGB(0xFF, 0x2F, 0x6B), th->accent, 0.22f);
+    u32 grd_v   = color_mix(RGB(0x45, 0xF0, 0xFF), th->accent, 0.22f);
+    u32 grd_h   = color_mix(RGB(0xFF, 0x46, 0xA5), th->accent, 0.18f);
+    u32 floor_t = color_mix(RGB(0x16, 0x04, 0x2A), th->bg_bottom, 0.22f);
+    u32 floor_b = color_mix(RGB(0x04, 0x01, 0x0C), RGB(0, 0, 0), 0.0f);
+
+    /* ---- sky: two stops, then a warm ramp into the horizon ---- */
+    for (int y = 0; y < hy; y++) {
+        float t = (float)y / (float)(hy > 1 ? hy - 1 : 1);
+        u32 c = wp_lerp_color(sky_top, sky_mid, (int)(t * 256.0f));
+        float w = wp_smoothf(0.55f, 1.0f, t);
+        if (w > 0.0f) c = wp_lerp_color(c, hz_col, (int)(w * w * 168.0f));
+        u32 *row = s->px + (size_t)y * s->stride;
+        for (int x = 0; x < W; x++) row[x] = c;
+    }
+
+    /* ---- the ground: a dark floor. Painted before the sun so the halo can
+       spill onto it - the sun is lighting the whole picture. ---- */
+    for (int y = hy; y < H; y++) {
+        float t = (float)(y - hy) / (float)(H - hy > 1 ? H - hy : 1);
+        u32 c = wp_lerp_color(floor_t, floor_b, (int)(t * 200.0f));
+        u32 *row = s->px + (size_t)y * s->stride;
+        for (int x = 0; x < W; x++) row[x] = c;
+    }
+
+    /* ---- the sun: a disc with horizontal slices cut out of its lower half,
+       centred on the vanishing point and cut by the horizon ---- */
+    float r = (float)W * 0.200f;
+    if (r > (float)H * 0.330f) r = (float)H * 0.330f;
+    if (r < 8.0f) r = 8.0f;
+    float cx = (float)W * 0.5f;
+    float cy = (float)hy - r * 0.42f;
+
+    wp_glow(s, cx, cy, r * 2.30f, color_mix(hz_col, sun_lo, 0.40f), 0.40f);
+
+    int sy0 = (int)floorf(cy - r - 2.0f), sy1 = (int)ceilf(cy + r + 2.0f);
+    int sx0 = (int)floorf(cx - r - 2.0f), sx1 = (int)ceilf(cx + r + 2.0f);
+    if (sy0 < 0) sy0 = 0;
+    if (sy1 > hy) sy1 = hy;                 /* the horizon cuts it */
+    if (sx0 < 0) sx0 = 0;
+    if (sx1 > W) sx1 = W;
+    for (int y = sy0; y < sy1; y++) {
+        float py = (float)y + 0.5f - cy;
+        float v = wp_clampf(((float)y + 0.5f - (cy - r)) / (2.0f * r), 0.0f, 1.0f);
+        u32 sc = v < 0.55f ? wp_lerp_color(sun_hi, sun_lo, (int)(v / 0.55f * 256.0f))
+                           : sun_lo;
+        /* The slices depend only on the row: the cell is 2r/7 px tall, and
+           inside is the signed distance in px from the slice's lower edge
+           (<0 inside the slice). */
+        int banded = v > 0.34f;
+        float inside_px = 0.0f;
+        if (banded) {
+            float st = (v - 0.34f) / 0.66f;
+            float cell_px = (2.0f * r) / 11.0f;
+            float ph = st * 11.0f + 0.20f;
+            float fr = ph - wp_floorf(ph);            /* 0..1 inside the cell */
+            float width = 0.13f + 0.30f * st;         /* slices thicken down */
+            inside_px = (width - fr) * cell_px;
+        }
+        for (int x = sx0; x < sx1; x++) {
+            float px = (float)x + 0.5f - cx;
+            float d = sqrtf(px * px + py * py);
+            float cov = wp_clampf(r + 0.5f - d, 0.0f, 1.0f);
+            if (cov <= 0.0f) continue;
+            if (banded) {
+                float cut = wp_clampf(inside_px / 1.3f + 0.5f, 0.0f, 1.0f);
+                cov *= 1.0f - cut;
+                if (cov <= 0.0f) continue;
+            }
+            wp_blend(s, x, y, sc, (int)(cov * 255.0f + 0.5f));
+        }
+    }
+
+    /* the sun's light spills onto the floor under it, low and faint: a
+       bright wash here would make the thin end of the grid a visible
+       speckle instead of a fade */
+    wp_glow(s, cx, (float)hy + (float)(H - hy) * 0.55f,
+            (float)W * 0.30f, hz_col, 0.12f);
+
+    /* ---- the horizon itself: a bright line with a 3 px falloff ---- */
+    for (int y = hy - 3; y < hy + 4; y++) {
+        if (y < 0 || y >= H) continue;
+        float d = fabsf((float)y + 0.5f - (float)hy);
+        int a = (int)(190.0f * wp_clampf(1.0f - d / 3.2f, 0.0f, 1.0f));
+        if (a <= 0) continue;
+        u32 *row = s->px + (size_t)y * s->stride;
+        for (int x = 0; x < W; x++) row[x] = wp_lerp_color(row[x], hz_col, a);
+    }
+
+    /* ---- the grid ----
+     * Camera height 1. A ground point at depth Z is on row t = fh/Z; a
+     * lateral offset X is at x = W/2 + X*t. So:
+     *   vertical lines   X = k*sw        -> x = W/2 + k*sw*t
+     *   horizontal lines Z = m*step - ph -> t = fh/Z
+     * Both are evaluated as a distance in pixels from the nearest line,
+     * which is what makes a line one pixel wide at any depth. */
+    const float fh = (float)(H - hy);
+    const float step = 0.100f;                       /* world spacing, rows */
+    const float sw = (float)W / 12.0f / fh;          /* W/12 px at the bottom */
+    const float lw = 1.00f;                          /* half width, px */
+    const float ph = (float)fmod(seconds * 0.22, 1.0);
+    const float half_w = (float)W * 0.5f;
+    const int hr = (int)GET_R(grd_h), hg = (int)GET_G(grd_h), hb = (int)GET_B(grd_h);
+    const int vr = (int)GET_R(grd_v), vg = (int)GET_G(grd_v), vb = (int)GET_B(grd_v);
+
+    for (int y = hy + 1; y < H; y++) {
+        float t = (float)y + 0.5f - (float)hy;
+        float Z = fh / t;
+        float inv_t_sw = 1.0f / (t * sw);            /* world k per px */
+        float dpx_per_k = t * sw;                    /* px per world k  */
+
+        /* one horizontal line can be near this row: find it in world Z */
+        float kz = Z / step + ph;
+        float mz = wp_floorf(kz + 0.5f);
+        float dz = (kz - mz) * step;                 /* world depth error */
+        float ds = t * t / fh * fabsf(dz);           /* px on this row    */
+        float ih = 1.0f - ds / lw;
+        if (ih < 0.0f) ih = 0.0f;
+
+        /* Both families fade toward the horizon, and both are dimmed by how
+           much of a pixel a line train covers there: once the rows are less
+           than a line width apart, the nearest-line model would paint EVERY
+           row and the grid would turn into a moire cloth. spacing/(2*lw) is
+           the average coverage of a train that dense, so the grid dissolves
+           into haze exactly where the lines merge. */
+        float fade = wp_smoothf(fh * 0.10f, fh * 0.62f, t);
+        float spacing_h = (t * t / fh) * step;
+        float spacing_v = sw * t;
+        float aa_h = wp_clampf(spacing_h / (2.0f * lw), 0.0f, 1.0f);
+        float aa_v = wp_clampf(spacing_v / (2.0f * lw), 0.0f, 1.0f);
+        float dim_h = fade * aa_h;
+        float dim_v = fade * aa_v;
+        ih *= dim_h;
+        if (ih > 1.0f) ih = 1.0f;
+
+        u32 *row = s->px + (size_t)y * s->stride;
+        for (int x = 0; x < W; x++) {
+            float k = ((float)x + 0.5f - half_w) * inv_t_sw;
+            int ik = wp_iround(k);
+            float dv = fabsf(k - (float)ik) * dpx_per_k;
+            float iv = 1.0f - dv / lw;
+            iv *= dim_v;
+            if (iv <= 0.0f) {
+                if (ih <= 0.0f) continue;
+                iv = 0.0f;
+            }
+            int add_r = (int)((float)hr * ih + (float)vr * iv);
+            int add_g = (int)((float)hg * ih + (float)vg * iv);
+            int add_b = (int)((float)hb * ih + (float)vb * iv);
+            u32 c = row[x];
+            int R = (int)GET_R(c) + add_r;
+            int G = (int)GET_G(c) + add_g;
+            int B = (int)GET_B(c) + add_b;
+            if (R > 255) R = 255;
+            if (G > 255) G = 255;
+            if (B > 255) B = 255;
+            row[x] = 0xFF000000u | ((u32)R << 16) | ((u32)G << 8) | (u32)B;
+        }
+    }
+}
+
+/* ------------------------------------------------------------ 7. Dunes
+ * A layered desert at dusk. The sky is a warm gradient with a low sun and a
+ * soft halo; five ridges run across the screen, each one a smooth noise
+ * silhouette (four octaves of value noise plus one long swell) whose crest
+ * sits a little lower and reaches a little further for every layer nearer
+ * the viewer. Each layer's colour is its own warm brown mixed toward the
+ * horizon colour by its haze, and the crest carries a one-pixel rim light
+ * from the sun. The layers cannot cross: a nearer crest is forced at least
+ * two pixels below the one behind it, so the column painter below can walk
+ * the layers in order with a single comparison per pixel.
+ *
+ * The stars are plotted from a 190-entry table built once from the same
+ * deterministic hash the rest of this file uses, not hashed per pixel: a
+ * per-pixel star field over the sky would cost more than all five ridges.
+ * An extra 240 dust motes, dimmer and packed near the horizon, give the sky
+ * some grain. Measured 3.3 ms at 1280x800.
+ */
+typedef struct { float u, v; unsigned char mag; } WpDuneStar;
+#define WP_DUNE_STARS 190
+typedef struct { float u, v; unsigned char mag; } WpDuneDust;
+#define WP_DUNE_DUST  240
+static WpDuneStar wp_dune_stars[WP_DUNE_STARS];
+static WpDuneDust wp_dune_dust[WP_DUNE_DUST];
+static int wp_dune_ready;
+
+static void wp_dune_build(void) {
+    if (wp_dune_ready) return;
+    wp_dune_ready = 1;
+    for (int i = 0; i < WP_DUNE_STARS; i++) {
+        u32 h = wp_h32((u32)i, 0x51A2u, 0xD00Du);
+        /* the sky owns the top 52% of the picture, above every crest */
+        wp_dune_stars[i].u = (float)(h & 0xFFFFu) * (1.0f / 65535.0f);
+        wp_dune_stars[i].v = (float)((h >> 16) & 0xFFFFu) * (1.0f / 65535.0f) * 0.52f;
+        wp_dune_stars[i].mag = (unsigned char)(70 + (int)((h >> 8) & 0x7Fu));
+    }
+    for (int i = 0; i < WP_DUNE_DUST; i++) {
+        u32 h = wp_h32((u32)i + 977u, 0x9E37u, 0x51A2u);
+        wp_dune_dust[i].u = (float)(h & 0xFFFFu) * (1.0f / 65535.0f);
+        /* dust hugs the horizon, where the air is thick */
+        float r = (float)((h >> 16) & 0xFFFFu) * (1.0f / 65535.0f);
+        wp_dune_dust[i].v = 0.20f + 0.36f * r * r;
+        wp_dune_dust[i].mag = (unsigned char)(16 + (int)((h >> 8) & 0x1Fu));
+    }
+}
+
+/* One soft point: the pixel itself plus four half-strength neighbours, so a
+ * star reads at any size without a sprite. */
+static void wp_dot(Surface *s, int x, int y, int r, int g, int b, int a) {
+    if (a <= 0) return;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            int w = (dx && dy) ? 0 : (dx || dy ? a / 3 : a);
+            if (w <= 0) continue;
+            int px = x + dx, py = y + dy;
+            if ((unsigned)px >= (unsigned)s->w || (unsigned)py >= (unsigned)s->h) continue;
+            u32 *p = s->px + (size_t)py * s->stride + px;
+            u32 c = *p;
+            int R = (int)GET_R(c) + (r * w) / 255;
+            int G = (int)GET_G(c) + (g * w) / 255;
+            int B = (int)GET_B(c) + (b * w) / 255;
+            if (R > 255) R = 255;
+            if (G > 255) G = 255;
+            if (B > 255) B = 255;
+            *p = 0xFF000000u | ((u32)R << 16) | ((u32)G << 8) | (u32)B;
+        }
+    }
+}
+
+#define WP_DUNE_LAYERS 5
+
+static void wp_draw_dunes(Surface *s, const Theme *th) {
+    const int W = s->w, H = s->h;
+    wp_dune_build();
+
+    int hy = (int)((float)H * 0.615f);
+    if (hy < 3) hy = 3;
+    if (hy > H - 4) hy = H - 4;
+
+    /* warm dusk: a deep violet top, an amber horizon, both pulled toward the
+       theme so a porcelain desktop is a hazy sunrise and not a night scene */
+    float tmix = th->dark ? 0.28f : 0.46f;
+    u32 sky_top = color_mix(RGB(0x1B, 0x12, 0x33), th->bg_top, tmix);
+    u32 sky_mid = color_mix(RGB(0x6B, 0x2E, 0x4A), th->bg_bottom, tmix);
+    u32 horizon = color_mix(RGB(0xF2, 0x9A, 0x54), th->glow, th->dark ? 0.26f : 0.42f);
+    u32 sun_col = color_mix(RGB(0xFF, 0xF6, 0xDC), th->accent, 0.10f);
+
+    /* the sky fills the whole surface; the ridges paint over the lower part,
+       and the strip between the horizon and the farthest crest keeps it */
+    for (int y = 0; y < H; y++) {
+        float t = (float)y / (float)(hy > 1 ? hy : 1);
+        if (t > 1.0f) t = 1.0f;
+        u32 c = t < 0.55f
+             ? wp_lerp_color(sky_top, sky_mid, (int)(t / 0.55f * 256.0f))
+             : wp_lerp_color(sky_mid, horizon, (int)((t - 0.55f) / 0.45f * 256.0f));
+        u32 *row = s->px + (size_t)y * s->stride;
+        for (int x = 0; x < W; x++) row[x] = c;
+    }
+
+    /* the sun: low, right of centre, with a wide halo on the horizon */
+    float sr = (float)W * 0.045f;
+    if (sr > (float)H * 0.070f) sr = (float)H * 0.070f;
+    if (sr < 5.0f) sr = 5.0f;
+    float sx = (float)W * 0.66f;
+    float sy = (float)hy - (float)(H - hy) * 0.30f;
+    wp_glow(s, sx, sy, (float)W * 0.30f, color_mix(horizon, sun_col, 0.45f), 0.55f);
+    {
+        int y0 = (int)(sy - sr - 2.0f), y1 = (int)(sy + sr + 2.0f);
+        int x0 = (int)(sx - sr - 2.0f), x1 = (int)(sx + sr + 2.0f);
+        if (y0 < 0) y0 = 0;
+        if (y1 > H) y1 = H;
+        if (x0 < 0) x0 = 0;
+        if (x1 > W) x1 = W;
+        for (int y = y0; y < y1; y++) {
+            float py = (float)y + 0.5f - sy;
+            for (int x = x0; x < x1; x++) {
+                float px = (float)x + 0.5f - sx;
+                float d = sqrtf(px * px + py * py);
+                float cov = wp_clampf(sr + 0.5f - d, 0.0f, 1.0f);
+                if (cov > 0.0f) wp_blend(s, x, y, sun_col, (int)(cov * 255.0f));
+            }
+        }
+    }
+    /* the sun's light spills along the horizon, under the ridges */
+    wp_glow(s, sx, (float)hy, (float)W * 0.55f, horizon, 0.30f);
+
+    /* ---- stars and dust, above the crests ---- */
+    {
+        const float inv_glow = 1.0f / ((float)W * 0.16f);
+        for (int i = 0; i < WP_DUNE_STARS; i++) {
+            float u = wp_dune_stars[i].u, v = wp_dune_stars[i].v;
+            int x = (int)(u * (float)W);
+            int y = (int)(v * (float)H);
+            /* the sun's halo washes the stars out */
+            float gx = (float)x - sx, gy = (float)y - sy;
+            float wash = wp_clampf(sqrtf(gx * gx + gy * gy) * inv_glow, 0.0f, 1.0f);
+            int a = (int)((float)wp_dune_stars[i].mag * (0.25f + 0.75f * wash));
+            wp_dot(s, x, y, 255, 244, 226, a);
+        }
+        for (int i = 0; i < WP_DUNE_DUST; i++) {
+            int x = (int)(wp_dune_dust[i].u * (float)W);
+            int y = (int)(wp_dune_dust[i].v * (float)H);
+            wp_dot(s, x, y, 255, 226, 190, wp_dune_dust[i].mag);
+        }
+    }
+
+    /* ---- the ridges ----
+     * Layer colours, farthest first: each one is the layer's own warm brown
+     * mixed toward the horizon by its haze, so distance reads as air. */
+    static const u32 base[WP_DUNE_LAYERS] = {
+        /* far */ RGB(0x7C, 0x46, 0x50),
+                  RGB(0x63, 0x33, 0x40),
+                  RGB(0x4A, 0x25, 0x30),
+                  RGB(0x33, 0x18, 0x22),
+        /* near */RGB(0x1F, 0x0E, 0x15)
+    };
+    u32 layer[WP_DUNE_LAYERS];
+    int rim[WP_DUNE_LAYERS];
+    for (int i = 0; i < WP_DUNE_LAYERS; i++) {
+        /* a light theme gets more air in every layer, otherwise the nearest
+           ridge is a black band under a pale sky */
+        float haze = 0.42f - 0.085f * (float)i + (th->dark ? 0.0f : 0.16f);
+        layer[i] = color_mix(base[i], horizon, haze);
+        /* the crest of a far ridge is backlit; the near ones are in their
+           own shadow, so the rim light dies with every layer */
+        rim[i] = 104 - 17 * i;
+        if (rim[i] < 22) rim[i] = 22;
+    }
+
+    const float inv_w = 1.0f / (float)W;
+    const float dh = (float)(H - hy > 1 ? H - hy : 1);
+    const float inv_sun = 1.0f / ((float)W * 0.72f);
+    /* The vertical shade, in 8.8: 1.0 at the horizon, 0.61 at the bottom.
+     * It is quantised to 16 steps and each layer resolves those steps into
+     * colours ONCE, so the inner loop is a shift, a table read and a store
+     * instead of three multiplies per pixel. */
+    const int shade_step = (99 << 8) / (int)dh;
+    u32 shade_lut[WP_DUNE_LAYERS][16];
+    for (int i = 0; i < WP_DUNE_LAYERS; i++) {
+        u32 c = layer[i];
+        for (int k = 0; k < 16; k++) {
+            int sh = 256 - k * 7;                /* 256 down to 151 */
+            if (sh < 158) sh = 158;
+            shade_lut[i][k] = 0xFF000000u
+                | ((u32)(((int)GET_R(c) * sh) >> 8) << 16)
+                | ((u32)(((int)GET_G(c) * sh) >> 8) << 8)
+                |  (u32)(((int)GET_B(c) * sh) >> 8);
+        }
+    }
+
+    /* Painted far to near, one pass per ridge: a nearer dune simply covers
+     * the base of the one behind it, which is what gives the stack its
+     * depth. (The first version walked the layers per column and forced
+     * every crest below the previous one; that cannot let two dunes overlap
+     * and it read as flat strata.) */
+    for (int li = 0; li < WP_DUNE_LAYERS; li++) {
+        float base_y = (float)hy + dh * (0.03f + 0.225f * (float)li);
+        float amp = dh * (0.150f + 0.045f * (float)li);
+        float swellf = 0.85f + 0.42f * (float)li;
+        float ripplef = 3.2f + 1.7f * (float)li;
+        int lrim = rim[li];
+        const u32 *lut = shade_lut[li];
+        for (int x = 0; x < W; x++) {
+            float u = ((float)x + 0.5f) * inv_w;
+            /* A dune is a broad arc first and a wind-cut wiggle second: one
+               long sine gives the swell (0.85 to 2.5 periods across the
+               width, layer by layer) and three octaves of value noise ride
+               on top of it. */
+            float swell = 0.5f + 0.5f * sinf(6.2831853f * u * swellf
+                                             + (float)li * 1.9f);
+            float n = wp_fbm(u * ripplef + 7.7f * (float)li,
+                             1.3f + 0.7f * (float)li, 3, 0xD000u + (u32)li * 977u);
+            float shape = 0.55f * swell + 0.45f * n;          /* 0..1 */
+            float topf = base_y - amp * shape;
+            if (topf < 0.0f) topf = 0.0f;
+            if (topf > (float)(H - 1)) topf = (float)(H - 1);
+            int top = (int)topf;
+            /* the crest's sub-pixel part: the first row is blended with what
+               is behind it, so a nearly horizontal crest is a smooth edge
+               and not a staircase of whole pixels */
+            int cov0 = (int)((1.0f - (topf - (float)top)) * 256.0f);
+
+            /* 1 under the sun, 0 at the far edges: the rim light's reach */
+            float sunw = 1.0f - wp_clampf(fabsf((float)x + 0.5f - sx) * inv_sun,
+                                          0.0f, 1.0f);
+            int rim_a = (lrim * (int)(64.0f + 192.0f * sunw * sunw)) >> 8;
+
+            int shade = 256 - (((top - hy) * shade_step) >> 8);
+            if (shade > 256) shade = 256;
+            u32 *col = s->px + (size_t)top * s->stride + x;
+            for (int y = top; y < H; y++, col += s->stride) {
+                int k = (256 - shade) / 7;
+                if (k < 0) k = 0;
+                if (k > 15) k = 15;
+                u32 c = lut[k];
+                if (y - top < 2) {
+                    /* rim light on the crest: the sun is behind these hills */
+                    int ra = rim_a * (2 - (y - top)) / 2;
+                    int R = (int)GET_R(c) + (((255 - (int)GET_R(c)) * ra) >> 8);
+                    int G = (int)GET_G(c) + (((205 - (int)GET_G(c)) * ra) >> 8);
+                    int B = (int)GET_B(c) + (((140 - (int)GET_B(c)) * ra) >> 8);
+                    if (R > 255) R = 255;
+                    if (G > 255) G = 255;
+                    if (B > 255) B = 255;
+                    c = 0xFF000000u | ((u32)R << 16) | ((u32)G << 8) | (u32)B;
+                }
+                if (y == top) {
+                    u32 u = *col;
+                    int ia = 256 - cov0;
+                    c = 0xFF000000u
+                      | ((u32)((((int)GET_R(c) * cov0 + (int)GET_R(u) * ia) >> 8)) << 16)
+                      | ((u32)((((int)GET_G(c) * cov0 + (int)GET_G(u) * ia) >> 8)) << 8)
+                      |  (u32)((((int)GET_B(c) * cov0 + (int)GET_B(u) * ia) >> 8));
+                }
+                *col = c;
+                shade -= shade_step;
+            }
+        }
+    }
+}
+
+/* ---------------------------------------------------- the custom image
+ * The one wallpaper that is not a function of the theme: a PNG, JPEG, BMP or
+ * PNM from disk. It is decoded with src/img.c (the same decoder the viewer
+ * and the browser use), cover-scaled to the surface - aspect ratio kept, the
+ * overflow cropped, never stretched - and the screen-size copy is cached.
+ *
+ * Three rules keep it off the per-frame path:
+ *   - the setting file is stat()ed at most once a second, and only read when
+ *     its size or mtime moved (wp_setting_sync);
+ *   - the picture is decoded once, when the setting changes;
+ *   - the cover scale runs once per picture and once per surface size, never
+ *     per frame. Every frame after that is one row memcpy (0.34 ms at
+ *     1280x800).
+ *
+ * The module owns the state, not the desktop: wallpaper_draw() reads the
+ * setting itself, so a picture written by Settings - or restored at boot by
+ * main.c's existing "first line of /etc/mystic/wallpaper" reader - is drawn
+ * without a new call from main.c. */
+
+#define WP_PATH_MAX  512          /* a path longer than this is refused */
+#define WP_FILE_MAX  (64u << 20)  /* refuse a file over 64 MiB             */
+
+static char  wp_img_path[WP_PATH_MAX];   /* the active (or attempted) path */
+static char  wp_img_err[192];            /* why the last attempt failed    */
+static Img   wp_img_src;                 /* decoded, freed by the first scale */
+static u32  *wp_img_dst;                 /* cached cover-scaled picture    */
+static int   wp_img_dw, wp_img_dh;
+static int   wp_img_sw, wp_img_sh;       /* decoded source size, for reports */
+static int   wp_img_ok;                  /* 1 = a picture is the background */
+static int   wp_img_gen;                 /* bumped by every change          */
+
+static int wp_prefix_ci(const char *s, const char *prefix) {
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    for (size_t i = 0; prefix[i]; i++)
+        if (wp_lower((unsigned char)s[i]) != prefix[i]) return 0;
+    return 1;
+}
+
+/* Read a whole file into a malloc'ed buffer. The caller frees. */
+static unsigned char *wp_read_file(const char *path, size_t *len, char *err, size_t esz) {
+    *len = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        if (err && esz) snprintf(err, esz, "%s: %s", path, strerror(errno));
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        if (err && esz) snprintf(err, esz, "%s: cannot seek: %s", path, strerror(errno));
+        fclose(f);
+        return NULL;
+    }
+    long sz = ftell(f);
+    if (sz <= 0) {
+        if (err && esz) snprintf(err, esz, "%s: %s", path,
+                                 sz == 0 ? "the file is empty" : "cannot tell its size");
+        fclose(f);
+        return NULL;
+    }
+    if ((unsigned long)sz > WP_FILE_MAX) {
+        if (err && esz)
+            snprintf(err, esz, "%s: %ld bytes is over the %u MiB limit", path, sz,
+                     (unsigned)(WP_FILE_MAX >> 20));
+        fclose(f);
+        return NULL;
+    }
+    rewind(f);
+    unsigned char *buf = malloc((size_t)sz);
+    if (!buf) {
+        if (err && esz) snprintf(err, esz, "%s: out of memory for %ld bytes", path, sz);
+        fclose(f);
+        return NULL;
+    }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    int rerr = ferror(f) ? errno : 0;
+    fclose(f);
+    if (got != (size_t)sz) {
+        if (err && esz)
+            snprintf(err, esz, "%s: read %zu of %ld bytes%s%s", path, got, sz,
+                     rerr ? ": " : "", rerr ? strerror(rerr) : "");
+        free(buf);
+        return NULL;
+    }
+    *len = got;
+    return buf;
+}
+
+/* ---- the resampler ----------------------------------------------------
+ * Cover, not stretch: the visible part of the source is the largest
+ * destination-aspect rectangle that fits in it, centred, and every
+ * destination pixel is that rectangle divided into a dw x dh grid.
+ *
+ * Shrinking averages the source pixels the cell covers (a real box filter:
+ * edge pixels are weighted by the fraction of the cell they own). Enlarging
+ * samples bilinearly, because a box filter narrower than one source pixel
+ * would just repeat pixels and look like a nearest-neighbour blow-up. Alpha
+ * is averaged as a plain channel and the result is composited over black, so
+ * a transparent wallpaper is black rather than last frame's pixels. */
+static u32 wp_src_px(const Img *im, int x, int y) {
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x >= im->w) x = im->w - 1;
+    if (y >= im->h) y = im->h - 1;
+    return im->px[(size_t)y * im->stride + x];
+}
+
+static u32 wp_over_black(int r, int g, int b, int a) {
+    if (a < 0) a = 0;
+    if (a > 255) a = 255;
+    r = (r * a) / 255;
+    g = (g * a) / 255;
+    b = (b * a) / 255;
+    if (r > 255) r = 255;
+    if (g > 255) g = 255;
+    if (b > 255) b = 255;
+    return 0xFF000000u | ((u32)r << 16) | ((u32)g << 8) | (u32)b;
+}
+
+static void wp_cover_scale(const Img *src, int dw, int dh, u32 *dst) {
+    const double sxf = (double)dw / (double)src->w;
+    const double syf = (double)dh / (double)src->h;
+    const double s = sxf > syf ? sxf : syf;      /* the cover factor */
+    const double vis_w = (double)dw / s;         /* source pixels shown */
+    const double vis_h = (double)dh / s;
+    const double ox = ((double)src->w - vis_w) * 0.5;   /* the centred crop */
+    const double oy = ((double)src->h - vis_h) * 0.5;
+    const double step_x = vis_w / (double)dw;
+    const double step_y = vis_h / (double)dh;
+
+    if (s >= 1.0) {
+        /* enlarge: bilinear, sampling at the cell centre */
+        for (int y = 0; y < dh; y++) {
+            float fy = (float)(oy + ((double)y + 0.5) * step_y - 0.5);
+            int iy = (int)wp_floorf(fy);
+            float ty = fy - (float)iy;
+            u32 *row = dst + (size_t)y * dw;
+            for (int x = 0; x < dw; x++) {
+                float fx = (float)(ox + ((double)x + 0.5) * step_x - 0.5);
+                int ix = (int)wp_floorf(fx);
+                float tx = fx - (float)ix;
+                u32 p00 = wp_src_px(src, ix, iy), p10 = wp_src_px(src, ix + 1, iy);
+                u32 p01 = wp_src_px(src, ix, iy + 1), p11 = wp_src_px(src, ix + 1, iy + 1);
+                float w00 = (1.0f - tx) * (1.0f - ty), w10 = tx * (1.0f - ty);
+                float w01 = (1.0f - tx) * ty, w11 = tx * ty;
+                int a = (int)(w00 * GET_A(p00) + w10 * GET_A(p10) +
+                              w01 * GET_A(p01) + w11 * GET_A(p11));
+                int r = (int)(w00 * GET_R(p00) + w10 * GET_R(p10) +
+                              w01 * GET_R(p01) + w11 * GET_R(p11));
+                int g = (int)(w00 * GET_G(p00) + w10 * GET_G(p10) +
+                              w01 * GET_G(p01) + w11 * GET_G(p11));
+                int b = (int)(w00 * GET_B(p00) + w10 * GET_B(p10) +
+                              w01 * GET_B(p01) + w11 * GET_B(p11));
+                row[x] = wp_over_black(r, g, b, a);
+            }
+        }
+        return;
+    }
+
+    /* Shrink: area average with fractional edge weights. The column spans
+     * and their weights are the same for every destination row, so they are
+     * worked out once (that is what makes a 6 MP photo a 60 ms scale and not
+     * a 200 ms one). */
+    int span = (int)ceil(step_x) + 2;            /* widest source span, px */
+    if (span < 1) span = 1;
+    int span_y = (int)ceil(step_y) + 2;
+    if (span_y < 1) span_y = 1;
+    int *xoff = malloc((size_t)dw * sizeof(int));
+    float *xwt = malloc((size_t)dw * (size_t)span * sizeof(float));
+    float *ywt = malloc((size_t)span_y * sizeof(float));
+    if (!xoff || !xwt || !ywt) {                 /* no table: nearest sample */
+        for (int y = 0; y < dh; y++) {
+            int sy = (int)(oy + ((double)y + 0.5) * step_y);
+            u32 *row = dst + (size_t)y * dw;
+            for (int x = 0; x < dw; x++) {
+                int sx = (int)(ox + ((double)x + 0.5) * step_x);
+                u32 p = wp_src_px(src, sx, sy);
+                row[x] = wp_over_black((int)GET_R(p), (int)GET_G(p),
+                                       (int)GET_B(p), (int)GET_A(p));
+            }
+        }
+        free(xoff);
+        free(xwt);
+        free(ywt);
+        return;
+    }
+    for (int x = 0; x < dw; x++) {
+        double x0 = ox + (double)x * step_x;
+        double x1 = x0 + step_x;
+        int ix0 = (int)floor(x0);
+        double wsum = 0.0;
+        int n = 0;
+        for (int i = ix0; i < (int)ceil(x1) && n < span; i++, n++) {
+            double xa = x0 > (double)i ? x0 : (double)i;
+            double xb = x1 < (double)(i + 1) ? x1 : (double)(i + 1);
+            double w = xb > xa ? xb - xa : 0.0;
+            xwt[(size_t)x * span + n] = (float)w;
+            wsum += w;
+        }
+        if (wsum <= 0.0) wsum = 1.0;
+        for (int k = 0; k < n; k++) xwt[(size_t)x * span + k] = (float)(xwt[(size_t)x * span + k] / wsum);
+        /* the taps must stay inside the image; shift the window, never read
+           past it (the weights still describe the true box) */
+        if (ix0 < 0) ix0 = 0;
+        if (src->w > span && ix0 > src->w - span) ix0 = src->w - span;
+        xoff[x] = ix0;
+    }
+
+    for (int y = 0; y < dh; y++) {
+        double y0 = oy + (double)y * step_y;
+        double y1 = y0 + step_y;
+        int iy0 = (int)floor(y0);
+        int yn = 0;
+        double wysum = 0.0;
+        for (int j = iy0; j < (int)ceil(y1) && yn < span_y; j++, yn++) {
+            double ya = y0 > (double)j ? y0 : (double)j;
+            double yb = y1 < (double)(j + 1) ? y1 : (double)(j + 1);
+            double w = yb > ya ? yb - ya : 0.0;
+            ywt[yn] = (float)w;
+            wysum += w;
+        }
+        if (wysum <= 0.0) wysum = 1.0;
+        for (int k = 0; k < yn; k++) ywt[k] = (float)(ywt[k] / wysum);
+        u32 *row = dst + (size_t)y * dw;
+        for (int x = 0; x < dw; x++) {
+            const float *wx = xwt + (size_t)x * span;
+            int ix0 = xoff[x];
+            float ar = 0.0f, ag = 0.0f, ab = 0.0f, aa = 0.0f;
+            for (int j = 0; j < yn; j++) {
+                int sy = iy0 + j;
+                if (sy < 0) sy = 0;
+                if (sy >= src->h) sy = src->h - 1;
+                const u32 *srow = src->px + (size_t)sy * src->stride + ix0;
+                float wy = ywt[j];
+                for (int i = 0; i < span; i++) {
+                    float w = wx[i];
+                    if (w <= 0.0f) continue;
+                    u32 p = srow[i];
+                    ar += w * wy * (float)GET_R(p);
+                    ag += w * wy * (float)GET_G(p);
+                    ab += w * wy * (float)GET_B(p);
+                    aa += w * wy * (float)GET_A(p);
+                }
+            }
+            row[x] = wp_over_black((int)(ar + 0.5f), (int)(ag + 0.5f),
+                                   (int)(ab + 0.5f), (int)(aa + 0.5f));
+        }
+    }
+    free(xoff);
+    free(xwt);
+    free(ywt);
+}
+
+/* Read, decode and (later) scale one picture. 0 = ok. */
+static int wp_load_image(const char *path, Img *out, char *err, size_t esz) {
+    size_t len = 0;
+    unsigned char *buf = wp_read_file(path, &len, err, esz);
+    if (!buf) return -1;
+    char derr[160];
+    memset(out, 0, sizeof(*out));
+    int rc = img_decode(buf, len, out, derr, sizeof(derr));
+    free(buf);
+    if (rc != 0) {
+        if (err && esz) snprintf(err, esz, "%s: %s", path, derr);
+        return -1;
+    }
+    return 0;
+}
+
+int wallpaper_set_image(const char *path, char *err, size_t esz) {
+    if (err && esz) err[0] = 0;
+    if (!path || !path[0]) {
+        if (err && esz) snprintf(err, esz, "%s", "no path given");
+        return -1;
+    }
+    if (strlen(path) >= sizeof(wp_img_path)) {
+        if (err && esz)
+            snprintf(err, esz, "the path is %zu bytes; the limit is %zu",
+                     strlen(path), sizeof(wp_img_path) - 1);
+        return -1;
+    }
+    /* Decode now, so a wrong file is refused at the pick and not at the
+     * first frame. The decoded picture is kept until the draw knows the
+     * surface size, then freed. */
+    Img im;
+    char why[192];
+    if (wp_load_image(path, &im, why, sizeof(why)) != 0) {
+        if (err && esz) snprintf(err, esz, "%s", why);
+        return -1;
+    }
+
+    img_free(&wp_img_src);
+    free(wp_img_dst);
+    wp_img_dst = NULL;
+    wp_img_dw = wp_img_dh = 0;
+    wp_img_src = im;
+    wp_img_sw = im.w;
+    wp_img_sh = im.h;
+    snprintf(wp_img_path, sizeof(wp_img_path), "%s", path);
+    wp_img_ok = 1;
+    wp_img_gen++;
+    wp_img_err[0] = 0;
+    return 0;
+}
+
+void wallpaper_clear_image(void) {
+    if (!wp_img_ok && !wp_img_dst && !wp_img_src.px && wp_img_path[0] == 0) return;
+    img_free(&wp_img_src);
+    free(wp_img_dst);
+    wp_img_dst = NULL;
+    wp_img_dw = wp_img_dh = 0;
+    wp_img_sw = wp_img_sh = 0;
+    wp_img_path[0] = 0;
+    wp_img_ok = 0;
+    wp_img_gen++;
+}
+
+int wallpaper_image_active(void) { return wp_img_ok; }
+
+const char *wallpaper_image_path(void) {
+    return wp_img_ok ? wp_img_path : "";
+}
+
+int wallpaper_image_generation(void) { return wp_img_gen; }
+
+int wallpaper_image_size(int *src_w, int *src_h, int *dst_w, int *dst_h) {
+    if (src_w) *src_w = wp_img_sw;
+    if (src_h) *src_h = wp_img_sh;
+    if (dst_w) *dst_w = wp_img_dw;
+    if (dst_h) *dst_h = wp_img_dh;
+    return wp_img_ok ? 1 : 0;
+}
+
+/* Build (or rebuild) the screen-size cache. The source is either the decoded
+ * picture set_image() left behind, or a fresh decode when the surface changed
+ * size after that source was freed. */
+static int wp_image_build(int w, int h) {
+    if (w <= 0 || h <= 0) return -1;
+    Img im;
+    int borrowed = 0;
+    memset(&im, 0, sizeof(im));
+    if (wp_img_src.px) {
+        im = wp_img_src;
+        borrowed = 1;
+    } else {
+        if (!wp_img_path[0]) return -1;
+        char why[192];
+        if (wp_load_image(wp_img_path, &im, why, sizeof(why)) != 0) {
+            snprintf(wp_img_err, sizeof(wp_img_err), "%s", why);
+            return -1;
+        }
+    }
+    u32 *dst = malloc((size_t)w * (size_t)h * sizeof(u32));
+    if (!dst) {
+        snprintf(wp_img_err, sizeof(wp_img_err), "out of memory for %dx%d", w, h);
+        if (borrowed) img_free(&wp_img_src); else img_free(&im);
+        return -1;
+    }
+    wp_img_sw = im.w;
+    wp_img_sh = im.h;
+    wp_cover_scale(&im, w, h, dst);
+    free(wp_img_dst);
+    wp_img_dst = dst;
+    wp_img_dw = w;
+    wp_img_dh = h;
+    wp_img_err[0] = 0;
+    if (borrowed) img_free(&wp_img_src); else img_free(&im);
+    return 0;
+}
+
+/* Blit the cache. Same size is a row memcpy; a different size (the surface
+ * changed and the rebuild failed, e.g. the file went away) is a centred
+ * copy that still never stretches. */
+static void wp_image_blit(Surface *s) {
+    if (!wp_img_dst || wp_img_dw <= 0 || wp_img_dh <= 0) return;
+    if (wp_img_dw == s->w && wp_img_dh == s->h) {
+        for (int y = 0; y < s->h; y++)
+            memcpy(s->px + (size_t)y * s->stride,
+                   wp_img_dst + (size_t)y * wp_img_dw, (size_t)s->w * 4u);
+        return;
+    }
+    surf_fill(s, 0, 0, s->w, s->h, RGB(0, 0, 0));
+    int cw = wp_img_dw < s->w ? wp_img_dw : s->w;
+    int ch = wp_img_dh < s->h ? wp_img_dh : s->h;
+    int ox = (wp_img_dw - cw) / 2, oy = (wp_img_dh - ch) / 2;
+    int dx = (s->w - cw) / 2, dy = (s->h - ch) / 2;
+    for (int y = 0; y < ch; y++)
+        memcpy(s->px + (size_t)(dy + y) * s->stride + dx,
+               wp_img_dst + (size_t)(oy + y) * wp_img_dw + ox, (size_t)cw * 4u);
+}
+
+/* Keep the module in step with the setting file, without touching the disk
+ * per frame: one stat per second, a read only when size or mtime moved, and
+ * a decode only when the picture really changed. */
+static void wp_setting_sync(int force) {
+    static time_t last_check;
+    static int have_memo;
+    static long long memo_mtime, memo_size;
+
+    time_t now = time(NULL);
+    if (!force && last_check != 0 && last_check == now) return;
+    last_check = now;
+
+    struct stat st;
+    if (stat(MYSTIC_WALLPAPER_FILE, &st) != 0) {
+        have_memo = 0;                 /* no setting: nothing to restore */
+        return;
+    }
+    long long mt = (long long)st.st_mtime;
+    long long sz = (long long)st.st_size;
+    if (have_memo && memo_mtime == mt && memo_size == sz) return;
+    have_memo = 1;
+    memo_mtime = mt;
+    memo_size = sz;
+
+    FILE *f = fopen(MYSTIC_WALLPAPER_FILE, "r");
+    if (!f) return;
+    char line[WP_PATH_MAX + 8];
+    if (!fgets(line, (int)sizeof(line), f)) { fclose(f); return; }
+    fclose(f);
+    char *nl = strchr(line, '\n');
+    if (nl) *nl = 0;
+    nl = strchr(line, '\r');
+    if (nl) *nl = 0;
+
+    if (wp_prefix_ci(line, "image:")) {
+        const char *p = line + 6;
+        while (*p == ' ' || *p == '\t') p++;
+        if (wp_img_ok && strcmp(p, wp_img_path) == 0) return;   /* already drawn */
+        char why[192];
+        if (wallpaper_set_image(p, why, sizeof(why)) != 0) {
+            /* Keep the previous background: a broken file must not blank the
+             * desktop. The reason is kept for a caller that asks. */
+            snprintf(wp_img_err, sizeof(wp_img_err), "%s", why);
+        }
+    } else if (line[0]) {
+        wallpaper_clear_image();
+    }
+}
+
 /* ------------------------------------------------------------ public */
 
 void wallpaper_draw(Surface *s, const Theme *th, int index, double seconds) {
     if (!s || !s->px || s->w <= 0 || s->h <= 0) return;
+
+    /* The setting is the truth. Forced (ignoring the one-second gate) when
+     * the caller asks for the image but none is loaded - that is the boot
+     * path, where main.c has read the setting but has no decoder. */
+    wp_setting_sync(index == WALLPAPER_IMAGE && !wp_img_ok);
+
+    if (wp_img_ok) {
+        if (!wp_img_dst || wp_img_dw != s->w || wp_img_dh != s->h) {
+            if (wp_image_build(s->w, s->h) != 0) {
+                /* the cache could not be rebuilt; blit what we have */
+            }
+        }
+        wp_image_blit(s);
+        return;
+    }
+
     if (!th) {                                  /* never leave the screen dirty */
         surf_fill(s, 0, 0, s->w, s->h, RGB(0, 0, 0));
         return;
@@ -1524,6 +2511,8 @@ void wallpaper_draw(Surface *s, const Theme *th, int index, double seconds) {
         case 3: wp_draw_orbits(s, th, seconds);       break;
         case 4: wp_draw_blackhole(s, th, seconds);    break;
         case 5: wp_draw_nebula(s, th);                break;
+        case 6: wp_draw_synthwave(s, th, seconds);    break;
+        case 7: wp_draw_dunes(s, th);                 break;
         case 0:
         default: wp_draw_dusk(s, th);                 break;
     }

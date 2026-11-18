@@ -95,6 +95,24 @@ float font_draw(Surface *s, Font *f, float x, float y, const char *text, u32 col
 /* ------------------------------------------------------------
  * Input (evdev)
  * ------------------------------------------------------------ */
+
+/* One trackpad gesture at a time. src/input.c classifies it from the real
+ * contacts (evdev protocol B) and LATCHES it until every finger lifts, so a
+ * scroll cannot turn into a pinch halfway through - the same promise macOS
+ * makes. A gesture is not named until the contacts have travelled past a
+ * threshold, which is what keeps a tap from being read as a swipe. */
+typedef enum {
+    GESTURE_NONE = 0,
+    GESTURE_SCROLL,     /* two fingers: the centroid moved more than the gap */
+    GESTURE_PINCH,      /* two fingers: the gap changed more than the centroid */
+    GESTURE_SWIPE,      /* three or more fingers past the swipe threshold     */
+    GESTURE_COUNT
+} GestureKind;
+
+/* Protocol B slots are per device; ten is the most this parser tracks, and
+ * also the length of the per-contact arrays below. */
+#define MT_MAX_FINGERS 10
+
 typedef struct {
     int   mouse_x, mouse_y;
     int   mouse_dx, mouse_dy;
@@ -113,6 +131,32 @@ typedef struct {
     int   key_pressed;      /* 0/1 */
     char  text[32];         /* printable chars typed this frame */
     int   text_len;
+
+    /* ---- trackpad gestures (src/input.c owns every field below) ----
+     * They stay zero on a machine whose pointing device is a plain mouse or
+     * a PS/2 one, because nothing outside the multitouch parser writes them.
+     * That is what makes the desktop's wheel path the fallback: there is no
+     * flag to test, only the absence of gestures.
+     *
+     * The centroid of the contacts is computed once per kernel packet in
+     * src/input.c and delivered as its DELTA, which is what a screen-space
+     * consumer can use; an absolute position on the pad has no meaning here. */
+    int   gesture;          /* GESTURE_* that is in progress this frame      */
+    int   gesture_fingers;  /* contacts it was made with (0 = no gesture)    */
+    int   gesture_dx, gesture_dy;   /* centroid travel, px, y grows downwards;
+                                     * summed over a gesture this is the whole
+                                     * travel, and it follows the finger       */
+    float gesture_scale;    /* two-finger distance now / distance at start   */
+    int   gesture_release;  /* 1 exactly once, on the frame the gesture ended;
+                             * `gesture` still names it on that frame        */
+    int   gesture_id;       /* +1 each time a gesture latches; the desktop
+                             * fires an action when this changes, so a swipe
+                             * that is held cannot fire twice                 */
+    int   gesture_tap;      /* 1 on the frame a tap ended (nothing latched)  */
+    int   gesture_tap_fingers;  /* 2 = right click, 3 = shortcuts panel      */
+    int   finger_n;                     /* contacts on the pad now          */
+    int   finger_dx[MT_MAX_FINGERS];    /* per-contact travel this frame    */
+    int   finger_dy[MT_MAX_FINGERS];
 } Input;
 
 /* ------------------------------------------------------------
@@ -301,6 +345,13 @@ void   disp_bench_report(int src_w, int src_h, int dst_w, int dst_h);
 /* ------------------------------------------------------------
  * Input (evdev)
  * ------------------------------------------------------------ */
+/* Gestures are produced by input_poll(); there is no separate call, and no
+ * open() of an input device here. The parser reads evdev protocol B:
+ * ABS_MT_SLOT / ABS_MT_TRACKING_ID / ABS_MT_POSITION_X / ABS_MT_POSITION_Y,
+ * and accepts BTN_TOOL_FINGER..BTN_TOOL_QUINT plus BTN_TOOL_DOUBLE_TAP /
+ * TRIPLE_TAP (all of which are EV_KEY codes) from a device that reports no
+ * slots at all. Positions arrive in the device's own units and are delivered
+ * as pixels, the same convention ABS_X already had in src/input.c. */
 int  input_open(Input *in);
 int  input_poll(Input *in);        /* fills Input for this frame; returns 1 if anything happened */
 void input_frame(Input *in);       /* clear per-frame fields */

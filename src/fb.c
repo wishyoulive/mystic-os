@@ -602,6 +602,22 @@ static void blit_box(Surface *dst, const Surface *src, const DispGeom *g,
     free(mem);
 }
 
+/* Which loop the next blit runs. This is the whole 1:1 question: a frame
+ * whose image rectangle is exactly the source size needs a copy, and the
+ * box filter must not be paid for it. fit on a panel that is already the
+ * design size, stretch at native, and 1:1/integer at k=1 all land here -
+ * the default startup state on every QEMU fbdev is one of them. Measured
+ * on the host at 1280x800: box filter 0.74-1.10 ms/frame, the copy
+ * 0.22-0.48 ms, for identical pixels. One function so the choice printed
+ * by the harness is the branch disp_blit() takes. */
+enum { BLIT_COPY = 0, BLIT_NEAREST, BLIT_BOX };
+
+static int blit_kind(const DispGeom *g, int sw, int sh) {
+    if (g->bw == sw && g->bh == sh) return BLIT_COPY;  /* 1:1: nothing to scale */
+    if (g->integer > 0) return BLIT_NEAREST;
+    return BLIT_BOX;
+}
+
 void disp_blit(Surface *dst, const Surface *src, const DispGeom *g,
                int x, int y, int w, int h) {
     if (!dst || !src || !g || !dst->px || !src->px) return;
@@ -609,13 +625,19 @@ void disp_blit(Surface *dst, const Surface *src, const DispGeom *g,
     if (g->bw <= 0 || g->bh <= 0) return;
     int x0, y0, x1, y1;
     if (!clip_region(dst, g, x, y, w, h, &x0, &y0, &x1, &y1)) return;
-    if (g->integer > 0) blit_nearest(dst, src, g, x0, y0, x1, y1);
-    else                blit_box(dst, src, g, x0, y0, x1, y1);
+    if (blit_kind(g, src->w, src->h) == BLIT_BOX)
+        blit_box(dst, src, g, x0, y0, x1, y1);
+    else
+        blit_nearest(dst, src, g, x0, y0, x1, y1);
 }
 
 /* ------------------------------------------------------------
  *  Opening the device
  * ------------------------------------------------------------ */
+/* Defined with the letterbox cache further down; disp_open() and
+ * disp_set_mode() invalidate it because a new mapping is new pixels. */
+static void bars_forget(void);
+
 int disp_open(Display *d, const char *path) {
     memset(d, 0, sizeof(*d));
     d->fd = open(path, O_RDWR);
@@ -659,6 +681,7 @@ int disp_open(Display *d, const char *path) {
 
     claim_console();
     g_disp = d;
+    bars_forget();
 
     disp_scan_modes(d);
     d->geom = disp_layout(d->scale, d->w, d->h, d->fb_w, d->fb_h);
@@ -785,6 +808,7 @@ int disp_set_mode(Display *d, int i) {
     }
     if (d->mode_index < 0) d->mode_index = 0;
     d->geom = disp_layout(d->scale, d->w, d->h, d->fb_w, d->fb_h);
+    bars_forget();              /* a new mode maps new pixels */
     fprintf(stderr, "display: mode %dx%d (%d bpp)\n", d->fb_w, d->fb_h, d->bpp);
     return 0;
 }
@@ -865,6 +889,50 @@ static void fb_fill_rect(Display *d, int x, int y, int w, int h) {
     surf_fill_rect(&dst, x, y, w, h);
 }
 
+/* The letterbox is black and nothing but disp_present() writes it: the blit
+ * is clipped to the image rectangle, and disp_present_rect() maps through
+ * the same rectangle. Re-clearing the same bars every frame was a memset of
+ * 0.7 MB at a 1024x768 canvas on a 1280x800 panel (0.23-0.53 ms measured on
+ * the host) to write zeros over zeros. The rectangles are remembered and
+ * cleared again only when something that can move them changes: the panel,
+ * its mapping, or the geometry. */
+typedef struct {
+    int      valid;
+    Display *d;
+    u32     *mem;
+    size_t   fb_bytes;
+    int      fb_w, fb_h;
+    int      bx, by, bw, bh;
+} BarCache;
+
+static BarCache g_bars;
+
+/* 1 when the four bar rectangles were already cleared for this mapping and
+ * geometry. 0 means the caller must clear them and remember the new key. */
+static int bars_still_black(Display *d, const DispGeom *g) {
+    BarCache *b = &g_bars;
+    if (!b->valid || b->d != d || b->mem != d->mem ||
+        b->fb_bytes != d->fb_bytes || b->fb_w != d->fb_w || b->fb_h != d->fb_h ||
+        b->bx != g->bx || b->by != g->by || b->bw != g->bw || b->bh != g->bh)
+        return 0;
+    return 1;
+}
+
+/* A new mapping is not the old pixels even when the driver reports the same
+ * geometry: forget what was cleared. */
+static void bars_forget(void) { g_bars.valid = 0; }
+
+static void bars_remember(Display *d, const DispGeom *g) {
+    BarCache *b = &g_bars;
+    b->valid = 1;
+    b->d = d;
+    b->mem = d->mem;
+    b->fb_bytes = d->fb_bytes;
+    b->fb_w = d->fb_w;
+    b->fb_h = d->fb_h;
+    b->bx = g->bx; b->by = g->by; b->bw = g->bw; b->bh = g->bh;
+}
+
 void disp_present(Display *d, Surface *s) {
     if (!d || !d->mem || !s || !s->px || s->w <= 0 || s->h <= 0) return;
 
@@ -877,13 +945,18 @@ void disp_present(Display *d, Surface *s) {
     const DispGeom *g = &d->geom;
 
     /* The bars are black and they are cleared here, so whatever a previous
-     * frame (or the kernel console) left there never shows through. */
-    if (g->by > 0) fb_fill_rect(d, 0, 0, d->fb_w, g->by);
-    if (g->by + g->bh < d->fb_h)
-        fb_fill_rect(d, 0, g->by + g->bh, d->fb_w, d->fb_h - (g->by + g->bh));
-    if (g->bx > 0) fb_fill_rect(d, 0, g->by, g->bx, g->bh);
-    if (g->bx + g->bw < d->fb_w)
-        fb_fill_rect(d, g->bx + g->bw, g->by, d->fb_w - (g->bx + g->bw), g->bh);
+     * frame (or the kernel console) left there never shows through. Once a
+     * mapping + geometry has been cleared they stay black until one of them
+     * changes (see BarCache above). */
+    if (!bars_still_black(d, g)) {
+        if (g->by > 0) fb_fill_rect(d, 0, 0, d->fb_w, g->by);
+        if (g->by + g->bh < d->fb_h)
+            fb_fill_rect(d, 0, g->by + g->bh, d->fb_w, d->fb_h - (g->by + g->bh));
+        if (g->bx > 0) fb_fill_rect(d, 0, g->by, g->bx, g->bh);
+        if (g->bx + g->bw < d->fb_w)
+            fb_fill_rect(d, g->bx + g->bw, g->by, d->fb_w - (g->bx + g->bw), g->bh);
+        bars_remember(d, g);
+    }
 
     Surface dst;
     dst.px = d->mem;
@@ -901,58 +974,49 @@ void disp_present(Display *d, Surface *s) {
  * 1280x800 pixels because there was no way to say "just this box"; the cursor
  * needs about 26x28 of them. Costs are proportional to what changed.
  *
- * With no scaling this is exactly the memcpy it has always been. With a scale
- * mode the same logical rectangle is mapped through the blit, so a partial
- * update (the cursor) still lands where the pointer is. */
+ * One path for every scale mode: the logical rectangle is mapped to the
+ * panel, then disp_blit() decides whether that is a copy or a scale. The
+ * old special case here tested `scale == 1:1`, which missed the state the
+ * desktop actually starts in (fit on a panel that is already the design
+ * size): every pointer move ran the box filter over the cursor rect. */
 void disp_present_rect(Display *d, Surface *s, int x, int y, int w, int h) {
     if (!d || !d->mem || !s || !s->px) return;
     if (s->w <= 0 || s->h <= 0) return;
 
-    if (!(d->scale == DISP_ONE_TO_ONE && s->w == d->fb_w && s->h == d->fb_h)) {
-        if (s->w != d->src_w || s->h != d->src_h || d->geom.bw <= 0) {
-            d->src_w = s->w;
-            d->src_h = s->h;
-            d->geom = disp_layout(d->scale, s->w, s->h, d->fb_w, d->fb_h);
-        }
-        if (x < 0) { w += x; x = 0; }
-        if (y < 0) { h += y; y = 0; }
-        if (x + w > s->w) w = s->w - x;
-        if (y + h > s->h) h = s->h - y;
-        if (w <= 0 || h <= 0) return;
-        const DispGeom *g = &d->geom;
-        int dx0, dy0, dx1, dy1;
-        if (g->integer > 0) {
-            dx0 = g->bx + x * g->integer;
-            dx1 = g->bx + (x + w) * g->integer;
-            dy0 = g->by + y * g->integer;
-            dy1 = g->by + (y + h) * g->integer;
-        } else {
-            dx0 = g->bx + (int)(((long long)x * g->bw) / s->w);
-            dx1 = g->bx + (int)((((long long)(x + w) * g->bw) + s->w - 1) / s->w);
-            dy0 = g->by + (int)(((long long)y * g->bh) / s->h);
-            dy1 = g->by + (int)((((long long)(y + h) * g->bh) + s->h - 1) / s->h);
-        }
-        Surface dst;
-        dst.px = d->mem;
-        dst.w = d->fb_w;
-        dst.h = d->fb_h;
-        dst.stride = d->fb_stride;
-        surf_unclip(&dst);
-        disp_blit(&dst, s, g, dx0, dy0, dx1 - dx0, dy1 - dy0);
-        return;
+    /* The geometry this present will use: the size the surface already is,
+     * or a fresh layout after Settings changed the canvas/scale. */
+    if (s->w != d->src_w || s->h != d->src_h || d->geom.bw <= 0) {
+        d->src_w = s->w;
+        d->src_h = s->h;
+        d->geom = disp_layout(d->scale, s->w, s->h, d->fb_w, d->fb_h);
     }
 
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
-    if (x + w > d->fb_w) w = d->fb_w - x;
-    if (y + h > d->fb_h) h = d->fb_h - y;
     if (x + w > s->w) w = s->w - x;
     if (y + h > s->h) h = s->h - y;
     if (w <= 0 || h <= 0) return;
-    for (int row = y; row < y + h; row++)
-        memcpy(d->mem + (size_t)row * (size_t)d->fb_stride + x,
-               s->px + (size_t)row * (size_t)s->stride + x,
-               (size_t)w * sizeof(u32));
+
+    const DispGeom *g = &d->geom;
+    int dx0, dy0, dx1, dy1;
+    if (g->integer > 0) {
+        dx0 = g->bx + x * g->integer;
+        dx1 = g->bx + (x + w) * g->integer;
+        dy0 = g->by + y * g->integer;
+        dy1 = g->by + (y + h) * g->integer;
+    } else {
+        dx0 = g->bx + (int)(((long long)x * g->bw) / s->w);
+        dx1 = g->bx + (int)((((long long)(x + w) * g->bw) + s->w - 1) / s->w);
+        dy0 = g->by + (int)(((long long)y * g->bh) / s->h);
+        dy1 = g->by + (int)((((long long)(y + h) * g->bh) + s->h - 1) / s->h);
+    }
+    Surface dst;
+    dst.px = d->mem;
+    dst.w = d->fb_w;
+    dst.h = d->fb_h;
+    dst.stride = d->fb_stride;
+    surf_unclip(&dst);
+    disp_blit(&dst, s, g, dx0, dy0, dx1 - dx0, dy1 - dy0);
 }
 
 /* ------------------------------------------------------------
@@ -1000,9 +1064,11 @@ double disp_bench_parts(int src_w, int src_h, int dst_w, int dst_h, DispScale m,
      * the first pass over a branch is not what the next frame will cost. */
     for (int r = -1; r < reps; r++) {
         clock_gettime(CLOCK_MONOTONIC, &a);
-        /* exactly what disp_present() clears before the blit: a fit or a
-         * centred frame leaves bars, and leaving them out of the measurement
-         * would report a cost the panel does not actually pay. */
+        /* The bars exactly as a present pays for them when the geometry has
+         * just changed - which is when disp_present() clears them. Once the
+         * mapping and geometry are unchanged disp_present() skips this
+         * (BarCache), so the number here is the conservative one: a present
+         * that has to repaint the letterbox as well as the image. */
         if (g.by > 0) surf_fill_rect(&dst, 0, 0, dst_w, g.by);
         if (g.by + g.bh < dst_h)
             surf_fill_rect(&dst, 0, g.by + g.bh, dst_w, dst_h - (g.by + g.bh));

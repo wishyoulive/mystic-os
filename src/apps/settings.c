@@ -79,11 +79,38 @@
  *
  *      Wallpaper   every wallpaper wallpaper_name() implements, by the
  *                  name that function returns (Dusk, Mesh, Waves,
- *                  Orbits, Black Hole, Nebula), so a wallpaper added
- *                  to src/wallpaper.c gets a row here without this
- *                  file changing.  Enter writes the name to
- *                  /etc/mystic/wallpaper, re-read by main.c once a
- *                  second (src/main.c:2284-2291).
+ *                  Orbits, Black Hole, Nebula, Synthwave, Dunes), so a
+ *                  wallpaper added to src/wallpaper.c gets a row here
+ *                  without this file changing.  Enter writes the name
+ *                  to /etc/mystic/wallpaper, re-read by main.c once a
+ *                  second.
+ *
+ *                  The last row is the custom image.  There is no file
+ *                  chooser, so Enter on that row opens an inline path
+ *                  field in the row itself - the same measured box,
+ *                  scrolling text and caret Files uses for rename.
+ *                  Typing a path and pressing Enter calls
+ *                  wallpaper_set_image(path, err, ...), which reads the
+ *                  file and DECODES it with src/img.c (PNG, JPEG, BMP,
+ *                  PNM) before anything is written; a missing file, a
+ *                  directory, an empty file or bytes that are not a
+ *                  picture are refused with the real strerror or the
+ *                  decoder's own sentence, the field stays open, and
+ *                  the wallpaper already on screen is untouched.  On
+ *                  success the line "image:/path/to/file.png" is
+ *                  written to /etc/mystic/wallpaper and the row shows
+ *                  the file's basename, so the list always says which
+ *                  file is set.  An empty field removes the custom
+ *                  image and goes back to Dusk.
+ *
+ *                  main.c needs no change for this format:
+ *                  wallpaper_from_name() returns WALLPAPER_IMAGE for a
+ *                  line that starts with "image:" without reading the
+ *                  path, and wallpaper_draw() then reads the path from
+ *                  the same file (once per second at most) and draws
+ *                  the cached picture instead of the procedural one.
+ *                  That is why the desktop shows the image within a
+ *                  second of Enter, and immediately at boot.
  *
  *      Users       changes the lock-screen password.  It asks for the
  *                  current one and then twice for the new one, checks
@@ -352,6 +379,15 @@ static const float  SIZE_VALUE[SIZE_COUNT] = { 0.8f, 1.0f, 1.2f, 1.4f, 1.6f };
 
 #define MAX_PAGE_ROWS 40
 
+/* The custom-image path field. src/wallpaper.c refuses a path at 512 bytes,
+ * so the field can hold one and the line written to /etc/mystic/wallpaper is
+ * "image:" + path + newline. */
+#define IMG_PATH_MAX 512
+
+/* The image row's label. One definition, because the row builder, the row
+ * painter and the inline field all have to agree on which row is the path. */
+#define IMG_ROW_LABEL "Custom image"
+
 enum { TAB_TEXT, TAB_DISP, TAB_THEME, TAB_WALL, TAB_USERS, TAB_NET,
        TAB_STORAGE, TAB_SYSTEM, TAB_COUNT };
 static const char *TAB_LABEL[TAB_COUNT] = {
@@ -403,6 +439,11 @@ typedef struct {
     char     pw_msg[192];
     int      pw_msg_err;
 
+    /* wallpaper path field: 1 while it is open. It owns the keyboard until
+     * Enter or Ctrl+C, exactly like the password prompt. */
+    int      img_stage;
+    int      img_len;
+    char     img_buf[IMG_PATH_MAX];
 } Settings;
 
 /* ============================================================
@@ -796,6 +837,60 @@ static void page_row_draw(Surface *s, const Layout *L, const Theme *th,
                                  : color_alpha(th->text, 0.55f));
 }
 
+/* ---- the custom-image path field -----------------------------------------
+ * The same measured box, scrolling text and caret Files draws for a rename:
+ * the text scrolls so the caret stays inside, and the caret is placed at the
+ * glyph pen (font_width of the text before it), never at a guessed column.
+ * It is drawn INSIDE the row it edits, so the page never jumps.
+ */
+static void img_field_draw(const Settings *st, Surface *s, const Layout *L,
+                           const Theme *th, int ox, int ry, int rh) {
+    Font *fnt = L->f.body;
+    if (!fnt) return;
+    float bx = (float)(ox + L->body_x);
+    float bw = (float)(L->body_r - L->body_x);
+    if (bw < (float)SP(4)) return;
+    float by = (float)ry + (float)SP(1) / 2.0f;
+    float bh = (float)(rh - SP(1));
+    if (bh < (float)SP(2)) return;
+
+    gfx_rrect_aa(s, bx, by, bw, bh, (float)L->radius, th->window_bg,
+                 color_alpha(th->accent, 0.90f), 1.0f);
+
+    float room = bw - (float)SP(2);
+    int start = 0;
+    char tmp[IMG_PATH_MAX];
+    for (;;) {
+        int len = st->img_len - start;
+        if (len <= 0) break;
+        if (len >= (int)sizeof(tmp)) len = (int)sizeof(tmp) - 1;
+        memcpy(tmp, st->img_buf + start, (size_t)len);
+        tmp[len] = 0;
+        if (font_width(fnt, tmp) <= room) break;
+        start++;
+    }
+
+    float tx = bx + (float)SP(1);
+    float ty = (float)ry + (float)L->row_dy;
+    int vis = st->img_len - start;
+    if (vis < 0) vis = 0;
+    if (vis >= (int)sizeof(tmp)) vis = (int)sizeof(tmp) - 1;
+    memcpy(tmp, st->img_buf + start, (size_t)vis);
+    tmp[vis] = 0;
+    draw_clipped(s, fnt, tx, ty, room, tmp, th->text);
+
+    int caret = st->img_len - start;
+    if (caret < 0) caret = 0;
+    if (caret > vis) caret = vis;
+    memcpy(tmp, st->img_buf + start, (size_t)caret);
+    tmp[caret] = 0;
+    float cxp = tx + font_width(fnt, tmp);
+    float caret_h = bh - (float)SP(1);
+    if (caret_h < 4.0f) caret_h = 4.0f;
+    gfx_line(s, cxp, by + (float)SP(1) / 2.0f, cxp,
+             by + (float)SP(1) / 2.0f + caret_h, 1.4f, th->accent);
+}
+
 /* ---- reading the facts back off the disk --------------------------------- */
 
 /* The first line of a small file, newline stripped.
@@ -902,21 +997,46 @@ static int read_scale(float *out) {
     return got;
 }
 
-/* The wallpaper on disk. -2 = no file (the desktop keeps its default, 0),
- * -1 = a name no wallpaper matches, >= 0 = that wallpaper. Cached for one
- * second like the scale; apply_wallpaper() drops the cache. */
+/* The wallpaper on disk: the raw first line, cached for one second like the
+ * scale (apply_*() drops the cache). The line is kept, not just the index,
+ * because the Wallpaper page shows the custom image's file name. */
+static char   wall_line[IMG_PATH_MAX + 8];
+static int    wall_line_ok;
 static time_t wall_read_at;
-static int    wall_read_val = -2;
 
-static int read_wallpaper(void) {
+static int read_wallpaper_line(void) {
     time_t t = time(NULL);
-    if (wall_read_at != 0 && wall_read_at == t) return wall_read_val;
-    char line[128];
-    int v = first_line(MYSTIC_WALLPAPER_FILE, line, sizeof(line))
-            ? wallpaper_from_name(line) : -2;
+    if (wall_read_at != 0 && wall_read_at == t) return wall_line_ok;
+    wall_line_ok = first_line(MYSTIC_WALLPAPER_FILE, wall_line, sizeof(wall_line));
     wall_read_at = t;
-    wall_read_val = v;
-    return v;
+    return wall_line_ok;
+}
+
+/* -2 = no file (the desktop keeps its default, 0), -1 = a line no wallpaper
+ * or image matches, 0..WALLPAPER_COUNT-1 = that wallpaper, WALLPAPER_IMAGE =
+ * a custom picture ("image:<path>"). */
+static int read_wallpaper(void) {
+    if (!read_wallpaper_line()) return -2;
+    return wallpaper_from_name(wall_line);
+}
+
+/* The path of an "image:" line, "" otherwise. wallpaper_from_name() has
+ * already established the tag; this skips it plus any spaces. */
+static void read_wallpaper_image(char *out, size_t n) {
+    out[0] = 0;
+    if (!read_wallpaper_line()) return;
+    if (wallpaper_from_name(wall_line) != WALLPAPER_IMAGE) return;
+    const char *p = wall_line;
+    while (*p == ' ' || *p == '	') p++;
+    p += 6;                                    /* "image:" */
+    while (*p == ' ' || *p == '	') p++;
+    snprintf(out, n, "%s", p);
+}
+
+/* The last path component, for the list. "/" and "" give "". */
+static const char *path_basename(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
 }
 
 /* ---- the display ---------------------------------------------------------- */
@@ -1324,6 +1444,9 @@ static void apply_wallpaper(Settings *s, int i) {
     snprintf(text, sizeof(text), "%s\n", name);
     int err = 0;
     wall_read_at = 0;
+    /* the name replaces any custom picture in this session too: the module
+     * would otherwise keep drawing the picture until the file was re-read */
+    wallpaper_clear_image();
     if (write_text(MYSTIC_WALLPAPER_FILE, text, &err)) {
         snprintf(s->status, sizeof(s->status), "wallpaper: %s", name);
         s->status_err = 0;
@@ -1332,6 +1455,71 @@ static void apply_wallpaper(Settings *s, int i) {
         snprintf(s->status, sizeof(s->status), "not saved: %s", err_txt);
         s->status_err = 1;
     }
+}
+
+/* Apply a custom image: decode it first (wallpaper_set_image returns the
+ * real reason when it cannot), and only then write the setting line. A
+ * refused path leaves both the file and the picture on screen alone. */
+static void apply_wallpaper_image(Settings *s, const char *path) {
+    if (!path[0]) {
+        /* an empty field means "no custom image": a real state, not a typo */
+        apply_wallpaper(s, 0);
+        snprintf(s->status, sizeof(s->status), "%s",
+                 "custom image removed; wallpaper: Dusk");
+        s->status_err = 0;
+        return;
+    }
+
+    char err[192];
+    if (wallpaper_set_image(path, err, sizeof(err)) != 0) {
+        snprintf(s->status, sizeof(s->status), "%s", err);
+        s->status_err = 1;
+        return;                                 /* the field stays open */
+    }
+
+    char text[IMG_PATH_MAX + 16];
+    snprintf(text, sizeof(text), "image:%s\n", path);
+    int werr = 0;
+    wall_read_at = 0;
+    int sw = 0, sh = 0;
+    wallpaper_image_size(&sw, &sh, NULL, NULL);
+    if (write_text(MYSTIC_WALLPAPER_FILE, text, &werr)) {
+        snprintf(s->status, sizeof(s->status), "wallpaper: image %s (%dx%d)",
+                 path_basename(path), sw, sh);
+        s->status_err = 0;
+    } else {
+        snprintf(s->status, sizeof(s->status),
+                 "image applied but not saved: %s", strerror(werr));
+        s->status_err = 1;
+    }
+}
+
+/* Open the inline path field on the Wallpaper page. It starts with the file
+ * that is set, so Enter alone re-applies it and Backspace can edit it. */
+static void img_open(Settings *s) {
+    char path[IMG_PATH_MAX];
+    read_wallpaper_image(path, sizeof(path));
+    snprintf(s->img_buf, sizeof(s->img_buf), "%s", path);
+    s->img_len = (int)strlen(s->img_buf);
+    s->img_stage = 1;
+    s->status[0] = 0;
+    s->status_err = 0;
+}
+
+static void img_cancel(Settings *s) {
+    s->img_stage = 0;
+    s->img_len = 0;
+    s->img_buf[0] = 0;
+    snprintf(s->status, sizeof(s->status), "%s", "path edit cancelled");
+    s->status_err = 0;
+}
+
+static void img_commit(Settings *s) {
+    apply_wallpaper_image(s, s->img_buf);
+    if (s->status_err) return;                  /* refused: let the user fix it */
+    s->img_stage = 0;
+    s->img_len = 0;
+    s->img_buf[0] = 0;
 }
 
 /* ---- the theme list ------------------------------------------------------ */
@@ -2093,6 +2281,19 @@ static int build_page(Settings *st, const Theme *live, PRow *rows, int max) {
             const char *nm = wallpaper_name(i);
             n = page_add(rows, n, max, i, nm ? nm : "?", "", i == cur, NULL);
         }
+        /* the custom image: its value is the file's basename, so the list
+         * says which file is set rather than just "custom" */
+        char val[224];
+        if (dw == WALLPAPER_IMAGE) {
+            char path[IMG_PATH_MAX];
+            read_wallpaper_image(path, sizeof(path));
+            const char *b = path_basename(path);
+            snprintf(val, sizeof(val), "%s", b[0] ? b : "no file");
+        } else {
+            snprintf(val, sizeof(val), "%s", "none - Enter to type a path");
+        }
+        n = page_add(rows, n, max, WALLPAPER_IMAGE, IMG_ROW_LABEL, val,
+                     dw == WALLPAPER_IMAGE, NULL);
         break;
     }
     case TAB_USERS: {
@@ -2173,7 +2374,7 @@ static int tab_rows(Settings *s) {
             return n + DISP_SCALE_COUNT + (di->native >= 0 ? 1 : 0);
         }
         case TAB_THEME: return s->theme_count;
-        case TAB_WALL:  return WALLPAPER_COUNT;
+        case TAB_WALL:  return WALLPAPER_COUNT + 1;
         case TAB_USERS: return s->pw_stage ? 0 : 1;
         default:        return 0;
     }
@@ -2226,11 +2427,26 @@ static void page_facts(Settings *s, const Theme *live,
         if (live && live->name[0]) snprintf(right, rn, "now %s", live->name);
         break;
     case TAB_WALL: {
-        snprintf(left, ln, "%d wallpapers", WALLPAPER_COUNT);
+        snprintf(left, ln, "%d wallpapers + a custom image", WALLPAPER_COUNT);
         int wi = read_wallpaper();
-        if (wi >= 0) snprintf(right, rn, "now %s", wallpaper_name(wi));
-        else if (wi == -2) snprintf(right, rn, "%s", "now default");
-        else snprintf(right, rn, "%s", "now unknown");
+        if (wi == WALLPAPER_IMAGE) {
+            char path[IMG_PATH_MAX];
+            read_wallpaper_image(path, sizeof(path));
+            snprintf(right, rn, "now image %s", path_basename(path));
+        } else if (wi >= 0) {
+            snprintf(right, rn, "now %s", wallpaper_name(wi));
+        } else if (wi == -2) {
+            snprintf(right, rn, "%s", "now default");
+        } else {
+            snprintf(right, rn, "%s", "now unknown");
+        }
+        if (s->img_stage) {
+            /* the field owns the page: the footer says how to leave it, and
+               the right cell is cleared so a long hint is not squeezed */
+            snprintf(left, ln, "%s",
+                     "Enter applies, an empty path removes the image, Ctrl+C cancels");
+            right[0] = 0;
+        }
         break;
     }
     case TAB_USERS: {
@@ -2471,6 +2687,8 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h,
                       st->py < ryt + rh;
             page_row_draw(s, &L, th, &rows[idx], x, y + ryt,
                           selectable, sel, hot);
+            if (st->img_stage && rows[idx].id == WALLPAPER_IMAGE)
+                img_field_draw(st, s, &L, th, x, y + ryt, rh);
         }
     }
 
@@ -2557,6 +2775,7 @@ static void set_tab(Settings *s, int t) {
     if (t >= TAB_COUNT) t = 0;
     if (t == s->tab) return;
     if (s->pw_stage) pw_cancel(s);
+    if (s->img_stage) { s->img_stage = 0; s->img_len = 0; s->img_buf[0] = 0; }
     s->tab = t;
     s->sel = 0;
     s->scroll = 0;
@@ -2601,7 +2820,8 @@ static void activate(Settings *s) {
             apply_theme(s, s->sel);
             break;
         case TAB_WALL:
-            apply_wallpaper(s, s->sel);
+            if (s->sel < WALLPAPER_COUNT) apply_wallpaper(s, s->sel);
+            else img_open(s);
             break;
         case TAB_USERS:
             if (s->pw_stage == 0) pw_start(s);
@@ -2622,6 +2842,7 @@ static void pick_digit(Settings *s, int idx) {
             break;
         case TAB_WALL:
             if (idx < WALLPAPER_COUNT) { s->sel = idx; apply_wallpaper(s, idx); }
+            else if (idx == WALLPAPER_IMAGE) { s->sel = idx; img_open(s); }
             break;
         default:
             break;
@@ -2660,6 +2881,27 @@ static void settings_key(App *a, const char *bytes, int n) {
 
     for (int i = 0; i < n; ) {
         unsigned char c = (unsigned char)bytes[i];
+
+        /* The wallpaper path field owns the keyboard while it is open, the
+         * same way the password prompt does. Esc is consumed by the desktop
+         * before an app sees it, so Ctrl+C cancels here too. */
+        if (s->img_stage) {
+            int el = esc_len(bytes, i, n);
+            if (el) { i += el; continue; }
+            i++;
+            if (c == '\r' || c == '\n') { img_commit(s); continue; }
+            if (c == '\b' || c == 0x7f) {
+                if (s->img_len > 0) s->img_buf[--s->img_len] = 0;
+                continue;
+            }
+            if (c == 3) { img_cancel(s); continue; }
+            if (c == '\t') continue;
+            if (c >= 0x20 && s->img_len < IMG_PATH_MAX - 1) {
+                s->img_buf[s->img_len++] = (char)c;
+                s->img_buf[s->img_len] = 0;
+            }
+            continue;
+        }
 
         /* While a password is being entered every byte is a secret. */
         if (s->pw_stage) {
@@ -2750,6 +2992,10 @@ static void settings_click(App *a, int x, int y, int buttons) {
             return;
         }
     }
+    /* the path field is a modal inside the page: the tabs above still work
+     * (set_tab() cancels the edit), a click anywhere below it does not */
+    if (s->img_stage) return;
+
     /* the password prompt's two buttons */
     if (s->pw_stage) {
         for (int which = 0; which < 2; which++) {
