@@ -67,7 +67,8 @@ void wallpaper_draw(Surface *s, const Theme *th, int index, double seconds);
  *   Positive notches advance the disk. The argument is seconds of disk
  *   time, so each radius keeps its own Keplerian speed and the wheel
  *   shears the material rather than rotating it rigidly. Negative delta
- *   runs it backwards. The accumulation wraps at one hour.
+ *   runs it backwards. The clock is kept in double precision and is
+ *   reduced per radius modulo 2*pi, so there is no wrap point to jump at.
  *
  * wallpaper_blackhole_reset() restores the 82-degree default view and zero
  * spin; wallpaper_blackhole_yaw() returns the current view in radians. */

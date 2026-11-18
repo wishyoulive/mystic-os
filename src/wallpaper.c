@@ -657,18 +657,19 @@ static u32 *wp_scratch(int w, int h, int q, int *ow, int *oh) {
  *    the hole; it is the only cached picture. A soft photon-ring term sits
  *    just outside the critical curve and shimmers slowly.
  *
- *  - Cost: the star field depends on the surface size and nothing else -
- *    not on the theme, the time or the view - so a theme switch, a drag
- *    and every animation frame keep it. The geodesic table and the display
- *    curve are built once. The disk is evaluated only where it can reach:
- *    inside the projected outer ellipse (its direct image) or inside the
- *    rho of the largest impact parameter whose secondary crossing is still
- *    in the disk (7.0 rs, measured from the table, so the gate can never
- *    clip a lit pixel). Above WP_TRACE_MAX pixels the whole frame (sky,
- *    stars, disk, ring) is evaluated at 1/q resolution and scaled up; the
- *    trace still samples every pixel of that layer through the same camera,
- *    and the upscale is one pass over the whole surface, never a pasted
- *    sub-rectangle.
+ *  - Cost: the star field is the only cached picture. It depends on the
+ *    surface size and nothing else - not on the theme, the time or the view
+ *    - so a theme switch, a drag and every animation frame keep it. The
+ *    geodesic table, the display curve and a 128-entry support bound are
+ *    built once: sup[psi] is the largest impact parameter whose crossing at
+ *    that sweep can still be inside the disk, measured from the same table
+ *    with a margin. That keeps the per-frame disk work to the pixels the
+ *    disk can actually reach, and because sup is a strict superset of the
+ *    lit region it cannot clip an arc or leave a seam. Above WP_TRACE_MAX
+ *    pixels the whole frame (sky, stars, disk, ring) is evaluated at 1/q
+ *    resolution and scaled up; the trace still samples every pixel of that
+ *    layer through the same camera, and the upscale is one pass over the
+ *    whole surface, never a pasted sub-rectangle.
  */
 
 #define WP_BH_NB0   160                    /* b samples, BC .. WP_BH_BM  */
@@ -695,7 +696,7 @@ static u32 *wp_scratch(int w, int h, int q, int *ow, int *oh) {
 /* The view and the disk clock. Only the single-threaded compositor touches
  * these, and only through the four functions at the bottom of the section. */
 static float bh_yaw  = WALLPAPER_BH_YAW_DEF;
-static float bh_spin = 0.0f;               /* seconds of disk time       */
+static double bh_spin = 0.0;              /* seconds of disk time       */
 
 static struct {
     int   built;
@@ -859,6 +860,15 @@ static void wp_bh_support(void) {
         }
         bhgeo.sup[i] = bmax + 0.15f;
     }
+    /* one-entry dilation: the table is indexed at 1.4 degree resolution, and
+     * a ray between two entries must use the wider of them so the gate can
+     * never cut the support it is meant to bound */
+    for (int i = 0; i < WP_BH_SUPN; i++) {
+        float m = bhgeo.sup[i];
+        if (i > 0 && bhgeo.sup[i - 1] > m) m = bhgeo.sup[i - 1];
+        if (i < WP_BH_SUPN - 1 && bhgeo.sup[i + 1] > m) m = bhgeo.sup[i + 1];
+        bhgeo.sup[i] = m;
+    }
     bhgeo.sup_built = 1;
 }
 
@@ -980,6 +990,7 @@ static void wp_bh_paint(Surface *s, const Theme *th, double seconds) {
     /* the hole sits a little off centre, which reads better as a desktop */
     const float cx = (float)W * 0.545f, cy = (float)H * 0.470f;
     const float ci = cosf(bh_yaw), si = sinf(bh_yaw);
+    const float ci2 = ci * ci;
 
     if (!bhgeo.built) wp_bh_build();
     if (!bhgeo.sup_built) wp_bh_support();
@@ -988,7 +999,7 @@ static void wp_bh_paint(Surface *s, const Theme *th, double seconds) {
     wp_bh_grain();
 
     const float t = (float)((seconds > 0.0) ? seconds : 0.0);
-    const float tf = t * WP_BH_RATE;
+    const double tf = (double)t * (double)WP_BH_RATE + bh_spin;
     const float lspan = WP_BH_ROUT - WP_BH_RIN;
 
     /* per-radius, per-frame: the Keplerian clock and the two slow shimmer
@@ -996,7 +1007,7 @@ static void wp_bh_paint(Surface *s, const Theme *th, double seconds) {
     float rot[WP_BH_NC], flick[WP_BH_NC], arc[WP_BH_NC];
     for (int i = 0; i < WP_BH_NC; i++) {
         float r = WP_BH_RIN + lspan * (float)i / (float)(WP_BH_NC - 1);
-        rot[i] = fmodf(bhgeo.om[i] * (tf + bh_spin), WP_BH_TAU);
+        rot[i] = fmodf((float)((double)bhgeo.om[i] * tf), WP_BH_TAU);
         flick[i] = 1.0f + 0.045f * sinf(t * 1.55f + r * 1.10f);
         arc[i]   = 1.0f + 0.060f * sinf(t * 1.05f + r * 0.55f + 1.2f);
     }
@@ -1061,11 +1072,11 @@ static void wp_bh_paint(Surface *s, const Theme *th, double seconds) {
                      * and never a hard edge. */
                     if (b <= bhgeo.sup[pi]) {
                         const float az = wp_atan2f(dy, dx * ci);
-                        const int az16 = (int)(az * 10430.378f);
-                        /* the line-of-sight velocity is sin(yaw) cos(azimuth),
-                           exactly; a cosine table saves a sqrt and a divide */
-                        const float bm = si * ((float)bhgeo.sinq[((az16 >> 8) + 64) & 255]
-                                               - 128.0f) * (1.0f / 127.5f);
+                        /* the line-of-sight component of the orbital velocity,
+                           exactly: the pixel's major-axis offset over its
+                           projected radius, times sin(yaw) */
+                        const float qz = sqrtf(dx2 * ci2 + dy2);
+                        const float bm = (qz > 1e-9f) ? (dx * ci * si / qz) : 0.0f;
                         const float tt = wp_bh_bidx(b);
                         const float s0 = psi * ((float)WP_BH_NA / (float)WP_BH_DMAX) - 0.5f;
                         int   j0 = (int)s0;
@@ -1168,20 +1179,28 @@ static u32 *wp_bh_scratch(int w, int h) {
     return buf;
 }
 
-/* Weighted mix of two packed RGB pixels with quarter weights. w3 is 0, 1
- * or 3 (the only weights a q = 2 bilinear tap uses): the result is
- * (a*(4-w3) + b*w3 + 2) / 4, exactly what the general path computes with
- * 64/192 out of 256. The R/B lanes stay 16 bits apart and the largest sum
- * is 1020, so no lane can carry into the next. */
-static inline u32 wp_bh_mix4(u32 a, u32 b, int w3) {
-    if (w3 == 0) return a | 0xFF000000u;
-    u32 rb = ((a & 0x00FF00FFu) * (u32)(4 - w3)
-            + (b & 0x00FF00FFu) * (u32)w3 + 0x00020002u);
-    u32 g  = ((a & 0x0000FF00u) * (u32)(4 - w3)
-            + (b & 0x0000FF00u) * (u32)w3 + 0x00000200u);
-    return 0xFF000000u | (((rb >> 2) & 0xFFu) << 16)
-                       | (((g  >> 10) & 0xFFu) << 8)
-                       |  ((rb >> 18) & 0xFFu);
+/* Weighted mix of two packed RGB pixels with the only weights a q = 2
+ * bilinear tap uses: 1/4 and 3/4. The x3 is a shift and an add, no
+ * multiply, and the row weights are hoisted out of the pixel loop so the
+ * hot loops are branch-free. The R/B lanes stay 16 bits apart and the
+ * largest sum is 1020, so no lane can carry into the next. */
+static inline u32 wp_bh_m1(u32 a, u32 b) {
+    u32 ra = a & 0x00FF00FFu, rb = b & 0x00FF00FFu;
+    u32 ga = a & 0x0000FF00u, gb = b & 0x0000FF00u;
+    u32 srb = ra + (ra << 1) + rb + 0x00020002u;
+    u32 sg  = ga + (ga << 1) + gb + 0x00000200u;
+    return 0xFF000000u | (((srb >> 2) & 0xFFu) << 16)
+                       | (((sg  >> 10) & 0xFFu) << 8)
+                       |  ((srb >> 18) & 0xFFu);
+}
+static inline u32 wp_bh_m3(u32 a, u32 b) {
+    u32 ra = a & 0x00FF00FFu, rb = b & 0x00FF00FFu;
+    u32 ga = a & 0x0000FF00u, gb = b & 0x0000FF00u;
+    u32 srb = rb + (rb << 1) + ra + 0x00020002u;
+    u32 sg  = gb + (gb << 1) + ga + 0x00000200u;
+    return 0xFF000000u | (((srb >> 2) & 0xFFu) << 16)
+                       | (((sg  >> 10) & 0xFFu) << 8)
+                       |  ((srb >> 18) & 0xFFu);
 }
 
 /* q = 2 upscale of the complete trace surface, separable so the vertical
@@ -1197,7 +1216,7 @@ static void wp_upscale2(Surface *dst, const u32 *src, int sw, int sh) {
 
     u32 *vrow = bhgeo.uprow;
     const int maxy = (sh - 1) * 256;
-    const int lasty = (sh > 1) ? sh - 2 : 0;
+    int lasty = (sh > 1) ? sh - 2 : 0;
     const int lastx = (sw > 1) ? sw - 2 : 0;
 
     for (int y = 0; y < dst->h; y++) {
@@ -1211,20 +1230,32 @@ static void wp_upscale2(Surface *dst, const u32 *src, int sw, int sh) {
         const u32 *r0 = src + (size_t)iy * sw;
         const u32 *r1 = src + (size_t)((iy < lasty) ? iy + 1 : iy) * sw;
 
-        if (wv == 0) {
-            memcpy(vrow, r0, (size_t)sw * sizeof(u32));
+        if (wv == 1) {
+            for (int x = 0; x < sw; x++) vrow[x] = wp_bh_m1(r0[x], r1[x]);
+        } else if (wv == 3) {
+            for (int x = 0; x < sw; x++) vrow[x] = wp_bh_m3(r0[x], r1[x]);
         } else {
-            for (int x = 0; x < sw; x++) vrow[x] = wp_bh_mix4(r0[x], r1[x], wv);
+            memcpy(vrow, r0, (size_t)sw * sizeof(u32));
         }
 
         u32 *out = dst->px + (size_t)y * dst->stride;
         out[0] = vrow[0];
-        for (int x = 1; x < dst->w; x++) {
-            int ix = (x - 1) >> 1;
-            int fx = (x & 1) ? 64 : 192;
-            if (ix > lastx) { ix = lastx; fx = 0; }
-            int wh = (fx == 64) ? 1 : (fx == 192) ? 3 : 0;
-            out[x] = wp_bh_mix4(vrow[ix], vrow[ix + 1], wh);
+        if (sw > 1) {
+            int x = 1;
+            for (; x + 1 < dst->w; x += 2) {
+                int ix = (x - 1) >> 1;               /* odd x: 1/4 */
+                int i2 = x >> 1;                     /* even x+1: 3/4 */
+                if (ix > lastx) out[x] = vrow[sw - 1];
+                else            out[x] = wp_bh_m1(vrow[ix], vrow[ix + 1]);
+                if (i2 > lastx) out[x + 1] = vrow[sw - 1];
+                else            out[x + 1] = wp_bh_m3(vrow[i2], vrow[i2 + 1]);
+            }
+            if (x < dst->w) {
+                int ix = (x - 1) >> 1;
+                out[x] = (ix > lastx) ? vrow[sw - 1] : wp_bh_m1(vrow[ix], vrow[ix + 1]);
+            }
+        } else {
+            for (int x = 1; x < dst->w; x++) out[x] = vrow[0];
         }
     }
 }
@@ -1262,11 +1293,10 @@ void wallpaper_blackhole_view(float delta) {
 
 void wallpaper_blackhole_spin(float delta) {
     if (!(delta == delta)) return;
-    bh_spin += delta;
-    /* A wheel is a few seconds of disk time at most; wrap a whole hour so
-     * the float keeps its precision without ever jumping the pattern. */
-    if (bh_spin >= 3600.0f) bh_spin = fmodf(bh_spin, 3600.0f);
-    if (bh_spin < 0.0f)     bh_spin = 3600.0f - fmodf(-bh_spin, 3600.0f);
+    /* A double keeps the clock exact for any realistic amount of wheel
+     * input. The per-radius phase is reduced modulo 2*pi in the paint, so
+     * there is nothing to wrap here and therefore no jump in the pattern. */
+    bh_spin += (double)delta;
 }
 
 void wallpaper_blackhole_reset(void) {
