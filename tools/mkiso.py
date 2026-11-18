@@ -23,7 +23,15 @@ for f in need:
     if not os.path.exists(f):
         sys.exit('missing %s - run ./image.sh first' % f)
 
-open('build/iso/isolinux.cfg', 'w').write(
+cfg = ('DEFAULT mystic
+PROMPT 0
+TIMEOUT 0
+LABEL mystic
+  KERNEL /vmlinuz
+  APPEND rdinit=/init console=ttyS0 loglevel=4
+  INITRD /initramfs.gz
+')
+open('build/iso/isolinux.cfg', 'w').write(cfg)
     'DEFAULT mystic
 PROMPT 0
 TIMEOUT 0
