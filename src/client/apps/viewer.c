@@ -34,7 +34,7 @@
  *  one hint - never a table of debug fields.
  *
  *  Every number on screen comes from stat(2), the file's own header,
- *  or the decoded pixels. The 'i' sheet repeats those facts, and the
+ *  or the decoded pixels. The 'i' sheet lists those facts, and the
  *  hover readout in the image footer is the actual 32-bit pixel from
  *  the decoder.
  * ============================================================ */
@@ -2341,6 +2341,9 @@ static void cap_first(char *s) {
 }
 
 /* The centred sentence for a state that has no content to paint. */
+/* A file this build cannot show gets the type name as its heading, and the
+ * header badge says the same words: the brief asks for both, and a heading
+ * is what gives the sentence under it a subject. */
 static void state_build(VLayout *L, Viewer *v) {
     char head[420];
     char sub[420];
@@ -2458,11 +2461,14 @@ static void foot_build(VLayout *L, Viewer *v) {
         snprintf(L->foot_right, sizeof(L->foot_right), "0 bytes");
         break;
     case DOC_MISSING:
-        snprintf(L->foot_left, sizeof(L->foot_left), "q · close");
         if (v->have_st) {
+            /* the file is there but unreadable: its facts still exist */
             char sz[48];
             fmt_size(sz, sizeof(sz), (unsigned long long)v->st.st_size);
+            snprintf(L->foot_left, sizeof(L->foot_left), "i · file details");
             snprintf(L->foot_right, sizeof(L->foot_right), "%s", sz);
+        } else {
+            snprintf(L->foot_left, sizeof(L->foot_left), "q · close");
         }
         break;
     default:                       /* DOC_NONE */
@@ -2708,9 +2714,17 @@ static void layout_build(VLayout *L, Viewer *v, int w, int h) {
         if (ih > h - 2 * L->gap) ih = h - 2 * L->gap;
         if (ih < 1) ih = 1;
         vis = (ih - 2 * pad - th - 2 * L->gap) / L->row_h;
-        if (vis < 1) vis = 1;
+        if (vis < 1) {
+            /* a window too short for even one row at the outer inset:
+             * tighten the sheet's own padding before giving up on rows */
+            pad = L->gap;
+            ih = 2 * pad + th + 2 * L->gap + L->nrow * L->row_h;
+            if (ih > h - 2 * L->gap) ih = h - 2 * L->gap;
+            if (ih < 1) ih = 1;
+            vis = (ih - 2 * pad - th - 2 * L->gap) / L->row_h;
+        }
+        if (vis < 0) vis = 0;
         if (vis > L->nrow) vis = L->nrow;
-        if (vis < 1) vis = 1;
 
         L->info = (VRect){ (w - iw) / 2, (h - ih) / 2, iw, ih };
         L->info_title_y = L->info.y + pad + vtop(L->f.title, th);

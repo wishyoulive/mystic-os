@@ -71,6 +71,9 @@ static void icon_grid(Surface*,float,float,float,u32);
 static void icon_bars(Surface*,float,float,float,u32);
 static void icon_pencil(Surface*,float,float,float,u32);
 static void icon_web(Surface*,float,float,float,u32);
+static void icon_viewer(Surface*,float,float,float,u32);
+static void icon_docview(Surface*,float,float,float,u32);
+static void icon_player(Surface*,float,float,float,u32);
 static void icon_2048(Surface*,float,float,float,u32);
 static void icon_sysinfo(Surface*,float,float,float,u32);
 typedef void (*IconFn)(Surface *, float, float, float, u32);
@@ -84,6 +87,9 @@ static IconFn icon_for_bundle(const char *id) {
     if (!strcmp(id, "paint"))      return icon_paint;
     if (!strcmp(id, "sysmon"))     return icon_sysmon;
     if (!strcmp(id, "web"))        return icon_web;
+    if (!strcmp(id, "viewer"))     return icon_viewer;
+    if (!strcmp(id, "docview"))    return icon_docview;
+    if (!strcmp(id, "vlcplayer"))  return icon_player;
     if (!strcmp(id, "sysinfo"))    return icon_sysinfo;
     if (!strcmp(id, "settings"))   return icon_gear;
     if (!strcmp(id, "monitor"))    return icon_bars;
@@ -305,6 +311,37 @@ static void icon_grid(Surface *s, float x, float y, float sz, u32 fg) {
     for (int r = 0; r < 2; r++)
         for (int c = 0; c < 2; c++)
             gfx_rrect(s, ox + c * (q + gap), oy + r * (q + gap), q, q, q * 0.22f, fg);
+}
+
+/* A page with a picture on it: the Viewer opens images and text. */
+static void icon_viewer(Surface *s, float x, float y, float sz, u32 fg) {
+    gfx_rrect_aa(s, x + sz * 0.16f, y + sz * 0.10f, sz * 0.68f, sz * 0.80f, sz * 0.08f,
+                 0, fg, sz * 0.055f);
+    gfx_rrect(s, x + sz * 0.26f, y + sz * 0.20f, sz * 0.48f, sz * 0.34f, sz * 0.04f, fg);
+    gfx_rrect(s, x + sz * 0.26f, y + sz * 0.62f, sz * 0.48f, sz * 0.06f, sz * 0.02f, fg);
+    gfx_rrect(s, x + sz * 0.26f, y + sz * 0.72f, sz * 0.32f, sz * 0.06f, sz * 0.02f, fg);
+}
+
+/* A document with a folded corner: the Documents app. */
+static void icon_docview(Surface *s, float x, float y, float sz, u32 fg) {
+    gfx_rrect_aa(s, x + sz * 0.18f, y + sz * 0.10f, sz * 0.60f, sz * 0.80f, sz * 0.07f,
+                 0, fg, sz * 0.055f);
+    /* the fold: a line across the top-right corner */
+    gfx_line(s, x + sz * 0.56f, y + sz * 0.10f, x + sz * 0.78f, y + sz * 0.32f,
+             sz * 0.055f, fg);
+    for (int i = 0; i < 3; i++)
+        gfx_rrect(s, x + sz * 0.28f, y + sz * (0.50f + (float)i * 0.12f),
+                  sz * (0.36f - (float)i * 0.06f), sz * 0.05f, sz * 0.02f, fg);
+}
+
+/* A play triangle in a disc: the video player. */
+static void icon_player(Surface *s, float x, float y, float sz, u32 fg) {
+    float cx = x + sz * 0.5f, cy = y + sz * 0.5f, r = sz * 0.34f;
+    gfx_rrect_aa(s, cx - r, cy - r, r * 2, r * 2, r, 0, fg, sz * 0.06f);
+    float tri[6] = { cx - r * 0.28f, cy - r * 0.44f,
+                     cx + r * 0.46f, cy,
+                     cx - r * 0.28f, cy + r * 0.44f };
+    gfx_polygon(s, tri, 3, fg);
 }
 
 static void icon_web(Surface *s, float x, float y, float sz, u32 fg) {
