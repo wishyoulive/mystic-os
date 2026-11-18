@@ -1662,6 +1662,13 @@ static const char kDefaultCss[] =
 "b, strong { font-weight: bold; }\n"
 "i, em, cite, var, dfn, address { font-style: italic; }\n"
 "th { font-weight: bold; text-align: center; }\n"
+/* Tables. A cell is a real block box in the renderer, so its padding
+ * is the distance between the column's edge and its text, and its
+ * background/border are painted by the same code as any other block.
+ * These are UA rules: an author sheet that sets `td { padding: 0 }`
+ * wins, because the cascade is the same one every other rule uses. */
+"table { margin-top: 10px; margin-bottom: 10px; }\n"
+"td, th { padding: 2px 6px; }\n"
 "caption { text-align: center; }\n"
 "center { text-align: center; }\n"
 "nobr { white-space: nowrap; }\n"

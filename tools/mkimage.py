@@ -64,6 +64,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--base', action='append', default=[], help='base rootfs tarball(s)')
     ap.add_argument('--stage', default=None, help='directory overlaid on top')
+    ap.add_argument('--modules-kver', default=None,
+                    help='pack only lib/modules/<kver>; the other kernel variant in stage/ is skipped')
+    ap.add_argument('--gzip-level', type=int, default=9,
+                    help='cpio.gz compression level (9 = smallest, 1 = fastest)')
     ap.add_argument('-o', '--output', required=True)
     args = ap.parse_args()
 
@@ -92,15 +96,49 @@ def main():
                     add(name, S_IFREG | (m.mode & 0o7777), int(m.mtime), data=tf.extractfile(m).read())
 
     # ---- stage overlay -------------------------------------------------
+    # stage/lib/modules holds one directory per kernel variant (6.18.63-0-virt
+    # from linux-virt, 6.18.63-0-lts from linux-lts). Packing both would add
+    # ~30 MB to an image that can only ever use one of them, so --modules-kver
+    # keeps the one the boot kernel will ask for and reports the rest.
+    def kver_of(rel):
+        parts = rel.split('/')
+        if len(parts) >= 3 and parts[0] == 'lib' and parts[1] == 'modules':
+            return parts[2]
+        return None
+
+    mod_files = mod_bytes = 0
+    skipped_files = skipped_bytes = 0
+    skipped_kvers = set()
+
     if args.stage:
         for root, dirs, files in os.walk(args.stage):
-            for d in dirs:
+            for d in list(dirs):
                 full = os.path.join(root, d)
                 rel = os.path.relpath(full, args.stage).replace(os.sep, '/')
+                k = kver_of(rel)
+                if args.modules_kver and k and k != args.modules_kver:
+                    dirs.remove(d)          # do not descend into the other kernel
+                    skipped_kvers.add(k)
+                    # count what was left out, so the report says how much
+                    for r2, _d2, f2 in os.walk(full):
+                        for f2n in f2:
+                            skipped_files += 1
+                            skipped_bytes += os.path.getsize(os.path.join(r2, f2n))
+                    continue
                 add(rel, S_IFDIR | 0o755, int(os.path.getmtime(full)))
             for f in files:
                 full = os.path.join(root, f)
                 rel = os.path.relpath(full, args.stage).replace(os.sep, '/')
+                k = kver_of(rel)
+                sz = os.path.getsize(full)
+                if args.modules_kver and k and k != args.modules_kver:
+                    skipped_files += 1
+                    skipped_bytes += sz
+                    skipped_kvers.add(k)
+                    continue
+                if k:
+                    mod_files += 1
+                    mod_bytes += sz
                 st = os.stat(full)
                 # Windows has no executable bit, so decide by path:
                 # anything that lives where a program lives is 0755.
@@ -143,14 +181,19 @@ def main():
     w.trailer()
 
     payload = raw.getvalue()
-    with gzip.open(args.output, 'wb', compresslevel=9) as f:
+    with gzip.open(args.output, 'wb', compresslevel=args.gzip_level) as f:
         f.write(payload)
 
     n_files = sum(1 for m in entries.values() if (m[0] & 0o170000) == S_IFREG)
     n_links = sum(1 for m in entries.values() if (m[0] & 0o170000) == S_IFLNK)
     print('entries: %d files, %d symlinks, %d dirs' % (n_files, n_links, len(entries) - n_files - n_links))
+    if mod_files:
+        print('modules: %d files, %.1f MB for %s' % (mod_files, mod_bytes / 1e6, args.modules_kver))
+    if skipped_files or skipped_kvers:
+        print('modules: skipped %d files, %.1f MB from %s (not this kernel)'
+              % (skipped_files, skipped_bytes / 1e6, ', '.join(sorted(skipped_kvers))))
     print('cpio:    %.1f MB raw' % (len(payload) / 1e6))
-    print('output:  %s  %.1f MB' % (args.output, os.path.getsize(args.output) / 1e6))
+    print('output:  %s  %.1f MB (gzip -%d)' % (args.output, os.path.getsize(args.output) / 1e6, args.gzip_level))
 
 
 if __name__ == '__main__':

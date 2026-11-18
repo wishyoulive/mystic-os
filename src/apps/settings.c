@@ -112,6 +112,20 @@
  *                  That is why the desktop shows the image within a
  *                  second of Enter, and immediately at boot.
  *
+ *                  "Choose image..." (the row under Custom image) uses
+ *                  the desktop's real file dialog instead of typing:
+ *                  it writes /run/mystic/filepick.request in open mode
+ *                  with filter=png,jpg (src/filepick.h owns the
+ *                  protocol) and the desktop draws its modal picker.
+ *                  The answer is read here, in settings_draw(), from
+ *                  filepick.result: a chosen path goes through the same
+ *                  apply_wallpaper_image() as the typed one - decoded
+ *                  and refused with the real reason, or written as
+ *                  "image:<path>" - and "cancel" is reported as
+ *                  "file picker cancelled" with the wallpaper untouched.
+ *                  The token in the request is compared exactly, so an
+ *                  answer left from an older dialog is never applied.
+ *
  *      Users       changes the lock-screen password.  It asks for the
  *                  current one and then twice for the new one, checks
  *                  the current one with mystic_check_password() -
@@ -190,6 +204,7 @@
  *      click Cancel/Submit in the password prompt
  *  ============================================================ */
 #include "mystic.h"
+#include "filepick.h"   /* the desktop's open dialog, protocol + state */
 #include "wallpaper.h"
 
 #include <arpa/inet.h>
@@ -387,6 +402,11 @@ static const float  SIZE_VALUE[SIZE_COUNT] = { 0.8f, 1.0f, 1.2f, 1.4f, 1.6f };
 /* The image row's label. One definition, because the row builder, the row
  * painter and the inline field all have to agree on which row is the path. */
 #define IMG_ROW_LABEL "Custom image"
+/* The row under it, which opens the desktop's file dialog. WALLPAPER_IMAGE
+ * is already the Custom image row's id (it is WALLPAPER_COUNT), so this is
+ * the one id after the wallpapers and that row. */
+#define PICK_ROW      (WALLPAPER_IMAGE + 1)
+#define PICK_ROW_LABEL "Choose image"
 
 enum { TAB_TEXT, TAB_DISP, TAB_THEME, TAB_WALL, TAB_USERS, TAB_NET,
        TAB_STORAGE, TAB_SYSTEM, TAB_COUNT };
@@ -444,6 +464,10 @@ typedef struct {
     int      img_stage;
     int      img_len;
     char     img_buf[IMG_PATH_MAX];
+
+    /* The open dialog: the token of the request we are waiting on ("" =
+     * none). The desktop owns the dialog; this is only the exchange. */
+    char     pick_token[FILEPICK_TOKEN_MAX + 1];
 } Settings;
 
 /* ============================================================
@@ -1522,6 +1546,66 @@ static void img_commit(Settings *s) {
     s->img_buf[0] = 0;
 }
 
+/* ---- "Choose image...": the desktop's open dialog ------------------------
+ *
+ * The dialog is not drawn here. This writes the request file the desktop
+ * watches (src/filepick.h has the exact protocol) and reads the answer on
+ * the next frame. The token is compared exactly there, so an answer to an
+ * older question can never be applied to this one.
+ */
+static void pick_image_start(Settings *s) {
+    char start[IMG_PATH_MAX];
+    char req[FILEPICK_PATH_MAX], res[FILEPICK_PATH_MAX], err[192];
+
+    /* Start where the picture that is set lives; if none is set, at the
+     * real /root. A start that does not exist is handled by the dialog
+     * (it climbs to the nearest ancestor and says why), not guessed here. */
+    read_wallpaper_image(start, sizeof(start));
+    if (start[0]) {
+        char *slash = strrchr(start, '/');
+        if (slash == start) start[1] = 0;
+        else if (slash) *slash = 0;
+    }
+    if (!start[0]) snprintf(start, sizeof(start), "%s", "/root");
+
+    filepick_paths(req, sizeof(req), res, sizeof(res));
+    if (filepick_request(req, FILEPICK_OPEN, "png,jpg", start, NULL,
+                         s->pick_token, sizeof(s->pick_token),
+                         err, sizeof(err)) != 0) {
+        s->pick_token[0] = 0;
+        snprintf(s->status, sizeof(s->status), "file picker: %s", err);
+        s->status_err = 1;
+        return;
+    }
+    snprintf(s->status, sizeof(s->status),
+             "file picker: choose a picture (png, jpg)");
+    s->status_err = 0;
+}
+
+/* Collect the answer, once. Called at the top of every draw; it costs one
+ * empty token until a request has been made. */
+static void pick_image_poll(Settings *s) {
+    if (!s->pick_token[0]) return;
+    char req[FILEPICK_PATH_MAX], res[FILEPICK_PATH_MAX];
+    char path[FILEPICK_PATH_MAX];
+    filepick_paths(req, sizeof(req), res, sizeof(res));
+
+    FpEvent ev = filepick_result_take(res, s->pick_token, path, sizeof(path));
+    if (ev == FILEPICK_NONE) return;              /* still open, or not ours */
+    remove(res);                                  /* read once */
+    s->pick_token[0] = 0;
+
+    if (ev == FILEPICK_CANCEL) {
+        snprintf(s->status, sizeof(s->status), "%s", "file picker cancelled");
+        s->status_err = 0;
+        return;
+    }
+    /* the chosen file goes through the same decode-and-refuse path a typed
+     * one does: no second implementation, no invented success */
+    apply_wallpaper_image(s, path);
+    s->sel = WALLPAPER_COUNT;                     /* the Custom image row */
+}
+
 /* ---- the theme list ------------------------------------------------------ */
 
 static int cmp_names(const void *a, const void *b) {
@@ -2294,6 +2378,10 @@ static int build_page(Settings *st, const Theme *live, PRow *rows, int max) {
         }
         n = page_add(rows, n, max, WALLPAPER_IMAGE, IMG_ROW_LABEL, val,
                      dw == WALLPAPER_IMAGE, NULL);
+        /* the real chooser: the desktop's open dialog, filtered to the two
+         * formats src/img.c decodes for a wallpaper */
+        n = page_add(rows, n, max, PICK_ROW, PICK_ROW_LABEL,
+                     "open the picker (png, jpg)", 0, NULL);
         break;
     }
     case TAB_USERS: {
@@ -2374,7 +2462,7 @@ static int tab_rows(Settings *s) {
             return n + DISP_SCALE_COUNT + (di->native >= 0 ? 1 : 0);
         }
         case TAB_THEME: return s->theme_count;
-        case TAB_WALL:  return WALLPAPER_COUNT + 1;
+        case TAB_WALL:  return WALLPAPER_COUNT + 2;   /* + Custom image + Choose image */
         case TAB_USERS: return s->pw_stage ? 0 : 1;
         default:        return 0;
     }
@@ -2617,6 +2705,11 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h,
     st->h = h;
     if (st->tab < 0 || st->tab >= TAB_COUNT) st->tab = TAB_TEXT;
 
+    /* the dialog's answer, on the frame the desktop closed it: a chosen
+     * file is decoded and becomes the wallpaper here, "cancel" changes
+     * nothing. One empty token in the steady state. */
+    pick_image_poll(st);
+
     Surface clip = rect_clip(s, x, y, w, h);
     s = &clip;
 
@@ -2821,7 +2914,8 @@ static void activate(Settings *s) {
             break;
         case TAB_WALL:
             if (s->sel < WALLPAPER_COUNT) apply_wallpaper(s, s->sel);
-            else img_open(s);
+            else if (s->sel == WALLPAPER_IMAGE) img_open(s);
+            else pick_image_start(s);
             break;
         case TAB_USERS:
             if (s->pw_stage == 0) pw_start(s);
