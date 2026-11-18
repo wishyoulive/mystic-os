@@ -14,7 +14,7 @@
  *        2    Waves       yes   - layered sine bands drifting sideways
  *        3    Orbits      yes   - rings and discs orbiting the centre
  *        4    Black Hole  yes   - traced Schwarzschild lens + disk,
- *                                Keplerian animation, draggable view
+ *                                Keplerian rotation, drag/wheel view
  *        5    Nebula      no    - warped fbm clouds, core and stars
  * ============================================================ */
 #ifndef MYSTIC_WALLPAPER_H
@@ -38,46 +38,48 @@ int wallpaper_from_name(const char *name);
  * redrawing), 0 when it is static (paint once and idle). */
 int wallpaper_animated(int index);
 
-/* ---- the Black Hole's two knobs ----------------------------------
- *
- * These steer wallpaper 4 ("Black Hole") and nothing else. They may be
- * called while another wallpaper is showing - the state is simply kept
- * for the next time Black Hole is selected, and reset() puts it back to
- * the default view. The calls the desktop should make:
- *
- *   on drag:   wallpaper_blackhole_spin(input.mouse_dx * 0.010f);
- *              wallpaper_blackhole_view(input.mouse_dy * -0.006f);
- *   on wheel:  wallpaper_blackhole_view(input.wheel * 0.05f);
- *
- * `view` adds a yaw offset in radians, measured from the disk axis:
- * 0 is face on, PI/2 is exactly edge on. It is clamped to
- * [WALLPAPER_BH_TILT_MIN, WALLPAPER_BH_TILT_MAX]; the default is 82
- * degrees. The projected disk is an ellipse with aspect cos(yaw), and
- * the lensed arcs and the Doppler term follow the same angle, so the
- * disk really foreshortens rather than being scaled. Dragging up closes
- * the disk towards edge-on, dragging down opens it towards face-on.
- *
- * `spin` adds a phase offset in radians to the disk's own rotation and
- * wraps to one turn, so a horizontal drag pushes the pattern forwards or
- * backwards by hand. The animation keeps running on its own: `seconds`
- * drives the Keplerian rotation of the disk, with the inner rings faster
- * than the outer ones, plus the photon-ring and lensed-arc shimmer.
- *
- * `tilt` returns the current yaw in radians, for a slider or a HUD.
- */
-#define WALLPAPER_BH_TILT_MIN  0.14f    /* ~8 deg, nearly face on  */
-#define WALLPAPER_BH_TILT_MAX  1.5533f  /* ~89 deg, edge on        */
-#define WALLPAPER_BH_TILT_DEF  1.4312f  /* ~82 deg, the default    */
-
-void  wallpaper_blackhole_view(float delta);
-void  wallpaper_blackhole_spin(float delta);
-void  wallpaper_blackhole_reset(void);
-float wallpaper_blackhole_tilt(void);
-
 /* Paint the whole of `s`. `seconds` only matters for animated
  * wallpapers; pass 0.0 when you have no clock. An out-of-range index
  * is clamped to the first wallpaper, so the screen is never left
  * unpainted. Never draws outside s->w x s->h. */
 void wallpaper_draw(Surface *s, const Theme *th, int index, double seconds);
+
+/* ---------------------- Black Hole: view and spin ----------------------
+ * The black hole is the only wallpaper with a view. These two knobs are
+ * state changes only - they do not repaint anything - so the desktop can
+ * call them from its input path and let the next wallpaper_draw() pick the
+ * new state up. Calling them while another wallpaper is selected is
+ * harmless: the state is remembered and used when index 4 is drawn.
+ *
+ * DRAG (yaw):
+ *     wallpaper_blackhole_view(input.mouse_dy * WALLPAPER_BH_YAW_PER_PX);
+ *   Positive dy (pointer moving down) tilts toward edge-on; dragging up
+ *   opens the disk toward face-on. One pixel is WALLPAPER_BH_YAW_PER_PX
+ *   radians, so a 300 px drag covers the whole range. If your drag axis is
+ *   horizontal, pass dx instead - the function only takes the delta.
+ *   The view is clamped to [WALLPAPER_BH_YAW_MIN, WALLPAPER_BH_YAW_MAX];
+ *   the default is WALLPAPER_BH_YAW_DEF. The disk is really projected at
+ *   cos(yaw) on its minor axis, so this is a change of camera, not a
+ *   scale of a circle.
+ *
+ * WHEEL (spin):
+ *     wallpaper_blackhole_spin(input.wheel * WALLPAPER_BH_SPIN_PER_NOTCH);
+ *   Positive notches advance the disk. The argument is seconds of disk
+ *   time, so each radius keeps its own Keplerian speed and the wheel
+ *   shears the material rather than rotating it rigidly. Negative delta
+ *   runs it backwards. The accumulation wraps at one hour.
+ *
+ * wallpaper_blackhole_reset() restores the 82-degree default view and zero
+ * spin; wallpaper_blackhole_yaw() returns the current view in radians. */
+#define WALLPAPER_BH_YAW_DEF        1.43116999f  /* 82 deg, near edge-on   */
+#define WALLPAPER_BH_YAW_MIN        0.17453293f  /* 10 deg, near face-on   */
+#define WALLPAPER_BH_YAW_MAX        1.53588974f  /* 88 deg, thin edge-on   */
+#define WALLPAPER_BH_YAW_PER_PX     0.0045f      /* rad per pixel dragged  */
+#define WALLPAPER_BH_SPIN_PER_NOTCH 0.35f        /* s of disk time / notch */
+
+void wallpaper_blackhole_view(float delta_radians);
+void wallpaper_blackhole_spin(float delta_seconds);
+void wallpaper_blackhole_reset(void);
+float wallpaper_blackhole_yaw(void);
 
 #endif /* MYSTIC_WALLPAPER_H */

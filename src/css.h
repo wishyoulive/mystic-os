@@ -49,7 +49,13 @@
  *              font-weight, font-style, text-decoration, text-align,
  *              margin-top, margin-bottom, padding-top, padding-bottom,
  *              border-top, border-bottom (and the -width/-style/-color
- *              longhands), list-style-type, white-space.
+ *              longhands), width, max-width, line-height,
+ *              list-style-type, white-space.
+ *
+ *              width/max-width take px or %; line-height takes px, a
+ *              unitless multiplier or a percentage. The renderer treats
+ *              every CSS px as a design pixel and scales it with the
+ *              desktop's text scale, the same way it treats margins.
  *
  *  At-rules:   @media, @import, @charset, @font-face, @supports and any
  *              other @... are skipped as a unit, including a balanced
@@ -132,7 +138,10 @@ enum {
     CSS_SET_LIST_STYLE      = 1u << 17,
     CSS_SET_WHITE_SPACE     = 1u << 18,
     CSS_SET_MONO            = 1u << 19,
-    CSS_SET_INDENT          = 1u << 20
+    CSS_SET_INDENT          = 1u << 20,
+    CSS_SET_WIDTH           = 1u << 21,
+    CSS_SET_MAX_WIDTH       = 1u << 22,
+    CSS_SET_LINE_HEIGHT     = 1u << 23
 };
 
 /* text-align */
@@ -213,6 +222,18 @@ enum {
  *  width > 0. A border whose colour was never written takes the text
  *  colour (CSS currentColor), filled in by css_for().
  *
+ *  width and max_width are px; 0 means auto / no limit. A percentage
+ *  is kept in width_pct / max_width_pct instead, because it can only be
+ *  resolved against the column the renderer finally has. A width or a
+ *  max-width that applies is a constrained column and the renderer
+ *  centres it in the available width, which is what makes a page with
+ *  `max-width: 960px` read like a page and not like a stretched line.
+ *
+ *  line_height is the resolved line box in px; 0 means "the face's own
+ *  height". line_height_pct is the parsed multiplier in percent (150
+ *  for 1.5) and is resolved against font_size by css_for(). line-height
+ *  inherits, width and max-width do not.
+ *
  *  font_size is px. indentation accumulates through nesting.
  * ------------------------------------------------------------ */
 typedef struct {
@@ -236,6 +257,11 @@ typedef struct {
 
     int border_top_w, border_top_style;
     int border_bottom_w, border_bottom_style;
+
+    int width, width_pct;             /* px; 0 = auto; pct 0..1000 */
+    int max_width, max_width_pct;     /* px; 0 = none; pct 0..1000 */
+    int line_height;                  /* resolved px; 0 = face height */
+    int line_height_pct;              /* 0 = unset; 150 = 1.5 */
 
     int monospace;            /* pre/code/kbd/samp/tt or CSS_ATTR_MONO */
     int indent;               /* px of horizontal indent at this block  */

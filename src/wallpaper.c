@@ -608,9 +608,9 @@ static u32 *wp_scratch(int w, int h, int q, int *ow, int *oh) {
 }
 
 /* ------------------------------------------------------------ 4. Black Hole
- * A Schwarzschild black hole seen nearly edge-on, with a thin accretion
- * disk traced through its own gravitational field. This is the one
- * wallpaper that is computed rather than painted:
+ * A Schwarzschild black hole at an adjustable inclination, with a thin
+ * accretion disk traced through its own gravitational field. This is the
+ * one wallpaper whose moving parts are computed rather than painted.
  *
  *  - A photon passing the hole at impact parameter b obeys
  *
@@ -623,56 +623,49 @@ static u32 *wp_scratch(int w, int h, int q, int *ow, int *oh) {
  *    run into the horizon) and the total sweep to escape (which is what
  *    lenses the star field).
  *
- *  - Geometry: a pixel at sky offset (X, Y) fixes the photon's orbital
- *    plane; its line of nodes with the disk plane gives the angle psi0 at
- *    which the ray starts, and therefore the ray crosses the disk plane at
- *    sweep psi0, psi0 + pi and psi0 + 2pi. Each crossing is one table
- *    lookup: the direct image (the near side of the disk, including the
- *    part that passes in front of the shadow), the lensed image of the far
- *    side that arcs over and under the shadow, and the photon ring.
+ *  - Geometry: the screen x axis is the line of nodes, so a disk radius r
+ *    appears at screen (r cos(theta), cos(yaw) r sin(theta)): the minor axis
+ *    is really foreshortened by cos(yaw), and the Doppler lever arm is
+ *    sin(yaw) cos(theta). yaw is the angle between the line of sight and the
+ *    disk axis: 82 degrees by default (nearly edge-on), 10 degrees opens it
+ *    into a broad annulus, 88 degrees closes it to a thin line. Pixels that
+ *    are outside the projected disk can still hold a lensed image of its far
+ *    side, so the disk is evaluated over the whole frame from one camera -
+ *    there is no clipped rectangle and therefore no rectangular seam.
  *
- *    The disk itself is an ellipse on screen with aspect cos(yaw), where
- *    yaw is the angle between the line of sight and the disk axis, so an
- *    inclined view really foreshortens: at yaw -> 0 the disk opens into a
- *    full annulus, at yaw -> pi/2 it collapses to a line. The same yaw
- *    drives the Doppler term sin(yaw) * cos(azimuth).
+ *  - Animation: the pattern is advected by the local Keplerian angular
+ *    velocity omega(r) = sqrt(0.5/r^3) times WP_BH_RATE, so the inner rings
+ *    visibly outrun the rim. That differential rotation is what makes the
+ *    disk read as orbiting matter instead of a spinning picture. The
+ *    photon ring and the lensed (secondary) image carry a few percent of
+ *    slow shimmer. Everything is a function of `seconds`, which is why
+ *    wallpaper_animated(4) is 1.
  *
- *  - Animation: the disk is emissive, and its pattern is advected by the
- *    local Keplerian angular velocity omega(r) = sqrt(0.5/r^3), scaled by
- *    WP_BH_RATE. The inner rings therefore visibly outrun the rim - the
- *    differential rotation is what makes it read as orbiting matter and not
- *    as a rotating picture. The photon ring and the secondary (lensed)
- *    image carry a smaller, slower shimmer. All of it is a function of the
- *    `seconds` argument, which is why wallpaper_animated(4) is 1.
- *
- *  - Interaction: wallpaper_blackhole_view() and _spin() below are the two
- *    knobs the desktop can drive from input; see wallpaper.h for the exact
- *    drag and wheel mapping. The view is a real change of projection, not
- *    a scale.
+ *  - Interaction: wallpaper_blackhole_view() and _spin() at the bottom of
+ *    this section are the two knobs the desktop drives from input; the
+ *    exact drag/wheel mapping is documented in wallpaper.h.
  *
  *  - Relativistic beaming: a circular orbit at r moves at
  *    beta = sqrt(0.5/(r-1)), its line-of-sight component is
- *    cos(azimuth) * sin(yaw), and the observed flux is scaled by delta^3
- *    with delta = sqrt(1-1/r) / (1 - beta_los) (gravitational redshift and
- *    Doppler together). The factor is clamped to 9x so the receding side
- *    stays visible instead of going black.
+ *    sin(yaw) cos(theta), and the observed flux is scaled by delta^3 with
+ *    delta = sqrt(1-1/r) / (1 - beta_los) (gravitational redshift and
+ *    Doppler together). The factor is clamped so the receding side stays
+ *    visible instead of going black.
  *
- *  - The shadow (b < 3*sqrt(3)/2) has no background: no stars, no ring on
- *    the far side. Background stars are sampled at the deflected sky
- *    position, so they bunch into arcs at the critical curve, and a soft
- *    photon-ring term sits just outside it.
+ *  - The shadow (b < 3*sqrt(3)/2) is black: no disk, no stars. Background
+ *    stars are sampled at the deflected sky position, so they bunch into
+ *    arcs at the critical curve, and a soft photon-ring term sits just
+ *    outside it. The strongly magnified band is tapered so a star there
+ *    reads as a short arc, not a radial scratch.
  *
- *  - Cost: the sky - gradient, lensed stars, grain, the shadow - does not
- *    depend on time or on the view, so it is rasterised once per size and
- *    sky colour: a full-resolution copy (the desktop blits it and then
- *    draws the moving part over it) plus a trace-resolution copy stored as
- *    10:10:10 before the tone curve so the disk can add light to it. Per
- *    frame only the disk ellipse and the photon-ring circle are recomputed,
- *    and only those rows are upscaled from the 1/q trace. See wp_bh_draw().
- *
- *  The cached geodesic table is a pure function of constants (no theme, no
- *  time, no resolution), so the picture stays a pure function of its
- *  arguments.
+ *  - Cost: the lensed star field is the only cached picture. It depends on
+ *    the surface size and nothing else - not on the theme, the time or the
+ *    view - so a theme switch, a drag and every animation frame keep it.
+ *    The geodesic table and the display curve are built once. Above
+ *    WP_TRACE_MAX pixels the whole frame (sky, stars, disk, ring) is
+ *    evaluated at 1/q resolution and scaled up; the trace still samples
+ *    every pixel of that layer through the same camera, and the upscale is
+ *    one bilinear pass over the whole surface, never a pasted sub-rectangle.
  */
 
 #define WP_BH_NB0   160                    /* b samples, BC .. WP_BH_BM  */
@@ -691,15 +684,14 @@ static u32 *wp_scratch(int w, int h, int q, int *ow, int *oh) {
 #define WP_BH_K1    ((float)WP_BH_NB1 / (WP_BH_BMAX - WP_BH_BM))
 #define WP_BH_NS    (WP_BH_NA / 3)         /* samples per pi of sweep    */
 #define WP_BH_NC    160                    /* disk palette entries       */
-#define WP_BH_RATE  2.2f                   /* Keplerian phase per second */
-#define WP_BH_RMAX  1.25f                  /* photon ring outer cut, x BC*/
-#define WP_BH_SPAN  (WP_BH_RMAX / WP_BH_DSC) /* ring radius in S units   */
+#define WP_BH_RATE  1.8f                   /* Keplerian phase per second */
+#define WP_BH_RMAX  1.30f                  /* photon ring outer cut, x BC*/
+#define WP_BH_TAU   6.28318530718f
 
-/* The view and the disk phase, driven by the desktop through the two
- * functions at the bottom of this section. Single-threaded compositor, so
- * plain floats are enough. */
-static float bh_yaw  = WALLPAPER_BH_TILT_DEF;
-static float bh_spin = 0.0f;
+/* The view and the disk clock. Only the single-threaded compositor touches
+ * these, and only through the four functions at the bottom of the section. */
+static float bh_yaw  = WALLPAPER_BH_YAW_DEF;
+static float bh_spin = 0.0f;               /* seconds of disk time       */
 
 static struct {
     int   built;
@@ -707,13 +699,28 @@ static struct {
     unsigned short r[WP_BH_NB][WP_BH_NA];  /* crossing radius * 64       */
     int   sinq[256];
     u8    tone[1024];                      /* display curve, 0..1023     */
+    u32   hot;                             /* palette's hottest colour   */
 
-    /* still sky, keyed by size and the two sky colours */
-    int   cw, ch, cq;                      /* trace size and 1/q         */
-    u32   key_top, key_bot;
-    u32  *bg;                              /* W*H, tone mapped           */
-    u32  *pre;                             /* cw*ch, packed 10:10:10     */
-    u32  *canvas;                          /* cw*ch, the moving part     */
+    /* palette, rebuilt only when the theme's three colours change */
+    int   pal_built;
+    u32   pal_accent, pal_glow, pal_bottom;
+    u32   lut[WP_BH_NC];
+    float bl[WP_BH_NC];                    /* orbital speed, c           */
+    float gl[WP_BH_NC];                    /* sqrt(1 - 1/r)              */
+    float om[WP_BH_NC];                    /* Keplerian omega, rad/s     */
+    float sl[WP_BH_NC];                    /* spiral pitch, radians      */
+
+    /* lensed star field: the one cached picture, keyed by size only */
+    int   star_w, star_h;
+    u8   *star;
+
+    /* a fixed 64x64 grain tile: deterministic, position independent */
+    int   grain_built;
+    signed char grain[64 * 64];
+
+    /* one reusable trace surface, so a frame allocates nothing */
+    int   scr_w, scr_h;
+    u32  *scratch;
 } bhgeo;
 
 /* One ray: integrate the null geodesic from r = 4000 inwards and store the
@@ -827,464 +834,421 @@ static inline float wp_bh_sweep(float b) {
     return bhgeo.sweep[i] + (bhgeo.sweep[i + 1] - bhgeo.sweep[i]) * ft;
 }
 
-/* ---- the still sky ------------------------------------------------
- * Everything that does not move: the gradient, the lensed stars, the
- * shadow and the grain. Packed 10:10:10 so the disk can add light to it
- * before the display curve. Pure: used both for the cached copies and for
- * the no-cache fallback.
- */
-static inline u32 wp_bh_pack(int R, int G, int B) {
-    if (R < 0) R = 0; if (R > 1023) R = 1023;
-    if (G < 0) G = 0; if (G > 1023) G = 1023;
-    if (B < 0) B = 0; if (B > 1023) B = 1023;
-    return (u32)R | ((u32)G << 10) | ((u32)B << 20);
-}
+/* ---- the disk palette, keyed by the theme's three colours -------------
+ * The colours and the radial physics do not change from frame to frame, so
+ * this is built on a theme change and reused. Only the phase arrays are
+ * refreshed per frame (in wp_bh_paint). */
+static void wp_bh_palette(const Theme *th) {
+    if (bhgeo.pal_built &&
+        bhgeo.pal_accent == th->accent &&
+        bhgeo.pal_glow   == th->glow &&
+        bhgeo.pal_bottom == th->bg_bottom) return;
 
-static inline u32 wp_bh_sky(float dx, float dy, float rho, float b,
-                            int bgr, int bgg, int bgb,
-                            float invca, float invra, u32 grain) {
-    int R = bgr, G = bgg, B = bgb;
-    if (b < WP_BH_BC) {
-        /* inside the shadow: no disk, no stars, nothing comes back */
-        R = 2; G = 2; B = 4;
-    } else {
-        /* background stars, at the deflected position */
-        float defl = wp_bh_sweep(b) - (float)WP_BH_PI;
-        if (defl < 0.0f) defl = 0.0f;
-        float wrp = defl * 0.22f / (rho + 1e-6f);   /* one divide, both axes */
-        int star = wp_star_at(dx + dx * wrp, dy + dy * wrp,
-                              invca, 0x5EEDu, 15, 225, invra);
-        R += star; G += star; B += star;
-    }
-    /* a little grain, so the smooth areas have some texture */
-    int nz = (int)(grain & 15u) - 7;
-    R += nz >> 2; G += nz >> 2; B += nz >> 2;
-    return wp_bh_pack(R, G, B);
-}
-
-/* Build (or keep) the two sky copies. Keyed by the size and the two colours
- * the sky is made of, so a theme switch rebuilds it and nothing else does. */
-static void wp_bh_cache_build(int W, int H, const Theme *th) {
-    if (!bhgeo.built) wp_bh_build();
-
-    int q = wp_q(W, H);
-    int tw = (W + q - 1) / q, thh = (H + q - 1) / q;
-    if (bhgeo.bg && bhgeo.pre && bhgeo.canvas &&
-        bhgeo.cw == tw && bhgeo.ch == thh && bhgeo.cq == q &&
-        bhgeo.key_top == th->bg_top && bhgeo.key_bot == th->bg_bottom) return;
-
-    free(bhgeo.bg); free(bhgeo.pre); free(bhgeo.canvas);
-    bhgeo.bg = NULL; bhgeo.pre = NULL; bhgeo.canvas = NULL;
-    bhgeo.cw = bhgeo.ch = bhgeo.cq = 0;
-    bhgeo.key_top = bhgeo.key_bot = 0;
-
-    u32 *bg  = (u32 *)malloc((size_t)W * (size_t)H * 4);
-    u32 *pre = (u32 *)malloc((size_t)tw * (size_t)thh * 4);
-    u32 *can = (u32 *)malloc((size_t)tw * (size_t)thh * 4);
-    if (!bg || !pre || !can) { free(bg); free(pre); free(can); return; }
-
-    bhgeo.bg = bg; bhgeo.pre = pre; bhgeo.canvas = can;
-    bhgeo.cw = tw; bhgeo.ch = thh; bhgeo.cq = q;
-    bhgeo.key_top = th->bg_top; bhgeo.key_bot = th->bg_bottom;
-
-    const float St = 0.5f * (float)(tw < thh ? tw : thh);
-    const float cxt = (float)tw * 0.545f, cyt = (float)thh * 0.470f;
-    /* one star size for both copies: the trace copy is what gets upscaled,
-       so measuring the stars on it keeps the two pictures consistent */
-    const float invca = 1.0f / 0.021f;
-    const float invra = (St * 0.021f) / 0.80f;
-
-    u32 sky_top = wp_opaque(color_mix(th->bg_top, RGB(0, 0, 0), 0.62f));
-    u32 sky_bot = wp_opaque(color_mix(th->bg_bottom, RGB(0, 0, 0), 0.48f));
-
-    for (int y = 0; y < thh; y++) {
-        const float dy = ((float)y + 0.5f - cyt) / St;
-        int ty = (thh > 1) ? (y * 256 + (thh - 1) / 2) / (thh - 1) : 0;
-        if (ty > 256) ty = 256;
-        const int bgr = wp_lerp8((int)GET_R(sky_top), (int)GET_R(sky_bot), ty);
-        const int bgg = wp_lerp8((int)GET_G(sky_top), (int)GET_G(sky_bot), ty);
-        const int bgb = wp_lerp8((int)GET_B(sky_top), (int)GET_B(sky_bot), ty);
-        u32 *row = pre + (size_t)y * tw;
-        for (int x = 0; x < tw; x++) {
-            const float dx = ((float)x + 0.5f - cxt) / St;
-            const float rho = sqrtf(dx * dx + dy * dy);
-            const float b = rho * (WP_BH_BC * WP_BH_DSC);
-            row[x] = wp_bh_sky(dx, dy, rho, b, bgr, bgg, bgb, invca, invra,
-                               wp_h32((u32)x, (u32)y, 0x51C7u));
-        }
-    }
-
-    /* The full-resolution copy is the same trace sky upscaled, not a second
-     * rasterisation: that way the moving band pasted over it later lands on
-     * exactly the pixels it would have had, and no seam shows where the
-     * upscale stops. `can` is free until the first frame, so it is the
-     * tone-mapped source here. */
-    const size_t n = (size_t)tw * (size_t)thh;
-    for (size_t i = 0; i < n; i++) {
-        u32 sk = pre[i];
-        can[i] = 0xFF000000u
-                  | ((u32)bhgeo.tone[sk & 1023u] << 16)
-                  | ((u32)bhgeo.tone[(sk >> 10) & 1023u] << 8)
-                  | (u32)bhgeo.tone[(sk >> 20) & 1023u];
-    }
-    if (q == 1) {
-        memcpy(bg, can, n * 4);
-    } else {
-        Surface ds, ss;
-        memset(&ds, 0, sizeof ds);
-        memset(&ss, 0, sizeof ss);
-        ds.px = bg; ds.w = W; ds.h = H; ds.stride = W;
-        ss.px = can; ss.w = tw; ss.h = thh; ss.stride = tw;
-        surf_unclip(&ds);
-        wp_upscale(&ds, can, tw, thh, q);
-    }
-}
-
-/* Everything the disk needs that is constant across one frame. */
-typedef struct {
-    float ci, si, ci2, invci, lspan;
-    u32   lut[WP_BH_NC];
-    float bl[WP_BH_NC];      /* orbital speed, c                  */
-    float gr[WP_BH_NC];      /* sqrt(1 - 1/r), gravitational part  */
-    float rot[WP_BH_NC];     /* Keplerian phase at this instant    */
-    float sl[WP_BH_NC];      /* spiral pitch, radians              */
-    float flick[WP_BH_NC];   /* slow brightness breathing          */
-    float arc[WP_BH_NC];     /* shimmer of the lensed image        */
-    u32   hot;
-    float ring_amp;
-    int   ring_ph;
-} BhPal;
-
-static void wp_bh_view_init(BhPal *v, const Theme *th, double seconds) {
-    const float t = (float)((seconds > 0.0) ? seconds : 0.0);
-    const float tf = t * WP_BH_RATE;
-
-    v->ci = cosf(bh_yaw);
-    v->si = sinf(bh_yaw);
-    v->ci2 = v->ci * v->ci;
-    v->invci = 1.0f / v->ci;
-    v->lspan = WP_BH_ROUT - WP_BH_RIN;
-
+    const float lspan = WP_BH_ROUT - WP_BH_RIN;
     u32 hot  = wp_opaque(color_mix(th->accent, RGB(0xFF, 0xF4, 0xDE), 0.62f));
     u32 warm = wp_opaque(th->accent);
     u32 cool = wp_opaque(color_mix(th->accent, th->glow, 0.62f));
     u32 rim  = wp_opaque(color_mix(th->glow, th->bg_bottom, 0.45f));
-    v->hot = hot;
+    bhgeo.hot = hot;
 
     for (int i = 0; i < WP_BH_NC; i++) {
-        float tt = (float)i / (float)(WP_BH_NC - 1);
-        float r = WP_BH_RIN + v->lspan * tt;
+        float t = (float)i / (float)(WP_BH_NC - 1);
+        float r = WP_BH_RIN + lspan * t;
         /* r^-1 emissivity, with a soft inner lip and a soft outer rim so
            the disk does not end in a hard edge */
         float env = 1.65f * (WP_BH_RIN / r);
         float lip = (r < WP_BH_RIN * 1.22f) ? (r - WP_BH_RIN) / (0.22f * WP_BH_RIN) : 1.0f;
         if (lip < 0.0f) lip = 0.0f;
-        float rimf = (tt > 0.80f) ? (1.0f - (tt - 0.80f) / 0.20f) : 1.0f;
+        float rimf = (t > 0.80f) ? (1.0f - (t - 0.80f) / 0.20f) : 1.0f;
         if (rimf < 0.0f) rimf = 0.0f;
         env *= lip * rimf * rimf;
 
         /* a narrow bright inner edge: the hottest, fastest material sits at
            the ISCO and that is what the eye reads as "the disk" */
-        if (tt < 0.18f) env *= 1.0f + 0.55f * (1.0f - tt / 0.18f);
+        if (t < 0.18f) env *= 1.0f + 0.55f * (1.0f - t / 0.18f);
 
         u32 c;
-        if (tt < 0.26f)      c = wp_lerp_color(hot,  warm, (int)(tt / 0.26f * 256.0f));
-        else if (tt < 0.68f) c = wp_lerp_color(warm, cool, (int)((tt - 0.26f) / 0.42f * 256.0f));
-        else                 c = wp_lerp_color(cool, rim,  (int)((tt - 0.68f) / 0.32f * 256.0f));
+        if (t < 0.26f)      c = wp_lerp_color(hot,  warm, (int)(t / 0.26f * 256.0f));
+        else if (t < 0.68f) c = wp_lerp_color(warm, cool, (int)((t - 0.26f) / 0.42f * 256.0f));
+        else                c = wp_lerp_color(cool, rim,  (int)((t - 0.68f) / 0.32f * 256.0f));
 
         int e8 = (int)(env * 255.0f + 0.5f);
         if (e8 > 255) e8 = 255;                 /* RGB() does not clamp, and   */
         if (e8 < 0) e8 = 0;                     /* an overflow would carry into */
-        v->lut[i] = RGB((u32)(GET_R(c) * e8 / 255),/* the next channel: this is */
-                        (u32)(GET_G(c) * e8 / 255),/* what turned the disk rainbow */
-                        (u32)(GET_B(c) * e8 / 255));
+        bhgeo.lut[i] = RGB((u32)(GET_R(c) * e8 / 255),/* the next channel: this is */
+                            (u32)(GET_G(c) * e8 / 255),/* what turned the disk rainbow */
+                            (u32)(GET_B(c) * e8 / 255));
 
         float beta = sqrtf(0.5f / (r - 1.0f));
         if (beta > 0.75f) beta = 0.75f;
-        v->bl[i] = beta;
-        v->gr[i] = sqrtf(1.0f - 1.0f / r);
-        v->rot[i] = sqrtf(0.5f / (r * r * r)) * tf + bh_spin;
-        v->sl[i] = 2.4f * logf(r / WP_BH_RIN);
-
-        /* turbulence and lensing shimmer: slow, and only a few percent, so
-           the disk keeps its shape while it moves */
-        v->flick[i] = 1.0f + 0.055f * sinf(t * 1.90f + r * 1.7f);
-        v->arc[i]   = 1.0f + 0.050f * sinf(t * 1.45f + r * 0.9f);
+        bhgeo.bl[i] = beta;                     /* orbital speed, c        */
+        bhgeo.gl[i] = sqrtf(1.0f - 1.0f / r);    /* gravitational redshift  */
+        bhgeo.om[i] = sqrtf(0.5f / (r * r * r)); /* Keplerian omega         */
+        bhgeo.sl[i] = 2.4f * logf(r / WP_BH_RIN);/* spiral pitch, radians   */
     }
-    v->ring_amp = 1.0f + 0.030f * sinf(t * 1.10f);
-    v->ring_ph  = (int)(t * 2.4f * 10430.378f);
+    bhgeo.pal_accent = th->accent;
+    bhgeo.pal_glow   = th->glow;
+    bhgeo.pal_bottom = th->bg_bottom;
+    bhgeo.pal_built  = 1;
 }
 
-/* Add the disk and the photon ring at one pixel. (dx, dy) are in units of
- * S = half the short side, the same units the geometry above uses. */
-static inline void wp_bh_light(const BhPal *v, float dx, float dy,
-                               int *R, int *G, int *B) {
-    const float rho = sqrtf(dx * dx + dy * dy);
-    const float b = rho * (WP_BH_BC * WP_BH_DSC);
-    const float az = wp_atan2f(dy, dx * v->ci);
-    /* the disk can only appear inside the projected ellipse of its outer
-       radius; the ring circle is a separate, much smaller footprint */
-    const float rmax = WP_BH_ROUT / (WP_BH_BC * WP_BH_DSC);
-    const float ex = dx, ey = dy * v->invci;
-
-    if (ex * ex + ey * ey <= rmax * rmax) {
-        const float qn = sqrtf(dx * dx * v->ci2 + dy * dy);
-        /* the line-of-sight component of the orbital velocity:
-           cos(azimuth) sin(yaw) */
-        const float bm = (qn > 1e-9f) ? (dx * v->ci * v->si / qn) : 0.0f;
-        /* psi is the sweep at which this ray crosses the disk plane */
-        const float psi = wp_atan2f(v->ci * rho, v->si * dy);
-        const float t   = wp_bh_bidx(b);
-        const float s0  = psi * ((float)WP_BH_NA / (float)WP_BH_DMAX) - 0.5f;
-        int   j0 = (int)s0;
-        const float fs = s0 - (float)j0;
-        /* the third crossing only exists within a few percent of the
-           critical curve, so it is gated on b and skipped for most pixels */
-        const int nc = (b < WP_BH_BC * 1.25f) ? 3 : 2;
-        int side = 1;
-
-        for (int k = 0; k < nc; k++, j0 += WP_BH_NS, side = -side) {
-            float r = wp_bh_radius(t, j0, fs);
-            if (r < WP_BH_RIN || r > WP_BH_ROUT) continue;
-            int li = (int)((r - WP_BH_RIN) * ((float)(WP_BH_NC - 1) / v->lspan));
-            if (li < 0) li = 0;
-            if (li > WP_BH_NC - 1) li = WP_BH_NC - 1;
-
-            /* delta = sqrt(1-1/r) / (1 - beta_los), flux ~ delta^3 */
-            float dop = 1.0f - bm * (float)side * v->bl[li];
-            if (dop < 0.10f) dop = 0.10f;
-            float gain = v->gr[li] / dop;
-            gain = gain * gain * gain;
-            if (gain > 4.5f) gain = 4.5f;
-
-            /* trailing spiral: two, four and eight arm harmonics on a
-               Keplerian shear, so the inner disk runs ahead of the rim */
-            float ph = az + v->sl[li] + v->rot[li] + (side < 0 ? (float)WP_BH_PI : 0.0f);
-            int ph16 = (int)(ph * 10430.378f);
-            int h2 = bhgeo.sinq[(ph16 >> 7) & 255];
-            int h4 = bhgeo.sinq[(ph16 >> 6) & 255];
-            int h8 = bhgeo.sinq[(ph16 >> 5) & 255];
-            int pat = 128 + ((h2 - 128) >> 1) + ((h4 - 128) >> 2) + ((h8 - 128) >> 3);
-            float f = v->flick[li] * (side < 0 ? v->arc[li] : 1.0f);
-            int inten = (int)(gain * (float)pat * f * 2.0f);
-
-            u32 c = v->lut[li];
-            *R += ((int)GET_R(c) * inten) >> 8;
-            *G += ((int)GET_G(c) * inten) >> 8;
-            *B += ((int)GET_B(c) * inten) >> 8;
-        }
+/* ---- the lensed star field --------------------------------------------
+ * A star's position is deflected by the same sweep that lenses the disk,
+ * so the field really bunches at the critical curve. The radial warp grows
+ * without bound at the shadow edge, which would stretch a point star into
+ * a long scratch; it is clamped, and the innermost band is tapered, so the
+ * magnified stars read as short arcs. Purely a function of position, never
+ * of the theme, the clock or the view.
+ */
+static inline int wp_bh_lensed_star(float dx, float dy, float rho, float b,
+                                    float invca, float invra) {
+    if (b < WP_BH_BC) return 0;
+    float defl = wp_bh_sweep(b) - (float)WP_BH_PI;
+    if (defl < 0.0f) defl = 0.0f;
+    float wrp = defl * 0.22f / (rho + 1e-6f);
+    if (wrp > 0.85f) wrp = 0.85f;
+    int val = wp_star_at(dx + dx * wrp, dy + dy * wrp,
+                         invca, 0x5EEDu, 15, 225, invra);
+    if (val > 0 && b < WP_BH_BC * 1.30f) {
+        float f = (b - WP_BH_BC) / (WP_BH_BC * 0.30f);
+        if (f < 0.0f) f = 0.0f;
+        if (f > 1.0f) f = 1.0f;
+        f = 0.20f + 0.80f * (f * f * (3.0f - 2.0f * f));
+        val = (int)((float)val * f);
     }
-
-    /* ---- photon ring: a thin bright halo just outside the critical curve,
-       where every crossing piles up. A slow three-lobed shimmer runs round
-       it so it is alive without changing its radius. */
-    if (b >= WP_BH_BC && b < WP_BH_BC * WP_BH_RMAX) {
-        float tt = (b - WP_BH_BC) / (WP_BH_BC * 0.055f);
-        float gr = 1.0f / (1.0f + tt * tt);
-        gr *= gr;
-        int az16 = (int)(az * 10430.378f);
-        int shim = bhgeo.sinq[(((az16 * 3) >> 8) + v->ring_ph) & 255];
-        float rm = v->ring_amp + (float)(shim - 128) * (0.05f / 128.0f);
-        int gi = (int)(gr * 185.0f * rm);
-        *R += ((int)GET_R(v->hot) * gi) >> 8;
-        *G += ((int)GET_G(v->hot) * gi) >> 8;
-        *B += ((int)GET_B(v->hot) * gi) >> 8;
-    }
+    return val;
 }
 
-/* Bilinear 1/q upscale of one destination row segment, on the same sampling
- * grid wp_upscale() uses (so the moving part lines up with the sky it is
- * pasted over). */
-static void wp_up_row(u32 *dstrow, const u32 *src, int sw, int sh, int q,
-                      int py, int x0, int x1, int ymin, int ymax) {
-    const int step = 256 / q;
-    const int maxx = (sw - 1) * 256;
-    const int lastx = (sw > 1) ? sw - 2 : 0;
-    const int lasty = (sh > 1) ? sh - 2 : 0;
-    int sy = ((2 * py + 1) * 128) / q - 128;
-    if (sy < 0) sy = 0;
-    if (sy > (sh - 1) * 256) sy = (sh - 1) * 256;
-    int iy = sy >> 8;
-    if (iy < ymin) iy = ymin;
-    if (iy > ymax - 1) iy = ymax - 1;
-    if (iy > lasty) iy = lasty;
-    int fy = sy & 255, ify = 256 - fy;
-    const u32 *r0 = src + (size_t)iy * sw;
-    const u32 *r1 = src + (size_t)((iy + 1 <= lasty) ? iy + 1 : iy) * sw;
-    int sx = ((2 * x0 + 1) * 128) / q - 128;
+static void wp_bh_stars(int w, int h) {
+    if (bhgeo.star && bhgeo.star_w == w && bhgeo.star_h == h) return;
+    free(bhgeo.star);
+    bhgeo.star = NULL;
+    bhgeo.star_w = bhgeo.star_h = 0;
+    u8 *st = (u8 *)malloc((size_t)w * (size_t)h);
+    if (!st) return;                            /* fallback computes them */
 
-    for (int x = x0; x <= x1; x++, sx += step) {
-        int v = sx;
-        if (v < 0) v = 0;
-        if (v > maxx) v = maxx;
-        int ix = v >> 8;
-        if (ix > lastx) ix = lastx;
-        int fx = v & 255, ifx = 256 - fx;
-        u32 a = r0[ix], b = r0[ix + 1], c = r1[ix], d = r1[ix + 1];
-        int ar = ((int)GET_R(a) * ifx + (int)GET_R(b) * fx) >> 8;
-        int ag = ((int)GET_G(a) * ifx + (int)GET_G(b) * fx) >> 8;
-        int ab = ((int)GET_B(a) * ifx + (int)GET_B(b) * fx) >> 8;
-        int br = ((int)GET_R(c) * ifx + (int)GET_R(d) * fx) >> 8;
-        int bg = ((int)GET_G(c) * ifx + (int)GET_G(d) * fx) >> 8;
-        int bb = ((int)GET_B(c) * ifx + (int)GET_B(d) * fx) >> 8;
-        int rr = (ar * ify + br * fy) >> 8;
-        int rg = (ag * ify + bg * fy) >> 8;
-        int rb = (ab * ify + bb * fy) >> 8;
-        dstrow[x] = 0xFF000000u | ((u32)rr << 16) | ((u32)rg << 8) | (u32)rb;
-    }
-}
-
-/* No-cache path: only taken when the 5 MB of sky copies cannot be had.
- * Correct, just slower - it recomputes the sky per pixel. */
-static void wp_bh_uncached(Surface *s, const Theme *th, const BhPal *v) {
-    const int W = s->w, H = s->h;
-    const float S = 0.5f * (float)(W < H ? W : H);
-    const float cx = (float)W * 0.545f, cy = (float)H * 0.470f;
+    const float S = 0.5f * (float)(w < h ? w : h);
+    const float cx = (float)w * 0.545f, cy = (float)h * 0.470f;
+    const float invS = 1.0f / S;
     const float invca = 1.0f / 0.021f;
     const float invra = (S * 0.021f) / 0.80f;
+    const float K = WP_BH_BC * WP_BH_DSC;
+
+    for (int y = 0; y < h; y++) {
+        const float dy = ((float)y + 0.5f - cy) * invS;
+        u8 *row = st + (size_t)y * (size_t)w;
+        for (int x = 0; x < w; x++) {
+            const float dx = ((float)x + 0.5f - cx) * invS;
+            const float rho = sqrtf(dx * dx + dy * dy);
+            const float b = rho * K;
+            row[x] = (u8)wp_bh_lensed_star(dx, dy, rho, b, invca, invra);
+        }
+    }
+    bhgeo.star = st;
+    bhgeo.star_w = w;
+    bhgeo.star_h = h;
+}
+
+static void wp_bh_grain(void) {
+    if (bhgeo.grain_built) return;
+    for (int i = 0; i < 64 * 64; i++) {
+        u32 h = wp_h32((u32)(i & 63), (u32)(i >> 6), 0x51C7u);
+        int n = (int)(h & 7u) - 3;              /* -3 .. 4 */
+        if (n < -1) n = -1;
+        if (n > 1) n = 1;
+        bhgeo.grain[i] = (signed char)n;
+    }
+    bhgeo.grain_built = 1;
+}
+
+/* Paint the whole black hole at the surface's own resolution. Every pixel
+ * goes through the same camera: no region is carved out for the disk. */
+static void wp_bh_paint(Surface *s, const Theme *th, double seconds) {
+    const int   W = s->w, H = s->h;
+    const float S  = 0.5f * (float)(W < H ? W : H);      /* px per unit    */
+    /* the hole sits a little off centre, which reads better as a desktop */
+    const float cx = (float)W * 0.545f, cy = (float)H * 0.470f;
+    const float ci = cosf(bh_yaw), si = sinf(bh_yaw);
+    const float ci2 = ci * ci;
+
+    if (!bhgeo.built) wp_bh_build();
+    wp_bh_palette(th);
+    wp_bh_stars(W, H);
+    wp_bh_grain();
+
+    const float t = (float)((seconds > 0.0) ? seconds : 0.0);
+    const float tf = t * WP_BH_RATE;
+    const float lspan = WP_BH_ROUT - WP_BH_RIN;
+
+    /* per-radius, per-frame: the Keplerian clock and the two slow shimmer
+       terms. Both are smooth in r, so they cannot draw rings. */
+    float rot[WP_BH_NC], flick[WP_BH_NC], arc[WP_BH_NC];
+    for (int i = 0; i < WP_BH_NC; i++) {
+        float r = WP_BH_RIN + lspan * (float)i / (float)(WP_BH_NC - 1);
+        rot[i] = fmodf(bhgeo.om[i] * (tf + bh_spin), WP_BH_TAU);
+        flick[i] = 1.0f + 0.045f * sinf(t * 1.55f + r * 1.10f);
+        arc[i]   = 1.0f + 0.060f * sinf(t * 1.05f + r * 0.55f + 1.2f);
+    }
+    const float ring_amp = 1.0f + 0.055f * sinf(t * 0.90f);
+    const int   ring_ph  = (int)(t * 1.70f * 10430.378f);
+
+    /* ---- display curve and sky ---- */
+    const u8 *tone = bhgeo.tone;
     u32 sky_top = wp_opaque(color_mix(th->bg_top, RGB(0, 0, 0), 0.62f));
     u32 sky_bot = wp_opaque(color_mix(th->bg_bottom, RGB(0, 0, 0), 0.48f));
 
+    const float invS = 1.0f / S;
+    const float invca = 1.0f / 0.021f;
+    const float invra = (S * 0.021f) / 0.80f;
+    const float bmaxd = WP_BH_ROUT * 1.06f;
+    const float K = WP_BH_BC * WP_BH_DSC;
+    /* the squared screen radius that can possibly hold a crossing */
+    const float gate = bmaxd / K;
+    const float gate2 = gate * gate;
+
     for (int y = 0; y < H; y++) {
-        const float dy = ((float)y + 0.5f - cy) / S;
+        const float dy = ((float)y + 0.5f - cy) * invS;
+        const float dy2 = dy * dy;
         int ty = (H > 1) ? (y * 256 + (H - 1) / 2) / (H - 1) : 0;
         if (ty > 256) ty = 256;
         const int bgr = wp_lerp8((int)GET_R(sky_top), (int)GET_R(sky_bot), ty);
         const int bgg = wp_lerp8((int)GET_G(sky_top), (int)GET_G(sky_bot), ty);
         const int bgb = wp_lerp8((int)GET_B(sky_top), (int)GET_B(sky_bot), ty);
         u32 *row = s->px + (size_t)y * s->stride;
+        const u8 *srow = bhgeo.star ? bhgeo.star + (size_t)y * (size_t)W : NULL;
+
         for (int x = 0; x < W; x++) {
-            const float dx = ((float)x + 0.5f - cx) / S;
-            const float rho = sqrtf(dx * dx + dy * dy);
-            const float b = rho * (WP_BH_BC * WP_BH_DSC);
-            u32 sk = wp_bh_sky(dx, dy, rho, b, bgr, bgg, bgb, invca, invra,
-                               wp_h32((u32)x, (u32)y, 0x51C7u));
-            int R = (int)(sk & 1023u);
-            int G = (int)((sk >> 10) & 1023u);
-            int B = (int)((sk >> 20) & 1023u);
-            wp_bh_light(v, dx, dy, &R, &G, &B);
+            const float dx = ((float)x + 0.5f - cx) * invS;
+            const float dx2 = dx * dx;
+            int R = bgr, G = bgg, B = bgb, star = 0;
+
+            if (dx2 + dy2 < gate2) {
+                const float rho = sqrtf(dx2 + dy2);
+                const float b = rho * K;
+
+                if (b < WP_BH_BC) {
+                    /* inside the shadow: no disk, no stars, nothing comes back */
+                    R = 2; G = 2; B = 4;
+                } else {
+                    if (srow) star = srow[x];
+                    else star = wp_bh_lensed_star(dx, dy, rho, b, invca, invra);
+
+                    /* ---- the disk, one addition per equatorial crossing ---- */
+                    if (b < bmaxd) {
+                        const float qz = sqrtf(dx2 * ci2 + dy2);
+                        const float bm = (qz > 1e-9f) ? (dx * ci * si / qz) : 0.0f;
+                        /* the sweep at which this ray crosses the disk plane */
+                        const float psi = wp_atan2f(ci * rho, si * dy);
+                        const float az = wp_atan2f(dy, dx * ci);
+                        const float tt = wp_bh_bidx(b);
+                        const float s0 = psi * ((float)WP_BH_NA / (float)WP_BH_DMAX) - 0.5f;
+                        int   j0 = (int)s0;
+                        const float fs = s0 - (float)j0;
+                        /* the third crossing only exists within a few percent
+                           of the critical curve, and is skipped elsewhere */
+                        const int nc = (b < WP_BH_BC * 1.25f) ? 3 : 2;
+                        int side = 1;
+
+                        for (int k = 0; k < nc; k++, j0 += WP_BH_NS, side = -side) {
+                            float r = wp_bh_radius(tt, j0, fs);
+                            if (r < WP_BH_RIN || r > WP_BH_ROUT) continue;
+                            int li = (int)((r - WP_BH_RIN) * ((float)(WP_BH_NC - 1) / lspan));
+                            if (li < 0) li = 0;
+                            if (li > WP_BH_NC - 1) li = WP_BH_NC - 1;
+
+                            /* delta = sqrt(1-1/r) / (1 - beta_los), flux ~ delta^3 */
+                            float dop = 1.0f - bm * (float)side * bhgeo.bl[li];
+                            if (dop < 0.10f) dop = 0.10f;
+                            float gain = bhgeo.gl[li] / dop;
+                            gain = gain * gain * gain;
+                            if (gain > 5.0f) gain = 5.0f;
+
+                            /* trailing spiral: 2, 4 and 8 arm harmonics on the
+                               Keplerian shear, so the inner disk runs ahead of
+                               the rim instead of turning as one rigid plate */
+                            float ph = az + bhgeo.sl[li] + rot[li]
+                                       + (side < 0 ? (float)WP_BH_PI : 0.0f);
+                            int ph16 = (int)(ph * 10430.378f);
+                            int h2 = bhgeo.sinq[(ph16 >> 7) & 255];
+                            int h4 = bhgeo.sinq[(ph16 >> 6) & 255];
+                            int h8 = bhgeo.sinq[(ph16 >> 5) & 255];
+                            int pat = 128 + ((h2 - 128) >> 1)
+                                          + ((h4 - 128) >> 2)
+                                          + ((h8 - 128) >> 3);
+                            float f = flick[li] * (side < 0 ? arc[li] : 1.0f);
+                            int inten = (int)(gain * (float)pat * f * 2.0f);
+
+                            u32 c = bhgeo.lut[li];
+                            R += ((int)GET_R(c) * inten) >> 8;
+                            G += ((int)GET_G(c) * inten) >> 8;
+                            B += ((int)GET_B(c) * inten) >> 8;
+                        }
+                    }
+
+                    /* ---- photon ring: a thin bright halo just outside the
+                       critical curve, where every crossing piles up. A slow
+                       three-lobed shimmer runs round it without moving it. */
+                    if (b < WP_BH_BC * WP_BH_RMAX) {
+                        float q = (b - WP_BH_BC) / (WP_BH_BC * 0.055f);
+                        float gr = 1.0f / (1.0f + q * q);
+                        gr *= gr;
+                        const float az = wp_atan2f(dy, dx * ci);
+                        int az16 = (int)(az * 10430.378f);
+                        int shim = bhgeo.sinq[(((az16 * 3) >> 8) + ring_ph) & 255];
+                        float rm = ring_amp + (float)(shim - 128) * (0.035f / 128.0f);
+                        int gi = (int)(gr * 185.0f * rm);
+                        R += ((int)GET_R(bhgeo.hot) * gi) >> 8;
+                        G += ((int)GET_G(bhgeo.hot) * gi) >> 8;
+                        B += ((int)GET_B(bhgeo.hot) * gi) >> 8;
+                    }
+                }
+            } else {
+                if (srow) star = srow[x];
+                else star = wp_bh_lensed_star(dx, dy, sqrtf(dx2 + dy2), 1e9f,
+                                              invca, invra);
+            }
+
+            /* stars sit behind the disk, not on it: fade them out by how
+               much light the crossings already put on this pixel */
+            if (star > 0) {
+                int lit = R - bgr;
+                if (G - bgg > lit) lit = G - bgg;
+                if (B - bgb > lit) lit = B - bgb;
+                if (lit >= 190) star = 0;
+                else if (lit > 0) star -= (star * lit) / 190;
+                R += star; G += star; B += star;
+            }
+
+            /* a little grain, so the smooth areas have some texture */
+            int nz = bhgeo.grain[(((y & 63) << 6) | (x & 63))];
+            R += nz; G += nz; B += nz;
             if (R < 0) R = 0; if (R > 1023) R = 1023;
             if (G < 0) G = 0; if (G > 1023) G = 1023;
             if (B < 0) B = 0; if (B > 1023) B = 1023;
-            row[x] = 0xFF000000u
-                   | ((u32)bhgeo.tone[R] << 16)
-                   | ((u32)bhgeo.tone[G] << 8)
-                   | (u32)bhgeo.tone[B];
+            row[x] = 0xFF000000u | ((u32)tone[R] << 16) | ((u32)tone[G] << 8)
+                   | (u32)tone[B];
         }
     }
 }
 
-/* Paint the black hole. The still sky comes from the cache, the disk and
- * the ring are recomputed only where they can reach, and those rows are the
- * only ones upscaled. Above WP_TRACE_MAX pixels the moving part is traced at
- * 1/q resolution; it is a smooth picture and the cost has to stay flat. */
+/* One reusable trace surface. This is a working buffer, not a picture
+ * cache: it is overwritten from the first pixel of every frame. */
+static u32 *wp_bh_scratch(int w, int h) {
+    if (bhgeo.scratch && bhgeo.scr_w == w && bhgeo.scr_h == h)
+        return bhgeo.scratch;
+    free(bhgeo.scratch);
+    bhgeo.scratch = NULL;
+    bhgeo.scr_w = bhgeo.scr_h = 0;
+    u32 *buf = (u32 *)malloc((size_t)w * (size_t)h * sizeof(u32));
+    if (!buf) return NULL;
+    bhgeo.scratch = buf;
+    bhgeo.scr_w = w;
+    bhgeo.scr_h = h;
+    return buf;
+}
+
+/* q = 2 bilinear upscale of the complete trace surface. The general
+ * wp_upscale() has to compute a source position and clamp it per pixel;
+ * at q = 2 the source coordinates are 128*x - 64 and 128*y - 64, so the
+ * weights settle to the fixed pair 64/192 and the position is a shift.
+ * Same sampling grid as wp_upscale(), so the two paths agree exactly. */
+static void wp_upscale2(Surface *dst, const u32 *src, int sw, int sh) {
+    const int maxy = (sh - 1) * 256;
+    const int lasty = (sh > 1) ? sh - 2 : 0;
+    const int lastx = (sw > 1) ? sw - 2 : 0;
+
+    for (int y = 0; y < dst->h; y++) {
+        int sy = 128 * y - 64;
+        if (sy < 0) sy = 0;
+        if (sy > maxy) sy = maxy;
+        int iy = sy >> 8;
+        if (iy > lasty) iy = lasty;
+        int fy = sy & 255, ify = 256 - fy;
+        const u32 *r0 = src + (size_t)iy * sw;
+        const u32 *r1 = src + (size_t)((iy < lasty) ? iy + 1 : iy) * sw;
+        u32 *out = dst->px + (size_t)y * dst->stride;
+
+        /* x = 0 samples the very left edge; the rest alternate 25/75. */
+        u32 a = r0[0], b = r0[0], c = r1[0], d = r1[0];
+        int ar = ((int)GET_R(a) * 256 + (int)GET_R(b) * 0) >> 8;
+        int ag = ((int)GET_G(a) * 256 + (int)GET_G(b) * 0) >> 8;
+        int ab = ((int)GET_B(a) * 256 + (int)GET_B(b) * 0) >> 8;
+        int br = ((int)GET_R(c) * 256 + (int)GET_R(d) * 0) >> 8;
+        int bg = ((int)GET_G(c) * 256 + (int)GET_G(d) * 0) >> 8;
+        int bb = ((int)GET_B(c) * 256 + (int)GET_B(d) * 0) >> 8;
+        int rr = (ar * ify + br * fy) >> 8;
+        int rg = (ag * ify + bg * fy) >> 8;
+        int rb = (ab * ify + bb * fy) >> 8;
+        out[0] = 0xFF000000u | ((u32)rr << 16) | ((u32)rg << 8) | (u32)rb;
+
+        for (int x = 1; x < dst->w; x++) {
+            int ix = (x - 1) >> 1;
+            int fx = (x & 1) ? 64 : 192;
+            if (ix > lastx) { ix = lastx; fx = 0; }
+            int ifx = 256 - fx;
+            a = r0[ix]; b = r0[ix + 1]; c = r1[ix]; d = r1[ix + 1];
+            ar = ((int)GET_R(a) * ifx + (int)GET_R(b) * fx) >> 8;
+            ag = ((int)GET_G(a) * ifx + (int)GET_G(b) * fx) >> 8;
+            ab = ((int)GET_B(a) * ifx + (int)GET_B(b) * fx) >> 8;
+            br = ((int)GET_R(c) * ifx + (int)GET_R(d) * fx) >> 8;
+            bg = ((int)GET_G(c) * ifx + (int)GET_G(d) * fx) >> 8;
+            bb = ((int)GET_B(c) * ifx + (int)GET_B(d) * fx) >> 8;
+            rr = (ar * ify + br * fy) >> 8;
+            rg = (ag * ify + bg * fy) >> 8;
+            rb = (ab * ify + bb * fy) >> 8;
+            out[x] = 0xFF000000u | ((u32)rr << 16) | ((u32)rg << 8) | (u32)rb;
+        }
+    }
+}
+
+/* Paint the black hole. Above WP_TRACE_MAX pixels the whole frame is traced
+ * at 1/q resolution and scaled up, so the cost stays flat as screens grow.
+ * The trace covers the complete surface - the disk is not clipped to a
+ * rectangle - and the upscale is a single bilinear pass, which is why there
+ * is no seam where a "moving band" would otherwise meet a cached sky. */
 static void wp_draw_blackhole(Surface *s, const Theme *th, double seconds) {
-    const int W = s->w, H = s->h;
-    BhPal v;
-    wp_bh_view_init(&v, th, seconds);
-    wp_bh_cache_build(W, H, th);
+    int q = wp_q(s->w, s->h);
+    int sw = (s->w + q - 1) / q, sh = (s->h + q - 1) / q;
+    u32 *buf = wp_bh_scratch(sw, sh);
+    if (!buf) { wp_bh_paint(s, th, seconds); return; }
 
-    if (!bhgeo.bg || !bhgeo.pre || !bhgeo.canvas) {
-        wp_bh_uncached(s, th, &v);
-        return;
-    }
-
-    /* 1. the still sky. The compositor owns the framebuffer and repaints
-     *    the whole background every frame, so this copy is the wallpaper. */
-    if (s->stride == W) {
-        memcpy(s->px, bhgeo.bg, (size_t)W * (size_t)H * 4);
-    } else {
-        for (int y = 0; y < H; y++)
-            memcpy(s->px + (size_t)y * s->stride, bhgeo.bg + (size_t)y * W,
-                   (size_t)W * 4);
-    }
-
-    /* 2. the moving part, at trace resolution. Its footprint is the disk
-     *    ellipse plus the photon-ring circle; both are inside a rectangle
-     *    whose half width is the larger of the two, so every canvas row in
-     *    the band is filled edge to edge and the upscale never reads stale
-     *    pixels. */
-    const int q = bhgeo.cq, tw = bhgeo.cw, thh = bhgeo.ch;
-    const float St = 0.5f * (float)(tw < thh ? tw : thh);
-    const float cxt = (float)tw * 0.545f, cyt = (float)thh * 0.470f;
-    const float Rmax = WP_BH_ROUT / (WP_BH_BC * WP_BH_DSC);   /* S units */
-    const float invSt = 1.0f / St;
-    const float invci = 1.0f / v.ci;
-    const float Rmax2 = Rmax * Rmax;
-    const float span2 = WP_BH_SPAN * WP_BH_SPAN;
-    /* the band the moving part can reach: the disk ellipse is wide and
-     * short (its half height is cos(yaw) * Rmax), the photon ring is a
-     * small circle, so the union is a rectangle across the disk's width */
-    const float yhalf = (v.ci * Rmax > WP_BH_SPAN ? v.ci * Rmax : WP_BH_SPAN) * St;
-    int ylo = (int)(cyt - yhalf) - 2, yhi = (int)(cyt + yhalf) + 2;
-    if (ylo < 0) ylo = 0;
-    if (yhi > thh - 1) yhi = thh - 1;
-    int x0 = (int)(cxt - Rmax * St) - 2, x1 = (int)(cxt + Rmax * St) + 2;
-    if (x0 < 0) x0 = 0;
-    if (x1 > tw - 1) x1 = tw - 1;
-
-    for (int y = ylo; y <= yhi; y++) {
-        const float dy = ((float)y + 0.5f - cyt) * invSt;
-        const float dy2 = dy * dy;
-        u32 *row = bhgeo.canvas + (size_t)y * tw;
-        for (int x = x0; x <= x1; x++) {
-            const float dx = ((float)x + 0.5f - cxt) * invSt;
-            u32 sk = bhgeo.pre[(size_t)y * tw + x];
-            int R = (int)(sk & 1023u);
-            int G = (int)((sk >> 10) & 1023u);
-            int B = (int)((sk >> 20) & 1023u);
-            /* cheap gate before the two atan2: is this pixel on the disk
-             * ellipse, or inside the photon-ring circle? */
-            float ei = dy * invci;
-            if (dx * dx + ei * ei <= Rmax2 || dx * dx + dy2 <= span2)
-                wp_bh_light(&v, dx, dy, &R, &G, &B);
-            if (R < 0) R = 0; if (R > 1023) R = 1023;
-            if (G < 0) G = 0; if (G > 1023) G = 1023;
-            if (B < 0) B = 0; if (B > 1023) B = 1023;
-            row[x] = 0xFF000000u
-                   | ((u32)bhgeo.tone[R] << 16)
-                   | ((u32)bhgeo.tone[G] << 8)
-                   | (u32)bhgeo.tone[B];
-        }
-    }
-
-    /* 3. paste the rows the moving part touched back over the still sky */
-    int py0 = ylo * q - q, py1 = (yhi + 1) * q + q;
-    if (py0 < 0) py0 = 0;
-    if (py1 > H - 1) py1 = H - 1;
-    int dx0 = x0 * q - q - 2, dx1 = (x1 + 1) * q + q + 2;
-    if (dx0 < 0) dx0 = 0;
-    if (dx1 > W - 1) dx1 = W - 1;
-    for (int py = py0; py <= py1; py++)
-        wp_up_row(s->px + (size_t)py * s->stride, bhgeo.canvas, tw, thh, q,
-                  py, dx0, dx1, ylo, yhi + 1);
+    Surface tmp;
+    tmp.px = buf; tmp.w = sw; tmp.h = sh; tmp.stride = sw;
+    tmp.cx0 = tmp.cy0 = tmp.cx1 = tmp.cy1 = 0;
+    wp_bh_paint(&tmp, th, seconds);
+    if (q == 2) wp_upscale2(s, buf, sw, sh);
+    else        wp_upscale(s, buf, sw, sh, q);
 }
 
-/* ---- the two knobs the desktop drives ---------------------------- */
+/* ---- the two knobs the desktop drives --------------------------------
+ * Both are state changes only: the next wallpaper_draw() picks them up.
+ * The clamps are in wallpaper.h, next to the documented drag/wheel map. */
 
 void wallpaper_blackhole_view(float delta) {
     if (!(delta == delta)) return;                 /* ignore NaN */
     float y = bh_yaw + delta;
-    if (y < WALLPAPER_BH_TILT_MIN) y = WALLPAPER_BH_TILT_MIN;
-    if (y > WALLPAPER_BH_TILT_MAX) y = WALLPAPER_BH_TILT_MAX;
+    if (y < WALLPAPER_BH_YAW_MIN) y = WALLPAPER_BH_YAW_MIN;
+    if (y > WALLPAPER_BH_YAW_MAX) y = WALLPAPER_BH_YAW_MAX;
     bh_yaw = y;
 }
 
 void wallpaper_blackhole_spin(float delta) {
     if (!(delta == delta)) return;
-    bh_spin = fmodf(bh_spin + delta, 6.28318530718f);
-    if (bh_spin < 0.0f) bh_spin += 6.28318530718f;
+    bh_spin += delta;
+    /* A wheel is a few seconds of disk time at most; wrap a whole hour so
+     * the float keeps its precision without ever jumping the pattern. */
+    if (bh_spin >= 3600.0f) bh_spin = fmodf(bh_spin, 3600.0f);
+    if (bh_spin < 0.0f)     bh_spin = 3600.0f - fmodf(-bh_spin, 3600.0f);
 }
 
 void wallpaper_blackhole_reset(void) {
-    bh_yaw = WALLPAPER_BH_TILT_DEF;
+    bh_yaw  = WALLPAPER_BH_YAW_DEF;
     bh_spin = 0.0f;
 }
 
-float wallpaper_blackhole_tilt(void) {
+float wallpaper_blackhole_yaw(void) {
     return bh_yaw;
 }
-
 
 /* ------------------------------------------------------------ 5. Nebula
  * Value-noise fbm, domain warped twice, in the theme's own two light
