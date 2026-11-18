@@ -421,7 +421,7 @@ static void sbx_plan_init(SbxPlan *p, const char *run, const char *id,
         s->ro = 1; s->mode = 0666;
     }
 
-    /* ---- child: the one document the requirement was to open, read-only */
+    /* ---- child: the one document the app asked to open, read-only */
     if (arg && arg[0] == '/' && !strstr(arg, ".."))
         sbx_add(p, SBX_CHILD, SBX_BIND, arg, arg)->ro = 1;
 

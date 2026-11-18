@@ -132,7 +132,7 @@ enum {
  *  If the history is full, the oldest UNPINNED entry is dropped. Pinned
  *  entries therefore survive; if all 32 entries are pinned the call
  *  fails with CLIP_ERR_FULL rather than silently throwing away something
- *  the requirement was to keep.
+ *  is deliberately kept.
  *
  *  clip_set_text takes NUL-terminated UTF-8, 1 .. CLIP_MAX_TEXT bytes.
  *
