@@ -1337,6 +1337,7 @@ static void draw_start_button(Surface *s, const Theme *th) {
  * window. Fit the string into `avail` pixels by truncating on UTF-8 codepoint
  * boundaries and marking the cut with an ellipsis. The stored title is never
  * touched - the caller passes a scratch buffer. */
+/* MYSTIC_TEXT_FIT_BEGIN - the harness renders with this exact function */
 static void text_fit(Font *f, const char *src, char *dst, size_t dstsz, float avail) {
     if (!dst || dstsz < 4) return;
     dst[0] = '\0';
@@ -1376,6 +1377,7 @@ static void text_fit(Font *f, const char *src, char *dst, size_t dstsz, float av
     out += elen;
     dst[out] = '\0';
 }
+/* MYSTIC_TEXT_FIT_END */
 
 static void draw_desktop(Surface *s, const Theme *th) {
     int W = s->w;
@@ -1792,12 +1794,54 @@ static Font *initial_font(int box) {
     return font_get(FONT_SEMIBOLD, (float)pt);
 }
 
+/* The search field's height: one line plus the pill's air, from the same
+ * face the field draws in. */
+static int launcher_field_h(void) {
+    return ui_line_h(FONT_MEDIUM, 12) + ui_px(8);
+}
+
+/* The bottom of the last grid tile for a grid laid out on a screen of
+ * `sh` logical pixels. The field may sit in the panel's padding below it,
+ * never on a tile. */
+static int launcher_grid_bottom(int sh) {
+    int total = launcher_items();
+    if (total <= 0) return 0;
+    int tx, ty, tw, th;
+    ui_launcher_geom(total, screen.w, sh, launcher_label_w(), total - 1,
+                     &tx, &ty, &tw, &th);
+    return ty + th;
+}
+
+/* The height the launcher grid may use.
+ *
+ * The empty-query screen keeps its grid exactly as it was whenever the field
+ * can live outside the tiles: above the panel if the screen has room, else in
+ * the panel's own bottom padding, else just below the panel. Only when none
+ * of those fits (a screen shorter than the grid already needs) is the grid
+ * measured one field shorter, and the field takes the band that frees. Every
+ * caller - paint, click, hover, arrow columns - asks this one function, so a
+ * click can never land on a cell the eye does not see. */
+static int launcher_sh(void) {
+    int total = launcher_items();
+    int px, py, pw, ph;
+    ui_launcher_panel(total, screen.w, screen.h, launcher_label_w(),
+                      &px, &py, &pw, &ph);
+    int fh = launcher_field_h();
+    int top = topbar_h() + ui_px(4);
+    if (py - ui_px(7) - fh >= top) return screen.h;          /* above */
+    if (py + ph - launcher_grid_bottom(screen.h) >= fh + ui_px(4))
+        return screen.h;                                     /* in the padding */
+    if (py + ph + ui_px(6) + fh <= screen.h - ui_px(2))
+        return screen.h;                                     /* below */
+    return screen.h - (fh + ui_px(7) + ui_px(6));            /* shrink once */
+}
+
 /* One grid for the panel, the tiles and the keyboard: ui.c owns the column
  * count (it depends on how many apps there are and how tall the screen is),
  * so a draw, a click and a Right-arrow cannot disagree about which cell is
  * which. */
 static void launcher_geom(int idx, int *tx, int *ty, int *tw, int *th) {
-    ui_launcher_geom(launcher_items(), screen.w, screen.h, launcher_label_w(),
+    ui_launcher_geom(launcher_items(), screen.w, launcher_sh(), launcher_label_w(),
                      idx, tx, ty, tw, th);
 }
 
@@ -1874,7 +1918,6 @@ typedef struct {
     int hl_at;        /* first highlighted byte, -1 = none */
     int hl_len;
     int hl_id;        /* 1 = the span is in the id, not the name */
-    int cmd;          /* 1 = promoted by a command word */
 } LauncherRow;
 
 static char launcher_query[LAUNCHER_QUERY_MAX + 1];
@@ -2060,7 +2103,6 @@ static void launcher_filter_refresh(void) {
                 r->hl_at = 0;
                 r->hl_len = wl;
                 r->hl_id = 0;
-                r->cmd = 1;
             }
             launcher_row_n = n;
             if (exact > 0) {           /* the one exact name is what Enter runs */
@@ -2103,7 +2145,6 @@ static void launcher_filter_refresh(void) {
         tmp[cand].hl_at = at;
         tmp[cand].hl_len = launcher_query_len;
         tmp[cand].hl_id = hl_id;
-        tmp[cand].cmd = 0;
         cand++;
     }
     /* insertion sort, stable: equal scores keep catalogue order, which puts
@@ -2126,11 +2167,9 @@ static void launcher_filter_refresh(void) {
             tmp[cand].hl_at = -1;
             tmp[cand].hl_len = 0;
             tmp[cand].hl_id = 0;
-            tmp[cand].cmd = 1;
             found = cand++;
         }
         if (found >= 0) {
-            tmp[found].cmd = 1;
             if (found > 0) {           /* the command target is row 0 */
                 LauncherRow c = tmp[found];
                 memmove(&tmp[1], &tmp[0], sizeof tmp[0] * (size_t)found);
@@ -2321,19 +2360,16 @@ static int anim_item_under_pointer(void) {
  *
  * One measured rectangle for the field, one for the list, and one row pitch
  * derived from the line the row really draws - so text scale 1.6 cannot put
- * two rows on top of each other. The field is above the grid when the screen
- * has room for it and in the old hint line's place when it does not; the grid
- * itself is never moved, which is why the empty-query screen is unchanged.
+ * two rows on top of each other. In the empty-query grid the field sits above
+ * the panel when the screen has room, otherwise in the panel's own bottom
+ * padding (or just below it), so it never covers a tile; see launcher_sh().
  */
-static int launcher_field_h(void) {
-    return ui_line_h(FONT_MEDIUM, 12) + ui_px(8);
-}
-
 static void launcher_field_rect(const Surface *s, int *x, int *y, int *w, int *h,
                                 int *below) {
     const int total = launcher_items();
     int px, py, pw, ph;
-    ui_launcher_panel(total, s->w, s->h, launcher_label_w(), &px, &py, &pw, &ph);
+    ui_launcher_panel(total, s->w, launcher_sh(), launcher_label_w(),
+                      &px, &py, &pw, &ph);
     int fh = launcher_field_h();
     int top = topbar_h() + ui_px(4);
     *below = 0;
@@ -2342,15 +2378,17 @@ static void launcher_field_rect(const Surface *s, int *x, int *y, int *w, int *h
         *x = px; *y = fy; *w = pw; *h = fh;
         return;
     }
-    fy = py + ph + ui_px(6);
-    if (fy + fh <= s->h - ui_px(2)) {
-        *x = px; *y = fy; *w = pw; *h = fh; *below = 1;
-        return;
-    }
-    /* no room either side: pin it to the bottom edge, still on screen */
-    fy = s->h - fh - ui_px(2);
+    /* the grid was left room for this band by launcher_sh(): inside the
+     * panel's bottom padding when there is one, else below the panel */
+    int gb = launcher_grid_bottom(launcher_sh());
+    if (gb > py && py + ph - gb >= fh + ui_px(4))
+        fy = gb + (py + ph - gb - fh) / 2;
+    else
+        fy = py + ph + ui_px(6);
+    if (fy + fh > s->h - ui_px(2)) fy = s->h - fh - ui_px(2);
     if (fy < top) fy = top;
-    *x = px; *y = fy; *w = pw; *h = fh; *below = 1;
+    *below = 1;
+    *x = px; *y = fy; *w = pw; *h = fh;
 }
 
 /* A field shows the TAIL of an overlong query: text_fit() would cut the end,
@@ -2390,8 +2428,9 @@ static void launcher_draw_hilite(Surface *s, Font *f, float x, float y,
     snprintf(a, sizeof a, "%.*s", at, str);
     snprintf(b, sizeof b, "%.*s", len, str + at);
     snprintf(c, sizeof c, "%s", str + at + len);
-    float x1 = x + font_draw(s, f, x, y, a, base);
-    float x2 = x1 + font_draw(s, f, x1, y, b, hi);
+    /* font_draw() returns the pen position (absolute end x), not a width */
+    float x1 = font_draw(s, f, x, y, a, base);
+    float x2 = font_draw(s, f, x1, y, b, hi);
     font_draw(s, f, x2, y, c, base);
 }
 
@@ -2469,7 +2508,8 @@ static void launcher_list_layout(const Surface *s, LauncherList *L) {
     int avail = s->h - ui_px(6) - (top + inset + fh + gap) - gap - foot_h - inset;
     int rows = avail / row_h;
     if (rows < 1) rows = 1;
-    if (launcher_row_n > 0 && rows > launcher_row_n) rows = launcher_row_n;
+    if (launcher_row_n == 0) rows = 1;      /* one line: the reason */
+    else if (rows > launcher_row_n) rows = launcher_row_n;
     if (rows > LAUNCHER_ROWS_MAX) rows = LAUNCHER_ROWS_MAX;
 
     L->pw = pw;
@@ -2657,7 +2697,7 @@ static void draw_launcher(Surface *s, const Theme *th) {
     const int total = launcher_items();
     const int label_w = launcher_label_w();
     int px, py, pw, ph;
-    ui_launcher_panel(total, s->w, s->h, label_w, &px, &py, &pw, &ph);
+    ui_launcher_panel(total, s->w, launcher_sh(), label_w, &px, &py, &pw, &ph);
 
     gfx_shadow(s, (float)px, (float)py, (float)pw, (float)ph, 22, 30, 0.55f);
     /* The panel body is opaque, so blurring the wallpaper underneath it was
@@ -5402,7 +5442,7 @@ int main(int argc, char **argv) {
          * alone loses the layout). Both are consumed here, before any key can
          * reach an overlay or a window. */
         launcher_focus_sync(launcher_open);
-        if (launcher_open) {
+        if (launcher_open && !locked && !help_open && !menu_open) {
             /* Chords are not text: Ctrl/Alt/Super belong to the shortcut
              * table, so their (control or layout) bytes never reach the
              * field. Shift is allowed - it is how capitals are typed. */
@@ -5439,7 +5479,8 @@ int main(int argc, char **argv) {
              * before the table, whose Esc row is SC_ALWAYS and would close
              * the whole overlay in one press. It is the same launcher_key()
              * the harness drives. */
-            if (launcher_open && k == SC_KEY_ESC && launcher_query_active()) {
+            if (launcher_open && !help_open && k == SC_KEY_ESC &&
+                launcher_query_active()) {
                 LauncherGo go;
                 (void)launcher_key(k, &go);
                 input.text_len = 0;
@@ -5500,7 +5541,7 @@ int main(int argc, char **argv) {
                  * the host - the harness drives that exact handler. */
                 if (!launcher_query_active() &&
                     (k == 105 || k == 106 || k == 103 || k == 108)) {
-                    int cols = ui_launcher_cols(launcher_items(), screen.w, screen.h,
+                    int cols = ui_launcher_cols(launcher_items(), screen.w, launcher_sh(),
                                                 launcher_label_w());
                     int total = launcher_items(), step = 0;
                     if (k == 105) step = -1;
