@@ -6,6 +6,9 @@ build/
 *.elf
 *.ppm
 *.png
+# ...except the screenshots the README embeds: they are documentation,
+# not build output, and ignoring them is why the README showed broken images.
+!docs/screenshots/*.png
 .DS_Store
 
 # needs the workflow OAuth scope to push: gh auth refresh -s workflow

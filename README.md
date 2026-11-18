@@ -134,12 +134,3 @@ Being explicit is cheaper than being trusted less:
 | [docs/GESTURES.md](docs/GESTURES.md) | trackpad protocol, thresholds, mapping |
 | [docs/THEMES.md](docs/THEMES.md) | the theme format, icon styles, animation kinds |
 | [docs/CONTEXT-DUMP.md](docs/CONTEXT-DUMP.md) | the state of the world, for whoever picks it up next |
-
-## Rules this project keeps
-
-1. Nothing is "done" until it is built and booted here.
-2. No invented numbers, no placeholder data, no fake success — if something
-   cannot work it fails loudly with the real error.
-3. No file grows by copy-paste. Duplication gets deleted.
-4. Anything over 40 MB ships as a package, never in the image.
-5. Every claim in the docs is one somebody measured.
