@@ -32,11 +32,12 @@
  *  a lock and the scheme, and the status bar shows the negotiated TLS
  *  version, cipher suite, certificate CN and expiry date.
  *
- *  It renders a real CSS subset: colours, type size/weight/style, text
- *  alignment, line height, and block boxes with margins, padding, top and
- *  bottom borders, backgrounds and centred max-width columns (src/css.c).
- *  It has no JavaScript and no layout beyond ordinary block flow - no
- *  floats, flex or grid - and that is the honest description of what is
+ *  It renders a real CSS subset: colours, text alignment, line height,
+ *  and block boxes with margins, padding, top and bottom borders,
+ *  backgrounds and centred max-width columns (src/css.c). It has no
+ *  JavaScript and no layout beyond ordinary block flow - no floats, flex
+ *  or grid - and the type scale is the built-in h1..h6 one rather than an
+ *  author font-size rule; that is the honest description of what is
  *  implemented.
  *
  *  Keys
@@ -144,15 +145,15 @@
 #define BADGE_H_D  16   /* design height of the scheme badge           */
 #define BADGE_PAD_D 7   /* its horizontal padding                       */
 
-/* The document's vertical rhythm, in design pixels. The parser stores
- * these on the atoms; layout applies the text scale when it places a
- * line, so a heading keeps its proportions when the desktop is zoomed.
- * One value above and one below every heading is what puts them on the
- * same grid, instead of the 10/7 px split the tags used to ask for. */
-#define GAP_BLOCK_D       6   /* <p>, <div>, <ul> ...                 */
-#define GAP_LI_D          2   /* list items follow each other closely */
-#define GAP_HEAD_D       16   /* space above any heading              */
-#define GAP_AFTER_HEAD_D 10   /* space below any heading              */
+/* The document's vertical rhythm, in design pixels. Block boxes take
+ * their margins from the cascade (the built-in sheet gives p 12 px and
+ * every heading 16 px); GAP_BLOCK_D is the fallback for a block tag the
+ * sheet says nothing about, so <div> keeps the spacing readers know.
+ * Layout applies the text scale when it places a line, so a heading
+ * keeps its proportions when the desktop is zoomed. */
+#define GAP_BLOCK_D       6   /* fallback margin for an unstyled block */
+#define GAP_LI_D          2   /* list items follow each other closely  */
+#define GAP_AFTER_HEAD_D 10   /* space below the help screen's title   */
 
 /* One wheel notch. Body lines, so it follows the text scale with the
  * fonts instead of being a fixed pixel distance. */
@@ -232,7 +233,7 @@ typedef struct {
     u16 atom;                        /* index into Doc.atom           */
     u16 start;                       /* first byte inside atom->text  */
     u16 len;                         /* byte count                    */
-    u16 x;                           /* px from the line's left edge  */
+    u16 x;                           /* page px, from the document edge */
     u16 w;                           /* measured width in px          */
 } Seg;
 
@@ -267,14 +268,16 @@ typedef struct {
     u32 content_y0, content_y1;      /* its content box, doc px       */
 
     u32 background;                  /* 0x00000000 = none             */
+    u32 color;                       /* resolved text colour          */
     u32 border_top_color, border_bottom_color;
     u8  border_top_w, border_bottom_w;
     u8  border_top_style, border_bottom_style;
     u8  align;                       /* CSS_ALIGN_*                   */
     u8  level;                       /* 0..6, the type face           */
-    u8  line_height;                 /* design px; 0 = face height    */
+    u16 line_height;                 /* design px; 0 = face height    */
     u8  has_top;                     /* box_y0 already fixed          */
     u8  is_body;                     /* <body>: its background is the canvas */
+    u8  has_color;                   /* the page (or an ancestor) set colour */
 } Block;
 
 typedef struct {
@@ -1297,8 +1300,11 @@ typedef struct {
     char href[WEB_PATH_MAX];
     char src[WEB_PATH_MAX];      /* <img src>  */
     char alt[96];
-    char cls[CSS_CLASS_MAX];     /* class attribute, as written */
-    char id[CSS_ID_MAX];         /* id attribute, as written    */
+    /* These are the attribute values, not selector tokens: a real page
+     * carries several classes ("mw-content-ltr mw-parser-output"), so the
+     * buffers are wider than CSS_CLASS_MAX/CSS_ID_MAX on purpose. */
+    char cls[96];
+    char id[48];
     int  align;                  /* align= hint: 0/1/2/3 = left/center/right/justify */
 } Tag;
 
@@ -1404,8 +1410,8 @@ static int parse_tag(const char *s, long n, long *used, Tag *t) {
 
 typedef struct {
     char   tag[CSS_TAG_MAX];
-    char   cls[CSS_CLASS_MAX];
-    char   id[CSS_ID_MAX];
+    char   cls[96];
+    char   id[48];
     CssNode node;                /* style resolved with its ancestors */
 } HtmlElem;
 
@@ -1708,6 +1714,9 @@ static void html_block_open(Html *h, const Tag *t, int level)
             b->width_pct = (u16)(cs->width_pct < 0 ? 0 : cs->width_pct);
             b->max_width_pct = (u16)(cs->max_width_pct < 0 ? 0 : cs->max_width_pct);
             b->background = cs->background;
+            b->color = cs->color;
+            b->has_color = (u8)((cs->set & CSS_SET_COLOR) != 0 ||
+                                (b->parent != 0xFFFF && d->block[b->parent].has_color));
             b->border_top_w = (u8)(cs->border_top_w > 0 ? cs->border_top_w : 0);
             b->border_bottom_w = (u8)(cs->border_bottom_w > 0 ? cs->border_bottom_w : 0);
             b->border_top_style = (u8)cs->border_top_style;
@@ -1717,8 +1726,8 @@ static void html_block_open(Html *h, const Tag *t, int level)
             b->align = (u8)cs->align;
             b->is_body = (u8)(!strcmp(t->name, "body"));
             b->level = (u8)(level > 0 ? level : level_for_px(cs->font_size));
-            b->line_height = (u8)(cs->line_height > 255 ? 255 :
-                                  cs->line_height < 0 ? 0 : cs->line_height);
+            b->line_height = (u16)(cs->line_height > 60000 ? 60000 :
+                                   cs->line_height < 0 ? 0 : cs->line_height);
         }
     }
 
@@ -2045,6 +2054,9 @@ static void lay_flush(Layout *L) {
 
         int h = L->height > 0 ? L->height : 12;
         if (b && b->line_height > 0) {
+            /* line-height opens the line box up; it never makes it shorter
+             * than the face, because overlapping glyphs are not a text
+             * browser's idea of tight leading. */
             int blh = layout_gap(b->line_height);
             if (blh > h) h = blh;
         }
@@ -2682,11 +2694,16 @@ static void draw_page_lines(Surface *v, Web *w) {
             memcpy(tmp, a->text + sg->start, (size_t)len);
             tmp[len] = 0;
 
-            /* The page's own CSS decides these three colours when it sets
-             * them; otherwise the built-in defaults stand. */
+            /* The page's own CSS decides the colour when a rule set one on
+             * this block or an ancestor; otherwise the theme defaults stand,
+             * which is what keeps an unstyled page readable on the dark
+             * desktop instead of turning it black on black. */
+            const Block *blk = (a->block != 0xFFFF && a->block < (u16)d->nblock)
+                               ? &d->block[a->block] : NULL;
             u32 col;
             if (a->link >= 0) col = w->col_link ? w->col_link
                                                 : color_for_link(a->flags & AF_LINKNUM);
+            else if (blk && blk->has_color) col = blk->color;
             else if (a->level) col = w->col_head ? w->col_head : C_HEAD;
             else col = w->col_text ? w->col_text : C_TEXT;
 
@@ -3196,14 +3213,12 @@ static void img_url(const Url *base, const char *src, char *out, size_t n) {
     snprintf(out, n, "%s://%s%s%s", base->scheme, hostport, dir, src);
 }
 
-/* Fetch and decode the images the page referenced. Called once per load,
- * after the body is in: the browser has exactly one connection in flight at
- * a time, so this is the only place it can happen. A failure is recorded on
- * that image and never stops the page from rendering. */
-/* What the stylesheet says the page's text, link and heading colours are.
- * Only colour is taken from CSS for now - layout (floats, flex) is not
- * something a text renderer can honour, and pretending would be worse than
- * saying so. Falls back to the built-in defaults when the page has none. */
+/* What the stylesheet says the page's default text, link and heading
+ * colours are. The per-block work (backgrounds, borders, widths, align,
+ * line-height) happens in html_build()/doc_layout() against the same
+ * resolved style; floats, flex and grid are not things this text renderer
+ * can honour, and pretending would be worse than saying so. Falls back to
+ * the built-in palette when the page sets nothing. */
 static void css_apply(Web *w) {
     if (!w->css_ready) {
         memset(&w->sheet, 0, sizeof(w->sheet));
@@ -3218,6 +3233,10 @@ static void css_apply(Web *w) {
     w->col_head = (head.set & CSS_SET_COLOR) ? head.color : C_HEAD;
 }
 
+/* Fetch and decode the images the page referenced. Called once per load,
+ * after the body is in: the browser has exactly one connection in flight at
+ * a time, so this is the only place it can happen. A failure is recorded on
+ * that image and never stops the page from rendering. */
 static void load_images(Web *w) {
     fprintf(stderr, "web: load_images n=%d\n", w->doc.nimg);
     char abs[WEB_PATH_MAX];

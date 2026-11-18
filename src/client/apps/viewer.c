@@ -99,6 +99,24 @@ enum {
     VCAT_VIDEO, VCAT_PDF, VCAT_DOCUMENT, VCAT_ARCHIVE, VCAT_BINARY
 };
 
+#if defined(VIEWER_HOST_TEST)
+/* Only the decoder harness prints the category; the window shows the
+ * badge instead, so this would be dead code in the app. */
+static const char *cat_name(int c) {
+    switch (c) {
+    case VCAT_TEXT:    return "text";
+    case VCAT_IMAGE:   return "image";
+    case VCAT_AUDIO:   return "audio";
+    case VCAT_VIDEO:   return "video";
+    case VCAT_PDF:     return "pdf";
+    case VCAT_DOCUMENT:return "document";
+    case VCAT_ARCHIVE: return "archive";
+    case VCAT_BINARY:  return "binary data";
+    default:           return "unknown";
+    }
+}
+#endif
+
 /* What one honest sentence would be needed for a category this build does
  * not decode. The caller prints this verbatim; it never claims to work. */
 static const char *cat_needs(int c) {
@@ -116,7 +134,7 @@ static const char *cat_needs(int c) {
     case VCAT_IMAGE:
         return "this image format has no decoder here (PNG, BMP and PPM/PGM are decoded)";
     default:
-        return "no decoder for these bytes; only the file's own facts are shown";
+        return "no decoder for these bytes; only its size and type are known";
     }
 }
 
@@ -1675,8 +1693,8 @@ static void load_document(Viewer *v, const char *path) {
         v->kind = DOC_OTHER;
         v->mark = MARK_FOLDER;
         v->cat = VCAT_UNKNOWN;
-        v->badge[0] = 0;               /* the centred heading is the type */
         snprintf(v->type_name, sizeof(v->type_name), "directory");
+        snprintf(v->badge, sizeof(v->badge), "%s", v->type_name);
         snprintf(v->other_note, sizeof(v->other_note),
                  "a directory has no bytes to display; open a file inside it");
         return;
@@ -1685,8 +1703,8 @@ static void load_document(Viewer *v, const char *path) {
         v->kind = DOC_OTHER;
         v->mark = MARK_PAGE;
         v->cat = VCAT_UNKNOWN;
-        v->badge[0] = 0;
         snprintf(v->type_name, sizeof(v->type_name), "special file");
+        snprintf(v->badge, sizeof(v->badge), "%s", v->type_name);
         snprintf(v->other_note, sizeof(v->other_note),
                  "not a regular file; only its facts are shown (nothing is opened)");
         return;
@@ -1764,7 +1782,8 @@ static void load_document(Viewer *v, const char *path) {
     }
 
     v->kind = DOC_OTHER;
-    v->badge[0] = 0;                   /* the centred heading is the type */
+    snprintf(v->badge, sizeof(v->badge), "%s",
+             v->type_name[0] ? v->type_name : "unknown");
     if (!v->other_note[0])
         snprintf(v->other_note, sizeof(v->other_note), "%s", cat_needs(v->cat));
 }
@@ -1880,12 +1899,23 @@ static void image_draw(const VImage *im, u32 *dst, int dw, int dh, int stride,
 }
 
 static float image_effective_zoom(const Viewer *v, int cw, int ch) {
+    float f, g;
     if (v->img.w <= 0 || v->img.h <= 0) return 1.0f;
     if (v->zoom > 0.0f) return v->zoom;
-    float f = (float)cw / (float)v->img.w;
-    float g = (float)ch / (float)v->img.h;
+    f = (float)cw / (float)v->img.w;
+    g = (float)ch / (float)v->img.h;
     if (g < f) f = g;
-    if (f > 32.0f) f = 32.0f;     /* a 1x1 icon should still be visible, not 800x */
+    if (f > 1.0f) {
+        /* Fit shrinks; it does not blow a picture up. A 480x300 photograph
+         * shown at 161% is a pixelated claim about detail the file does not
+         * have. Only a mark-sized image is allowed to grow, so that it is
+         * visible at all. */
+        if (v->img.w <= 32 && v->img.h <= 32) {
+            if (f > 8.0f) f = 8.0f;
+        } else {
+            f = 1.0f;
+        }
+    }
     if (f < 0.01f) f = 0.01f;
     return f;
 }
@@ -2181,9 +2211,12 @@ typedef struct {
     int  show_badge, badge_x, badge_y, badge_w, badge_h, badge_dy;
     u32  badge_col;
 
-    /* image: the picture's box and the one caption line under it */
-    VRect pic;
-    int  caption_y, caption_w;
+    /* image: the viewport the picture is fitted into, the rect it actually
+     * occupies, and the one caption line under it */
+    VRect view, pic;
+    int  pic_exact;                /* pic is the picture, not the page */
+    float pic_zoom;                /* the zoom pic was measured at */
+    int  caption_x, caption_y, caption_w;
     char caption[260];
 
     /* text: the reading column and its gutter */
@@ -2360,26 +2393,36 @@ static void foot_build(VLayout *L, Viewer *v) {
         if (v->truncated) {
             fmt_size(sz, sizeof(sz), (unsigned long long)v->text_len);
             fmt_size(tot, sizeof(tot), (unsigned long long)v->st.st_size);
-            snprintf(L->foot_left, sizeof(L->foot_left),
-                     "first %s of %s · %s · %s", sz, tot, v->encoding, v->eol);
+            if (!strcmp(sz, tot))
+                /* rounding would say "4.0 MB of 4.0 MB": print the bytes */
+                snprintf(L->foot_left, sizeof(L->foot_left),
+                         "first %lu of %lu bytes · %s · %s",
+                         (unsigned long)v->text_len,
+                         (unsigned long)v->st.st_size, v->encoding, v->eol);
+            else
+                snprintf(L->foot_left, sizeof(L->foot_left),
+                         "first %s of %s · %s · %s", sz, tot, v->encoding, v->eol);
+            snprintf(L->foot_right, sizeof(L->foot_right),
+                     "%d lines shown", v->nlines);
         } else {
             fmt_size(sz, sizeof(sz), (unsigned long long)v->st.st_size);
             snprintf(L->foot_left, sizeof(L->foot_left),
                      "%s · %s · %s", sz, v->encoding, v->eol);
+            snprintf(L->foot_right, sizeof(L->foot_right),
+                     "%d lines", v->nlines);
         }
-        snprintf(L->foot_right, sizeof(L->foot_right), "%d lines", v->nlines);
         break;
     }
     case DOC_IMAGE: {
-        float z = image_effective_zoom(v, L->pic.w, L->pic.h);
+        float z = image_effective_zoom(v, L->view.w, L->view.h);
         int pct = (int)(z * 100.0f + 0.5f);
         int hover = 0;
         if (v->img.px && v->img.w > 0 && v->img.h > 0 &&
-            rect_hit(L->pic, v->mx, v->my)) {
+            rect_hit(L->view, v->mx, v->my)) {
             int sw = iround((float)v->img.w * z);
             int sh = iround((float)v->img.h * z);
-            int ox = L->pic.x + (L->pic.w - sw) / 2 + iround(v->pan_x);
-            int oy = L->pic.y + (L->pic.h - sh) / 2 + iround(v->pan_y);
+            int ox = L->view.x + (L->view.w - sw) / 2 + iround(v->pan_x);
+            int oy = L->view.y + (L->view.h - sh) / 2 + iround(v->pan_y);
             int ix = (int)((float)(v->mx - ox) / z);
             int iy = (int)((float)(v->my - oy) / z);
             if (ix >= 0 && ix < v->img.w && iy >= 0 && iy < v->img.h) {
@@ -2394,6 +2437,7 @@ static void foot_build(VLayout *L, Viewer *v) {
             snprintf(L->foot_left, sizeof(L->foot_left), "wheel · zoom     drag · pan");
         if (v->zoom <= 0.0f) {
             if (pct < 1) snprintf(L->foot_right, sizeof(L->foot_right), "fit · <1%%");
+            else if (pct >= 100) snprintf(L->foot_right, sizeof(L->foot_right), "%d%%", pct);
             else snprintf(L->foot_right, sizeof(L->foot_right), "fit · %d%%", pct);
         } else {
             if (pct < 1) snprintf(L->foot_right, sizeof(L->foot_right), "<1%%");
@@ -2425,6 +2469,12 @@ static void foot_build(VLayout *L, Viewer *v) {
         snprintf(L->foot_left, sizeof(L->foot_left), "q · close");
         break;
     }
+}
+
+/* The height of the centred block as it currently stands. */
+static int state_block_h(const VLayout *L) {
+    return L->icon_sz + L->gap + L->state_head_n * L->head_lh
+         + (L->state_sub_n ? L->gap + L->state_sub_n * L->sub_lh : 0);
 }
 
 static void layout_build(VLayout *L, Viewer *v, int w, int h) {
@@ -2513,14 +2563,43 @@ static void layout_build(VLayout *L, Viewer *v, int w, int h) {
         text_clamp(v, L);
     } else if (v->kind == DOC_IMAGE) {
         int cap_h = vceil(font_height(L->f.small));
-        L->caption_y = L->body.y + L->body.h - L->gap - cap_h;
-        L->pic.x = L->body.x + L->gap;
-        L->pic.y = L->body.y + L->gap;
-        L->pic.w = L->body.w - 2 * L->gap;
-        L->pic.h = L->caption_y - L->gap - L->pic.y;
-        if (L->pic.w < 1) L->pic.w = 1;
-        if (L->pic.h < 1) L->pic.h = 1;
+        VRect box;
+        box.x = L->body.x + L->gap;
+        box.y = L->body.y + L->gap;
+        box.w = L->body.w - 2 * L->gap;
+        box.h = L->body.h - cap_h - 2 * L->gap - L->gap;
+        if (box.w < 1) box.w = 1;
+        if (box.h < 1) box.h = 1;
+
+        /* At fit the picture keeps its own size, so the caption can sit
+         * directly under it and the pair can be centred as one block. When
+         * the reader has zoomed past the page, the picture fills the page
+         * and the caption takes the reserved line at the bottom. */
+        {
+            float z = image_effective_zoom(v, box.w, box.h);
+            int sw = iround((float)v->img.w * z);
+            int sh = iround((float)v->img.h * z);
+            L->view = box;
+            if (sw <= box.w && sh <= box.h) {
+                int block = sh + L->gap + cap_h;
+                int top = L->body.y + (L->body.h - block) / 2;
+                if (top < L->body.y + L->gap) top = L->body.y + L->gap;
+                L->pic.x = box.x + (box.w - sw) / 2;
+                L->pic.y = top;
+                L->pic.w = sw;
+                L->pic.h = sh;
+                L->caption_y = top + sh + L->gap;
+                L->pic_exact = 1;
+                L->pic_zoom = z;
+            } else {
+                L->pic = box;
+                L->caption_y = L->body.y + L->body.h - L->gap - cap_h;
+                L->pic_exact = 0;
+                L->pic_zoom = z;
+            }
+        }
         L->caption_w = L->body.w - 2 * L->gap;
+        L->caption_x = L->body.x + L->body.w / 2;
         {
             char sz[48], fmt[24];
             const char *fw = v->img.fmt;
@@ -2536,8 +2615,8 @@ static void layout_build(VLayout *L, Viewer *v, int w, int h) {
         }
         /* clamp the pan here too, so the footer's pixel readout is taken
          * from the pan the painter is about to use */
-        image_clamp_pan(v, image_effective_zoom(v, L->pic.w, L->pic.h),
-                        L->pic.w, L->pic.h);
+        image_clamp_pan(v, image_effective_zoom(v, L->view.w, L->view.h),
+                        L->view.w, L->view.h);
     } else {
         /* the centred state: a mark above a sentence, centred as one block */
         L->head_lh = vceil(font_height(L->f.body));
@@ -2553,38 +2632,44 @@ static void layout_build(VLayout *L, Viewer *v, int w, int h) {
 
         state_build(L, v);
 
-        /* Fit the block to the page. The sentence is what the state is
-         * FOR, so it is the last thing shortened: the mark shrinks first,
-         * then (never for an unsupported type, whose sentence this is) the
-         * line under it, and only then the sentence itself. */
+        /* Fit the block to the page it was given. The sentence is what
+         * the state is FOR, so it is the last thing shortened: a hint line
+         * goes first, then the mark shrinks, and only then is a sentence
+         * that cannot fit elided - with a visible ".." so no one is told
+         * less than the file without being told so. */
         {
             int avail = L->body.h - 2 * L->gap;
-            int text_h = L->state_head_n * L->head_lh
-                       + (L->state_sub_n ? L->gap + L->state_sub_n * L->sub_lh : 0);
-            int block;
 
             while (L->state_sub_n > 0 && v->kind != DOC_OTHER &&
-                   text_h + L->gap + L->icon_sz > avail) {
+                   state_block_h(L) > avail)
                 L->state_sub_n--;
-                text_h = L->state_head_n * L->head_lh
-                       + (L->state_sub_n ? L->gap + L->state_sub_n * L->sub_lh : 0);
-            }
-            if (text_h + L->gap + L->icon_sz > avail) {
-                int room = avail - L->gap - text_h;
-                L->icon_sz = room > 0 ? room : 0;
+            if (state_block_h(L) > avail) {
+                int room = avail - L->gap - L->state_head_n * L->head_lh
+                         - (L->state_sub_n ? L->gap + L->state_sub_n * L->sub_lh : 0);
+                L->icon_sz = room > 0 ? vmin_i(L->icon_sz, room) : 0;
             }
             if (L->icon_sz < SP(2)) L->icon_sz = 0;
-            block = L->icon_sz + L->gap
-                  + L->state_head_n * L->head_lh
-                  + (L->state_sub_n ? L->gap + L->state_sub_n * L->sub_lh : 0);
-            while (L->state_head_n > 1 && block > avail) {
-                L->state_head_n--;
-                block = L->icon_sz + L->gap
-                      + L->state_head_n * L->head_lh
-                      + (L->state_sub_n ? L->gap + L->state_sub_n * L->sub_lh : 0);
+            if (state_block_h(L) > avail && L->state_sub_n > 0) {
+                int room = avail - L->gap - L->icon_sz
+                         - L->state_head_n * L->head_lh - L->gap;
+                int fit = room > 0 ? room / L->sub_lh : 0;
+                if (fit < 0) fit = 0;
+                if (fit < L->state_sub_n) {
+                    L->state_sub_n = fit;
+                    if (fit > 0) {
+                        char last[VLINE];
+                        snprintf(last, sizeof(last), "%s ..",
+                                 L->state_sub[fit - 1]);
+                        tx_fit(L->state_sub[fit - 1], VLINE, L->f.small,
+                               last, L->state_w);
+                    }
+                }
             }
+            while (L->state_head_n > 1 && state_block_h(L) > avail)
+                L->state_head_n--;
 
             {
+                int block = state_block_h(L);
                 int top = L->body.y + (L->body.h - block) / 2;
                 if (top < L->body.y + L->gap) top = L->body.y + L->gap;
                 L->icon_y = top;
@@ -2650,7 +2735,7 @@ static void layout_build(VLayout *L, Viewer *v, int w, int h) {
             }
             if (lw > cap) lw = cap;
             L->info_label_right = L->info.x + pad + lw;
-            L->info_value_x = L->info_label_right + 2 * L->gap;
+            L->info_value_x = L->info_label_right + L->gap;
             L->info_value_w = L->info.x + iw - pad - L->info_value_x;
             if (L->info_value_w < SP(2)) L->info_value_w = SP(2);
         }
@@ -2678,10 +2763,20 @@ static void draw_mark(Surface *s, int kind, int cx, int y, int sz, u32 tint_col)
     if (lw < 1.0f) lw = 1.0f;
 
     if (kind == MARK_FOLDER) {
-        gfx_rrect_aa(s, fx, fy + fs * 0.26f, fs * 0.46f, fs * 0.18f,
-                     r * 0.5f, line, 0, 0);
-        gfx_rrect_aa(s, fx, fy + fs * 0.36f, fs, fs * 0.42f,
-                     r, fill, line, lw);
+        /* one outline: body, tab, and the bevel between them */
+        float q[12] = {
+            fx + fs * 0.03f, fy + fs * 0.78f,
+            fx + fs * 0.03f, fy + fs * 0.36f,
+            fx + fs * 0.38f, fy + fs * 0.36f,
+            fx + fs * 0.46f, fy + fs * 0.26f,
+            fx + fs * 0.97f, fy + fs * 0.26f,
+            fx + fs * 0.97f, fy + fs * 0.78f
+        };
+        gfx_polygon(s, q, 6, fill);
+        for (i = 0; i < 6; i++) {
+            int j = (i + 1) % 6;
+            gfx_line(s, q[i * 2], q[i * 2 + 1], q[j * 2], q[j * 2 + 1], lw, line);
+        }
         return;
     }
 
@@ -2739,8 +2834,8 @@ static void draw_mark(Surface *s, int kind, int cx, int y, int sz, u32 tint_col)
 static void draw_scroll_v(Surface *s, int x, int y, int h, int first,
                           int total, int vis, int bw) {
     if (h <= 0 || bw <= 0) return;
+    if (total <= vis || total < 1) return;    /* nothing to scroll: no bar */
     tint(s, x, y, bw, h, color_alpha(C_TEXT, 0.045f));
-    if (total <= vis || total < 1) return;
     {
         int th = h * vis / total;
         int maxf = total - vis;
@@ -2755,8 +2850,8 @@ static void draw_scroll_v(Surface *s, int x, int y, int h, int first,
 static void draw_scroll_h(Surface *s, int x, int y, int w, int first,
                           int total, int vis, int bh) {
     if (w <= 0 || bh <= 0) return;
+    if (total <= vis || total < 1) return;    /* nothing to scroll: no bar */
     tint(s, x, y, w, bh, color_alpha(C_TEXT, 0.045f));
-    if (total <= vis || total < 1) return;
     {
         int tw = w * vis / total;
         int maxf = total - vis;
@@ -2828,32 +2923,58 @@ static void draw_text_view(Surface *s, const Viewer *v, const VLayout *L) {
 
 static void draw_image_view(Surface *s, Viewer *v, const VLayout *L) {
     VRect p = L->pic;
-    float z = image_effective_zoom(v, p.w, p.h);
     Surface sub = *s;
+    float z = L->pic_zoom;
+    int sw, sh, ox, oy;
 
-    image_clamp_pan(v, z, p.w, p.h);
+    if (L->pic_exact) {
+        /* the picture keeps its own size and its own rect, so no pan or
+         * clip maths can move it off that rect */
+        sw = p.w;
+        sh = p.h;
+        ox = p.x;
+        oy = p.y;
+    } else {
+        p = L->view;
+        image_clamp_pan(v, z, p.w, p.h);
+        sw = iround((float)v->img.w * z);
+        sh = iround((float)v->img.h * z);
+        ox = p.x + (p.w - sw) / 2 + iround(v->pan_x);
+        oy = p.y + (p.h - sh) / 2 + iround(v->pan_y);
+    }
 
-    /* the picture's own edge, when it fits: keeps a light image from
-     * bleeding into the page */
-    {
-        int sw = iround((float)v->img.w * z);
-        int sh = iround((float)v->img.h * z);
-        int ox = p.x + (p.w - sw) / 2 + iround(v->pan_x);
-        int oy = p.y + (p.h - sh) / 2 + iround(v->pan_y);
-        if (sw <= p.w && sh <= p.h)
-            gfx_rrect_aa(s, (float)ox - 0.5f, (float)oy - 0.5f,
-                         (float)sw + 1.0f, (float)sh + 1.0f, 0.0f,
-                         0, color_alpha(C_TEXT, 0.10f), 1.0f);
+    /* The transparency checker belongs under the PIXELS, not across the
+     * page: a 5x4 icon at 800% must not look like a transparent canvas
+     * the size of the window. It goes down first, then the pixels blend
+     * over it. */
+    if (!v->img.opaque) {
+        int x0 = vmax_i(p.x, ox), x1 = vmin_i(p.x + p.w, ox + sw);
+        int y0 = vmax_i(p.y, oy), y1 = vmin_i(p.y + p.h, oy + sh);
+        for (int y = y0; y < y1; y++) {
+            u32 *row = s->px + (size_t)y * (size_t)s->stride;
+            for (int x = x0; x < x1; x++)
+                row[x] = ((((x - ox) >> 3) + ((y - oy) >> 3)) & 1) ? C_CHK2 : C_CHK1;
+        }
     }
 
     sub.px = s->px + (size_t)p.y * (size_t)s->stride + (size_t)p.x;
     sub.w = p.w;
     sub.h = p.h;
     surf_clip(&sub, 0, 0, p.w, p.h);
-    image_draw(&v->img, sub.px, sub.w, sub.h, sub.stride, z,
-               v->pan_x, v->pan_y, !v->img.opaque);
+    if (L->pic_exact)
+        image_draw(&v->img, sub.px, sub.w, sub.h, sub.stride, z, 0.0f, 0.0f, 0);
+    else
+        image_draw(&v->img, sub.px, sub.w, sub.h, sub.stride, z,
+                   v->pan_x, v->pan_y, 0);
 
-    tx_center(s, L->f.small, L->body.x + L->body.w / 2, L->caption_y,
+    /* the picture's own edge, when it fits: keeps a light image from
+     * bleeding into the page */
+    if (sw <= p.w && sh <= p.h)
+        gfx_rrect_aa(s, (float)ox - 0.5f, (float)oy - 0.5f,
+                     (float)sw + 1.0f, (float)sh + 1.0f, 0.0f,
+                     0, color_alpha(C_TEXT, 0.10f), 1.0f);
+
+    tx_center(s, L->f.small, L->caption_x, L->caption_y,
               L->caption_w, L->caption, C_DIM);
 }
 
@@ -3027,12 +3148,12 @@ static void handle_key(Viewer *v, int vw, int vh, int key, int mods, int *quit) 
         case KEY_UP:    v->pan_y += (float)step; break;
         case KEY_DOWN:  v->pan_y -= (float)step; break;
         case KEY_EQUAL:
-            zoom_around(v, L.pic, L.pic.x + L.pic.w / 2,
-                        L.pic.y + L.pic.h / 2, 1.25f);
+            zoom_around(v, L.view, L.view.x + L.view.w / 2,
+                        L.view.y + L.view.h / 2, 1.25f);
             break;
         case KEY_MINUS:
-            zoom_around(v, L.pic, L.pic.x + L.pic.w / 2,
-                        L.pic.y + L.pic.h / 2, 0.8f);
+            zoom_around(v, L.view, L.view.x + L.view.w / 2,
+                        L.view.y + L.view.h / 2, 0.8f);
             break;
         case KEY_0:
         case KEY_F:
@@ -3042,8 +3163,8 @@ static void handle_key(Viewer *v, int vw, int vh, int key, int mods, int *quit) 
             break;
         default: break;
         }
-        image_clamp_pan(v, image_effective_zoom(v, L.pic.w, L.pic.h),
-                        L.pic.w, L.pic.h);
+        image_clamp_pan(v, image_effective_zoom(v, L.view.w, L.view.h),
+                        L.view.w, L.view.h);
         return;
     }
 
@@ -3088,9 +3209,9 @@ static void handle_wheel(Viewer *v, int vw, int vh, int notches) {
         while (n > 0) { factor *= 1.25f; n--; }
         while (n < 0) { factor *= 0.8f; n++; }
         {
-            int mx = rect_hit(L.pic, v->mx, v->my) ? v->mx : L.pic.x + L.pic.w / 2;
-            int my = rect_hit(L.pic, v->mx, v->my) ? v->my : L.pic.y + L.pic.h / 2;
-            zoom_around(v, L.pic, mx, my, factor);
+            int mx = rect_hit(L.view, v->mx, v->my) ? v->mx : L.view.x + L.view.w / 2;
+            int my = rect_hit(L.view, v->mx, v->my) ? v->my : L.view.y + L.view.h / 2;
+            zoom_around(v, L.view, mx, my, factor);
         }
         return;
     }
@@ -3174,7 +3295,7 @@ int main(int argc, char **argv) {
                             v.info_open = 0;
                         v.dragging = 0;
                     } else if (v.kind == DOC_IMAGE && (ev.buttons & 1) &&
-                               rect_hit(L.pic, ev.x, ev.y)) {
+                               rect_hit(L.view, ev.x, ev.y)) {
                         if (!v.dragging) {
                             v.dragging = 1;
                             v.last_mx = ev.x;
@@ -3185,8 +3306,8 @@ int main(int argc, char **argv) {
                             v.last_mx = ev.x;
                             v.last_my = ev.y;
                             image_clamp_pan(&v,
-                                image_effective_zoom(&v, L.pic.w, L.pic.h),
-                                L.pic.w, L.pic.h);
+                                image_effective_zoom(&v, L.view.w, L.view.h),
+                                L.view.w, L.view.h);
                         }
                     } else {
                         v.dragging = 0;

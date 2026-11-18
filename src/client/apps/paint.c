@@ -18,10 +18,10 @@
  *                it reports how many pixels it changed.
  *    undo/redo   a bounded ring of whole canvas bitmaps kept in malloc'd
  *                memory. HIST_STATES snapshots => HIST_STATES-1 undo
- *                steps (13), and every byte is counted and shown on
- *                screen: the ring can never exceed HIST_STATES *
- *                CANVAS_BYTES. If malloc fails, history is disabled and
- *                the app says so instead of dying.
+ *                steps (13), and every byte is counted: the ring can
+ *                never exceed HIST_STATES * CANVAS_BYTES. If malloc
+ *                fails, history is disabled and the footer says so
+ *                instead of the app dying.
  *    save        a real PNG in /root/Pictures (or /tmp/Pictures when the
  *                jail has hidden /root - the place actually used is
  *                printed). The writer emits a valid zlib stream made of
@@ -39,9 +39,17 @@
  *    brush       width 1..16, a disc stamp, shared by every shape.
  *    clear       asks first, and the clear is undoable.
  *
- *  Nothing is invented: the only numbers on screen are the pen position,
- *  the mixer channels you set, the brush size, the undo bytes, and the
- *  size of files that stat() reported.
+ *  The window is one column: a header (the tool, the brush stepper), a
+ *  strip of drawn icons (the eight tools, then undo, redo, save, open,
+ *  clear), the sheet, one row of inks under it, and one footer line (the
+ *  picture folder, the undo depth, the brush). The mixer is a card beside
+ *  the sheet when the window is wide enough and a popover on it when it is
+ *  not. There are no hint lines: what the program has to say about the
+ *  last action appears as a toast and leaves on its own.
+ *
+ *  Nothing is invented: the only numbers on screen are the mixer channels
+ *  you set, the brush size, the undo depth, and the pixel count a fill
+ *  really changed.
  * ============================================================ */
 #include "../mystic_client.h"
 #include "../../mystic.h"
@@ -69,13 +77,6 @@
 
 #define HIST_STATES 14          /* 13 undo steps + the live state */
 #define MAX_BRUSH   16
-
-#define CX0 100                 /* canvas origin inside the window */
-#define CY0 8
-#define RAIL_X 8
-#define RAIL_W 84
-#define PANEL_X 508
-#define PANEL_W 124
 
 /* The OS build writes to the desktop's Pictures folder. The host test
  * overrides these on the compiler command line so it can exercise the
@@ -1346,7 +1347,7 @@ typedef struct {
     Rect brush_minus, brush_plus;
 
     /* the tool strip */
-    int strip_y, strip_h, strip_rows, btn, gap, divider_x;
+    int strip_y, strip_h, strip_rows, btn, divider_x;
     Rect tool[T_N];
     Rect act[A_N];
 
@@ -1765,7 +1766,6 @@ static void layout_build(int vw, int vh, const Fonts *F, const PaintState *st, L
 
     th = ui_ceil(font_height(F->title));
     sh = ui_ceil(font_height(F->small));
-    L->gap = gap;
 
     /* ---- header ---- */
     L->header_y = pad;
@@ -1819,7 +1819,7 @@ static void layout_build(int vw, int vh, const Fonts *F, const PaintState *st, L
             L->tool[i] = rect_make(x, L->strip_y, btn, btn);
             x += btn + gap;
         }
-        L->divider_x = x - gap / 2;
+        L->divider_x = x - gap + over;      /* the middle of the wide gap */
         x += 2 * over - gap;
         for (int i = 0; i < A_N; i++) {
             L->act[i] = rect_make(x, L->strip_y, btn, btn);
@@ -1945,6 +1945,7 @@ static void layout_build(int vw, int vh, const Fonts *F, const PaintState *st, L
         L->dlg_btn_y = L->dlg.y + dh2 - m - b_h;
         if (L->dlg_btn_y < L->dlg_body_y + sh) L->dlg_btn_y = L->dlg_body_y + sh;
         bw = ui_min(SP(14), (dw2 - 3 * m) / 2);
+        if (bw < 1) bw = 1;
         L->dlg_no = rect_make(L->dlg.x + m, L->dlg_btn_y, bw, b_h);
         L->dlg_yes = rect_make(L->dlg.x + dw2 - m - bw, L->dlg_btn_y, bw, b_h);
     }
@@ -2095,7 +2096,7 @@ static void draw_ui(MClient *c, const Layout *L, const Fonts *F,
     /* ---- the palette row: current colour, then the twelve inks ---- */
     gfx_rrect_aa(&s, (float)L->chip.x, (float)L->chip.y,
                  (float)L->chip.w, (float)L->chip.h, 3.0f, cur,
-                 (L->panel_on || L->pop_on) ? C_ACCENT : C_LINE, 1.0f);
+                 L->pop_on ? C_ACCENT : C_TEXT, 1.2f);
     for (int i = 0; i < PAL_N; i++) {
         const Rect *r = &L->swatch[i];
         int chosen = st->r == (int)GET_R(PALETTE[i]) &&
@@ -2160,24 +2161,27 @@ static void draw_ui(MClient *c, const Layout *L, const Fonts *F,
     }
 
     /* ---- what just happened, as a toast over the sheet ---- */
-    if (msg && msg[0] && !L->pop_on) {
+    if (msg && msg[0] && !L->pop_on &&
+        L->canvas.h >= 5 * ui_ceil(font_height(F->small))) {
         char t[224];
         int inner = ui_min(vw - 2 * L->pad - 2 * SP(2),
                            ui_ceil(font_width(F->small, msg)));
-        int w, h, tx, ty;
         text_fit(t, sizeof(t), F->small, msg, inner);
-        w = ui_ceil(font_width(F->small, t)) + 2 * SP(2);
-        h = ui_ceil(font_height(F->small)) + 2 * SP(1);
-        if (w > vw - 2 * L->pad) w = vw - 2 * L->pad;
-        tx = L->canvas.x + (L->canvas.w - w) / 2;
-        tx = ui_clamp(tx, L->pad, ui_max(L->pad, vw - L->pad - w));
-        ty = L->canvas.y + L->canvas.h - h - SP(1);
-        if (ty < L->canvas.y) ty = L->canvas.y + SP(1);
-        gfx_rrect_aa(&s, (float)tx, (float)ty, (float)w, (float)h,
-                     (float)h * 0.5f, C_PANEL,
-                     msg_warn ? C_WARN : C_ACCENT, 1.0f);
-        text_draw(&s, F->small, tx + SP(2), ty + SP(1), w - 2 * SP(2), 0, t,
-                  msg_warn ? C_WARN : C_TEXT);
+        if (t[0]) {
+            int w = ui_ceil(font_width(F->small, t)) + 2 * SP(2);
+            int h = ui_ceil(font_height(F->small)) + 2 * SP(1);
+            int tx, ty;
+            if (w > vw - 2 * L->pad) w = vw - 2 * L->pad;
+            tx = L->canvas.x + (L->canvas.w - w) / 2;
+            tx = ui_clamp(tx, L->pad, ui_max(L->pad, vw - L->pad - w));
+            ty = L->canvas.y + L->canvas.h - h - SP(1);
+            if (ty < L->canvas.y) ty = L->canvas.y + SP(1);
+            gfx_rrect_aa(&s, (float)tx, (float)ty, (float)w, (float)h,
+                         (float)h * 0.5f, C_PANEL,
+                         msg_warn ? C_WARN : C_ACCENT, 1.0f);
+            text_draw(&s, F->small, tx + SP(2), ty + SP(1), w - 2 * SP(2), 0, t,
+                      msg_warn ? C_WARN : C_TEXT);
+        }
     }
 
     /* ---- the clear confirmation ---- */
@@ -3053,7 +3057,11 @@ static int render_scene(float scale, int vw, int vh, int scene,
     g_text_drawn = 0;
     g_text_over = 0;
 
-    ui_scale_set_effective(scale);
+    /* scale is the value Settings shows (1.0 = Normal). The window server
+     * exports the absolute multiplier - scale * UI_BASE, src/ui.c - and the
+     * client hands that to ui_scale_set_effective(), so a proof render has
+     * to do the same or it would test a scale nobody can select. */
+    ui_scale_set_effective(1.4f * scale);
     if (font_init("assets/fonts") != 0) { printf("fonts: font_init failed\n"); return 2; }
     F.title = font_get(FONT_SEMIBOLD, 15);
     F.body  = font_get(FONT_REGULAR, 11);
@@ -3136,9 +3144,13 @@ int paint_render_at(float scale, int vw, int vh, const char *png, int scene) {
 int paint_render(float scale, const char *drag_out, const char *dialog_out);
 
 int paint_render(float scale, const char *drag_out, const char *dialog_out) {
+    /* This entry point predates the Settings-relative proof: it takes the
+     * absolute multiplier the window server exports, where 1.4 is Normal. */
+    float rel = scale / 1.4f;
     int rc = 0;
-    rc |= render_scene(scale, WIN_W, WIN_H, 0, NULL, drag_out);
-    rc |= render_scene(scale, WIN_W, WIN_H, 1, NULL, dialog_out);
+    printf("render at absolute %.2f (Settings %.2f)\n", (double)scale, (double)rel);
+    rc |= render_scene(rel, WIN_W, WIN_H, 0, NULL, drag_out);
+    rc |= render_scene(rel, WIN_W, WIN_H, 1, NULL, dialog_out);
     return rc ? 1 : 0;
 }
 
@@ -3165,7 +3177,7 @@ int paint_ui_test(void) {
     int dirty, cx, cy;
 
     ui_fails = 0;
-    ui_scale_set_effective(1.0f);
+    ui_scale_set_effective(1.4f);              /* Settings 1.0 = Normal */
     if (font_init("assets/fonts") != 0) { printf("fonts: font_init failed\n"); return 2; }
     F.title = font_get(FONT_SEMIBOLD, 15);
     F.body  = font_get(FONT_REGULAR, 11);
@@ -3231,6 +3243,29 @@ int paint_ui_test(void) {
           "the pencil wrote the pixel under the pointer");
     uichk(hist_at == 1, "the stroke committed one undo state");
 
+    /* ---- the eyedropper really reads the pixel under the pointer ---- */
+    {
+        u32 pv = canvas[(size_t)cy * CANVAS_W + cx];
+        st.r = 1; st.g = 2; st.b = 3;
+        st.tool = T_PICK;
+        dirty = 0;
+        press_at(&st, &L, L.canvas.x + L.canvas.w / 2, L.canvas.y + L.canvas.h / 2,
+                 msg, sizeof(msg), &dirty);
+        uichk(RGB(st.r, st.g, st.b) == pv && dirty,
+              "the eyedropper reads the pixel under the pointer");
+        st.r = GET_R(pv); st.g = GET_G(pv); st.b = GET_B(pv);
+    }
+
+    /* ---- the fill changes a real number of pixels and says how many ---- */
+    {
+        long was = count_colour(RGB(st.r, st.g, st.b));
+        st.tool = T_FILL;
+        dirty = 0;
+        press_at(&st, &L, L.canvas.x + 2, L.canvas.y + 2, msg, sizeof(msg), &dirty);
+        uichk(count_colour(RGB(st.r, st.g, st.b)) > was &&
+              strstr(msg, "filled ") != NULL,
+              "the fill reports the pixels it changed");
+    }
     /* ---- undo and redo ---- */
     {
         Rect r = L.act[A_UNDO];
@@ -3255,6 +3290,18 @@ int paint_ui_test(void) {
               "the clear is undoable");
     }
 
+    /* ---- save and open are wired to the two file buttons ---- */
+    {
+        Rect r = L.act[A_SAVE];
+        dirty = 0;
+        press_at(&st, &L, r.x + r.w / 2, r.y + r.h / 2, msg, sizeof(msg), &dirty);
+        uichk(strncmp(msg, "saved ", 6) == 0, "the save button writes a PNG");
+        r = L.act[A_OPEN];
+        dirty = 0;
+        press_at(&st, &L, r.x + r.w / 2, r.y + r.h / 2, msg, sizeof(msg), &dirty);
+        uichk(strncmp(msg, "opened ", 7) == 0, "the open button reads the newest PNG");
+    }
+
     /* ---- the popover mixer in the narrow window ---- */
     {
         Rect r = L.chip;
@@ -3276,6 +3323,17 @@ int paint_ui_test(void) {
         Rect r = L.sl[2];
         press_at(&st, &L, r.x + r.w / 4, r.y + r.h / 2, msg, sizeof(msg), &dirty);
         uichk(st.b >= 62 && st.b <= 65, "the panel's B slider sets the blue channel");
+    }
+
+    /* ---- the truncation itself: an ellipsis, inside the box ---- */
+    {
+        char b[80];
+        int box = (int)font_width(F.small, "undo");
+        int cut = text_fit(b, sizeof(b), F.small,
+                           "a label far too long for this column", box);
+        uichk(cut && strstr(b, "\xE2\x80\xA6") != NULL &&
+              font_width(F.small, b) <= (float)box,
+              "text_fit cuts with an ellipsis that fits the box");
     }
 
     /* ---- hover is the same hit test ---- */

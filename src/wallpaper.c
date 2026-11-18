@@ -652,20 +652,23 @@ static u32 *wp_scratch(int w, int h, int q, int *ow, int *oh) {
  *    Doppler together). The factor is clamped so the receding side stays
  *    visible instead of going black.
  *
- *  - The shadow (b < 3*sqrt(3)/2) is black: no disk, no stars. Background
- *    stars are sampled at the deflected sky position, so they bunch into
- *    arcs at the critical curve, and a soft photon-ring term sits just
- *    outside it. The strongly magnified band is tapered so a star there
- *    reads as a short arc, not a radial scratch.
+ *  - The shadow (b < 3*sqrt(3)/2) is black: no disk, no stars. The star
+ *    field is a deterministic, position-independent layer sampled behind
+ *    the hole; it is the only cached picture. A soft photon-ring term sits
+ *    just outside the critical curve and shimmers slowly.
  *
- *  - Cost: the lensed star field is the only cached picture. It depends on
- *    the surface size and nothing else - not on the theme, the time or the
- *    view - so a theme switch, a drag and every animation frame keep it.
- *    The geodesic table and the display curve are built once. Above
- *    WP_TRACE_MAX pixels the whole frame (sky, stars, disk, ring) is
- *    evaluated at 1/q resolution and scaled up; the trace still samples
- *    every pixel of that layer through the same camera, and the upscale is
- *    one bilinear pass over the whole surface, never a pasted sub-rectangle.
+ *  - Cost: the star field depends on the surface size and nothing else -
+ *    not on the theme, the time or the view - so a theme switch, a drag
+ *    and every animation frame keep it. The geodesic table and the display
+ *    curve are built once. The disk is evaluated only where it can reach:
+ *    inside the projected outer ellipse (its direct image) or inside the
+ *    rho of the largest impact parameter whose secondary crossing is still
+ *    in the disk (7.0 rs, measured from the table, so the gate can never
+ *    clip a lit pixel). Above WP_TRACE_MAX pixels the whole frame (sky,
+ *    stars, disk, ring) is evaluated at 1/q resolution and scaled up; the
+ *    trace still samples every pixel of that layer through the same camera,
+ *    and the upscale is one pass over the whole surface, never a pasted
+ *    sub-rectangle.
  */
 
 #define WP_BH_NB0   160                    /* b samples, BC .. WP_BH_BM  */
@@ -683,6 +686,7 @@ static u32 *wp_scratch(int w, int h, int q, int *ow, int *oh) {
 #define WP_BH_K0    ((float)WP_BH_NB0 / (WP_BH_BM - WP_BH_BC))
 #define WP_BH_K1    ((float)WP_BH_NB1 / (WP_BH_BMAX - WP_BH_BM))
 #define WP_BH_NS    (WP_BH_NA / 3)         /* samples per pi of sweep    */
+#define WP_BH_SUPN  128                    /* support-bound table entries */
 #define WP_BH_NC    160                    /* disk palette entries       */
 #define WP_BH_RATE  1.8f                   /* Keplerian phase per second */
 #define WP_BH_RMAX  1.30f                  /* photon ring outer cut, x BC*/
@@ -698,6 +702,8 @@ static struct {
     float sweep[WP_BH_NB];                 /* sweep to escape, radians   */
     unsigned short r[WP_BH_NB][WP_BH_NA];  /* crossing radius * 64       */
     int   sinq[256];
+    int   sup_built;
+    float sup[WP_BH_SUPN];                 /* max b with a lit crossing   */
     u8    tone[1024];                      /* display curve, 0..1023     */
     u32   hot;                             /* palette's hottest colour   */
 
@@ -710,7 +716,7 @@ static struct {
     float om[WP_BH_NC];                    /* Keplerian omega, rad/s     */
     float sl[WP_BH_NC];                    /* spiral pitch, radians      */
 
-    /* lensed star field: the one cached picture, keyed by size only */
+    /* star field: the one cached picture, keyed by size only */
     int   star_w, star_h;
     u8   *star;
 
@@ -721,6 +727,10 @@ static struct {
     /* one reusable trace surface, so a frame allocates nothing */
     int   scr_w, scr_h;
     u32  *scratch;
+
+    /* one reusable row for the separable q = 2 upscale */
+    int   up_w;
+    u32  *uprow;
 } bhgeo;
 
 /* One ray: integrate the null geodesic from r = 4000 inwards and store the
@@ -825,13 +835,31 @@ static inline float wp_bh_radius(float t, int j, float fs) {
     return (a + (c - a) * ft) * (1.0f / 64.0f);
 }
 
-static inline float wp_bh_sweep(float b) {
-    float t = wp_bh_bidx(b);
-    if (t < 0.0f) return 0.0f;
-    if (t >= (float)(WP_BH_NB - 1)) return (float)WP_BH_PI;
-    int i = (int)t;
-    float ft = t - (float)i;
-    return bhgeo.sweep[i] + (bhgeo.sweep[i + 1] - bhgeo.sweep[i]) * ft;
+/* The largest impact parameter whose crossing at sweep psi can still be
+ * inside [RIN, ROUT]. This is a property of the geodesic table alone: it
+ * does not depend on the theme, the clock or the view, so it is built once.
+ * The 0.15 rs margin makes the bound a strict superset of the lit region,
+ * which is what lets it be used as a culling gate without clipping (and
+ * therefore without a seam) at its edge. */
+static void wp_bh_support(void) {
+    for (int i = 0; i < WP_BH_SUPN; i++) {
+        float psi = ((float)i + 0.5f) * ((float)WP_BH_PI / (float)WP_BH_SUPN);
+        float s0 = psi * ((float)WP_BH_NA / (float)WP_BH_DMAX) - 0.5f;
+        int   j0 = (int)s0;
+        float fs = s0 - (float)j0;
+        float bmax = 0.0f;
+        for (float b = WP_BH_BC; b <= WP_BH_ROUT; b += 0.02f) {
+            float t = wp_bh_bidx(b);
+            float r1 = wp_bh_radius(t, j0, fs);
+            float r2 = wp_bh_radius(t, j0 + WP_BH_NS, fs);
+            float r3 = wp_bh_radius(t, j0 + 2 * WP_BH_NS, fs);
+            if ((r1 >= WP_BH_RIN && r1 <= WP_BH_ROUT) ||
+                (r2 >= WP_BH_RIN && r2 <= WP_BH_ROUT) ||
+                (r3 >= WP_BH_RIN && r3 <= WP_BH_ROUT)) bmax = b;
+        }
+        bhgeo.sup[i] = bmax + 0.15f;
+    }
+    bhgeo.sup_built = 1;
 }
 
 /* ---- the disk palette, keyed by the theme's three colours -------------
@@ -892,31 +920,17 @@ static void wp_bh_palette(const Theme *th) {
     bhgeo.pal_built  = 1;
 }
 
-/* ---- the lensed star field --------------------------------------------
- * A star's position is deflected by the same sweep that lenses the disk,
- * so the field really bunches at the critical curve. The radial warp grows
- * without bound at the shadow edge, which would stretch a point star into
- * a long scratch; it is clamped, and the innermost band is tapered, so the
- * magnified stars read as short arcs. Purely a function of position, never
- * of the theme, the clock or the view.
+/* ---- the star field ---------------------------------------------------
+ * A deterministic 32 bit hash places the stars, so the same sky appears at
+ * every resolution and on every boot. The layer is independent of the
+ * theme, the clock and the view; it is the only picture this wallpaper
+ * caches. Stars are not warped: a radial warp turns a point star into a
+ * long scratch near the critical curve, and scratches are exactly the
+ * speckle this background must not have. The photon ring carries the
+ * strong-field light instead.
  */
-static inline int wp_bh_lensed_star(float dx, float dy, float rho, float b,
-                                    float invca, float invra) {
-    if (b < WP_BH_BC) return 0;
-    float defl = wp_bh_sweep(b) - (float)WP_BH_PI;
-    if (defl < 0.0f) defl = 0.0f;
-    float wrp = defl * 0.22f / (rho + 1e-6f);
-    if (wrp > 0.85f) wrp = 0.85f;
-    int val = wp_star_at(dx + dx * wrp, dy + dy * wrp,
-                         invca, 0x5EEDu, 15, 225, invra);
-    if (val > 0 && b < WP_BH_BC * 1.30f) {
-        float f = (b - WP_BH_BC) / (WP_BH_BC * 0.30f);
-        if (f < 0.0f) f = 0.0f;
-        if (f > 1.0f) f = 1.0f;
-        f = 0.20f + 0.80f * (f * f * (3.0f - 2.0f * f));
-        val = (int)((float)val * f);
-    }
-    return val;
+static inline int wp_bh_star_at(float dx, float dy, float invca, float invra) {
+    return wp_star_at(dx, dy, invca, 0x5EEDu, 15, 225, invra);
 }
 
 static void wp_bh_stars(int w, int h) {
@@ -932,16 +946,13 @@ static void wp_bh_stars(int w, int h) {
     const float invS = 1.0f / S;
     const float invca = 1.0f / 0.021f;
     const float invra = (S * 0.021f) / 0.80f;
-    const float K = WP_BH_BC * WP_BH_DSC;
 
     for (int y = 0; y < h; y++) {
         const float dy = ((float)y + 0.5f - cy) * invS;
         u8 *row = st + (size_t)y * (size_t)w;
         for (int x = 0; x < w; x++) {
             const float dx = ((float)x + 0.5f - cx) * invS;
-            const float rho = sqrtf(dx * dx + dy * dy);
-            const float b = rho * K;
-            row[x] = (u8)wp_bh_lensed_star(dx, dy, rho, b, invca, invra);
+            row[x] = (u8)wp_bh_star_at(dx, dy, invca, invra);
         }
     }
     bhgeo.star = st;
@@ -969,9 +980,9 @@ static void wp_bh_paint(Surface *s, const Theme *th, double seconds) {
     /* the hole sits a little off centre, which reads better as a desktop */
     const float cx = (float)W * 0.545f, cy = (float)H * 0.470f;
     const float ci = cosf(bh_yaw), si = sinf(bh_yaw);
-    const float ci2 = ci * ci;
 
     if (!bhgeo.built) wp_bh_build();
+    if (!bhgeo.sup_built) wp_bh_support();
     wp_bh_palette(th);
     wp_bh_stars(W, H);
     wp_bh_grain();
@@ -1000,11 +1011,14 @@ static void wp_bh_paint(Surface *s, const Theme *th, double seconds) {
     const float invS = 1.0f / S;
     const float invca = 1.0f / 0.021f;
     const float invra = (S * 0.021f) / 0.80f;
-    const float bmaxd = WP_BH_ROUT * 1.06f;
     const float K = WP_BH_BC * WP_BH_DSC;
-    /* the squared screen radius that can possibly hold a crossing */
-    const float gate = bmaxd / K;
-    const float gate2 = gate * gate;
+    /* Broad outer bound: no crossing can put light on a pixel whose impact
+     * parameter exceeds the outermost crossing radius. This is a radial
+     * test, not a projected ellipse: lensing moves a disk point away from
+     * its flat projection, so an ellipse gate would clip real light and
+     * leave a hard edge. Inside this circle, sup[psi] narrows the gate to
+     * the actual reach of the disk at that sweep. */
+    const float rdisk2 = (WP_BH_ROUT / K) * (WP_BH_ROUT / K);
 
     for (int y = 0; y < H; y++) {
         const float dy = ((float)y + 0.5f - cy) * invS;
@@ -1020,26 +1034,38 @@ static void wp_bh_paint(Surface *s, const Theme *th, double seconds) {
         for (int x = 0; x < W; x++) {
             const float dx = ((float)x + 0.5f - cx) * invS;
             const float dx2 = dx * dx;
-            int R = bgr, G = bgg, B = bgb, star = 0;
+            int R = bgr, G = bgg, B = bgb;
+            int star = srow ? srow[x] : wp_bh_star_at(dx, dy, invca, invra);
 
-            if (dx2 + dy2 < gate2) {
+            if (dx2 + dy2 <= rdisk2) {
                 const float rho = sqrtf(dx2 + dy2);
                 const float b = rho * K;
 
                 if (b < WP_BH_BC) {
                     /* inside the shadow: no disk, no stars, nothing comes back */
                     R = 2; G = 2; B = 4;
+                    star = 0;
                 } else {
-                    if (srow) star = srow[x];
-                    else star = wp_bh_lensed_star(dx, dy, rho, b, invca, invra);
+                    /* The sweep where this ray crosses the disk plane. It is
+                     * a function of the screen angle only, so the same value
+                     * also indexes the support bound below. */
+                    const float psi = wp_atan2f(ci * rho, si * dy);
+                    int pi = (int)(psi * ((float)WP_BH_SUPN / (float)WP_BH_PI));
+                    if (pi < 0) pi = 0;
+                    if (pi > WP_BH_SUPN - 1) pi = WP_BH_SUPN - 1;
 
-                    /* ---- the disk, one addition per equatorial crossing ---- */
-                    if (b < bmaxd) {
-                        const float qz = sqrtf(dx2 * ci2 + dy2);
-                        const float bm = (qz > 1e-9f) ? (dx * ci * si / qz) : 0.0f;
-                        /* the sweep at which this ray crosses the disk plane */
-                        const float psi = wp_atan2f(ci * rho, si * dy);
+                    /* sup[] is the largest impact parameter whose crossing at
+                     * this psi can still be inside the disk. It is built once
+                     * from the same geodesic table, with a margin, so it can
+                     * only ever be wider than the lit region - never a clip
+                     * and never a hard edge. */
+                    if (b <= bhgeo.sup[pi]) {
                         const float az = wp_atan2f(dy, dx * ci);
+                        const int az16 = (int)(az * 10430.378f);
+                        /* the line-of-sight velocity is sin(yaw) cos(azimuth),
+                           exactly; a cosine table saves a sqrt and a divide */
+                        const float bm = si * ((float)bhgeo.sinq[((az16 >> 8) + 64) & 255]
+                                               - 128.0f) * (1.0f / 127.5f);
                         const float tt = wp_bh_bidx(b);
                         const float s0 = psi * ((float)WP_BH_NA / (float)WP_BH_DMAX) - 0.5f;
                         int   j0 = (int)s0;
@@ -1102,12 +1128,7 @@ static void wp_bh_paint(Surface *s, const Theme *th, double seconds) {
                         B += ((int)GET_B(bhgeo.hot) * gi) >> 8;
                     }
                 }
-            } else {
-                if (srow) star = srow[x];
-                else star = wp_bh_lensed_star(dx, dy, sqrtf(dx2 + dy2), 1e9f,
-                                              invca, invra);
             }
-
             /* stars sit behind the disk, not on it: fade them out by how
                much light the crossings already put on this pixel */
             if (star > 0) {
@@ -1147,12 +1168,34 @@ static u32 *wp_bh_scratch(int w, int h) {
     return buf;
 }
 
-/* q = 2 bilinear upscale of the complete trace surface. The general
- * wp_upscale() has to compute a source position and clamp it per pixel;
- * at q = 2 the source coordinates are 128*x - 64 and 128*y - 64, so the
- * weights settle to the fixed pair 64/192 and the position is a shift.
- * Same sampling grid as wp_upscale(), so the two paths agree exactly. */
+/* Weighted mix of two packed RGB pixels with quarter weights. w3 is 0, 1
+ * or 3 (the only weights a q = 2 bilinear tap uses): the result is
+ * (a*(4-w3) + b*w3 + 2) / 4, exactly what the general path computes with
+ * 64/192 out of 256. The R/B lanes stay 16 bits apart and the largest sum
+ * is 1020, so no lane can carry into the next. */
+static inline u32 wp_bh_mix4(u32 a, u32 b, int w3) {
+    if (w3 == 0) return a | 0xFF000000u;
+    u32 rb = ((a & 0x00FF00FFu) * (u32)(4 - w3)
+            + (b & 0x00FF00FFu) * (u32)w3 + 0x00020002u);
+    u32 g  = ((a & 0x0000FF00u) * (u32)(4 - w3)
+            + (b & 0x0000FF00u) * (u32)w3 + 0x00000200u);
+    return 0xFF000000u | (((rb >> 2) & 0xFFu) << 16)
+                       | (((g  >> 10) & 0xFFu) << 8)
+                       |  ((rb >> 18) & 0xFFu);
+}
+
+/* q = 2 upscale of the complete trace surface, separable so the vertical
+ * blend is done once per source column and reused by both destination
+ * columns. Same sampling grid and weights as wp_upscale(). */
 static void wp_upscale2(Surface *dst, const u32 *src, int sw, int sh) {
+    if (bhgeo.up_w != sw || !bhgeo.uprow) {
+        free(bhgeo.uprow);
+        bhgeo.uprow = (u32 *)malloc((size_t)sw * sizeof(u32));
+        bhgeo.up_w = bhgeo.uprow ? sw : 0;
+    }
+    if (!bhgeo.uprow) { wp_upscale(dst, src, sw, sh, 2); return; }
+
+    u32 *vrow = bhgeo.uprow;
     const int maxy = (sh - 1) * 256;
     const int lasty = (sh > 1) ? sh - 2 : 0;
     const int lastx = (sw > 1) ? sw - 2 : 0;
@@ -1163,40 +1206,25 @@ static void wp_upscale2(Surface *dst, const u32 *src, int sw, int sh) {
         if (sy > maxy) sy = maxy;
         int iy = sy >> 8;
         if (iy > lasty) iy = lasty;
-        int fy = sy & 255, ify = 256 - fy;
+        int fy = sy & 255;
+        int wv = (fy == 64) ? 1 : (fy == 192) ? 3 : 0;
         const u32 *r0 = src + (size_t)iy * sw;
         const u32 *r1 = src + (size_t)((iy < lasty) ? iy + 1 : iy) * sw;
+
+        if (wv == 0) {
+            memcpy(vrow, r0, (size_t)sw * sizeof(u32));
+        } else {
+            for (int x = 0; x < sw; x++) vrow[x] = wp_bh_mix4(r0[x], r1[x], wv);
+        }
+
         u32 *out = dst->px + (size_t)y * dst->stride;
-
-        /* x = 0 samples the very left edge; the rest alternate 25/75. */
-        u32 a = r0[0], b = r0[0], c = r1[0], d = r1[0];
-        int ar = ((int)GET_R(a) * 256 + (int)GET_R(b) * 0) >> 8;
-        int ag = ((int)GET_G(a) * 256 + (int)GET_G(b) * 0) >> 8;
-        int ab = ((int)GET_B(a) * 256 + (int)GET_B(b) * 0) >> 8;
-        int br = ((int)GET_R(c) * 256 + (int)GET_R(d) * 0) >> 8;
-        int bg = ((int)GET_G(c) * 256 + (int)GET_G(d) * 0) >> 8;
-        int bb = ((int)GET_B(c) * 256 + (int)GET_B(d) * 0) >> 8;
-        int rr = (ar * ify + br * fy) >> 8;
-        int rg = (ag * ify + bg * fy) >> 8;
-        int rb = (ab * ify + bb * fy) >> 8;
-        out[0] = 0xFF000000u | ((u32)rr << 16) | ((u32)rg << 8) | (u32)rb;
-
+        out[0] = vrow[0];
         for (int x = 1; x < dst->w; x++) {
             int ix = (x - 1) >> 1;
             int fx = (x & 1) ? 64 : 192;
             if (ix > lastx) { ix = lastx; fx = 0; }
-            int ifx = 256 - fx;
-            a = r0[ix]; b = r0[ix + 1]; c = r1[ix]; d = r1[ix + 1];
-            ar = ((int)GET_R(a) * ifx + (int)GET_R(b) * fx) >> 8;
-            ag = ((int)GET_G(a) * ifx + (int)GET_G(b) * fx) >> 8;
-            ab = ((int)GET_B(a) * ifx + (int)GET_B(b) * fx) >> 8;
-            br = ((int)GET_R(c) * ifx + (int)GET_R(d) * fx) >> 8;
-            bg = ((int)GET_G(c) * ifx + (int)GET_G(d) * fx) >> 8;
-            bb = ((int)GET_B(c) * ifx + (int)GET_B(d) * fx) >> 8;
-            rr = (ar * ify + br * fy) >> 8;
-            rg = (ag * ify + bg * fy) >> 8;
-            rb = (ab * ify + bb * fy) >> 8;
-            out[x] = 0xFF000000u | ((u32)rr << 16) | ((u32)rg << 8) | (u32)rb;
+            int wh = (fx == 64) ? 1 : (fx == 192) ? 3 : 0;
+            out[x] = wp_bh_mix4(vrow[ix], vrow[ix + 1], wh);
         }
     }
 }

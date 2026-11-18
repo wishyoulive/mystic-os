@@ -338,6 +338,7 @@ static int scan_root(WmApp *out, int n, int max, const char *root, int from_imag
             else if (!strcmp(k, "desc")) snprintf(a->desc, sizeof(a->desc), "%s", v);
             else if (!strcmp(k, "exec")) snprintf(a->exe, sizeof(a->exe), "%s", v);
             else if (!strcmp(k, "network") && !strcmp(v, "host")) a->net = 1;
+            else if (!strcmp(k, "audio") && !strcmp(v, "yes")) a->audio = 1;
         }
         fclose(f);
         if (!a->name[0]) snprintf(a->name, sizeof(a->name), "%s", a->id);
@@ -402,7 +403,7 @@ static void mkdirp_for(const char *jail, const char *sub) {
     mkdir(buf, 0755);
 }
 
-static void sandbox_child(const char *exe, const char *id, int net, const char *arg) {
+static void sandbox_child(const char *exe, const char *id, int net, int audio, const char *arg) {
     char jail[192], path[256];
     snprintf(jail, sizeof(jail), "/run/mystic/jail/%s", id);
 
@@ -549,6 +550,15 @@ static void sandbox_child(const char *exe, const char *id, int net, const char *
             }
         }
 
+        /* Audio: libVLC's ALSA output opens /dev/snd/pcmC0D0p. Without this
+         * bind a video plays silently and the player has to say so. */
+        if (audio) {
+            snprintf(path, sizeof(path), "%s/dev/snd", jail);
+            mkdirp_for(jail, "/dev/snd");
+            if (mount("/dev/snd", path, NULL, MS_BIND, NULL) < 0)
+                fprintf(stderr, "wms: sandbox /dev/snd bind failed: %s\n", strerror(errno));
+        }
+
         snprintf(path, sizeof(path), "%s/proc", jail);
         mkdirp_for(jail, "/proc");
         mount("/proc", path, NULL, MS_BIND, NULL);
@@ -602,7 +612,7 @@ static int wms_launch_arg(const WmApp *app, WmClient *cl, int slot, const char *
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
-        sandbox_child(exe, app->id, app->net, arg);
+        sandbox_child(exe, app->id, app->net, app->audio, arg);
         (void)arg;
         if (arg && arg[0]) {
             /* an app that was asked to open a document gets the path as
