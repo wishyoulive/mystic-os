@@ -1,7 +1,7 @@
 /* ============================================================
  *  Mystic OS - apps/settings.c
  *
- *  Settings is one window with seven pages. Every page is a real
+ *  Settings is one window with eight pages. Every page is a real
  *  control over the running system, and every value on it is read
  *  from the file or the syscall named beside it - nothing here is
  *  remembered, invented or rounded from a guess.
@@ -19,14 +19,54 @@
  *                  silently converted to 0.9.  With the marker the
  *                  chosen value is the value the desktop uses.
  *
+ *      Display     two independent choices, both applied in the
+ *                  running session:
+ *
+ *                  Canvas - the logical size the compositor draws,
+ *                  listed as Match panel / 1920x1080 / ... / 640x400.
+ *                  This is the setting that works on a device that
+ *                  reports a single mode (every QEMU fbdev): Enter
+ *                  calls desk_set_logical() in src/main.c, which calls
+ *                  disp_set_logical_size() and reallocates the
+ *                  desktop's surfaces on the next frame.  Each row
+ *                  shows the factor and bars the current scale mode
+ *                  would produce for that canvas, computed by the
+ *                  same disp_layout() the blit uses.
+ *
+ *                  Mode - every resolution the framebuffer driver
+ *                  reported in /sys/class/graphics/fbN/modes, read by
+ *                  disp_scan_modes() into Display::modes.  When the
+ *                  device named no other size the page says which of
+ *                  the two it is ("not named by the device" or
+ *                  "named only the current size") instead of offering
+ *                  a row that cannot do anything.  Enter calls
+ *                  disp_set_mode(), which asks the driver with
+ *                  FBIOPUT_VSCREENINFO; a refusal is shown with
+ *                  errno's own words and the old mode, mapping and
+ *                  display.conf are left alone.
+ *
+ *                  The four scale modes come from src/fb.c and decide
+ *                  how the canvas lands on the panel; the preview is
+ *                  the canvas, the native size, the blit disp_layout()
+ *                  will use (factor and bars), and the cost the last
+ *                  disp_present() measured with clock_gettime().  The
+ *                  choice is written as "mode=<w>x<h>",
+ *                  "logical=<w>x<h>|auto" and "scale=<name>" to
+ *                  /etc/mystic/display.conf and to the disk copy
+ *                  /root/mystic-display.conf; src/main.c reads it after
+ *                  disp_open() and keeps the current mode when the
+ *                  saved one is not offered.  Reset applies the native
+ *                  mode, Fit and the automatic canvas, and says what
+ *                  actually happened.
+ *
  *      Theme       every *.theme in /etc/mystic/themes, parsed with
  *                  theme_load() - the very function main.c uses - so
  *                  the swatch fill, bottom colour, accent border and
  *                  text bar are the colours in the real file.  The
  *                  list is rescanned every frame, so editing a theme
- *                  file is visible on the next repaint.  The "now"
- *                  row is the Theme the desktop passes to this draw
- *                  call, so even the Ctrl+1..9 shortcut (which never
+ *                  file is visible on the next repaint.  The footer's
+ *                  "now" fact is the Theme the desktop passes to this
+ *                  draw call, so even the Ctrl+1..9 shortcut (which never
  *                  writes the file, src/main.c:1901-1911) is shown
  *                  truthfully.  Enter writes the file's "name ="
  *                  value to /etc/mystic/current-theme, which main.c
@@ -61,15 +101,25 @@
  *                  closes, so a change, a refusal and a cancel are all
  *                  visible after the fact.
  *
- *                  /etc/mystic lives in the RAM rootfs, so the new
- *                  line survives until reboot only if something
- *                  mirrors it to the disk: stage/init:restore_settings
- *                  copies /root/mystic-<name> back for the three names
- *                  it lists (ui.conf, wallpaper, current-theme).
- *                  Adding "passwd" to that list, and to
- *                  persist_settings() in src/main.c, is what makes a
- *                  password change permanent; this file writes the
- *                  real file the lock screen reads (src/main.c:1177).
+ *                  /etc/mystic lives in the RAM rootfs, so the same
+ *                  line is ALSO written atomically to the disk copy
+ *                  /root/mystic-passwd (mode 0600) in the same call.
+ *                  That is the name persist_settings() and
+ *                  restore_settings() use for every other setting
+ *                  (they read /root/mystic-<name>). Two one-word
+ *                  changes outside this file make the boot restore
+ *                  complete: add "passwd" to the loop in
+ *                  stage/init:restore_settings (line 82) and to the
+ *                  names[] array in src/main.c:531. Apply BOTH in the
+ *                  same commit: main.c copies /etc/mystic/<name> to
+ *                  /root/mystic-<name>, so without the boot restore it
+ *                  would overwrite the good disk copy with the image's
+ *                  default on the next theme or scale change. Until the
+ *                  image is rebuilt with that change, settings_init()
+ *                  re-adopts /root/mystic-passwd whenever it is newer
+ *                  than the RAM file, so opening Settings repairs the
+ *                  boot loss; the very first unlock after a reboot still
+ *                  sees the image's file because init runs first.
  *
  *      Network     the interface of the default route from
  *                  /proc/net/route, its real IPv4 address from
@@ -88,18 +138,17 @@
  *                  /proc/meminfo, /proc/sys/kernel/osrelease and
  *                  /proc/uptime.
  *
- *  LOOK - one header with the app's name and no action, then the seven
- *  pages either as a left rail (when the window is tall enough to show
- *  all of them without scrolling) or as a single page bar with two
- *  arrows.  A page is one column of rows: the label on the left, the
- *  value right-aligned on the one right edge, and a mark gutter that
- *  holds the theme's real colours or a tick on the row in effect.  The
- *  one footer line says what Enter will do, or where the facts came
- *  from, or the result of the last write.  Every padding and gap is a
- *  multiple of the 8 px unit in SP(); the only three fonts are the
- *  shared title/body/small faces; every row is ui_row_h() tall and
- *  centred by ui_top(), so the text scale cannot make rows overlap.
- *  Columns are dropped by measurement when a window is too narrow.
+ *  LOOK - one header with the app's name and no action, then the eight
+ *  pages on one navigation band: every page name when they fit, otherwise
+ *  the one page name with two arrows.  A page is one column of rows: the
+ *  label on the left, the value right-aligned on the one right edge, and a
+ *  mark gutter that holds the theme's real colours or a tick on the row in
+ *  effect.  The one footer line says what Enter will do, or where the facts
+ *  came from, or the result of the last write.  Every padding and gap is a
+ *  multiple of the 8 px unit in SP(); the only three fonts are the shared
+ *  title/body/small faces; every row is ui_row_h() tall and centred by
+ *  ui_top(), so the text scale cannot make rows overlap.  Columns are
+ *  dropped by measurement when a window is too narrow.
  *
  *  Input:
  *      Up/Down, j/k        move the selection on a page with controls
@@ -109,7 +158,7 @@
  *      wheel               move the selection (a page of facts scrolls)
  *      Ctrl+C              cancel a password prompt (Esc is consumed by
  *                          main.c before an app sees it)
- *      click a page        change page (rail, arrow or the page name)
+ *      click a page        change page (a tab, an arrow or the page name)
  *      click a row         select and apply it
  *      click Cancel/Submit in the password prompt
  *  ============================================================ */
@@ -117,6 +166,7 @@
 #include "wallpaper.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -130,6 +180,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <time.h>
 #include <unistd.h>
 
 /* The files the desktop watches. Macros so a host harness can run this app
@@ -149,6 +200,16 @@
 #ifndef MYSTIC_PASSWD
 #define MYSTIC_PASSWD "/etc/mystic/passwd"
 #endif
+/* The disk copy of the same line. src/main.c:persist_settings() and
+ * stage/init:restore_settings() use /root/mystic-<name> as the disk copy of
+ * every setting; "passwd" is the one name that is not in their lists yet.
+ * This file writes it directly so a change is durable immediately, and
+ * re-adopts it at startup when the RAM file is older. See the Users note at
+ * the top of this file for the two one-word changes that belong in init and
+ * main.c. */
+#ifndef MYSTIC_PASSWD_SAVED
+#define MYSTIC_PASSWD_SAVED "/root/mystic-passwd"
+#endif
 #ifndef MYSTIC_RESOLV
 #define MYSTIC_RESOLV "/etc/resolv.conf"
 #endif
@@ -162,6 +223,112 @@
 #ifndef MYSTIC_SYS_NET
 #define MYSTIC_SYS_NET "/sys/class/net"
 #endif
+
+/* The display choice, in the format src/main.c reads at start-up:
+ *     mode=<w>x<h>
+ *     scale=<fit|stretch|integer|1:1>
+ * /etc/mystic is a RAM rootfs and stage/init restores ui.conf, wallpaper and
+ * current-theme from /root/mystic-<name>, so the same file is written there
+ * too; main.c falls back to that copy when the RAM one is missing. */
+#ifndef MYSTIC_DISPLAY_CONF
+#define MYSTIC_DISPLAY_CONF "/etc/mystic/display.conf"
+#endif
+#ifndef MYSTIC_DISPLAY_SAVED
+#define MYSTIC_DISPLAY_SAVED "/root/mystic-display.conf"
+#endif
+/* MemAvailable lives here; a host probe points it at a fixture. */
+#ifndef MYSTIC_MEMINFO
+#define MYSTIC_MEMINFO "/proc/meminfo"
+#endif
+
+/* Settings is a built-in app: it runs in the desktop process, so it asks the
+ * compositor for the Display it already has open instead of opening /dev/fb0
+ * a second time (two mappings of one panel is a way to corrupt the screen).
+ * Both are defined in src/main.c; a host probe supplies the same two. */
+Display *desk_display(void);
+/* The one policy for the size the compositor draws at: the shipped 1280x800
+ * design on any panel at least that large, never larger than the panel. */
+void desk_design_size(int fb_w, int fb_h, int *w, int *h);
+/* The canvas (logical size). (0,0) means "follow the panel"; any other pair
+ * is used as the drawing size. Applies now, remembers for the next mode
+ * change, and returns 1 when the pair was used as given. */
+int  desk_set_logical(Display *d, int w, int h);
+/* Re-apply the remembered choice after the panel changed size. */
+void desk_follow_mode(Display *d);
+/* 1 when the canvas follows the panel (no explicit size was chosen). */
+int  desk_logical_auto(void);
+
+/* The four scale modes, in the order the page lists them. Everything that
+ * has to name one goes through these two functions, so the label, the value
+ * written to display.conf and the enum the core takes cannot drift apart. */
+static const char *scale_label(DispScale m) {
+    switch (m) {
+        case DISP_FIT:        return "Fit";
+        case DISP_STRETCH:    return "Stretch";
+        case DISP_INTEGER:    return "Integer";
+        case DISP_ONE_TO_ONE: return "1:1";
+        default:              return "?";
+    }
+}
+
+static const char *scale_key(DispScale m) {
+    switch (m) {
+        case DISP_FIT:        return "fit";
+        case DISP_STRETCH:    return "stretch";
+        case DISP_INTEGER:    return "integer";
+        case DISP_ONE_TO_ONE: return "1:1";
+        default:              return "fit";
+    }
+}
+
+/* One line of plain English for each mode. It is the row's value, not a
+ * second label, and it is short enough to survive the 320 px window. */
+static const char *scale_hint(DispScale m) {
+    switch (m) {
+        case DISP_FIT:        return "whole screen, bars";
+        case DISP_STRETCH:    return "fills, not square";
+        case DISP_INTEGER:    return "whole pixels, bars";
+        case DISP_ONE_TO_ONE: return "pixel for pixel";
+        default:              return "";
+    }
+}
+
+/* The canvases the page offers, largest first. These are design sizes, not
+ * modes: every one is drawn at and then mapped onto the panel by the chosen
+ * scale mode, so a device that reports a single mode still gets a real
+ * choice. 1280x800 is the size the desktop was authored on, so it is the
+ * one most panels should pick. The page adds "Match panel" above these. */
+static const struct { int w, h; } CANVAS[] = {
+    { 1920, 1080 },
+    { 1600,  900 },
+    { 1280,  800 },
+    { 1024,  768 },
+    {  960,  600 },
+    {  800,  600 },
+    {  640,  400 },
+    {  512,  384 },   /* exactly 2x on a 1024x768 or 1280x800 panel, so
+                       * Integer has a canvas where it differs from 1:1 */
+};
+#define CANVAS_COUNT ((int)(sizeof(CANVAS) / sizeof(CANVAS[0])))
+
+/* A snapshot of the Display's public fields. They live in memory (the core
+ * keeps them), so this is a read of a struct, not I/O: the page can ask once
+ * per frame and still be exactly what the compositor will use. */
+typedef struct {
+    int      ok;
+    int      n;             /* modes the device reports */
+    int      mode_source;   /* DispModeSource: none / native only / extra */
+    int      named;         /* parseable lines in the mode file */
+    int      extra;         /* sizes other than the native one */
+    int      cur, native;   /* indices into the Display's mode list */
+    DispScale scale;
+    int      lw, lh;        /* logical size */
+    int      fw, fh;        /* framebuffer size right now */
+    int      nw, nh;        /* native panel size */
+    DispGeom geom;          /* the exact placement the core uses */
+    double   ms;            /* measured cost of the last present */
+    char     err[96];
+} DispInfo;
 
 /* src/main.c loads at most this many theme files: `static Theme themes[16]`
  * filled by theme_load_all(themes, 16, THEME_DIR) (src/main.c:105,1812).
@@ -185,10 +352,11 @@ static const float  SIZE_VALUE[SIZE_COUNT] = { 0.8f, 1.0f, 1.2f, 1.4f, 1.6f };
 
 #define MAX_PAGE_ROWS 40
 
-enum { TAB_TEXT, TAB_THEME, TAB_WALL, TAB_USERS, TAB_NET, TAB_STORAGE,
-       TAB_SYSTEM, TAB_COUNT };
+enum { TAB_TEXT, TAB_DISP, TAB_THEME, TAB_WALL, TAB_USERS, TAB_NET,
+       TAB_STORAGE, TAB_SYSTEM, TAB_COUNT };
 static const char *TAB_LABEL[TAB_COUNT] = {
-    "Text", "Theme", "Wallpaper", "Users", "Network", "Storage", "System"
+    "Text", "Display", "Theme", "Wallpaper", "Users", "Network", "Storage",
+    "System"
 };
 
 typedef struct {
@@ -198,14 +366,20 @@ typedef struct {
 
 /* One row of whichever page is showing. Built from real data each frame.
  * id >= 0 marks a selectable picker row (Enter applies it); id == -1 is a
- * fact row, which has a value but no action. */
+ * fact row, which has a value but no action. id is the row's ordinal among
+ * the page's selectable rows, so sel can never land on a fact. act/arg say
+ * what Enter does without re-parsing the row's text. */
 typedef struct {
     int         id;
     char        label[192];
     char        value[224];
     int         current;        /* this row is what is in effect on disk */
     const Theme *swatch;        /* non-NULL: draw this theme's colours here */
+    int         act;            /* ACT_*: what Enter does */
+    int         arg;            /* mode index or DispScale */
 } PRow;
+
+enum { ACT_NONE = 0, ACT_MODE, ACT_SCALE, ACT_LOGICAL, ACT_RESET };
 
 typedef struct {
     ThemeRow themes[MAX_THEMES];
@@ -218,6 +392,8 @@ typedef struct {
     int      px, py;            /* last pointer position reported to us */
     char     status[192];       /* real result of the last write */
     int      status_err;
+    time_t   themes_at;         /* last theme-directory scan (1 s TTL) */
+    DispInfo disp;              /* display facts, read from the core's struct */
 
     /* password flow: 0 idle, 1 old, 2 new, 3 repeat */
     int      pw_stage;
@@ -313,44 +489,47 @@ static void ui_button(Surface *s, int x, int y, int w, int h, float r,
 }
 
 
-/* Copy src into out, shortened with ".." until it fits maxw. */
-static void fit_text(Font *f, const char *src, char *out, size_t cap, float maxw) {
-    /* src and out are allowed to be the same buffer (callers shorten in
-     * place), so copy first: snprintf with overlapping source and
-     * destination is undefined behaviour. */
+/* ONE ELLIPSIS. Every string in this window is measured against the box it
+ * has to live in; when it does not fit, the tail becomes a single U+2026 and
+ * nothing is ever painted outside its column (or its window). Returned in a
+ * caller buffer, so the painter and the hit test see the same string. */
+#define ELLIPSIS "\xE2\x80\xA6"
+
+static void fit_ellipsis(Font *f, const char *src, char *out, size_t cap,
+                         float maxw) {
     char tmp[512];
-    if (cap == 0) return;
+    if (!cap) return;
     snprintf(tmp, sizeof(tmp), "%s", src ? src : "");
-    if (maxw <= 0.0f) { out[0] = 0; return; }
-    snprintf(out, cap, "%s", tmp);
-    if (font_width(f, out) <= maxw) return;
+    out[0] = 0;
+    if (!f || maxw <= 0.0f) return;
+    if (font_width(f, tmp) <= maxw) {
+        snprintf(out, cap, "%s", tmp);
+        return;
+    }
+    /* drop whole UTF-8 characters, never half of one */
     size_t n = strlen(tmp);
     while (n > 0) {
         n--;
-        snprintf(out, cap, "%.*s..", (int)n, tmp);
-        if (font_width(f, out) <= maxw) return;
+        while (n > 0 && ((unsigned char)tmp[n] & 0xC0) == 0x80) n--;
+        tmp[n] = 0;
+        char trybuf[600];
+        snprintf(trybuf, sizeof(trybuf), "%s" ELLIPSIS, tmp);
+        if (font_width(f, trybuf) <= maxw) {
+            snprintf(out, cap, "%s", trybuf);
+            return;
+        }
     }
-    out[0] = 0;
+    /* even the ellipsis alone is wider than the box: draw nothing rather
+     * than overflow it */
 }
 
-/* Draw text clipped to maxw pixels, ending in ".." when it does not fit. */
+/* Draw text fitted to maxw pixels, ending in one ellipsis when truncated. */
 static void draw_clipped(Surface *s, Font *f, float x, float y, float maxw,
                          const char *text, u32 color) {
     char buf[512];
     if (!text || !text[0] || maxw < 4.0f) return;
-    snprintf(buf, sizeof(buf), "%s", text);
-    if (font_width(f, buf) <= maxw + 0.5f) {
-        font_draw(s, f, x, y, buf, color);
-        return;
-    }
-    size_t n = strlen(buf);
-    while (n > 0) {
-        buf[n] = 0;
-        if (font_width(f, buf) + font_width(f, "..") <= maxw) break;
-        n--;
-    }
-    snprintf(buf + n, sizeof(buf) - n, "..");
-    font_draw(s, f, x, y, buf, color);
+    fit_ellipsis(f, text, buf, sizeof(buf), maxw);
+    if (buf[0]) font_draw(s, f, x, y, buf, color);
 }
 
 /* Best effort: the password buffers are cleared before the page moves on. */
@@ -359,16 +538,18 @@ static void secure_zero(void *p, size_t n) {
     while (n--) *v++ = 0;
 }
 
-/* The page on one grid. The navigation is a rail down the left when the
- * window is tall enough to show all seven pages without scrolling, and a
- * single page bar with two arrows when it is not - never a cramped strip
- * of wrapped tabs.
+/* The page on one grid, and the same four bands Files has:
+ *
+ *      header      the app's name, nothing else
+ *      navigation  every page name when they fit, otherwise one name with
+ *                  two arrows - never a rail and never a wrapped strip
+ *      body        one column of rows: mark gutter, label, value
+ *      footer      one line of facts
  *
  * Every x is one of three edges:
  *
- *      body_x        the content edge (the page-name column, or the
- *                    window margin in bar mode)
- *      label_x       the left edge of every label
+ *      body_x        the window margin
+ *      label_x       the left edge of every label (after the mark gutter)
  *      val_r         the right column: every value, right-aligned
  *
  * and every y is one of the bands, all built from the fonts and SP().
@@ -379,10 +560,9 @@ typedef struct {
     int m, gap;
     int header_h, footer_h;
 
-    int mode;                   /* 0 = rail, 1 = page bar */
-    int rail_x, rail_y, rail_w;
-
-    int bar_y, bar_h;
+    int nav_mode;               /* 0 = all page names, 1 = arrows */
+    int nav_y, nav_h;
+    int tab_x[TAB_COUNT], tab_w[TAB_COUNT];
     int prev_x, next_x, arrow_w, name_x, name_w;
 
     int body_x, body_r, body_y, body_bot;
@@ -394,11 +574,6 @@ typedef struct {
 
     int radius, rule, bar_w2, footer_dy;
 } Layout;
-
-/* Does every page name fit down the left side without scrolling? */
-static int rail_rows_fit(int body_h, int row_h) {
-    return body_h - 2 * SP(1) >= TAB_COUNT * row_h;
-}
 
 static int layout_settings(Layout *L, const Settings *st, int w, int h) {
     memset(L, 0, sizeof(*L));
@@ -418,7 +593,19 @@ static int layout_settings(Layout *L, const Settings *st, int w, int h) {
 
     L->header_h = ui_ceilf(font_height(L->f.title)) + 2 * SP(1);
     L->footer_h = ui_ceilf(font_height(L->f.small)) + 2 * SP(1);
-    if (L->header_h + L->footer_h + L->row_h > h) L->footer_h = 0;
+
+    /* The navigation band is the body line box with one unit of air above
+     * and below - the same band shape as the path bar in Files. A short
+     * window compacts the band, then gives up the footer, and only then the
+     * band itself: rows of the page are the last thing to go. */
+    L->nav_h = ui_ceilf(font_height(L->f.body)) + 2 * SP(1);
+    if (L->nav_h < L->row_h) L->nav_h = L->row_h;
+    if (L->header_h + L->nav_h + SP(1) + L->footer_h + L->row_h > h)
+        L->nav_h = ui_ceilf(font_height(L->f.body));
+    if (L->header_h + L->nav_h + SP(1) + L->footer_h + L->row_h > h) L->footer_h = 0;
+    if (L->header_h + L->nav_h + L->row_h > h)
+        L->nav_h = h - L->header_h - L->row_h;
+    if (L->nav_h < 0) L->nav_h = 0;
     if (L->header_h + L->row_h > h) L->header_h = h;
 
     int top = L->header_h;
@@ -426,48 +613,47 @@ static int layout_settings(Layout *L, const Settings *st, int w, int h) {
     if (bottom < top) bottom = top;
 
     L->footer_dy = L->footer_h > 0 ? ui_top(L->f.small, L->footer_h) : 0;
+    L->nav_y = top;
 
-    /* one navigation column, chosen by what actually fits */
-    L->mode = 1;
-    if (rail_rows_fit(bottom - top, L->row_h) && w >= SP(40)) {
-        int widest = 0;
-        for (int i = 0; i < TAB_COUNT; i++) {
-            int tw = ui_ceilf(font_width(L->f.body, TAB_LABEL[i]));
-            if (tw > widest) widest = tw;
-        }
-        L->mode = 0;
-        L->rail_w = widest + 2 * SP(2);
-        if (L->rail_w > w - 2 * L->m - SP(20))
-            L->rail_w = w - 2 * L->m - SP(20);
-        if (L->rail_w < SP(8)) L->rail_w = SP(8);
-        L->rail_x = L->m;
-        L->rail_y = top + SP(1);
-        L->body_x = L->rail_x + L->rail_w + SP(2);
-        L->body_y = top + SP(1);
-    } else {
-        L->bar_h = L->row_h;
-        L->bar_y = top + SP(1);
+    /* all eight names, measured; use the band only when every one fits */
+    int x = L->m;
+    int total = L->m;
+    for (int i = 0; i < TAB_COUNT; i++) {
+        int tw = ui_ceilf(font_width(L->f.body, TAB_LABEL[i])) + 2 * SP(1);
+        L->tab_x[i] = x;
+        L->tab_w[i] = tw;
+        x += tw;
+        total = x + L->m;
+    }
+    L->nav_mode = (L->nav_h > 0 && total <= w) ? 0 : 1;
+    if (L->nav_mode == 1) {
         L->arrow_w = SP(4);
+        if (L->arrow_w > L->nav_h) L->arrow_w = L->nav_h;
+        if (L->arrow_w < SP(2)) L->arrow_w = SP(2);
         L->prev_x = L->m;
         L->next_x = w - L->m - L->arrow_w;
-        L->name_x = L->prev_x + L->arrow_w + L->gap;
+        L->name_x = L->prev_x + L->arrow_w + SP(2);
         L->name_w = L->next_x - L->gap - L->name_x;
-        if (L->name_w < SP(6)) L->name_w = SP(6);
-        L->body_x = L->m;
-        L->body_y = L->bar_y + L->bar_h + SP(1);
+        if (L->name_w < SP(4)) L->name_w = SP(4);
     }
+
+    L->body_x = L->m;
     L->body_r = w - L->m;
+    L->body_y = L->nav_y + L->nav_h + (L->nav_h > 0 ? SP(1) : 0);
     L->body_bot = bottom - SP(1);
     if (L->body_bot < L->body_y) L->body_bot = L->body_y;
 
-    /* the mark gutter only exists on pages that carry a mark */
+    /* the mark gutter only exists on pages that carry a mark, and the label
+     * always starts one unit after the mark so the two never touch */
     L->mark_sz = SP(2);
     L->sw_h = L->row_h - SP(1);
     if (L->sw_h > SP(3)) L->sw_h = SP(3);
-    L->sw_w = SP(6);
+    if (L->sw_h < SP(1)) L->sw_h = SP(1);
+    L->sw_w = SP(5);
     L->gut = 0;
     if (st->tab == TAB_THEME) L->gut = L->sw_w + L->gap;
-    else if (st->tab == TAB_TEXT || st->tab == TAB_WALL) L->gut = L->mark_sz + L->gap;
+    else if (st->tab == TAB_TEXT || st->tab == TAB_WALL || st->tab == TAB_DISP)
+        L->gut = SP(1) + L->mark_sz + L->gap;
     L->label_x = L->body_x + L->gut;
     L->val_r = L->body_r;
 
@@ -479,22 +665,21 @@ static int layout_settings(Layout *L, const Settings *st, int w, int h) {
     return 1;
 }
 
-/* the rail entry (page i) */
-static int rail_rect(const Layout *L, int i, int *bx, int *by, int *bw, int *bh) {
-    if (L->mode != 0 || i < 0 || i >= TAB_COUNT) return 0;
-    *bx = L->rail_x;
-    *by = L->rail_y + i * L->row_h;
-    *bw = L->rail_w;
-    *bh = L->row_h;
-    if (*by + *bh > L->rail_y + L->row_h * TAB_COUNT) return 0;
+/* one page-name tab */
+static int tab_rect(const Layout *L, int i, int *bx, int *by, int *bw, int *bh) {
+    if (L->nav_mode != 0 || i < 0 || i >= TAB_COUNT || L->nav_h <= 0) return 0;
+    *bx = L->tab_x[i];
+    *by = L->nav_y;
+    *bw = L->tab_w[i];
+    *bh = L->nav_h;
     return 1;
 }
 
 /* the page bar's two arrows */
 static int arrow_rect(const Layout *L, int which, int *bx, int *by, int *bw, int *bh) {
-    if (L->mode != 1) return 0;
+    if (L->nav_mode != 1 || L->nav_h <= 0) return 0;
     *bx = which ? L->next_x : L->prev_x;
-    *by = L->bar_y;
+    *by = L->nav_y;
     *bw = *bh = L->arrow_w;
     return 1;
 }
@@ -527,7 +712,7 @@ static int pw_btn_rect(const Layout *L, int w, int which,
     int wd = ui_ceilf(font_width(L->f.small, lab)) + 2 * SP(2);
     *bw = wd;
     *bh = h;
-    *by = -(L->footer_h - h) / 2;              /* relative to the footer top */
+    *by = (L->footer_h - h) / 2;               /* relative to the footer top */
     if (which) *bx = w - L->m - wd;
     else       *bx = w - L->m - wd - SP(1) - wd;
     if (*bx < L->m) *bx = L->m;
@@ -567,37 +752,46 @@ static void tick_draw(Surface *s, float x, float y, float sz, u32 c) {
  * mark gutter; the current row of a picker draws a tick there. Hover and
  * selection are the same rectangle with a different colour. */
 static void page_row_draw(Surface *s, const Layout *L, const Theme *th,
-                          const PRow *r, int ry, int selectable, int sel) {
+                          const PRow *r, int ox, int ry, int selectable,
+                          int sel, int hot) {
+    /* ox is the window's origin on the compositor surface; every column in
+     * Layout is app-local, so each x is ox + column. (The y is already the
+     * absolute row top, computed by the caller from L->body_y.) */
     if (sel)
-        ui_pill(s, L->body_x, ry, L->body_r - L->body_x, L->row_h,
+        ui_pill(s, ox + L->body_x, ry, L->body_r - L->body_x, L->row_h,
                 (float)L->radius, color_alpha(th->accent, 0.18f));
+    else if (selectable && hot)
+        ui_pill(s, ox + L->body_x, ry, L->body_r - L->body_x, L->row_h,
+                (float)L->radius, color_alpha(th->text, 0.05f));
 
     if (r->swatch) {
         float sy = (float)ry + ((float)L->row_h - (float)L->sw_h) * 0.5f;
-        swatch_draw(s, (float)L->body_x, sy, (float)L->sw_w, (float)L->sw_h,
-                    r->swatch);
+        swatch_draw(s, (float)(ox + L->body_x), sy, (float)L->sw_w,
+                    (float)L->sw_h, r->swatch);
     } else if (r->current && L->gut > 0) {
         float sy = (float)ry + ((float)L->row_h - (float)L->mark_sz) * 0.5f;
-        tick_draw(s, (float)L->body_x + (float)SP(1), sy, (float)L->mark_sz,
-                  th->accent);
+        tick_draw(s, (float)(ox + L->body_x + SP(1)), sy, (float)L->mark_sz,
+                  color_alpha(th->accent, 0.92f));
     }
 
     char vb[256];
     snprintf(vb, sizeof(vb), "%s", r->value);
     float vw = 0.0f;
     if (vb[0]) {
-        fit_text(L->f.small, vb, vb, sizeof(vb),
+        fit_ellipsis(L->f.small, vb, vb, sizeof(vb),
                  (float)(L->val_r - L->label_x) * 0.62f);
         if (vb[0]) vw = font_width(L->f.small, vb) + (float)L->gap;
     }
 
     char nb[256];
-    fit_text(L->f.body, r->label, nb, sizeof(nb),
+    fit_ellipsis(L->f.body, r->label, nb, sizeof(nb),
              (float)L->val_r - vw - (float)L->label_x);
-    font_draw(s, L->f.body, (float)L->label_x, (float)(ry + L->row_dy), nb,
-              selectable && sel ? th->text : color_alpha(th->text, 0.86f));
+    font_draw(s, L->f.body, (float)(ox + L->label_x),
+              (float)(ry + L->row_dy), nb,
+              sel ? th->text
+                  : color_alpha(th->text, hot && selectable ? 0.95f : 0.86f));
     if (vb[0])
-        ui_text_right(s, L->f.small, L->val_r, ry + L->small_dy, vb,
+        ui_text_right(s, L->f.small, ox + L->val_r, ry + L->small_dy, vb,
                       r->current ? color_alpha(th->accent, 0.95f)
                                  : color_alpha(th->text, 0.55f));
 }
@@ -642,7 +836,7 @@ static void read_file(const char *path, char *out, size_t n) {
 /* One line at a time: a key such as "HugePages_Total: 0" must not stop the
  * scan before MemAvailable. */
 static long mem_kb(const char *key) {
-    FILE *f = fopen("/proc/meminfo", "r");
+    FILE *f = fopen(MYSTIC_MEMINFO, "r");
     if (!f) return -1;
     size_t klen = strlen(key);
     char line[256];
@@ -658,47 +852,420 @@ static long mem_kb(const char *key) {
 
 /* The scale the desktop is really using. This is ui_scale_load()'s own
  * algorithm (src/ui.c:44-68): the clamp, and the legacy conversion when the
- * "baseline" marker is absent. Returns 0 when there is no usable setting. */
+ * "baseline" marker is absent. Returns 0 when there is no usable setting.
+ *
+ * The answer is cached for one second: the draw path asks for it more than
+ * once per frame, and the file changes only when the user applies a size
+ * (apply_size() drops the cache). */
+static time_t scale_read_at;
+static float  scale_read_val = 1.0f;
+static int    scale_read_ok;
+
+static void scale_cache_drop(void) { scale_read_at = 0; }
+
 static int read_scale(float *out) {
-    *out = 1.0f;
-    FILE *f = fopen(MYSTIC_UI_CONF, "r");
-    if (!f) return 0;
-    char line[256];
-    int marker = 0, got = 0;
-    float v = 1.0f;
-    while (fgets(line, sizeof(line), f)) {
-        if (!strncmp(line, "baseline", 8)) { marker = 1; continue; }
-        if (strncmp(line, "scale", 5)) continue;
-        char *eq = strchr(line, '=');
-        if (!eq) continue;
-        float x = (float)atof(eq + 1);
-        if (!isfinite(x)) continue;              /* NaN passes comparisons */
-        if (x < 0.8f) x = 0.8f;
-        if (x > 1.6f) x = 1.6f;
-        v = x;
-        got = 1;
-        break;
+    time_t t = time(NULL);
+    if (scale_read_at != 0 && scale_read_at == t) {
+        *out = scale_read_ok ? scale_read_val : 1.0f;
+        return scale_read_ok;
     }
-    fclose(f);
-    if (!got) return 0;
-    if (!marker) {
+
+    float v = 1.0f;
+    int marker = 0, got = 0;
+    FILE *f = fopen(MYSTIC_UI_CONF, "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (!strncmp(line, "baseline", 8)) { marker = 1; continue; }
+            if (strncmp(line, "scale", 5)) continue;
+            char *eq = strchr(line, '=');
+            if (!eq) continue;
+            float x = (float)atof(eq + 1);
+            if (!isfinite(x)) continue;          /* NaN passes comparisons */
+            if (x < 0.8f) x = 0.8f;
+            if (x > 1.6f) x = 1.6f;
+            v = x;
+            got = 1;
+            break;
+        }
+        fclose(f);
+    }
+    if (got && !marker) {
         v /= SETTINGS_BASELINE;
         if (v < 0.8f) v = 0.8f;
         if (v > 1.6f) v = 1.6f;
     }
+    scale_read_at = t;
+    scale_read_val = v;
+    scale_read_ok = got;
     *out = v;
-    return 1;
+    return got;
 }
 
 /* The wallpaper on disk. -2 = no file (the desktop keeps its default, 0),
- * -1 = a name no wallpaper matches, >= 0 = that wallpaper. */
+ * -1 = a name no wallpaper matches, >= 0 = that wallpaper. Cached for one
+ * second like the scale; apply_wallpaper() drops the cache. */
+static time_t wall_read_at;
+static int    wall_read_val = -2;
+
 static int read_wallpaper(void) {
+    time_t t = time(NULL);
+    if (wall_read_at != 0 && wall_read_at == t) return wall_read_val;
     char line[128];
-    if (!first_line(MYSTIC_WALLPAPER_FILE, line, sizeof(line))) return -2;
-    return wallpaper_from_name(line);
+    int v = first_line(MYSTIC_WALLPAPER_FILE, line, sizeof(line))
+            ? wallpaper_from_name(line) : -2;
+    wall_read_at = t;
+    wall_read_val = v;
+    return v;
 }
 
-/* ---- writing the facts back to the disk ---------------------------------- */
+/* ---- the display ---------------------------------------------------------- */
+
+/* Defined with the other durable writes below; the display's own save path
+ * needs it before that definition. */
+static int write_atomic(const char *path, const char *data, size_t len,
+                        mode_t mode, int *err);
+
+/* Everything the Display page prints comes from here: the mode list the
+ * kernel reported, the one in effect, the logical size the compositor draws
+ * at, the exact blit the core will use, and the cost it measured. All of
+ * them are fields of the display the compositor already holds, so this is a
+ * struct read and the draw path never touches the device. */
+static DispInfo *disp_info(Settings *s) {
+    DispInfo *di = &s->disp;
+
+    memset(di, 0, sizeof(*di));
+    di->native = -1;
+
+    Display *d = desk_display();
+    if (!d) {
+        snprintf(di->err, sizeof(di->err), "%s", "display not open");
+        return di;
+    }
+    di->n = disp_mode_count(d);
+    di->mode_source = (int)disp_modes_source(d);
+    di->named = disp_modes_named(d);
+    di->extra = disp_modes_extra(d);
+    di->scale = disp_get_scale(d);
+    di->lw = d->w;
+    di->lh = d->h;
+    di->fw = d->fb_w;
+    di->fh = d->fb_h;
+    di->ms = disp_present_ms(d);
+
+    di->cur = disp_mode_current(d);
+    /* modes[0] is the size the device was in when it was opened: the one
+     * disp_scan_modes() can prove the kernel is in, and the list is never
+     * reordered when a mode is set. It is therefore the native entry even
+     * after disp_set_mode() re-flags the mode in effect. */
+    di->native = di->n > 0 ? 0 : -1;
+    if (di->cur < 0 || di->cur >= di->n) di->cur = -1;
+
+    const DispMode *nm = di->native >= 0 ? disp_mode_at(d, di->native) : NULL;
+    if (nm) {
+        di->nw = nm->w;
+        di->nh = nm->h;
+    } else {
+        di->nw = d->fb_w;
+        di->nh = d->fb_h;
+    }
+
+    /* The placement the next present() will use. Pure arithmetic in the
+     * core, so the preview cannot disagree with the blit. */
+    di->geom = disp_layout(di->scale, di->lw, di->lh, di->fw, di->fh);
+    /* The display is open, so the canvas and scale rows are usable even when
+     * the device named no modes at all - which is exactly the QEMU case. */
+    di->ok = 1;
+    return di;
+}
+
+/* One short line for a mapping: the factor(s) and what is lost. The canvas
+ * rows, the preview and the status line all call this, so a factor printed
+ * in one place cannot disagree with the blit in another. `g` must be
+ * disp_layout(scale, cw, ch, fw, fh). */
+static void fmt_mapping(char *out, size_t n, const DispGeom *g,
+                        int cw, int ch, int fw, int fh) {
+    if (!out || n == 0) return;
+    out[0] = 0;
+    if (!g || cw <= 0 || ch <= 0) return;
+    double fx = (double)g->bw / (double)cw;
+    double fy = (double)g->bh / (double)ch;
+    char fac[32];
+    if (fabs(fx - fy) < 0.005)
+        snprintf(fac, sizeof(fac), "%.2fx", fx);
+    else
+        snprintf(fac, sizeof(fac), "%.2f x %.2f", fx, fy);
+
+    if (g->crop) {
+        int cropw = cw - g->bw, croph = ch - g->bh;
+        if (cropw > 0 && croph > 0)
+            snprintf(out, n, "%s, crops %dx%d", fac, cropw, croph);
+        else if (croph > 0)
+            snprintf(out, n, "%s, crops %d px tall", fac, croph);
+        else
+            snprintf(out, n, "%s, crops %d px wide", fac, cropw > 0 ? cropw : 0);
+        return;
+    }
+    int bx = fw - g->bw, by = fh - g->bh;
+    if (bx > 0 || by > 0)
+        snprintf(out, n, "%s, bars %dx%d", fac, bx, by);
+    else
+        snprintf(out, n, "%s, fills panel", fac);
+}
+
+/* The choice, in the exact format src/main.c parses: mode=<w>x<h> and
+ * scale=<name>. Written with the same temp+rename as the password file: a
+ * power cut must not leave half a resolution behind. Returns 1 when both
+ * copies landed, 0 otherwise; *why says which step failed. */
+static int display_persist(Settings *s, Display *d, char *why, size_t cap) {
+    const DispMode *m = disp_mode_at(d, disp_mode_current(d));
+    if (!m) { snprintf(why, cap, "%s", "the core has no current mode"); return 0; }
+    /* The canvas is independent of the mode: a panel that offers one mode
+     * still restores the size the user drew at. "auto" is written as the
+     * word, not the number it resolves to now, so it follows a new panel. */
+    char canvas[24];
+    if (desk_logical_auto())
+        snprintf(canvas, sizeof(canvas), "%s", "auto");
+    else
+        snprintf(canvas, sizeof(canvas), "%dx%d", d->w, d->h);
+    char text[160];
+    snprintf(text, sizeof(text), "mode=%dx%d\nlogical=%s\nscale=%s\n",
+             m->w, m->h, canvas, scale_key(disp_get_scale(d)));
+
+    int err = 0;
+    if (!write_atomic(MYSTIC_DISPLAY_CONF, text, strlen(text), 0644, &err)) {
+        snprintf(why, cap, "not saved: %s: %s", MYSTIC_DISPLAY_CONF,
+                 strerror(err ? err : EIO));
+        return 0;
+    }
+    if (!write_atomic(MYSTIC_DISPLAY_SAVED, text, strlen(text), 0644, &err)) {
+        snprintf(why, cap, "saved for this boot only: %s: %s",
+                 MYSTIC_DISPLAY_SAVED, strerror(err ? err : EIO));
+        return 0;
+    }
+    snprintf(why, cap, "saved in %s", MYSTIC_DISPLAY_CONF);
+    return 1;
+}
+
+/* Enter on a resolution row. The core asks the driver with
+ * FBIOPUT_VSCREENINFO and keeps the old mapping when it refuses, so a
+ * refusal is reported with errno's own words and the previous mode stays in
+ * effect - never a claim that a mode was set. */
+static void disp_apply_mode(Settings *s, int idx) {
+    Display *d = desk_display();
+    if (!d) { snprintf(s->status, sizeof(s->status), "%s", "no display"); s->status_err = 1; return; }
+    const DispMode *want = disp_mode_at(d, idx);
+    if (!want) { snprintf(s->status, sizeof(s->status), "%s", "that mode is no longer listed"); s->status_err = 1; return; }
+    int want_w = want->w, want_h = want->h, hz = want->refresh;
+
+    errno = 0;
+    int rc = disp_set_mode(d, idx);
+    int e = errno;
+    if (rc != 0) {
+        /* The core reports -1 both for a driver refusal (old mapping kept)
+         * and for a mode the driver took whose new framebuffer could not be
+         * mapped (drawing stopped). Those are different outcomes; say which
+         * one happened instead of calling both a refusal. */
+        const DispMode *now = disp_mode_at(d, disp_mode_current(d));
+        if (now && now->w == want_w && now->h == want_h && !d->mem) {
+            snprintf(s->status, sizeof(s->status),
+                     "panel switched to %dx%d but the new framebuffer could not be mapped: %s; drawing stopped",
+                     want_w, want_h, strerror(e ? e : EIO));
+        } else {
+            snprintf(s->status, sizeof(s->status), "%dx%d refused: %s",
+                     want_w, want_h, strerror(e ? e : EIO));
+        }
+        s->status_err = 1;
+        return;
+    }
+
+    /* Prove it with the device, not with the return code: a driver that
+     * changes something other than the request is a real failure to say. */
+    const DispMode *now = disp_mode_at(d, disp_mode_current(d));
+    if (!now || now->w != want_w || now->h != want_h) {
+        snprintf(s->status, sizeof(s->status),
+                 "%dx%d was accepted but the panel reports %dx%d",
+                 want_w, want_h, now ? now->w : d->fb_w, now ? now->h : d->fb_h);
+        s->status_err = 1;
+        return;
+    }
+
+    /* A success with no mapping is still a dead screen: disp_set_mode()
+     * returns 0 for a mode that is already in effect without remapping, and
+     * an earlier failed map can have left d->mem NULL. Say so, do not save
+     * a choice that cannot be drawn. */
+    if (!d->mem) {
+        snprintf(s->status, sizeof(s->status),
+                 "%dx%d is set but the framebuffer is not mapped; drawing stopped",
+                 want_w, want_h);
+        s->status_err = 1;
+        return;
+    }
+
+    /* Keep the canvas choice across a panel change: auto re-resolves for the
+     * new panel, an explicit canvas stays exactly what the user picked. The
+     * core applies it to the surfaces and to the inverse mapper. */
+    desk_follow_mode(d);
+
+    char map[64];
+    DispGeom g = disp_layout(disp_get_scale(d), d->w, d->h, d->fb_w, d->fb_h);
+    fmt_mapping(map, sizeof(map), &g, d->w, d->h, d->fb_w, d->fb_h);
+
+    char why[160];
+    int saved = display_persist(s, d, why, sizeof(why));
+    char hzb[32];
+    if (hz > 0) snprintf(hzb, sizeof(hzb), " at %d Hz", hz);
+    else hzb[0] = 0;
+    snprintf(s->status, sizeof(s->status), "%dx%d%s, canvas %dx%d %s; %s",
+             want_w, want_h, hzb, d->w, d->h, map, why);
+    s->status_err = saved ? 0 : 1;
+}
+
+/* A canvas costs two compositor surfaces (screen + scene) at 4 bytes per
+ * pixel, and the machine must still be able to run: the shipped image is
+ * started with 32 MB. Refuse a size here, with both real numbers, instead
+ * of saving a choice the desktop would find it cannot allocate two frames
+ * later - and would then try to restore at the next boot. MemAvailable is
+ * the kernel's own figure; when /proc is absent (host probe) the core's
+ * compile-time bounds are the only limit. */
+#define CANVAS_RESERVE_KB (4 * 1024)
+static int canvas_memory_ok(int w, int h, char *why, size_t cap) {
+    if (w < 1 || h < 1) return 1;
+    long avail = mem_kb("MemAvailable:");
+    if (avail <= 0) return 1;                 /* no /proc/meminfo here */
+    long need = (long)(((unsigned long long)w * (unsigned long long)h * 8ull) / 1024ull);
+    if (need + CANVAS_RESERVE_KB <= avail) return 1;
+    snprintf(why, cap,
+             "canvas %dx%d needs %ld MB, %ld MB available (4 MB kept free)",
+             w, h, (need + 1023) / 1024, avail / 1024);
+    return 0;
+}
+
+/* Enter on a canvas row: the logical size the compositor draws before the
+ * blit. This is pure state in the core (no driver call, so it cannot be
+ * refused by the kernel), and the desktop reallocates its surfaces on the
+ * next frame - the same session, no restart. The proof shown is the size
+ * read back and the mapping the next present will use, both from the
+ * Display struct. */
+static void disp_apply_logical(Settings *s, int arg) {
+    Display *d = desk_display();
+    if (!d) { snprintf(s->status, sizeof(s->status), "%s", "no display"); s->status_err = 1; return; }
+    int want_w = 0, want_h = 0;
+    if (arg >= 0 && arg < CANVAS_COUNT) {
+        want_w = CANVAS[arg].w;
+        want_h = CANVAS[arg].h;
+    }
+    char memwhy[160];
+    memwhy[0] = 0;
+    if (want_w > 0 && !canvas_memory_ok(want_w, want_h, memwhy, sizeof(memwhy))) {
+        snprintf(s->status, sizeof(s->status), "%s; not applied", memwhy);
+        s->status_err = 1;
+        return;
+    }
+    int exact = desk_set_logical(d, want_w, want_h);
+    int got_w = d->w, got_h = d->h;
+    /* A clamp is still an applied choice (the core used the nearest size it
+     * can allocate), so it is saved - and said in the same line, because a
+     * status that says "clamped" while nothing was written would be a lie. */
+    DispGeom g = disp_layout(disp_get_scale(d), got_w, got_h, d->fb_w, d->fb_h);
+    char map[64];
+    fmt_mapping(map, sizeof(map), &g, got_w, got_h, d->fb_w, d->fb_h);
+
+    char why[160];
+    int saved = display_persist(s, d, why, sizeof(why));
+    if (want_w > 0 && !exact)
+        snprintf(s->status, sizeof(s->status),
+                 "canvas %dx%d asked, %dx%d used (bounds), %s; %s",
+                 want_w, want_h, got_w, got_h, map, why);
+    else if (desk_logical_auto())
+        snprintf(s->status, sizeof(s->status),
+                 "canvas follows the panel: %dx%d, %s; %s", got_w, got_h, map, why);
+    else
+        snprintf(s->status, sizeof(s->status),
+                 "canvas %dx%d, %s; %s", got_w, got_h, map, why);
+    s->status_err = saved ? 0 : 1;
+}
+
+/* Enter on a scaling row. disp_set_scale() is pure state, so the only proof
+ * is reading it back; the next frame is mapped with it. */
+static void disp_apply_scale(Settings *s, DispScale want) {
+    Display *d = desk_display();
+    if (!d) { snprintf(s->status, sizeof(s->status), "%s", "no display"); s->status_err = 1; return; }
+    disp_set_scale(d, want);
+    DispScale got = disp_get_scale(d);
+    if (got != want) {
+        snprintf(s->status, sizeof(s->status), "%s refused by the core", scale_label(want));
+        s->status_err = 1;
+        return;
+    }
+    char why[160];
+    int saved = display_persist(s, d, why, sizeof(why));
+    DispGeom g = disp_layout(got, d->w, d->h, d->fb_w, d->fb_h);
+    char map[64];
+    fmt_mapping(map, sizeof(map), &g, d->w, d->h, d->fb_w, d->fb_h);
+    snprintf(s->status, sizeof(s->status), "scaling: %s, %s; %s",
+             scale_key(got), map, why);
+    s->status_err = saved ? 0 : 1;
+}
+
+/* The two defaults, together: the panel's own mode and the scale that fits
+ * it without inventing pixels. Said in that order so a refusal of the mode
+ * leaves the scale untouched and the message names what failed. */
+static void disp_apply_reset(Settings *s) {
+    Display *d = desk_display();
+    if (!d) { snprintf(s->status, sizeof(s->status), "%s", "no display"); s->status_err = 1; return; }
+    /* modes[0]: the size the device was opened in, which disp_scan_modes()
+     * puts first and disp_set_mode() never reorders. */
+    const DispMode *nm = disp_mode_at(d, 0);
+    if (!nm) {
+        snprintf(s->status, sizeof(s->status), "%s", "the device did not name a native mode");
+        s->status_err = 1;
+        return;
+    }
+    int nat = 0;
+    int nw = nm->w, nh = nm->h;
+
+    errno = 0;
+    int rc = disp_set_mode(d, nat);
+    int e = errno;
+    if (rc != 0) {
+        snprintf(s->status, sizeof(s->status), "reset refused: %s",
+                 strerror(e ? e : EIO));
+        s->status_err = 1;
+        return;
+    }
+    /* A reset that leaves no mapping is not a reset anyone can use. */
+    if (!d->mem) {
+        snprintf(s->status, sizeof(s->status),
+                 "native %dx%d is set but the framebuffer is not mapped; drawing stopped",
+                 nw, nh);
+        s->status_err = 1;
+        return;
+    }
+
+    /* The driver can accept the request and land somewhere else. Set the
+     * scale and the logical surface from what it actually reported, and say
+     * the difference rather than calling it a successful reset. */
+    if (d->fb_w != nw || d->fb_h != nh) {
+        disp_set_scale(d, DISP_FIT);
+        desk_set_logical(d, 0, 0);
+        snprintf(s->status, sizeof(s->status),
+                 "reset changed the panel to %dx%d, not the native %dx%d; not saved",
+                 d->fb_w, d->fb_h, nw, nh);
+        s->status_err = 1;
+        return;
+    }
+    disp_set_scale(d, DISP_FIT);
+    desk_set_logical(d, 0, 0);
+
+    char why[160];
+    int saved = display_persist(s, d, why, sizeof(why));
+    snprintf(s->status, sizeof(s->status),
+             "reset to native: %dx%d, fit, canvas auto (%dx%d); %s",
+             nw, nh, d->w, d->h, why);
+    s->status_err = saved ? 0 : 1;
+}
+
 
 /* One small file, written whole: open, write, flush, close - every step
  * checked, and the caller gets the errno of whichever step failed. */
@@ -738,6 +1305,7 @@ static void apply_size(Settings *s, int i) {
     snprintf(text, sizeof(text), "baseline = %.1f\nscale = %.1f\n",
              SETTINGS_BASELINE, SIZE_VALUE[i]);
     int err = 0;
+    scale_cache_drop();
     if (write_text(MYSTIC_UI_CONF, text, &err)) {
         snprintf(s->status, sizeof(s->status), "text size: %s (%.1fx)",
                  SIZE_LABEL[i], SIZE_VALUE[i]);
@@ -755,6 +1323,7 @@ static void apply_wallpaper(Settings *s, int i) {
     char text[128], err_txt[160];
     snprintf(text, sizeof(text), "%s\n", name);
     int err = 0;
+    wall_read_at = 0;
     if (write_text(MYSTIC_WALLPAPER_FILE, text, &err)) {
         snprintf(s->status, sizeof(s->status), "wallpaper: %s", name);
         s->status_err = 0;
@@ -774,8 +1343,13 @@ static int cmp_names(const void *a, const void *b) {
 /* Read every *.theme the desktop can load, in the same order: filename order
  * (theme_load_all sorts first, src/theme.c:363). theme_load() supplies the
  * real colours and the "name =" field, so the swatch and the applied name can
- * never disagree. Rescanned on every draw: the list is the disk. */
+ * never disagree. Rescanned at most once a second: this is the disk, but a
+ * directory and every theme file in it do not change between two frames. */
 static void scan_themes(Settings *s) {
+    time_t t = time(NULL);
+    if (s->themes_at != 0 && s->themes_at == t) return;
+    s->themes_at = t;
+
     char names[64][64];
     int nf = 0, err = 0;
 
@@ -839,20 +1413,22 @@ static int random_salt(u8 *out, int n) {
     return 1;
 }
 
-/* Replace /etc/mystic/passwd atomically: a temp file in the same directory,
- * written and flushed, then rename(2). A power cut leaves either the old
- * line or the new one, never a truncated hash the lock screen cannot parse. */
-static int write_passwd(const char *line, int *err) {
-    char tmp[160];
-    snprintf(tmp, sizeof(tmp), "%s.new", MYSTIC_PASSWD);
+/* Write one small file atomically: a temp file in the same directory,
+ * written, fsynced, then rename(2). A power cut leaves either the old bytes
+ * or the new ones, never a truncated hash the lock screen cannot parse. */
+static int write_atomic(const char *path, const char *data, size_t len,
+                        mode_t mode, int *err) {
+    char tmp[256];
+    int n = snprintf(tmp, sizeof(tmp), "%s.new", path);
+    if (n < 0 || n >= (int)sizeof(tmp)) { *err = ENAMETOOLONG; return 0; }
     *err = 0;
 
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, mode);
     if (fd < 0) { *err = errno ? errno : EIO; return 0; }
 
-    size_t len = strlen(line), off = 0;
+    size_t off = 0;
     while (off < len) {
-        ssize_t w = write(fd, line + off, len - off);
+        ssize_t w = write(fd, data + off, len - off);
         if (w < 0) {
             if (errno == EINTR) continue;
             *err = errno;
@@ -861,13 +1437,90 @@ static int write_passwd(const char *line, int *err) {
         if (w == 0) { *err = EIO; break; }
         off += (size_t)w;
     }
-    if (!*err && fchmod(fd, 0600) != 0) *err = errno;
+    if (!*err && fchmod(fd, mode) != 0) *err = errno;
     if (!*err && fsync(fd) != 0) *err = errno;
     if (close(fd) != 0 && !*err) *err = errno;
 
-    if (!*err && rename(tmp, MYSTIC_PASSWD) != 0) *err = errno;
+    if (!*err && rename(tmp, path) != 0) *err = errno;
     if (*err) unlink(tmp);
     return *err == 0;
+}
+
+/* The format mystic_check_password() parses: <salt-hex>:<rounds>:<hash-hex>.
+ * This is used only to refuse to re-adopt a disk copy that is not a whole
+ * line: try_unlock() fails OPEN on an unparseable file, so copying a
+ * truncated fragment over the RAM file would silently remove the lock. */
+static int passwd_line_ok(const char *line) {
+    if (!line) return 0;
+    const char *c1 = strchr(line, ':');
+    if (!c1 || c1 == line) return 0;
+
+    const char *p = c1 + 1;
+    int rounds = 0, digits = 0;
+    while (*p >= '0' && *p <= '9') {
+        rounds = rounds * 10 + (*p - '0');
+        p++;
+        digits++;
+    }
+    if (!digits || rounds <= 0 || *p != ':') return 0;
+    p++;
+
+    int hashlen = 0;
+    while (isxdigit((unsigned char)*p)) { hashlen++; p++; }
+    if (*p || hashlen != 64) return 0;
+
+    size_t saltlen = (size_t)(c1 - line);
+    if (saltlen == 0 || saltlen > 64 || (saltlen & 1)) return 0;
+    for (const char *q = line; q < c1; q++)
+        if (!isxdigit((unsigned char)*q)) return 0;
+    return 1;
+}
+
+/* Write the lock-screen line to the RAM file (what try_unlock reads) AND to
+ * the disk copy that makes it survive a reboot. *err is the live write's
+ * errno; *saved_err is the disk copy's (0 when durable). Returns 1 when the
+ * lock screen's file was replaced, even if the disk copy failed: the caller
+ * must then say "this boot only" instead of claiming permanence. */
+static int write_passwd(const char *line, int *err, int *saved_err) {
+    *saved_err = 0;
+    size_t len = strlen(line);
+    if (!write_atomic(MYSTIC_PASSWD, line, len, 0600, err)) return 0;
+    if (!write_atomic(MYSTIC_PASSWD_SAVED, line, len, 0600, saved_err)) return 1;
+    return 1;
+}
+
+/* After a reboot /etc/mystic is the RAM rootfs again and carries the image's
+ * default line. When the disk copy is newer, put it back before anything can
+ * read the RAM file. 1 = copied, 0 = nothing to do; *err says why not (0
+ * when there was nothing to do). A fragment that does not parse is never
+ * adopted. */
+static int restore_passwd(int *err) {
+    *err = 0;
+
+    struct stat ds, ls;
+    if (stat(MYSTIC_PASSWD_SAVED, &ds) != 0) {
+        if (errno != ENOENT) *err = errno;
+        return 0;
+    }
+    if (!S_ISREG(ds.st_mode)) return 0;
+
+    int have_live = (stat(MYSTIC_PASSWD, &ls) == 0 && S_ISREG(ls.st_mode));
+    if (have_live && ds.st_mtime <= ls.st_mtime) return 0;
+
+    FILE *f = fopen(MYSTIC_PASSWD_SAVED, "rb");
+    if (!f) { *err = errno ? errno : EIO; return 0; }
+    char line[320];
+    size_t n = fread(line, 1, sizeof(line) - 1, f);
+    int rerr = ferror(f) ? (errno ? errno : EIO) : 0;
+    fclose(f);
+    if (rerr) { *err = rerr; return 0; }
+
+    line[n] = 0;
+    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+    if (!passwd_line_ok(line)) { *err = EINVAL; return 0; }
+
+    if (!write_atomic(MYSTIC_PASSWD, line, n, 0600, err)) return 0;
+    return 1;
 }
 
 /* Nothing typed is shown: one '*' per byte, and only a count-neutral
@@ -953,8 +1606,8 @@ static void pw_finish(Settings *s) {
                               line, sizeof(line));
     snprintf(rec, sizeof(rec), "%s\n", line);
 
-    int err = 0;
-    if (!write_passwd(rec, &err)) {
+    int err = 0, saved_err = 0;
+    if (!write_passwd(rec, &err, &saved_err)) {
         char why[96];
         snprintf(why, sizeof(why), "%s", strerror(err));
         pw_set_msg(s, 1, "New password not written - the old one still works.");
@@ -971,10 +1624,21 @@ static void pw_finish(Settings *s) {
     int rerr = 0;
     int r = read_passwd(check, sizeof(check), &rerr);
     if (r > 0 && mystic_check_password(check, s->pw_buf)) {
-        pw_set_msg(s, 0, "Password changed. The file was read back and verified.");
-        snprintf(s->status, sizeof(s->status),
-                 "lock-screen password changed and verified");
-        s->status_err = 0;
+        if (saved_err) {
+            /* The lock screen already reads the new line, but the disk copy
+             * that would carry it past a reboot did not land. Say so. */
+            pw_set_msg(s, 1, "Password changed for this boot only: /root/mystic-passwd was not written.");
+            snprintf(s->status, sizeof(s->status),
+                     "changed and verified, but %s: %s",
+                     MYSTIC_PASSWD_SAVED, strerror(saved_err));
+            s->status_err = 1;
+        } else {
+            pw_set_msg(s, 0, "Password changed and saved to disk; the file was read back and verified.");
+            snprintf(s->status, sizeof(s->status),
+                     "lock-screen password changed, verified, saved to %s",
+                     MYSTIC_PASSWD_SAVED);
+            s->status_err = 0;
+        }
     } else {
         pw_set_msg(s, 1, "The file was written but did not verify - check it.");
         snprintf(s->status, sizeof(s->status),
@@ -1274,6 +1938,8 @@ static int page_add(PRow *r, int n, int max, int id,
     p->id = id;
     p->current = current;
     p->swatch = swatch;
+    p->act = ACT_NONE;
+    p->arg = 0;
     snprintf(p->label, sizeof(p->label), "%s", label ? label : "");
     snprintf(p->value, sizeof(p->value), "%s", value ? value : "");
     return n + 1;
@@ -1305,6 +1971,106 @@ static int build_page(Settings *st, const Theme *live, PRow *rows, int max) {
             int cur = fabsf(now - SIZE_VALUE[i]) < 0.005f;
             snprintf(v, sizeof(v), "%.1fx", (double)SIZE_VALUE[i]);
             n = page_add(rows, n, max, i, SIZE_LABEL[i], v, cur, NULL);
+        }
+        break;
+    }
+    case TAB_DISP: {
+        DispInfo *di = disp_info(st);
+        int sid = 0;                     /* ordinal among the selectable rows */
+        int auto_cur = desk_logical_auto();
+        Display *disp = desk_display();
+
+        /* Canvas first. It is the one choice that changes the picture on a
+         * device that reports a single mode, and every row carries the
+         * factor and bars the current scale mode would produce - computed by
+         * the same disp_layout() the blit uses, so the row cannot promise
+         * something the next frame will not do. */
+        {
+            int aw = 0, ah = 0;
+            desk_design_size(di->fw, di->fh, &aw, &ah);
+            DispGeom ag = disp_layout(di->scale, aw, ah, di->fw, di->fh);
+            char am[64], av[80];
+            fmt_mapping(am, sizeof(am), &ag, aw, ah, di->fw, di->fh);
+            snprintf(av, sizeof(av), "%d x %d, %s", aw, ah, am);
+            n = page_add(rows, n, max, sid++, "Match panel", av, auto_cur, NULL);
+            if (n > 0) { rows[n - 1].act = ACT_LOGICAL; rows[n - 1].arg = -1; }
+        }
+        for (int i = 0; i < CANVAS_COUNT; i++) {
+            DispGeom cg = disp_layout(di->scale, CANVAS[i].w, CANVAS[i].h,
+                                      di->fw, di->fh);
+            char cm[64], lbl[24];
+            fmt_mapping(cm, sizeof(cm), &cg, CANVAS[i].w, CANVAS[i].h,
+                        di->fw, di->fh);
+            snprintf(lbl, sizeof(lbl), "%d x %d", CANVAS[i].w, CANVAS[i].h);
+            int cur = !auto_cur && di->lw == CANVAS[i].w && di->lh == CANVAS[i].h;
+            n = page_add(rows, n, max, sid++, lbl, cm, cur, NULL);
+            if (n > 0) { rows[n - 1].act = ACT_LOGICAL; rows[n - 1].arg = i; }
+        }
+
+        /* The panel's own modes, only when the device named a size other
+         * than the one in effect. A row that is already current cannot do
+         * anything, so when there is no choice the page says which kind of
+         * silence it has instead of offering a dead row. */
+        if (di->n > 1) {
+            /* The panel's own modes, prefixed so a size that is also a
+             * canvas cannot be mistaken for it. Index 0 is the size the
+             * device was opened in; it stays first even after a mode change
+             * re-flags which one is native. */
+            char pm[48];
+            snprintf(pm, sizeof(pm), "%d sizes reported", di->n);
+            n = page_add(rows, n, max, -1, "Panel modes", pm, 0, NULL);
+            for (int i = 0; i < di->n; i++) {
+                const DispMode *m = disp_mode_at(disp, i);
+                int mw = m ? m->w : 0, mh = m ? m->h : 0;
+                if (mw <= 0 || mh <= 0) continue;
+                char lbl[48];
+                snprintf(lbl, sizeof(lbl), "Panel %d x %d", mw, mh);
+                const char *tag = (i == di->cur) ? "current"
+                                : (i == di->native ? "native" : "");
+                int id = sid++;
+                n = page_add(rows, n, max, id, lbl, tag, i == di->cur, NULL);
+                if (n > 0) { rows[n - 1].act = ACT_MODE; rows[n - 1].arg = i; }
+            }
+        } else {
+            const char *why = di->mode_source == DISP_MODES_NATIVE_ONLY
+                            ? "named only the current size"
+                            : "not named by the device";
+            n = page_add(rows, n, max, -1, "Panel modes", why, 0, NULL);
+        }
+
+        /* fit / stretch / integer / 1:1, each with one line saying what it
+         * does. The value column is the explanation; the tick is the mode
+         * that is in effect, so no label is repeated. */
+        for (int m = 0; m < DISP_SCALE_COUNT; m++) {
+            DispScale sc = (DispScale)m;
+            int id = sid++;
+            n = page_add(rows, n, max, id, scale_label(sc), scale_hint(sc),
+                         m == (int)di->scale, NULL);
+            if (n > 0) { rows[n - 1].act = ACT_SCALE; rows[n - 1].arg = m; }
+        }
+
+        /* The preview: four numbers, every one from the Display struct. */
+        {
+            char a[48], b[48], c[80], e[40];
+            snprintf(a, sizeof(a), "%d x %d", di->lw, di->lh);
+            snprintf(b, sizeof(b), "%d x %d", di->nw, di->nh);
+            fmt_mapping(c, sizeof(c), &di->geom, di->lw, di->lh, di->fw, di->fh);
+
+            if (di->ms > 0.0) snprintf(e, sizeof(e), "%.1f ms", di->ms);
+            else              snprintf(e, sizeof(e), "%s", "not measured yet");
+
+            n = page_add(rows, n, max, -1, "Canvas", a, 0, NULL);
+            n = page_add(rows, n, max, -1, "Native", b, 0, NULL);
+            n = page_add(rows, n, max, -1, "Mapping", c, 0, NULL);
+            n = page_add(rows, n, max, -1, "Present", e, 0, NULL);
+        }
+
+        if (di->native >= 0) {
+            char rv[48];
+            int id = sid++;
+            snprintf(rv, sizeof(rv), "%d x %d, fit", di->nw, di->nh);
+            n = page_add(rows, n, max, id, "Reset to native", rv, 0, NULL);
+            if (n > 0) rows[n - 1].act = ACT_RESET;
         }
         break;
     }
@@ -1361,8 +2127,10 @@ static int build_page(Settings *st, const Theme *live, PRow *rows, int max) {
     }
     case TAB_SYSTEM:
     default: {
+        /* The framebuffer's own geometry, distinct from the Display page's
+         * logical/mode pair: /sys reports pixels the device holds. */
         read_file("/sys/class/graphics/fb0/virtual_size", v, sizeof(v));
-        n = page_add(rows, n, max, -1, "Display", v, 0, NULL);
+        n = page_add(rows, n, max, -1, "Framebuffer", v, 0, NULL);
 
         long total = mem_kb("MemTotal:"), avail = mem_kb("MemAvailable:");
         if (total > 0 && avail >= 0) {
@@ -1391,9 +2159,19 @@ static int build_page(Settings *st, const Theme *live, PRow *rows, int max) {
     return n;
 }
 
-static int tab_rows(const Settings *s) {
+static int tab_rows(Settings *s) {
     switch (s->tab) {
         case TAB_TEXT:  return SIZE_COUNT;
+        case TAB_DISP: {
+            /* canvas rows (Match panel + CANVAS_COUNT), the panel modes only
+             * when the device named another one, the four scale choices and
+             * Reset. It must equal the number of id >= 0 rows build_page()
+             * makes. */
+            DispInfo *di = disp_info(s);
+            int n = 1 + CANVAS_COUNT;
+            if (di->n > 1) n += di->n;
+            return n + DISP_SCALE_COUNT + (di->native >= 0 ? 1 : 0);
+        }
         case TAB_THEME: return s->theme_count;
         case TAB_WALL:  return WALLPAPER_COUNT;
         case TAB_USERS: return s->pw_stage ? 0 : 1;
@@ -1412,35 +2190,68 @@ static const char *page_empty(const Settings *s, char *buf, size_t n) {
     return buf;
 }
 
-/* One footer line: what Enter will do, or where the values come from. */
-static const char *page_hint(const Settings *s, const Theme *live, char *buf, size_t n) {
+/* One footer line of facts. The left cell says where the page's numbers
+ * come from (or the result of the last real write); the right cell is the
+ * one value the page is about: the scale in effect, the theme, the
+ * wallpaper, whether a password is set. No instructions live here. */
+static void page_facts(Settings *s, const Theme *live,
+                       char *left, size_t ln, char *right, size_t rn) {
+    left[0] = 0;
+    right[0] = 0;
+
     switch (s->tab) {
-        case TAB_TEXT:
-            return "Enter applies - writes /etc/mystic/ui.conf";
-        case TAB_THEME:
-            if (live && live->name[0]) {
-                int found = 0;
-                for (int i = 0; i < s->theme_count && !found; i++)
-                    if (!strcmp(live->name, s->themes[i].theme.name)) found = 1;
-                if (!found) {
-                    snprintf(buf, n, "In use: %s - no theme file has that name",
-                             live->name);
-                    return buf;
-                }
-            }
-            return "Enter applies - writes /etc/mystic/current-theme";
-        case TAB_WALL:
-            return "Enter applies - writes /etc/mystic/wallpaper";
-        case TAB_USERS:
-            return s->pw_stage
-                 ? "Enter submits - Ctrl+C cancels - nothing is echoed"
-                 : "Enter starts - the current password is checked first";
-        case TAB_NET:
-            return "Read now: /proc/net/route, SIOCGIFADDR, /etc/resolv.conf";
-        case TAB_STORAGE:
-            return "Read now: statvfs(2) on / and /root";
-        default:
-            return "Read now: /proc and /sys";
+    case TAB_TEXT: {
+        float now = 1.0f;
+        read_scale(&now);
+        snprintf(right, rn, "now %.1fx", (double)now);
+        snprintf(left, ln, "%d sizes, %.1fx to %.1fx", SIZE_COUNT,
+                 (double)SIZE_VALUE[0], (double)SIZE_VALUE[SIZE_COUNT - 1]);
+        break;
+    }
+    case TAB_DISP: {
+        DispInfo *di = disp_info(s);
+        if (di->ok) {
+            if (di->ms > 0.0)
+                snprintf(right, rn, "canvas %dx%d, %.1f ms", di->lw, di->lh, di->ms);
+            else
+                snprintf(right, rn, "canvas %dx%d", di->lw, di->lh);
+            snprintf(left, ln, "%s", "canvas in RAM, panel via /sys; clock_gettime");
+        } else {
+            snprintf(left, ln, "%s", di->err[0] ? di->err : "display unavailable");
+        }
+        break;
+    }
+    case TAB_THEME:
+        snprintf(left, ln, "%d themes in %s", s->theme_count, MYSTIC_THEME_DIR);
+        if (live && live->name[0]) snprintf(right, rn, "now %s", live->name);
+        break;
+    case TAB_WALL: {
+        snprintf(left, ln, "%d wallpapers", WALLPAPER_COUNT);
+        int wi = read_wallpaper();
+        if (wi >= 0) snprintf(right, rn, "now %s", wallpaper_name(wi));
+        else if (wi == -2) snprintf(right, rn, "%s", "now default");
+        else snprintf(right, rn, "%s", "now unknown");
+        break;
+    }
+    case TAB_USERS: {
+        snprintf(left, ln, "%s", "/etc/mystic/passwd, saved to /root/mystic-passwd");
+        char line[256];
+        int err = 0;
+        int r = read_passwd(line, sizeof(line), &err);
+        if (r > 0) snprintf(right, rn, "%s", "set");
+        else if (r == 0) snprintf(right, rn, "%s", "not set");
+        else snprintf(right, rn, "%s", "unreadable");
+        break;
+    }
+    case TAB_NET:
+        snprintf(left, ln, "%s", "/proc/net/route + SIOCGIFADDR + resolv.conf");
+        break;
+    case TAB_STORAGE:
+        snprintf(left, ln, "%s", "statvfs(2) on / and /root");
+        break;
+    default:
+        snprintf(left, ln, "%s", "/proc and /sys");
+        break;
     }
 }
 
@@ -1464,44 +2275,61 @@ static void nav_arrow(Surface *s, int dir, float x, float y, float sz, u32 c) {
     }
 }
 
-/* The rail (all seven names, the current one in an accent pill) or the
- * page bar (one name, two arrows). Both are built from Layout rectangles
- * the click handler also uses. */
+/* The navigation band: all eight page names on one line, or one name with
+ * two arrows when the names cannot fit. The current page is the same pill
+ * a selected row uses; hover is the same pill in the row-hover colour. Both
+ * are built from Layout rectangles the click handler also uses. */
 static void nav_draw(Surface *s, int x, int y, const Layout *L,
                      const Settings *st, const Theme *th) {
-    if (L->mode == 0) {
+    if (L->nav_h <= 0) return;
+
+    if (L->nav_mode == 0) {
         for (int i = 0; i < TAB_COUNT; i++) {
             int bx, by, bw, bh;
-            if (!rail_rect(L, i, &bx, &by, &bw, &bh)) continue;
+            if (!tab_rect(L, i, &bx, &by, &bw, &bh)) continue;
             int on = (i == st->tab);
+            int hot = st->px >= bx && st->px < bx + bw &&
+                      st->py >= by && st->py < by + bh;
             if (on)
                 ui_pill(s, x + bx, y + by, bw, bh, (float)L->radius,
-                        color_alpha(th->accent, 0.16f));
-            font_draw(s, L->f.body, (float)(x + bx + SP(2)),
-                      (float)(y + by) + (float)ui_top(L->f.body, bh),
-                      TAB_LABEL[i],
-                      on ? th->text : color_alpha(th->text, 0.58f));
+                        color_alpha(th->accent, 0.18f));
+            else if (hot)
+                ui_pill(s, x + bx, y + by, bw, bh, (float)L->radius,
+                        color_alpha(th->text, 0.05f));
+            draw_clipped(s, L->f.body, (float)(x + bx + SP(1)),
+                         (float)(y + by) + (float)ui_top(L->f.body, bh),
+                         (float)(bw - 2 * SP(1)), TAB_LABEL[i],
+                         on ? th->text
+                            : color_alpha(th->text, hot ? 0.92f : 0.62f));
         }
-        return;
+    } else {
+        for (int which = 0; which < 2; which++) {
+            int bx, by, bw, bh;
+            if (!arrow_rect(L, which, &bx, &by, &bw, &bh)) continue;
+            int hot = st->px >= bx && st->px < bx + bw &&
+                      st->py >= by && st->py < by + bh;
+            if (hot)
+                ui_pill(s, x + bx, y + by, bw, bh, (float)L->radius,
+                        color_alpha(th->text, 0.05f));
+            int sz = L->nav_h - 2 * SP(1);
+            if (sz > SP(3)) sz = SP(3);
+            if (sz < SP(2)) sz = SP(2);
+            if (sz > L->arrow_w - SP(1)) sz = L->arrow_w - SP(1);
+            if (sz < SP(1)) sz = SP(1);
+            nav_arrow(s, which ? 1 : -1,
+                      (float)(x + bx) + (float)(L->arrow_w - sz) * 0.5f,
+                      (float)(y + by) + (float)(bh - sz) * 0.5f,
+                      (float)sz, color_alpha(th->text, hot ? 0.95f : 0.55f));
+        }
+        draw_clipped(s, L->f.body, (float)(x + L->name_x),
+                     (float)(y + L->nav_y) + (float)ui_top(L->f.body, L->nav_h),
+                     (float)L->name_w, TAB_LABEL[st->tab], th->text);
     }
 
-    for (int which = 0; which < 2; which++) {
-        int bx, by, bw, bh;
-        if (!arrow_rect(L, which, &bx, &by, &bw, &bh)) continue;
-        int hot = st->px >= bx && st->px < bx + bw &&
-                  st->py >= by && st->py < by + bh;
-        if (hot)
-            ui_pill(s, x + bx, y + by, bw, bh, (float)L->radius,
-                    color_alpha(th->accent, 0.18f));
-        int sz = L->arrow_w - 2 * SP(1);
-        nav_arrow(s, which ? 1 : -1,
-                  (float)(x + bx) + (float)SP(1),
-                  (float)(y + by) + (float)SP(1),
-                  (float)sz, color_alpha(th->text, hot ? 0.95f : 0.55f));
-    }
-    font_draw(s, L->f.body, (float)(x + L->name_x),
-              (float)(y + L->bar_y) + (float)ui_top(L->f.body, L->bar_h),
-              TAB_LABEL[st->tab], th->text);
+    /* one hairline closes the band, inset like the path rule in Files */
+    surf_blend(s, x + L->m, y + L->nav_y + L->nav_h - L->rule,
+               L->body_r - L->body_x, L->rule,
+               color_alpha(th->panel_border, 0.55f));
 }
 
 /* ---- AppVT --------------------------------------------------------------- */
@@ -1513,6 +2341,24 @@ static void settings_init(App *a, int w, int h) {
     s->h = h;
     s->tab = TAB_TEXT;
     s->px = s->py = -1;
+
+    /* /etc/mystic is RAM: after a reboot the image's default password is
+     * there again. Adopt the newer disk copy before the Users page (or the
+     * lock screen's next read) can use the stale one. */
+    {
+        int rerr = 0;
+        int restored = restore_passwd(&rerr);
+        if (rerr) {
+            snprintf(s->status, sizeof(s->status),
+                     "cannot re-adopt %s: %s", MYSTIC_PASSWD_SAVED, strerror(rerr));
+            s->status_err = 1;
+        } else if (restored) {
+            snprintf(s->status, sizeof(s->status),
+                     "restored the saved password from %s", MYSTIC_PASSWD_SAVED);
+            s->status_err = 0;
+        }
+    }
+
     scan_themes(s);
     /* start with the row that matches the scale really in effect */
     {
@@ -1586,9 +2432,20 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h,
 
     int max_scroll = nr - L.rows;
     if (max_scroll < 0) max_scroll = 0;
-    if (sel_n > 0 && st->sel >= 0) {
-        if (st->sel < st->scroll) st->scroll = st->sel;
-        if (st->sel >= st->scroll + L.rows) st->scroll = st->sel - L.rows + 1;
+
+    /* The selection is an ordinal among the selectable rows, and a page may
+     * carry fact rows between them (the Display preview sits between the
+     * scale choices and Reset). Find the row it names, then keep that row
+     * visible; using the ordinal as a row index is what made the old page
+     * stop scrolling short of its last row. */
+    int sel_row = -1;
+    if (sel_n > 0) {
+        for (int i = 0; i < nr; i++)
+            if (rows[i].id == st->sel) { sel_row = i; break; }
+    }
+    if (sel_row >= 0) {
+        if (sel_row < st->scroll) st->scroll = sel_row;
+        if (sel_row >= st->scroll + L.rows) st->scroll = sel_row - L.rows + 1;
     }
     if (st->scroll < 0) st->scroll = 0;
     if (st->scroll > max_scroll) st->scroll = max_scroll;
@@ -1609,14 +2466,18 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h,
             if (!page_row_rect(&L, i, &ryt, &rh)) break;
             int selectable = rows[idx].id >= 0;
             int sel = selectable && rows[idx].id == st->sel;
-            page_row_draw(s, &L, th, &rows[idx], y + ryt, selectable, sel);
+            int hot = selectable && st->px >= L.body_x &&
+                      st->px < L.body_r && st->py >= ryt &&
+                      st->py < ryt + rh;
+            page_row_draw(s, &L, th, &rows[idx], x, y + ryt,
+                          selectable, sel, hot);
         }
     }
 
     /* ---- a map of the page, in the right margin ---- */
     if (nr > L.rows && L.rows > 0) {
         int band = L.body_bot - L.body_y;
-        int bx = x + w - L.bar_w2;
+        int bx = x + w - L.bar_w2 - SP(1);
         if (band > 0) {
             int thumb = band * L.rows / nr;
             if (thumb < SP(2)) thumb = SP(2);
@@ -1630,15 +2491,16 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h,
         }
     }
 
-    /* ---- one status line: the last real result, else this page's hint ---- */
+    /* ---- one footer line of facts (and the password's two buttons) ---- */
     if (L.footer_h > 0) {
         int fy = y + h - L.footer_h;
         surf_blend(s, x, fy, w, L.footer_h, th->panel);
         surf_blend(s, x, fy, w, L.rule, th->panel_border);
 
-        char buf[256];
-        const char *line;
-        u32 col;
+        char fact[256], right[128];
+        page_facts(st, th, fact, sizeof(fact), right, sizeof(right));
+        const char *line = fact;
+        u32 col = color_alpha(th->text, 0.45f);
         if (st->pw_stage && st->pw_msg[0]) {
             line = st->pw_msg;
             col = st->pw_msg_err ? color_mix(th->accent, RGB(255, 92, 92), 0.65f)
@@ -1651,13 +2513,15 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h,
             line = st->pw_msg;
             col = st->pw_msg_err ? color_mix(th->accent, RGB(255, 92, 92), 0.65f)
                                  : color_alpha(th->accent, 0.85f);
-        } else {
-            line = page_hint(st, th, buf, sizeof(buf));
-            col = color_alpha(th->text, 0.45f);
         }
+        /* the result line owns the footer; do not repeat the same value on
+         * the right of it */
+        if (line != fact) right[0] = 0;
 
         int text_r = x + w - L.m;
         if (st->pw_stage) {
+            /* the prompt owns the footer: its message and two buttons */
+            right[0] = 0;
             int bx, by, bw, bh;
             if (pw_btn_rect(&L, w, 0, &bx, &by, &bw, &bh)) {
                 text_r = x + bx - L.gap;
@@ -1670,10 +2534,19 @@ static void settings_draw(App *a, Surface *s, int x, int y, int w, int h,
                 ui_button(s, x + bx, fy + by, bw, bh, (float)L.radius,
                           "Submit", L.f.small, hot, th);
             }
+        } else if (right[0]) {
+            /* only draw the right fact when it leaves the left one room */
+            float rw = font_width(L.f.small, right);
+            if ((float)(text_r - (x + L.m)) >= rw + 2 * L.gap) {
+                ui_text_right(s, L.f.small, text_r, fy + L.footer_dy, right,
+                              color_alpha(th->text, 0.42f));
+                text_r -= (int)rw + L.gap;
+            }
         }
-        draw_clipped(s, L.f.small, (float)(x + L.m),
-                     (float)(fy + L.footer_dy), (float)(text_r - (x + L.m)),
-                     line, col);
+        int avail = text_r - (x + L.m);
+        if (avail >= SP(4))
+            draw_clipped(s, L.f.small, (float)(x + L.m),
+                         (float)(fy + L.footer_dy), (float)avail, line, col);
     }
 }
 
@@ -1687,6 +2560,10 @@ static void set_tab(Settings *s, int t) {
     s->tab = t;
     s->sel = 0;
     s->scroll = 0;
+    /* a result belongs to the page that produced it */
+    s->status[0] = 0;
+    s->status_err = 0;
+    s->pw_msg[0] = 0;
 }
 
 static void move_sel(Settings *s, int delta) {
@@ -1702,6 +2579,24 @@ static void activate(Settings *s) {
         case TAB_TEXT:
             apply_size(s, s->sel);
             break;
+        case TAB_DISP: {
+            /* The page mixes mode rows, scale rows and Reset with fact rows,
+             * so Enter is resolved against the row the selection names. */
+            PRow rows[MAX_PAGE_ROWS];
+            int nr = build_page(s, NULL, rows, MAX_PAGE_ROWS);
+            for (int i = 0; i < nr; i++) {
+                if (rows[i].id != s->sel || !rows[i].act) continue;
+                switch (rows[i].act) {
+                    case ACT_MODE:    disp_apply_mode(s, rows[i].arg); break;
+                    case ACT_SCALE:   disp_apply_scale(s, (DispScale)rows[i].arg); break;
+                    case ACT_LOGICAL: disp_apply_logical(s, rows[i].arg); break;
+                    case ACT_RESET:   disp_apply_reset(s); break;
+                    default: break;
+                }
+                break;
+            }
+            break;
+        }
         case TAB_THEME:
             apply_theme(s, s->sel);
             break;
@@ -1841,7 +2736,7 @@ static void settings_click(App *a, int x, int y, int buttons) {
     /* navigation first: it is above and beside the body */
     for (int i = 0; i < TAB_COUNT; i++) {
         int bx, by, bw, bh;
-        if (!rail_rect(&L, i, &bx, &by, &bw, &bh)) continue;
+        if (!tab_rect(&L, i, &bx, &by, &bw, &bh)) continue;
         if (x >= bx && x < bx + bw && y >= by && y < by + bh) {
             set_tab(s, i);
             return;
@@ -1855,12 +2750,6 @@ static void settings_click(App *a, int x, int y, int buttons) {
             return;
         }
     }
-    if (L.mode == 1 && x >= L.name_x && x < L.name_x + L.name_w &&
-        y >= L.bar_y && y < L.bar_y + L.bar_h) {
-        set_tab(s, s->tab + 1);
-        return;
-    }
-
     /* the password prompt's two buttons */
     if (s->pw_stage) {
         for (int which = 0; which < 2; which++) {

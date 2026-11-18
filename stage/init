@@ -12,6 +12,14 @@
 #  /dev/vda is either a dm-crypt volume with ext4 inside it
 #  (docs/ENCRYPTION.md, tools/mkenc.sh) or a plain ext4 made by
 #  an older build. Both boot; the messages say which one it is.
+#
+#  The key has two halves and one of them is never on the disk:
+#    boot half  /etc/mystic/luks.key, or sealed under the boot
+#               passphrase as /etc/mystic/luks.key.sealed
+#    disk half  inside the MYSTICC1 header on the disk itself
+#  Neither half opens anything alone. Sealing the boot half makes
+#  the boot ask for the lock-screen password before /root is
+#  mounted; docs/ENCRYPTION.md section 6 says what that is worth.
 # ============================================================
 
 # ------------------------------------------------------------
@@ -105,7 +113,8 @@ save_settings() {
 #  userspace side is stage/sbin/mystic-dmcrypt, a static musl
 #  binary that speaks the dm-ioctl ABI directly - no dmsetup,
 #  no libdevmapper, no libcryptsetup. tools/mkenc.sh builds it,
-#  stages the two modules and creates the key file.
+#  stages the two modules, creates the key and can seal it with
+#  the lock-screen passphrase.
 #
 #  Nothing below invents a fact: every branch either reads a
 #  header written by mystic-dmcrypt or takes the same path this
@@ -114,6 +123,16 @@ save_settings() {
 CRYPT_DEV=${MYSTIC_DISK:-/dev/vda}
 CRYPT_NAME=${MYSTIC_MAP:-mystic-root}
 CRYPT_KEY=${MYSTIC_KEY:-/etc/mystic/luks.key}
+# The sealed form of the same 32 bytes: PBKDF2-HMAC-SHA256(passphrase) ->
+# ChaCha20 + HMAC-SHA256 (tools/mkenc.sh seal). When this file exists and
+# the plaintext key does not, the boot asks for the passphrase before /root
+# is mounted and keeps the opened key in RAM only.
+CRYPT_SEAL=${MYSTIC_SEAL:-/etc/mystic/luks.key.sealed}
+CRYPT_RAMKEY=${MYSTIC_RAMKEY:-/run/mystic/luks.key}
+CRYPT_CONSOLE=${MYSTIC_CONSOLE:-/dev/console}
+CRYPT_CMDLINE=${MYSTIC_CMDLINE:-/proc/cmdline}
+CRYPT_PASSWD=${MYSTIC_PASSWD:-/etc/mystic/passwd}
+CRYPT_KEY_USE=$CRYPT_KEY
 CRYPT_HELPER=${MYSTIC_DMCRYPT:-/sbin/mystic-dmcrypt}
 CRYPT_MAP=${MYSTIC_MAP_PATH:-/dev/mapper/$CRYPT_NAME}
 DM_CONTROL=${MYSTIC_DM_CONTROL:-/dev/mapper/control}
@@ -154,7 +173,9 @@ dev_has_ext4() {     # ext2/3/4 superblock magic 0x53EF at byte 1080
     # A real ext4 therefore always matches; a ciphertext byte that happens to
     # be 'S' can only make this say "yes", and "yes" means the caller refuses
     # to format. There is no way for a real ext4 to be missed.
-    a=$(dd if="$1" bs=1 skip=1080 count=1 2>/dev/null)
+    # Both bytes go through tr so that a NUL at 1080 does not make the shell
+    # print "ignored null byte in input" on the boot console.
+    a=$(dd if="$1" bs=1 skip=1080 count=1 2>/dev/null | tr -c '[:print:]' '.')
     b=$(dd if="$1" bs=1 skip=1081 count=1 2>/dev/null | tr -c '[:print:]' '.')
     [ "$a" = "S" ] && [ "$b" = "." ]
 }
@@ -185,6 +206,98 @@ crypt_modules() {
     [ -e "$DM_CONTROL" ] && return 0
     [ -d "$(dirname "$DM_CONTROL")" ] || mkdir -p "$(dirname "$DM_CONTROL")" 2>/dev/null
     [ -e "$DM_CONTROL" ]
+}
+
+# ------------------------------------------------------------
+# Which key opens the disk, and can it be obtained right now?
+#
+#   0  a 32-byte key is ready, $CRYPT_KEY_USE points at it
+#   1  there is no key at all: nothing to encrypt with, nothing to lose
+#   2  a key exists but cannot be reached now (no console, no helper,
+#      probe mode, unreadable file)
+#   3  the passphrase was refused (three attempts) or the seal is damaged
+#
+# Two forms are accepted, in this order:
+#   /etc/mystic/luks.key         the boot half in the clear (unattended boot)
+#   /etc/mystic/luks.key.sealed  the same 32 bytes under a passphrase-derived
+#                                key; unsealed into RAM for this boot only
+# The disk itself is never consulted for this: it holds only the *other*
+# half of the key material, inside the MYSTICC1 header.
+# ------------------------------------------------------------
+crypt_key_ready() {
+    # Crypt_create() and crypt_mount() both ask. Re-resolving is pointless (and
+    # on a sealed image would mean a second passphrase prompt), so a key that
+    # is already ready for this boot is reused.
+    if [ "${CRYPT_KEY_OK:-0}" = 1 ] && [ -f "$CRYPT_KEY_USE" ]; then
+        [ "$CRYPT_KEY_USE" = "$CRYPT_RAMKEY" ] \
+            && echo "key: $CRYPT_KEY_USE (unsealed earlier in this boot)"
+        return 0
+    fi
+    CRYPT_KEY_USE=$CRYPT_KEY
+    CRYPT_KEY_OK=0
+    if [ -e "$CRYPT_KEY" ]; then
+        size=$(wc -c < "$CRYPT_KEY" 2>/dev/null | tr -d ' ')
+        if [ "$size" = 32 ]; then
+            echo "key: $CRYPT_KEY (32 bytes, not sealed)"
+            CRYPT_KEY_OK=1
+            return 0
+        fi
+        echo "disk: $CRYPT_KEY is ${size:-0} bytes, not 32 - refusing to use it"
+        return 2
+    fi
+    if [ ! -e "$CRYPT_SEAL" ]; then
+        echo "disk: no key at $CRYPT_KEY and no sealed key at $CRYPT_SEAL"
+        return 1
+    fi
+    if [ ! -e "$CRYPT_CONSOLE" ]; then
+        echo "disk: $CRYPT_SEAL needs the passphrase, and there is no console at $CRYPT_CONSOLE"
+        return 2
+    fi
+    # probe mode exists to report facts without a human at the keyboard; a
+    # blocking read there would hang the boot until the outer timeout kills it.
+    if [ -r "$CRYPT_CMDLINE" ] && grep -q 'mystic.probe=1' "$CRYPT_CMDLINE" 2>/dev/null; then
+        echo "disk: $CRYPT_SEAL needs the passphrase; probe mode does not prompt"
+        return 2
+    fi
+    if [ ! -x "$CRYPT_HELPER" ]; then
+        echo "disk: $CRYPT_SEAL needs $CRYPT_HELPER to be unsealed, and it is not in the image"
+        return 2
+    fi
+    mkdir -p "$(dirname "$CRYPT_RAMKEY")" 2>/dev/null
+    tries=0
+    while [ "$tries" -lt 3 ]; do
+        tries=$((tries + 1))
+        "$CRYPT_HELPER" unseal "$CRYPT_SEAL" "$CRYPT_RAMKEY" \
+            --prompt --console "$CRYPT_CONSOLE" --passwd-file "$CRYPT_PASSWD"
+        us_rc=$?
+        case "$us_rc" in
+            0)  CRYPT_KEY_USE=$CRYPT_RAMKEY
+                CRYPT_KEY_OK=1
+                echo "key: unsealed $CRYPT_SEAL into $CRYPT_RAMKEY (RAM only)"
+                return 0 ;;
+            5)  # the seal's HMAC failed: either a damaged seal or a typo
+                echo "disk: the sealed key did not decrypt (attempt $tries of 3)" ;;
+            6)  echo "disk: $CRYPT_SEAL is not a sealed key - it is left untouched"
+                return 3 ;;
+            7)  echo "disk: no passphrase could be read (attempt $tries of 3)" ;;
+            8)  echo "disk: that is not the lock-screen password (attempt $tries of 3)" ;;
+            *)  echo "disk: $CRYPT_HELPER unseal failed with exit $us_rc"
+                return 2 ;;
+        esac
+    done
+    echo "disk: giving up after 3 attempts - the volume stays locked"
+    return 3
+}
+
+# The opened key only needs to exist until dm-crypt has it. Overwrite it and
+# unlink: an initramfs/ramfs keeps the blocks in RAM, so this shortens the
+# window in which a stray read of the rootfs finds the key. It does not, and
+# cannot, remove the key from the kernel's dm-crypt state.
+crypt_key_wipe() {
+    [ "$CRYPT_KEY_USE" = "$CRYPT_RAMKEY" ] || return 0
+    [ -f "$CRYPT_RAMKEY" ] || return 0
+    dd if=/dev/zero of="$CRYPT_RAMKEY" bs=32 count=1 conv=notrunc 2>/dev/null
+    rm -f "$CRYPT_RAMKEY"
 }
 
 # prints one of:
@@ -257,16 +370,30 @@ show_log() {   # show_log <indent> < file
 
 # Open an existing volume and mount it. $1 is the header fingerprint.
 crypt_mount() {
+    # Get the key first: the disk half lives in the header, the other half is
+    # in the initramfs in the clear or sealed under the boot passphrase. A
+    # locked key must not be reported as a broken disk.
+    crypt_key_ready
+    krc=$?
+    if [ "$krc" -ne 0 ]; then
+        case "$krc" in
+            1) CRYPT_STATUS="locked (no key)" ;;
+            3) CRYPT_STATUS="locked (passphrase refused)" ;;
+            *) CRYPT_STATUS="locked (no usable key)" ;;
+        esac
+        echo "disk: refusing to touch $CRYPT_DEV, /root stays on the RAM filesystem"
+        return 1
+    fi
     # mystic-dmcrypt says which class of failure this was: 2 = the key file is
     # missing or the wrong length, 3 = the key does not match the header,
     # 4 = the device mapper refused (no /dev/mapper/control, ioctl, mknod).
     # Without that, every first-boot dm failure would be reported as a wrong
     # key and send the owner looking for a new key instead of a module.
-    "$CRYPT_HELPER" attach "$CRYPT_NAME" "$CRYPT_DEV" "$CRYPT_KEY" >"$CRYPT_LOG" 2>&1
+    "$CRYPT_HELPER" attach "$CRYPT_NAME" "$CRYPT_DEV" "$CRYPT_KEY_USE" >"$CRYPT_LOG" 2>&1
     attach_rc=$?
     if [ "$attach_rc" -ne 0 ]; then
         case "$attach_rc" in
-            2)  echo "disk: cannot read the boot key $CRYPT_KEY - $CRYPT_DEV is left untouched"
+            2)  echo "disk: cannot read the boot key $CRYPT_KEY_USE - $CRYPT_DEV is left untouched"
                 CRYPT_STATUS="locked (no usable key)" ;;
             3)  echo "disk: encrypted, but the key did not unlock it - $CRYPT_DEV is left untouched"
                 CRYPT_STATUS="locked (key does not match)" ;;
@@ -276,27 +403,52 @@ crypt_mount() {
                 CRYPT_STATUS="locked (helper error)" ;;
         esac
         show_log "  " < "$CRYPT_LOG"
+        crypt_key_wipe
         return 1
     fi
     show_log "crypt: " < "$CRYPT_LOG"
+    # dm-crypt holds the key from here on; the file is no longer needed.
+    crypt_key_wipe
     if mount -t ext4 "$CRYPT_MAP" /root 2>/dev/null; then
         echo "disk: dm-crypt unlocked, formatted ext4 mounted on /root"
         echo "crypt: aes-xts-plain64, key fingerprint $1"
         CRYPT_STATUS="aes-xts-plain64, key $1"
         return 0
     fi
-    # A failed mount is not proof that there is no filesystem. Check the
-    # superblock magic at byte 1080 inside the mapping before destroying it.
+    # A failed mount is not proof that there is no filesystem. Two
+    # independent pieces of evidence are checked before anything is written:
+    # the ext2/3/4 magic at byte 1080 inside the mapping, and the marker the
+    # helper wrote into the header after the last successful mkfs.
     if dev_has_ext4 "$CRYPT_MAP"; then
         echo "disk: dm-crypt unlocked, ext4 is there but did not mount - refusing to format it"
         echo "disk: nothing was written; the volume is intact"
         CRYPT_STATUS="unlocked, ext4 present but not mounted"
         return 1
     fi
-    echo "disk: dm-crypt unlocked, no ext4 inside - creating one"
-    mkfs_ext4 "$CRYPT_MAP"
+    "$CRYPT_HELPER" hasfs "$CRYPT_DEV" >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        echo "disk: dm-crypt unlocked, no ext4 magic, but its header records that a"
+        echo "disk: filesystem was created in it once - refusing to format it"
+        echo "disk: nothing was written; the volume is intact"
+        CRYPT_STATUS="unlocked, filesystem recorded but not mounted"
+        return 1
+    fi
+    echo "disk: dm-crypt unlocked, no filesystem inside - creating one"
+    if ! mkfs_ext4 "$CRYPT_MAP"; then
+        echo "disk: mkfs.ext4 failed inside the mapping - nothing is mounted"
+        CRYPT_STATUS="unlocked, mkfs failed"
+        return 1
+    fi
     if mount -t ext4 "$CRYPT_MAP" /root 2>/dev/null; then
         chmod 755 /root
+        # Record it in the header, so that a later boot can never mistake this
+        # volume for one that was never formatted.
+        if "$CRYPT_HELPER" markfs "$CRYPT_DEV" >"$CRYPT_LOG" 2>&1; then
+            show_log "crypt: " < "$CRYPT_LOG"
+        else
+            echo "disk: warning: could not record the filesystem in the header"
+            show_log "  " < "$CRYPT_LOG"
+        fi
         echo "disk: formatted ext4 inside dm-crypt and mounted on /root"
         echo "crypt: aes-xts-plain64, key fingerprint $1"
         CRYPT_STATUS="aes-xts-plain64, key $1"
@@ -310,16 +462,40 @@ crypt_mount() {
 # First boot: write the MYSTICC1 header, then open it. Only ever called on a
 # device whose first 4 KiB is zero, so no data can be lost here.
 crypt_create() {
-    if [ ! -f "$CRYPT_KEY" ]; then
-        echo "disk: no encryption key at $CRYPT_KEY - using plain ext4"
-        setup_plain_disk
+    crypt_key_ready
+    krc=$?
+    if [ "$krc" -eq 1 ]; then
+        # No key anywhere: this image was built without ./tools/mkenc.sh. The
+        # pre-encryption boot path stays available, but it says out loud that
+        # the result is not encrypted.
+        echo "disk: this image has no boot key, so $CRYPT_DEV stays UNENCRYPTED"
+        echo "disk: run ./tools/mkenc.sh seal (or plain mkenc.sh) and rebuild the image"
+        setup_plain_disk format
         return 0
     fi
-    if ! "$CRYPT_HELPER" init "$CRYPT_DEV" "$CRYPT_KEY" >"$CRYPT_LOG" 2>&1; then
-        echo "disk: could not create the encrypted volume - using plain ext4"
+    if [ "$krc" -ne 0 ]; then
+        # A key exists but cannot be used now. Creating a plain fallback here
+        # would silently hand the owner an unencrypted disk; refuse instead.
+        echo "disk: cannot create the encrypted volume without the key - $CRYPT_DEV is left untouched"
+        case "$krc" in
+            3) CRYPT_STATUS="locked (passphrase refused)" ;;
+            *) CRYPT_STATUS="locked (no usable key)" ;;
+        esac
+        return 1
+    fi
+    if ! "$CRYPT_HELPER" init "$CRYPT_DEV" "$CRYPT_KEY_USE" >"$CRYPT_LOG" 2>&1; then
+        echo "disk: could not create the encrypted volume - $CRYPT_DEV is left untouched"
         show_log "  " < "$CRYPT_LOG"
-        setup_plain_disk
-        return 0
+        # init writes the header before anything else. If it got that far, the
+        # disk is an encrypted volume now and must never see a plain mkfs.
+        if dev_has_header "$CRYPT_DEV"; then
+            echo "disk: the MYSTICC1 header is on the disk; it will not be formatted"
+            CRYPT_STATUS="not created (header written, mapping failed)"
+        else
+            CRYPT_STATUS="not created (see the log above)"
+        fi
+        crypt_key_wipe
+        return 1
     fi
     show_log "crypt: " < "$CRYPT_LOG"
     echo "disk: created dm-crypt volume on $CRYPT_DEV (aes-xts-plain64)"
@@ -327,31 +503,43 @@ crypt_create() {
     crypt_mount "${probe_out##* }"
 }
 
-# The pre-encryption behaviour, unchanged: mount what is there, otherwise
-# format it. Used for a plain ext4 disk and when dm-crypt is unavailable.
-# $1 = format (the disk holds ext4 or is blank: keep the pre-encryption
-# behaviour) or keep (something unrecognisable: mount it or leave it alone).
+# A plain ext4 disk, the pre-encryption path. Formatting is allowed ONLY when
+# the device provably holds no filesystem: no MYSTICC1 header, no ext2/3/4
+# magic and a zeroed first 4 KiB. "The mount failed" is not that proof.
+# $1 = format (a blank disk may be formatted) or keep (never format).
 setup_plain_disk() {
     if mount -t ext4 "$CRYPT_DEV" /root 2>/dev/null; then
         echo "disk: mounted $CRYPT_DEV (ext4) on /root"
         CRYPT_STATUS="none (plain ext4)"
         return 0
     fi
-    if [ "${1:-format}" != format ]; then
+    if dev_has_header "$CRYPT_DEV"; then
+        echo "disk: $CRYPT_DEV carries a MYSTICC1 header - refusing to format it"
+        echo "disk: nothing was written; /root stays on the RAM filesystem"
+        CRYPT_STATUS="locked (header present, not opened)"
+        return 1
+    fi
+    if dev_has_ext4 "$CRYPT_DEV"; then
+        echo "disk: $CRYPT_DEV has an ext4 superblock but did not mount - refusing to format it"
+        echo "disk: run e2fsck -y on it, or ./tools/mkenc.sh reset-disk for a fresh disk"
+        CRYPT_STATUS="present but not mountable (left untouched)"
+        return 1
+    fi
+    if [ "${1:-format}" != format ] || ! dev_is_blank "$CRYPT_DEV"; then
         echo "disk: $CRYPT_DEV did not mount and is not blank - refusing to format it"
         echo "disk: nothing was written; delete build/disk.img (or run"
         echo "disk: ./tools/mkenc.sh reset-disk) if you want a fresh disk"
         CRYPT_STATUS="present but not mountable (left untouched)"
         return 1
     fi
-# KNOWN RISK (tracked in docs/CONTEXT-DUMP.md): this formats whenever the mount
-# fails on a disk that is blank or carries an ext4 superblock - including
-# failures that do not mean "the disk is empty" (a module that loaded late, a
-# busy device). Disks that are neither are refused above, so the risk is now
-# limited to ext4 itself; the earlier magic-first version was reverted because
-# mkfs then refused to run on a fresh disk.
-    echo "disk: $CRYPT_DEV did not mount, creating ext4 filesystem"
-    mkfs_ext4 "$CRYPT_DEV"
+    echo "disk: $CRYPT_DEV is blank - creating ext4 filesystem"
+    # -F is explicit: format even if a stale signature is still visible to
+    # mkfs, which the three checks above have already ruled out.
+    if ! mkfs_ext4 "$CRYPT_DEV"; then
+        echo "disk: mkfs.ext4 failed on $CRYPT_DEV - nothing is mounted"
+        CRYPT_STATUS="blank (mkfs failed)"
+        return 1
+    fi
     if mount -t ext4 "$CRYPT_DEV" /root 2>/dev/null; then
         chmod 755 /root
         echo "disk: formatted ext4 and mounted on /root"
@@ -386,8 +574,7 @@ setup_disk() {
             ;;
         fs)
             # an ext2/3/4 disk from before encryption, or made by hand
-            echo "disk: $CRYPT_DEV has no encryption header and is not blank"
-            echo "disk: to switch to an encrypted volume run ./tools/mkenc.sh reset-disk"
+            echo "disk: $CRYPT_DEV has no encryption header, so it is not encrypted"
             setup_plain_disk format
             return 0
             ;;
@@ -397,8 +584,10 @@ setup_disk() {
             return 0
             ;;
         unavailable:*)
-            # blank disk, nothing to encrypt it with: format it plain, as before
+            # blank disk, nothing to encrypt it with: format it plain, as before,
+            # and say that the result is not encrypted.
             echo "disk: dm-crypt unavailable - ${crypt_state_out#unavailable:}"
+            echo "disk: $CRYPT_DEV is blank, so this creates an UNENCRYPTED /root"
             setup_plain_disk format
             return 0
             ;;

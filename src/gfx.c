@@ -699,7 +699,8 @@ static inline u32 shadow_blend(u32 d, int a, float alpha) {
  * share one mask sample, so the block loop keeps the mask in a register
  * instead of re-dividing by BLUR_DOWN for every pixel. */
 static void shadow_apply(Surface *s, int tx, int ty, int tw, int th,
-                         const float *mask, int sw, int sh, float alpha) {
+                         const float *mask, int sw, int sh, float alpha,
+                         int ix0, int iy0, int ix1, int iy1) {
     int x_lo = tx < 0 ? 0 : tx;
     int x_hi = tx + tw > s->w ? s->w : tx + tw;
     if (x_hi <= x_lo) return;
@@ -720,15 +721,31 @@ static void shadow_apply(Surface *s, int tx, int ty, int tw, int th,
             if (a > 255) a = 255;
             if (x0 < x_lo) x0 = x_lo;
             if (x1 > x_hi) x1 = x_hi;
-            for (int x = x0; x < x1; x++)
-                drow[x] = shadow_blend(drow[x], a, alpha);
+            if (dy >= iy0 && dy < iy1) {
+                /* the caller paints an opaque shape over this whole span, so
+                 * blending the shadow into it cannot be seen: skip it */
+                int left_end = x1 < ix0 ? x1 : ix0;
+                for (int x = x0; x < left_end; x++)
+                    drow[x] = shadow_blend(drow[x], a, alpha);
+                int right_start = x0 > ix1 ? x0 : ix1;
+                for (int x = right_start; x < x1; x++)
+                    drow[x] = shadow_blend(drow[x], a, alpha);
+            } else {
+                for (int x = x0; x < x1; x++)
+                    drow[x] = shadow_blend(drow[x], a, alpha);
+            }
         }
     }
 }
 
-/* shadow = a blurred dark rounded rect, drawn underneath */
-void gfx_shadow(Surface *s, float x, float y, float w, float h, float radius,
-                float spread, float alpha) {
+/* shadow = a blurred dark rounded rect, drawn underneath.
+ *
+ * solid says the caller will paint an opaque shape over the full (x,y,w,h)
+ * rect immediately after: the shadow pixels under that shape can never be
+ * seen, so the interior is skipped (the corner ring is kept). That is most
+ * of a 900x600 shadow's 4 ms on the host and directly shortens a compose. */
+static void gfx_shadow_impl(Surface *s, float x, float y, float w, float h,
+                            float radius, float spread, float alpha, int solid) {
     int pad = (int)(spread * 3);
     int rx = (int)x - pad, ry = (int)y - pad;
     int rw = (int)w + pad * 2, rh = (int)h + pad * 2;
@@ -767,11 +784,20 @@ void gfx_shadow(Surface *s, float x, float y, float w, float h, float radius,
     }
     if (tw <= 0 || th <= 0) return;              /* never touches the destination */
 
+    int ix0 = 0, iy0 = 0, ix1 = 0, iy1 = 0;      /* empty = do not skip */
+    if (solid) {
+        int ir = (int)radius + 1;                /* keep the whole corner ring */
+        ix0 = (int)x + ir; iy0 = (int)y + ir;
+        ix1 = (int)(x + w) - ir; iy1 = (int)(y + h) - ir;
+        if (ix1 <= ix0 || iy1 <= iy0) ix0 = ix1 = iy0 = iy1 = 0;
+    }
+
     if (tx == rx && ty == ry && tw == rw && th == rh) {
         int sw = 0, sh = 0;
         float *mask = NULL;
         if (shadow_mask_for((int)w, (int)h, radius, spread, &sw, &sh, &mask) && mask) {
-            shadow_apply(s, tx, ty, tw, th, mask, sw, sh, alpha);
+            shadow_apply(s, tx, ty, tw, th, mask, sw, sh, alpha,
+                         ix0, iy0, ix1, iy1);
             return;
         }
     }
@@ -803,14 +829,26 @@ void gfx_shadow(Surface *s, float x, float y, float w, float h, float radius,
         if ((unsigned)dy >= (unsigned)s->h) continue;
         u32 *drow = s->px + (size_t)dy * s->stride;
         u32 *srow = mask + (size_t)yy * tw;
+        int skip_row = (dy >= iy0 && dy < iy1);
         for (int xx = 0; xx < tw; xx++) {
             int dx = tx + xx;
             if ((unsigned)dx >= (unsigned)s->w) continue;
+            if (skip_row && dx >= ix0 && dx < ix1) continue;
             int a = GET_R(srow[xx]);
             if (a <= 0) continue;
             drow[dx] = shadow_blend(drow[dx], a, alpha);
         }
     }
+}
+
+void gfx_shadow(Surface *s, float x, float y, float w, float h, float radius,
+                float spread, float alpha) {
+    gfx_shadow_impl(s, x, y, w, h, radius, spread, alpha, 0);
+}
+
+void gfx_shadow_solid(Surface *s, float x, float y, float w, float h, float radius,
+                      float spread, float alpha) {
+    gfx_shadow_impl(s, x, y, w, h, radius, spread, alpha, 1);
 }
 
 void gfx_line(Surface *s, float x0, float y0, float x1, float y1, float width, u32 color) {

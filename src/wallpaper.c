@@ -8,31 +8,35 @@
  *      - the wallpaper index,
  *      - `seconds`, and only for the animated ones.
  *
- *  Cost is what makes this usable on old hardware, so the rules
- *  here are: no transcendental function inside a per-pixel loop
- *  unless it is amortised over a table (a 256 entry sine table does
- *  the sin work for Waves and for the Black Hole's spiral arms, one
- *  sqrt per row does it for Orbits and the Dusk lights, and the
- *  Black Hole's geodesics are integrated once and cached), and the
- *  float divide gfx_glow does per pixel becomes a multiply by a
- *  precomputed reciprocal plus a 128 step alpha ramp.
+ *  Cost is what makes this usable on old hardware, so the expensive
+ *  work is amortised: a 256 entry sine table does the sin work for
+ *  Waves and for the black hole's spiral arms, the black hole's
+ *  geodesics are integrated once and cached, the display curve is
+ *  built once, and the star field is the only cached picture. The
+ *  per-pixel path is a closed-form projection; the disk's atan2/sqrt
+ *  work runs only inside a support gate that is a measured superset of
+ *  the lit region, and the float divide gfx_glow does per pixel is a
+ *  multiply by a precomputed reciprocal plus a 128 step alpha ramp.
  *
- *  Measured at 1280x800 with the shipping flags (-Os), process CPU
- *  time, best of 30 draws (this host was running three other builds,
- *  so the four originals read about twice their idle figures here):
+ *  Measured at 1280x800 with the shipping flags (-Os), best of 30 draws
+ *  per wallpaper. The host was also running other builds, so a repeat run
+ *  moves by a millisecond or two and these are the lowest figures seen:
  *
- *      Dusk 5.2 ms   Mesh 3.1 ms   Waves 3.1 ms   Orbits 0.5 ms
- *      Black Hole 16 ms          Nebula 48 ms
+ *      Dusk 5.1 ms   Mesh 3.5 ms   Waves 3.7 ms   Orbits 0.5 ms
+ *      Black Hole 6.5 ms         Nebula 44 ms
  *
- *  So the black hole costs about 3x Dusk and the nebula about 9x. Only
- *  the black hole is ever on the animation path (the desktop repaints
- *  animated backgrounds at 12.5 Hz, which is ~20% of one core); the
- *  nebula reports wallpaper_animated() == 0 and is painted once.
- *
- *  Both new ones also cap how many pixels they trace: above 360k pixels
- *  they are computed at 1/q resolution and scaled up bilinearly, because
- *  both are low-pass pictures and the cost has to stay flat as screens
- *  grow. See wp_q() / wp_upscale().
+ *  In one quiet 30-frame block the black hole measured 7.4 ms best, 8.0 ms
+ *  mean; of that, 2.0 ms is the q = 2 upscale, 1.3 ms the sky / star / grain
+ *  pass, and 4.2 ms the disk itself, spread over the 35% of the traced layer
+ *  the support gate admits (0.72 crossing evaluations per traced pixel).
+ *  Forcing that gate fully open costs 9.6 ms in the same block, and an
+ *  interleaved gate-on/gate-off test puts the saving at 2.6 ms (24%). Above
+ *  360k pixels the whole frame (sky, stars, disk, ring) is traced at 1/q
+ *  resolution and scaled up, which keeps the cost flat as screens grow. Only
+ *  the black hole is on the animation path (the desktop repaints animated
+ *  backgrounds at 12.5 Hz, about 9% of one core at the -Os figure); the
+ *  nebula reports wallpaper_animated() == 0 and is painted once. See wp_q()
+ *  / wp_upscale().
  * ============================================================ */
 #include "wallpaper.h"
 
@@ -505,7 +509,7 @@ static inline int wp_ifloor(float v) {
 
 /* atan2 with one divide and three branches; worst error 0.0032 rad, which
  * is 0.2% of the range we index a geodesic table with. */
-static inline float wp_atan2f(float y, float x) {
+static inline __attribute__((always_inline)) float wp_atan2f(float y, float x) {
     float ax = fabsf(x), ay = fabsf(y);
     int swap = (ay > ax);
     float t = swap ? ax / (ay + 1e-20f) : ay / (ax + 1e-20f);
@@ -705,6 +709,7 @@ static struct {
     int   sinq[256];
     int   sup_built;
     float sup[WP_BH_SUPN];                 /* max b with a lit crossing   */
+    float sup_max;                         /* max over psi, a radial bound */
     u8    tone[1024];                      /* display curve, 0..1023     */
     u32   hot;                             /* palette's hottest colour   */
 
@@ -819,14 +824,14 @@ static void wp_bh_build(void) {
  * through the strong field where the photon ring lives, 0.32 rs steps
  * outside it, where the image is smooth and interpolation absorbs the
  * difference. */
-static inline float wp_bh_bidx(float b) {
+static inline __attribute__((always_inline)) float wp_bh_bidx(float b) {
     if (b < WP_BH_BM) return (b - WP_BH_BC) * WP_BH_K0;
     return (float)WP_BH_NB0 + (b - WP_BH_BM) * WP_BH_K1;
 }
 
 /* crossing radius at impact parameter b after `dlt` radians of sweep;
  * 0 when that crossing does not exist (captured, or already escaped) */
-static inline float wp_bh_radius(float t, int j, float fs) {
+static inline __attribute__((always_inline)) float wp_bh_radius(float t, int j, float fs) {
     if (t < 0.0f || t >= (float)(WP_BH_NB - 1)) return 0.0f;
     if (j < 0 || j >= WP_BH_NA - 1) return 0.0f;
     int i = (int)t;
@@ -860,15 +865,34 @@ static void wp_bh_support(void) {
         }
         bhgeo.sup[i] = bmax + 0.15f;
     }
-    /* one-entry dilation: the table is indexed at 1.4 degree resolution, and
-     * a ray between two entries must use the wider of them so the gate can
-     * never cut the support it is meant to bound */
+    /* One-entry dilation: sup[i] becomes the largest of the three raw bounds
+     * i-1, i, i+1. The table is sampled at bin centres (i + 0.5) but the
+     * paint floors psi into a bin, so a ray can sit anywhere in its bin and
+     * must be allowed the widest bound the bin touches - the maximum over
+     * the entry and its two neighbours is what makes the gate a superset of
+     * the lit region at every psi instead of only at the centres.
+     *
+     * This has to read the undilated values. Dilating in place reads
+     * sup[i - 1] after that entry was overwritten with the maximum of
+     * everything before it, which turns the table into a running (prefix)
+     * maximum: past the widest psi the bound is the global sup_max, the gate
+     * stops culling, and the per-frame trace pays for pixels no disk can
+     * reach. Keep the raw pass in its own array. */
+    float raw[WP_BH_SUPN];
+    memcpy(raw, bhgeo.sup, sizeof raw);
     for (int i = 0; i < WP_BH_SUPN; i++) {
-        float m = bhgeo.sup[i];
-        if (i > 0 && bhgeo.sup[i - 1] > m) m = bhgeo.sup[i - 1];
-        if (i < WP_BH_SUPN - 1 && bhgeo.sup[i + 1] > m) m = bhgeo.sup[i + 1];
+        float m = raw[i];
+        if (i > 0 && raw[i - 1] > m) m = raw[i - 1];
+        if (i < WP_BH_SUPN - 1 && raw[i + 1] > m) m = raw[i + 1];
         bhgeo.sup[i] = m;
     }
+    /* one radial bound for the whole frame: outside it no sweep can put a
+     * crossing in the disk. It is never tighter than the photon ring, so the
+     * ring can live inside the same gate. */
+    float m = 0.0f;
+    for (int i = 0; i < WP_BH_SUPN; i++) if (bhgeo.sup[i] > m) m = bhgeo.sup[i];
+    if (m < WP_BH_BC * WP_BH_RMAX) m = WP_BH_BC * WP_BH_RMAX;
+    bhgeo.sup_max = m;
     bhgeo.sup_built = 1;
 }
 
@@ -1012,7 +1036,14 @@ static void wp_bh_paint(Surface *s, const Theme *th, double seconds) {
         arc[i]   = 1.0f + 0.060f * sinf(t * 1.05f + r * 0.55f + 1.2f);
     }
     const float ring_amp = 1.0f + 0.055f * sinf(t * 0.90f);
-    const int   ring_ph  = (int)(t * 1.70f * 10430.378f);
+    /* The shimmer pattern turns at 1.70 rad/s - one revolution every 3.7 s -
+     * which is the "slow" the ring comment above promises. 40.7436654 is the
+     * 256 entry sine table's units per radian; the az16 scale (10430.378) is
+     * units per radian times 256, for the shift that converts it back, and
+     * using it here stepped the pattern 5.5 turns per 12.5 Hz frame: a
+     * flicker, not the rotation. Reduced mod one turn in double so a desktop
+     * left running for days cannot push the int conversion out of range. */
+    const int   ring_ph  = (int)fmod((double)t * (1.70 * 40.74366543152521), 256.0);
 
     /* ---- display curve and sky ---- */
     const u8 *tone = bhgeo.tone;
@@ -1056,7 +1087,7 @@ static void wp_bh_paint(Surface *s, const Theme *th, double seconds) {
                     /* inside the shadow: no disk, no stars, nothing comes back */
                     R = 2; G = 2; B = 4;
                     star = 0;
-                } else {
+                } else if (b <= bhgeo.sup_max) {
                     /* The sweep where this ray crosses the disk plane. It is
                      * a function of the screen angle only, so the same value
                      * also indexes the support bound below. */
@@ -1182,30 +1213,44 @@ static u32 *wp_bh_scratch(int w, int h) {
 /* Weighted mix of two packed RGB pixels with the only weights a q = 2
  * bilinear tap uses: 1/4 and 3/4. The x3 is a shift and an add, no
  * multiply, and the row weights are hoisted out of the pixel loop so the
- * hot loops are branch-free. The R/B lanes stay 16 bits apart and the
- * largest sum is 1020, so no lane can carry into the next. */
-static inline u32 wp_bh_m1(u32 a, u32 b) {
+ * hot loops are branch-free. R and B share the 0x00FF00FF mask, 16 bits
+ * apart, and the largest sum is 1020, so no lane can carry into its
+ * neighbour.
+ *
+ * Each lane goes back to the position it was masked from: (srb >> 2) is the
+ * blue sum and stays in bits 0..7, (srb >> 18) is the red sum and goes to
+ * bits 16..23. Writing them the other way round is invisible in the middle
+ * of the frame - the vertical and the horizontal pass then swap twice - but
+ * the outer row and the outer column of the upscale are written by a single
+ * pass, so a swap here leaves red and blue exchanged in a hard line around
+ * the whole frame. That line is what this extraction has to keep straight. */
+static inline __attribute__((always_inline)) u32 wp_bh_m1(u32 a, u32 b) {
     u32 ra = a & 0x00FF00FFu, rb = b & 0x00FF00FFu;
     u32 ga = a & 0x0000FF00u, gb = b & 0x0000FF00u;
     u32 srb = ra + (ra << 1) + rb + 0x00020002u;
     u32 sg  = ga + (ga << 1) + gb + 0x00000200u;
-    return 0xFF000000u | (((srb >> 2) & 0xFFu) << 16)
+    return 0xFF000000u | (((srb >> 18) & 0xFFu) << 16)
                        | (((sg  >> 10) & 0xFFu) << 8)
-                       |  ((srb >> 18) & 0xFFu);
+                       |  ((srb >> 2) & 0xFFu);
 }
-static inline u32 wp_bh_m3(u32 a, u32 b) {
+static inline __attribute__((always_inline)) u32 wp_bh_m3(u32 a, u32 b) {
     u32 ra = a & 0x00FF00FFu, rb = b & 0x00FF00FFu;
     u32 ga = a & 0x0000FF00u, gb = b & 0x0000FF00u;
     u32 srb = rb + (rb << 1) + ra + 0x00020002u;
     u32 sg  = gb + (gb << 1) + ga + 0x00000200u;
-    return 0xFF000000u | (((srb >> 2) & 0xFFu) << 16)
+    return 0xFF000000u | (((srb >> 18) & 0xFFu) << 16)
                        | (((sg  >> 10) & 0xFFu) << 8)
-                       |  ((srb >> 18) & 0xFFu);
+                       |  ((srb >> 2) & 0xFFu);
 }
 
 /* q = 2 upscale of the complete trace surface, separable so the vertical
  * blend is done once per source column and reused by both destination
- * columns. Same sampling grid and weights as wp_upscale(). */
+ * columns. Same 1/4-3/4 weights and the same clamped sample positions as
+ * wp_upscale(), with the vertical clamp taken to the last source sample
+ * (sh - 1) rather than to the base of the last pair. The clamp lands
+ * exactly on that sample, so clamping one row short would answer the bottom
+ * row with a second copy of the row above instead of the row the frame
+ * ends on - a flat two-row band at the very bottom of the screen. */
 static void wp_upscale2(Surface *dst, const u32 *src, int sw, int sh) {
     if (bhgeo.up_w != sw || !bhgeo.uprow) {
         free(bhgeo.uprow);
@@ -1216,19 +1261,22 @@ static void wp_upscale2(Surface *dst, const u32 *src, int sw, int sh) {
 
     u32 *vrow = bhgeo.uprow;
     const int maxy = (sh - 1) * 256;
-    int lasty = (sh > 1) ? sh - 2 : 0;
     const int lastx = (sw > 1) ? sw - 2 : 0;
 
     for (int y = 0; y < dst->h; y++) {
         int sy = 128 * y - 64;
         if (sy < 0) sy = 0;
         if (sy > maxy) sy = maxy;
+        /* Clamp to the last source sample, not to the base of the last pair:
+         * the clamp lands exactly on sample sh-1 (sy = (sh-1)*256, fy = 0),
+         * so clamping to sh-2 would replace the bottom row with a copy of the
+         * one above it instead of the row the ray actually hits. */
         int iy = sy >> 8;
-        if (iy > lasty) iy = lasty;
+        if (iy > sh - 1) iy = sh - 1;
         int fy = sy & 255;
         int wv = (fy == 64) ? 1 : (fy == 192) ? 3 : 0;
         const u32 *r0 = src + (size_t)iy * sw;
-        const u32 *r1 = src + (size_t)((iy < lasty) ? iy + 1 : iy) * sw;
+        const u32 *r1 = src + (size_t)((iy + 1 < sh) ? iy + 1 : iy) * sw;
 
         if (wv == 1) {
             for (int x = 0; x < sw; x++) vrow[x] = wp_bh_m1(r0[x], r1[x]);

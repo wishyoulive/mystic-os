@@ -46,21 +46,42 @@
  *
  *  Properties: color, background-color  (#rgb #rgba #rrggbb #rrggbbaa,
  *              rgb(), rgba(), the 148 CSS names, transparent)
+ *              background (its colour, wherever it sits in the value)
  *              font-weight, font-style, text-decoration, text-align,
- *              margin-top, margin-bottom, padding-top, padding-bottom,
- *              border-top, border-bottom (and the -width/-style/-color
- *              longhands), width, max-width, line-height,
- *              list-style-type, white-space.
+ *              font-size (px, pt, em, %, rem, the absolute keywords),
+ *              margin, margin-top/-right/-bottom/-left,
+ *              padding, padding-top/-right/-bottom/-left,
+ *              border, border-top, border-bottom (and the -width/-style/
+ *              -color longhands), width, max-width, line-height,
+ *              list-style-type, white-space, display.
+ *
+ *              Shorthands take one to four values with CSS's own
+ *              expansion (all / top+bottom left+right / top right+bottom
+ *              left / top right bottom left), which is what nearly every
+ *              real stylesheet is written in.
  *
  *              width/max-width take px or %; line-height takes px, a
- *              unitless multiplier or a percentage. The renderer treats
- *              every CSS px as a design pixel and scales it with the
- *              desktop's text scale, the same way it treats margins.
+ *              unitless multiplier or a percentage. font-size takes px,
+ *              pt, em, %, rem and the keywords; em and % are relative to
+ *              the parent's resolved size, rem to the root element's.
+ *              The renderer treats every CSS px as a design pixel and
+ *              scales it with the desktop's text scale, the same way it
+ *              treats margins.
  *
- *  At-rules:   @media, @import, @charset, @font-face, @supports and any
- *              other @... are skipped as a unit, including a balanced
- *              { ... } block and strings inside it. Nothing in them is
- *              applied, and none of them is an error.
+ *              display: none hides the element and its whole subtree;
+ *              display: block / list-item is a block box even when the
+ *              tag would have been inline. Every other display value is
+ *              treated as inline, because a text renderer has no second
+ *              axis to float, flex or grid on.
+ *
+ *  At-rules:   @media is evaluated for its media TYPE: a screen (or all)
+ *              block has its inner rules parsed in place, a print-only
+ *              block is skipped. A block that narrows on a viewport
+ *              feature - @media (max-width: 600px) - cannot be honoured
+ *              by a text browser and is skipped and counted, rather than
+ *              guessed at. @import, @charset, @font-face, @supports and
+ *              every other @... are skipped as a unit, including a
+ *              balanced { ... } block and strings inside it.
  *
  *  WHAT IS DELIBERATELY NOT A CSS PROPERTY HERE
  *
@@ -141,7 +162,48 @@ enum {
     CSS_SET_INDENT          = 1u << 20,
     CSS_SET_WIDTH           = 1u << 21,
     CSS_SET_MAX_WIDTH       = 1u << 22,
-    CSS_SET_LINE_HEIGHT     = 1u << 23
+    CSS_SET_LINE_HEIGHT     = 1u << 23,
+    CSS_SET_DISPLAY         = 1u << 24,
+    CSS_SET_MARGIN_LEFT     = 1u << 25,
+    CSS_SET_MARGIN_RIGHT    = 1u << 26,
+    CSS_SET_PAD_LEFT        = 1u << 27,
+    CSS_SET_PAD_RIGHT       = 1u << 28,
+    /* font-size has three sources and they exclude each other: an
+     * absolute length, a percentage of the parent (em and % are the same
+     * thing here) and a percentage of the root element (rem). css_for()
+     * resolves both relative forms before returning, so a caller only
+     * ever sees font_size in px. */
+    CSS_SET_FONT_SIZE_REL   = 1u << 29,
+    CSS_SET_FONT_SIZE_REM   = 1u << 30
+};
+
+/* Which box length is relative. One bit per property, so a shorthand can
+ * set four of them with one write. */
+enum {
+    CSS_RL_MARGIN_TOP    = 1u << 0,
+    CSS_RL_MARGIN_RIGHT  = 1u << 1,
+    CSS_RL_MARGIN_BOTTOM = 1u << 2,
+    CSS_RL_MARGIN_LEFT   = 1u << 3,
+    CSS_RL_PAD_TOP       = 1u << 4,
+    CSS_RL_PAD_RIGHT     = 1u << 5,
+    CSS_RL_PAD_BOTTOM    = 1u << 6,
+    CSS_RL_PAD_LEFT      = 1u << 7,
+    CSS_RL_WIDTH         = 1u << 8,
+    CSS_RL_MAX_WIDTH     = 1u << 9
+};
+
+/* display. Only NONE and BLOCK change anything in this renderer; the
+ * other block-ish values are kept apart so a caller can tell them from
+ * an inline box. */
+enum {
+    CSS_DISPLAY_INLINE = 0,
+    CSS_DISPLAY_BLOCK,
+    CSS_DISPLAY_INLINE_BLOCK,
+    CSS_DISPLAY_LIST_ITEM,
+    CSS_DISPLAY_TABLE,
+    CSS_DISPLAY_TABLE_ROW,
+    CSS_DISPLAY_TABLE_CELL,
+    CSS_DISPLAY_NONE
 };
 
 /* text-align */
@@ -222,6 +284,12 @@ enum {
  *  width > 0. A border whose colour was never written takes the text
  *  colour (CSS currentColor), filled in by css_for().
  *
+ *  margin_left/right and pad_left/right are the horizontal half of the
+ *  box. A text renderer has one column, so they are an inset from that
+ *  column's edges and nothing else: text starts that much further in and
+ *  wraps that much earlier, which is what a padded or indented container
+ *  looks like in a document view.
+ *
  *  width and max_width are px; 0 means auto / no limit. A percentage
  *  is kept in width_pct / max_width_pct instead, because it can only be
  *  resolved against the column the renderer finally has. A width or a
@@ -252,8 +320,19 @@ typedef struct {
     int list_style;           /* CSS_LIST_* */
     int white_space;          /* CSS_WS_* */
 
-    int margin_top, margin_bottom;
-    int pad_top, pad_bottom;
+    int display;             /* CSS_DISPLAY_*; NONE hides the subtree */
+
+    int margin_top, margin_bottom, margin_left, margin_right;
+    int pad_top, pad_bottom, pad_left, pad_right;
+
+    /* Which of the box lengths above were written in em and therefore
+     * still have to be multiplied by the element's own font size:
+     * CSS_RL_* bits, with the value in hundredths of an em (120 = 1.2em).
+     * css_for() resolves them before returning, so a caller never sees a
+     * relative length. rem is not in this set: a length in rem needs the
+     * root element, which the declaration parser does not have, and
+     * guessing would be worse than counting the declaration. */
+    unsigned rel;
 
     int border_top_w, border_top_style;
     int border_bottom_w, border_bottom_style;
@@ -262,6 +341,7 @@ typedef struct {
     int max_width, max_width_pct;     /* px; 0 = none; pct 0..1000 */
     int line_height;                  /* resolved px; 0 = face height */
     int line_height_pct;              /* 0 = unset; 150 = 1.5 */
+    int font_size_pct;                /* 100 = 1em, while REL/REM set */
 
     int monospace;            /* pre/code/kbd/samp/tt or CSS_ATTR_MONO */
     int indent;               /* px of horizontal indent at this block  */
@@ -300,6 +380,8 @@ typedef struct {
     int unknown_props;    /* property outside the subset            */
     int bad_values;       /* supported property, unusable value     */
     int truncated;        /* CSS_MAX_RULES reached, rest dropped    */
+    int media_applied;    /* @media blocks whose rules were parsed   */
+    int media_skipped;    /* @media blocks skipped (print / feature) */
     int ignored;          /* sum of the six counters above          */
     char first_problem[CSS_WARN_MAX];   /* "line 12: ...", or ""     */
 } CssStats;
@@ -379,6 +461,13 @@ CSS_API CssStyle css_for(const CssSheet *sheet, const char *tag,
                          const char *class_attr, const char *id_attr,
                          const CssNode *attr_state);
 
+/* Does a media query list apply to a screen? `@media` blocks and a
+ * <link media=...> ask the same question, so they get the same answer:
+ * media types only (`screen`, `all` match; `print` does not; `not print`
+ * does), a query that narrows on a viewport feature does not match, and
+ * an empty list matches everything. */
+CSS_API int css_media_matches(const char *list);
+
 /* Fill `n` from the arguments and set n->style = css_for(...). The
  * usual way to build the ancestor stack; see the example above. */
 CSS_API void css_node_init(CssNode *n, const char *tag, const char *class_attr,
@@ -398,7 +487,26 @@ CSS_API int css_color(const char *text, size_t len, u32 *out);
  * already-resolved style: last declaration wins, no selector, no
  * inheritance. Returns how many declarations took effect, or -1 on a
  * NULL style. Unknown properties are ignored and counted nowhere (an
- * inline attribute has no sheet to record them in). */
+ * inline attribute has no sheet to record them in).
+ *
+ * A relative font-size in the attribute (style="font-size:1.4em") cannot
+ * be resolved here: the parent's resolved size is not in this struct.
+ * Call css_resolve_relative() with the parent's size afterwards, or use
+ * css_inline_for(). */
 CSS_API int css_inline(CssStyle *style, const char *decls, size_t len);
+
+/* Resolve a relative font-size (em / % / rem) left by the cascade or by
+ * css_inline() into px. `parent_font_size` is the enclosing block's
+ * resolved size; `root_font_size` is the <html> element's, for rem (0 is
+ * CSS_BASE_FONT_SIZE). Recomputes line_height when it was a multiplier.
+ * A no-op when the style has an absolute size. */
+CSS_API void css_resolve_relative(CssStyle *style, int parent_font_size,
+                                  int root_font_size);
+
+/* css_inline() plus the relative-size resolution, in one call: the
+ * inline attribute is the last word on the element, and `parent` is the
+ * enclosing element (NULL at the root). Returns declarations applied. */
+CSS_API int css_inline_for(CssStyle *style, const char *decls, size_t len,
+                           const CssStyle *parent);
 
 #endif /* MYSTIC_CSS_H */

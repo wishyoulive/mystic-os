@@ -2,49 +2,78 @@
 """
 fetch-vlc.py - build the libVLC video player package for Mystic OS.
 
-This is the whole supply chain for the one app that needs a third-party
-media stack, and it is deliberately one command:
+One command builds every artifact the player needs and prints the real
+numbers it found:
 
-    python tools/fetch-vlc.py                 # resolve, download, unpack, pack
+    python tools/fetch-vlc.py                 # resolve, download, unpack, build, pack
     python tools/fetch-vlc.py --dry-run       # resolve and print only
     python tools/fetch-vlc.py --profile minimal
     python tools/fetch-vlc.py --force         # ignore the caches
 
 What it produces:
 
+    stage/usr/share/mystic/apps/vlc/manifest  the ONE manifest (id 'vlc')
+    stage/usr/share/mystic/apps/vlc/bin       the image placeholder: this
+                                              player compiled statically. It
+                                              cannot dlopen (see below), so
+                                              its window says exactly that
+                                              and that `pkg install vlc`
+                                              fixes it. Never a fake frame.
     build/vlc-root/            the vmem closure (libs + the plugin subset)
-    build/vlc-pkg/             the package stage (manifest, libexec, lib/)
+    build/vlc-pkg/             the package stage
     build/repo/vlc.tar.gz      the installable package, plus an index row
     build/repo/index.tsv       updated in place and re-signed if a key exists
 
-The package layout is the normal Mystic one, with one addition:
+The package layout - one id everywhere (the directory, the manifest's
+'bundle =' line, the Store row and the window's app id):
 
-    manifest                   name/desc/exec/version
-    bin -> libexec/vlcplayer   symlink, so exec = bin is a bare filename
-    libexec/vlcplayer          the player, a DYNAMIC musl executable
-    lib/                       libvlc, libvlccore and their real closure
-    lib/vlc/plugins/...        only the plugin files a player needs
+    manifest                   name/desc/exec/version/network/audio/bundle,
+                               and 'placeholder = no' (the image's copy of
+                               the same file says 'yes')
+    bin                        static launcher (-DVP_BOOT=1): no PT_INTERP,
+                               so it runs in a jail that has no /lib
+    libexec/vlcplayer          the player: DYNAMIC musl, PT_INTERP
+                               /lib/ld-musl-x86_64.so.1, RUNPATH $ORIGIN/../lib
+    lib/ld-musl-x86_64.so.1    the musl loader from Alpine's musl apk (0755)
+    lib/libvlc.so.5 ...        libVLC and its real closure
+    lib/vlc/plugins/...        only the plugin files a profile needs
 
-Why the player is dynamic, and what that costs
-----------------------------------------------
-Alpine ships libVLC as shared objects only; there is no libvlc.a. A static
-musl program also cannot dlopen (the dynamic linker is not part of a static
-image), so a static player could never call libVLC. The app is therefore
-built as a dynamically linked musl executable: its only DT_NEEDED is
-libc.musl-x86_64.so.1, which the Alpine base rootfs already provides, and
-it loads libvlc.so.5 with dlopen() from the package's own lib/ directory
-(after one re-exec with LD_LIBRARY_PATH, because musl reads that at process
-start). Nothing is linked with -lvlc at build time.
+The manifest's 'exec' must be a BARE FILE NAME. src/wmsrv.c (wms_launch_arg)
+rejects any exec containing '/' or '..' - 'unsafe exec' - so 'exec =
+libexec/vlcplayer' is not a layout this OS can launch, and nothing here may
+claim otherwise. 'exec = bin' names the static launcher at the bundle root;
+libexec/ is an internal path the launcher execs through the bundled loader.
 
-The closure is not a guessed list. For a trimmed profile this script
-downloads vlc + vlc-libs, unpacks the selected plugin .so files, reads
-their real ELF DT_NEEDED entries, and resolves only those `so:` names
-against the Alpine index. The emitted package contains exactly the
-libraries that closure produced.
+Why a launcher and not just a dynamic bin
+-----------------------------------------
+The image ships no dynamic loader (stage/lib has no ld-musl), and the
+kernel refuses to exec a dynamic ELF whose PT_INTERP does not exist. So the
+package's entry point is the static launcher; it replaces itself with the
+bundled loader:
 
-Index fields: `S:` is the .apk download size, `I:` the installed size.
-Both are printed, labelled. Caches: build/vlc-index/, build/vlc-apks/.
-Everything is written under build/, which is not part of the OS image.
+    lib/ld-musl-x86_64.so.1 --library-path <bundle>/lib         <bundle>/libexec/vlcplayer <args...>
+
+musl's loader supports being run as a program and parses --library-path
+(ldso/dynlink.c, __dls3), and it resolves a DT_NEEDED of libc.so or
+libc.musl-* to itself (load_library's reserved-name check), so the bundle
+needs no separate libc.so.
+
+Why the player is not static, and why -lvlc never appears on its link line
+-------------------------------------------------------------------------
+Alpine ships libVLC as shared objects only: there is no libvlc.a, and
+libVLC's own module loader uses dlopen for plugins. A static musl program
+cannot dlopen either - musl's static dlopen is the stub whose whole body is
+__dl_seterr("Dynamic loading not supported") (src/ldso/dlopen.c) - so a
+static player could never call libVLC. This script builds both ways and
+reads the result instead of trusting this paragraph: the static+libvlc link
+is attempted and its exact failure printed; the dynamic build is checked for
+PT_INTERP, DT_NEEDED and RUNPATH before anything is packed.
+
+Index fields: `S:` is the .apk download size, `I:` the installed size. Both
+are printed, labelled. Caches: build/vlc-index/, build/vlc-apks/, and a
+signature stamp in build/vlc-root. Everything is written under build/
+except the two files in the image stage, which are the bundle the image
+ships - and those are only rewritten when their bytes would change.
 
 Honesty notes:
   * The download cap is enforced before anything big is fetched. A profile
@@ -55,7 +84,7 @@ Honesty notes:
   * No sound driver is staged in the image and QEMU is started without a
     sound device, so this package contains only the dummy audio output.
     libVLC still decodes audio; nothing can play it until a PCM device
-    exists. See docs/MULTIMEDIA.md.
+    exists. See docs/VLC.md.
 """
 
 import argparse
@@ -84,7 +113,19 @@ PKG_STAGE = os.path.join("build", "vlc-pkg")
 REPO = os.path.join("build", "repo")
 PKG_NAME = "vlc"
 PKG_VERSION = "3.0.23"
-MANIFEST = os.path.join("src", "client", "apps", "vlcplayer.manifest")
+
+# The bundle id is PKG_NAME, the image stage directory, the manifest's
+# 'bundle =' line and the window's app id. There is no second spelling.
+IMAGE_BUNDLE = os.path.join("stage", "usr", "share", "mystic", "apps", PKG_NAME)
+MANIFEST = os.path.join(IMAGE_BUNDLE, "manifest")
+OLD_BUNDLE = os.path.join("stage", "usr", "share", "mystic", "apps", "vlcplayer")
+
+# The dynamic loader the DYNAMIC player needs, taken out of Alpine's musl
+# package. It is the only file in the bundle that must be executable.
+LOADER_PKG = "musl"
+LOADER_IN_APK = "lib/ld-musl-x86_64.so.1"
+LOADER_IN_PKG = "lib/ld-musl-x86_64.so.1"
+
 APP_SRC = [
     "src/client/apps/vlcplayer.c",
     "src/client/mystic_client.c",
@@ -92,6 +133,7 @@ APP_SRC = [
     "src/font.c",
     "src/ui.c",
 ]
+BOOT_SRC = ["src/client/apps/vlcplayer.c"]
 
 # libVLC is not a package name in Alpine: vlc-libs provides both shared
 # objects, so the roots are written the way the index writes them.
@@ -392,6 +434,228 @@ def elf_needed(path):
     return elf_info(path)[1]
 
 
+def elf_full(path):
+    """Everything the packaging decisions depend on, read from the bytes.
+
+    size, e_type (2 = executable, 3 = shared object), PT_INTERP, DT_NEEDED,
+    DT_RPATH/DT_RUNPATH, DT_SONAME and the entry point. A file that is not
+    an ELF yields the defaults, so the caller can still report its size.
+    """
+    out = {"size": 0, "e_type": 0, "interp": "", "needed": [], "rpath": [],
+           "soname": "", "entry": 0}
+    try:
+        with open(path, "rb") as f:
+            b = f.read()
+    except OSError:
+        return out
+    out["size"] = len(b)
+    if b[:4] != b"\x7fELF" or len(b) < 64:
+        return out
+    is64 = b[4] == 2
+    le = "<" if b[5] == 1 else ">"
+    try:
+        if is64:
+            e_type, = struct.unpack_from(le + "H", b, 0x10)
+            e_entry, = struct.unpack_from(le + "Q", b, 0x18)
+            phoff, = struct.unpack_from(le + "Q", b, 0x20)
+            shoff, = struct.unpack_from(le + "Q", b, 0x28)
+            phentsize, phnum = struct.unpack_from(le + "HH", b, 0x36)
+            shentsize, shnum, shstrndx = struct.unpack_from(le + "HHH", b, 0x3a)
+        else:
+            e_type, = struct.unpack_from(le + "H", b, 0x10)
+            e_entry, = struct.unpack_from(le + "I", b, 0x18)
+            phoff, = struct.unpack_from(le + "I", b, 0x1c)
+            shoff, = struct.unpack_from(le + "I", b, 0x20)
+            phentsize, phnum = struct.unpack_from(le + "HH", b, 0x2a)
+            shentsize, shnum, shstrndx = struct.unpack_from(le + "HHH", b, 0x2e)
+        out["e_type"] = e_type
+        out["entry"] = e_entry
+        for i in range(phnum):
+            off = phoff + i * phentsize
+            p_type, = struct.unpack_from(le + "I", b, off)
+            if p_type != 3:
+                continue
+            if is64:
+                p_offset, = struct.unpack_from(le + "Q", b, off + 8)
+                p_filesz, = struct.unpack_from(le + "Q", b, off + 32)
+            else:
+                p_offset, = struct.unpack_from(le + "I", b, off + 4)
+                p_filesz, = struct.unpack_from(le + "I", b, off + 16)
+            out["interp"] = b[p_offset:p_offset + p_filesz].split(b"\0")[0].decode(
+                "utf-8", "replace")
+            break
+
+        def sh(i):
+            off = shoff + i * shentsize
+            if is64:
+                return struct.unpack_from(le + "IIQQQQIIQQ", b, off)
+            return struct.unpack_from(le + "IIIIIIIIII", b, off)
+
+        base = sh(shstrndx)[4]
+
+        def name_at(off):
+            return b[off:b.index(b"\0", off)].decode("utf-8", "replace")
+
+        dyn = dstr = None
+        for i in range(shnum):
+            nm = name_at(base + sh(i)[0])
+            if nm == ".dynamic":
+                dyn = sh(i)
+            elif nm == ".dynstr":
+                dstr = sh(i)[4]
+        if dyn is None or dstr is None:
+            return out
+        off, end = dyn[4], dyn[4] + dyn[5]
+        esz = 16 if is64 else 8
+        while off + esz <= end:
+            if is64:
+                tag, val = struct.unpack_from(le + "qQ", b, off)
+            else:
+                tag, val = struct.unpack_from(le + "iI", b, off)
+            off += esz
+            if tag == 0:
+                break
+            if tag not in (1, 14, 15, 29):
+                continue
+            v = name_at(dstr + val)
+            if tag == 1:
+                out["needed"].append(v)
+            elif tag == 14:
+                out["soname"] = v
+            else:
+                out["rpath"].append(v)
+    except (ValueError, IndexError, struct.error):
+        pass
+    return out
+
+
+def check_elf(path, kind, what):
+    """Assert the file we just built is the kind of ELF we are going to ship.
+
+    kind "static"  : e_type 2, no PT_INTERP, no DT_NEEDED
+    kind "dynamic" : e_type 2, PT_INTERP, no DT_NEEDED on libVLC
+    kind "loader"  : e_type 3, SONAME libc.musl-x86_64.so.1, entry point set
+    """
+    got = elf_full(path)
+    if kind in ("static", "dynamic") and got["e_type"] != 2:
+        raise RuntimeError("%s is not an executable ELF (e_type=%d)"
+                           % (what, got["e_type"]))
+    if kind == "static":
+        if got["interp"]:
+            raise RuntimeError("%s has PT_INTERP %s; a static launcher must not "
+                               "depend on a loader the image does not ship"
+                               % (what, got["interp"]))
+        if got["needed"]:
+            raise RuntimeError("%s has DT_NEEDED %s; a static launcher must not"
+                               % (what, ", ".join(got["needed"])))
+    elif kind == "dynamic":
+        if not got["interp"]:
+            raise RuntimeError("%s has no PT_INTERP: a static musl binary cannot "
+                               "dlopen libVLC (its dlopen is a stub that says "
+                               "'Dynamic loading not supported')" % what)
+        if any("vlc" in n for n in got["needed"]):
+            raise RuntimeError("%s is linked against libVLC (%s); it must load it "
+                               "with dlopen so the package stays relocatable"
+                               % (what, ", ".join(got["needed"])))
+    elif kind == "loader":
+        if got["e_type"] != 3:
+            raise RuntimeError("%s is not a shared object (e_type=%d)"
+                               % (what, got["e_type"]))
+        if got["soname"] != "libc.musl-x86_64.so.1":
+            raise RuntimeError("%s has SONAME %r, expected libc.musl-x86_64.so.1"
+                               % (what, got["soname"]))
+        if got["entry"] == 0:
+            raise RuntimeError("%s has no entry point, so it cannot be exec'd"
+                               % what)
+    return got
+
+
+def build_player(stage, zig):
+    """Compile the DYNAMIC player, the one that talks to libVLC.
+
+    -dynamic is not optional: zig's musl target defaults to a static link,
+    and a static musl program's dlopen is a stub. RUNPATH $ORIGIN/../lib is
+    the third way to find the closure (the launcher passes --library-path,
+    wmsrv passes LD_LIBRARY_PATH), so a direct exec still works.
+    """
+    out = os.path.join(stage, "libexec", "vlcplayer")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    cmd = [zig, "cc", "-target", "x86_64-linux-musl", "-O2", "-dynamic",
+           "-Wl,-rpath,$ORIGIN/../lib",
+           "-Isrc", "-Isrc/client", "-o", out] + APP_SRC + ["-lm", "-pthread"]
+    print("==> compiling the DYNAMIC player: %s" % out)
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        raise RuntimeError("zig cc failed with status %d" % r.returncode)
+    info = check_elf(out, "dynamic", "the player")
+    if not any("$ORIGIN" in rp for rp in info["rpath"]):
+        raise RuntimeError("the player has no $ORIGIN RUNPATH (got %r); a direct "
+                           "exec could not find <bundle>/lib" % (info["rpath"],))
+    return out, info
+
+
+def build_boot(stage, zig):
+    """Compile the static launcher that becomes the package's exec = bin."""
+    out = os.path.join(stage, "bin")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    cmd = [zig, "cc", "-target", "x86_64-linux-musl", "-Os", "-static", "-s",
+           "-DVP_BOOT=1", "-Isrc", "-Isrc/client", "-o", out] + BOOT_SRC
+    print("==> compiling the static launcher: %s" % out)
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        raise RuntimeError("zig cc failed with status %d" % r.returncode)
+    info = check_elf(out, "static", "the launcher")
+    return out, info
+
+
+def build_image_stub(zig):
+    """Compile the image placeholder into the stage bundle (id 'vlc').
+
+    Same source, static, and honest when it runs: it cannot dlopen, so its
+    window says libVLC is not installed and that `pkg install vlc` brings
+    the dynamic player and the closure. The image must not ship the 100+ MB
+    closure; it must ship the truth.
+    """
+    out = os.path.join(IMAGE_BUNDLE, "bin")
+    os.makedirs(IMAGE_BUNDLE, exist_ok=True)
+    cmd = [zig, "cc", "-target", "x86_64-linux-musl", "-Os", "-static", "-s",
+           "-Isrc", "-Isrc/client", "-o", out] + APP_SRC + ["-lm", "-pthread"]
+    print("==> compiling the image placeholder: %s" % out)
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        raise RuntimeError("zig cc failed with status %d" % r.returncode)
+    info = check_elf(out, "static", "the image placeholder")
+    return out, info
+
+
+def loader_from_apk(pkgs, stage):
+    """Copy the musl dynamic loader out of Alpine's musl package.
+
+    The player is dynamic, so something must be its interpreter. The image
+    ships none and the jail has no /lib, so the bundle carries its own,
+    executable, and the launcher execs that path.
+    """
+    if LOADER_PKG not in pkgs:
+        raise RuntimeError("the index has no %r package; cannot ship a loader"
+                           % LOADER_PKG)
+    path = get_apk(pkgs, LOADER_PKG, True)
+    if not path:
+        raise RuntimeError("could not fetch %s" % pkgs[LOADER_PKG]["file"])
+    probe = os.path.join(APK_CACHE, "_loader")
+    if os.path.isdir(probe):
+        shutil.rmtree(probe)
+    unpack_apk(path, probe, members={LOADER_IN_APK})
+    src = os.path.join(probe, LOADER_IN_APK)
+    if not os.path.isfile(src):
+        raise RuntimeError("%s does not contain %s" % (path, LOADER_IN_APK))
+    info = check_elf(src, "loader", LOADER_IN_APK)
+    dst = os.path.join(stage, LOADER_IN_PKG)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copyfile(src, dst)
+    os.chmod(dst, 0o755)
+    return dst, info, sha256_file(src), pkgs[LOADER_PKG]["version"]
+
+
 # ---------------------------------------------------------------------------
 # apk fetch / unpack
 # ---------------------------------------------------------------------------
@@ -628,8 +892,6 @@ def build_root(pkgs, closure, dest, profile, plugins, stamp, force=False):
 
 
 # ---------------------------------------------------------------------------
-# the app + the package
-# ---------------------------------------------------------------------------
 def find_zig():
     z = os.environ.get("ZIG")
     if z:
@@ -655,28 +917,11 @@ def app_inputs_digest(zig):
     except (OSError, subprocess.CalledProcessError):
         pass
     h.update(open(MANIFEST, "rb").read())
+    # The packaging logic itself: a cached tarball must not survive a change
+    # to what build_stage puts in it (the soname aliases were one such fix).
+    with open(os.path.abspath(__file__), "rb") as f:
+        h.update(b"tool\0" + f.read() + b"\0")
     return h.hexdigest()
-
-
-def build_app(stage, zig):
-    """Compile the player as a dynamic musl executable and verify that it is
-    one. Returns (path, interp, needed, size)."""
-    out = os.path.join(stage, "libexec", "vlcplayer")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    cmd = [zig, "cc", "-target", "x86_64-linux-musl", "-O2",
-           "-Isrc", "-Isrc/client", "-o", out] + APP_SRC + ["-lm", "-pthread"]
-    print("==> compiling %s" % out)
-    r = subprocess.run(cmd)
-    if r.returncode != 0:
-        raise RuntimeError("zig cc failed with status %d" % r.returncode)
-    interp, needed = elf_info(out)
-    if not interp:
-        raise RuntimeError("the compiled player has no PT_INTERP: a static "
-                           "musl binary cannot dlopen libVLC")
-    if "libvlc" in " ".join(needed):
-        raise RuntimeError("the player is linked against libVLC; it must "
-                           "load it with dlopen so the package stays relocatable")
-    return out, interp, needed, os.path.getsize(out)
 
 
 def collect_libs(root):
@@ -705,6 +950,48 @@ def collect_libs(root):
                 continue
             out[n] = src
     return out
+
+
+def soname_aliases(libs):
+    """alias -> real basename for every DT_SONAME that is not a file yet.
+
+    Alpine's packages carry libvlc.so.5 -> libvlc.so.5.6.1. A trimmed profile
+    copies only the versioned file out of the apk, so without this the bundle
+    would contain libvlc.so.5.6.1 and no libvlc.so.5 at all: the loader would
+    start the player, dlopen("libvlc.so.5") would fail, and the player would
+    print "cannot load libvlc.so.5" - the exact defect this task exists to
+    remove, one layer deeper. The alias is what the dynamic loader looks for,
+    so it is not optional.
+    """
+    out = {}
+    for name, path in libs.items():
+        soname = elf_full(path)["soname"]
+        if soname and soname != name and soname not in libs:
+            out[soname] = name
+    return out
+
+
+def check_closure(libs, aliases, extra):
+    """Every DT_NEEDED that is not musl's own libc must resolve inside lib/.
+
+    This is the check that catches "the closure is present but the loader
+    cannot find a name". extra is a list of (label, path) for plugins and the
+    player, so their NEEDED entries are covered too.
+    """
+    have = set(libs) | set(aliases)
+    missing = {}
+    for name, path in list(libs.items()) + list(extra):
+        for need in elf_full(path)["needed"]:
+            if need == "libc.so" or need.startswith("libc."):
+                continue           # musl's loader resolves these to itself
+            if need not in have:
+                missing.setdefault(need, []).append(name)
+    if missing:
+        raise RuntimeError(
+            "the bundle would be missing DT_NEEDED libraries: %s"
+            % ", ".join("%s (needed by %s)" % (k, ", ".join(sorted(v)[:3]))
+                        for k, v in sorted(missing.items())))
+    return len(have)
 
 
 def plan_symlinks(libs):
@@ -749,25 +1036,107 @@ def plugin_list(root, profile, plugins):
     return sorted(out)
 
 
-def build_stage(root, stage, profile, plugins, app_digest, zig):
+def package_manifest(text):
+    """The manifest pkg installs: the image file with 'placeholder = no'.
+
+    The image bundle is a placeholder - only bin, no libVLC - and says so in
+    its own manifest. The package carries the real closure, so the one line
+    that describes the payload is the one line that differs. pkg copies the
+    manifest it unpacks, so /root/apps/vlc/manifest ends up saying 'no' and
+    src/apps/store.c can tell the placeholder from the installed package by
+    what is on the disk, not by a guess about the directory name.
+    """
+    out = []
+    seen = 0
+    for line in text.splitlines():
+        key = line.split("=", 1)[0].strip() if "=" in line else ""
+        if key == "placeholder":
+            out.append("placeholder = no")
+            seen += 1
+        else:
+            out.append(line)
+    if seen != 1:
+        raise RuntimeError("the bundle manifest must have exactly one "
+                           "'placeholder =' line (the image copy is yes); "
+                           "found %d" % seen)
+    return "\n".join(out) + "\n"
+
+
+def check_manifest(path):
+    """The bundle manifest is the one place the id lives; check it here.
+
+    Returns the file's text so the package ships what the image has (plus
+    the one payload line package_manifest() rewrites). A typo in any of
+    these lines is a tile that cannot start, so it is a hard error, not a
+    warning. 'version' must equal PKG_VERSION: the index row built below is
+    what src/apps/store.c compares against, and two numbers that disagree
+    would make an installed package look permanently outdated.
+    """
+    if not os.path.isfile(path):
+        raise RuntimeError("%s is missing: the bundle manifest is the source of "
+                           "truth for the id, the exec and the jail flags" % path)
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    fields = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        fields[k.strip()] = v.strip()
+    need = {"name": None, "desc": None, "exec": "bin",
+            "version": PKG_VERSION, "network": "host", "audio": "yes",
+            "bundle": PKG_NAME, "placeholder": "yes"}
+    for k, want in need.items():
+        if k not in fields:
+            raise RuntimeError("%s has no %r line" % (path, k))
+        if want is not None and fields[k] != want:
+            raise RuntimeError("%s has %s = %r, expected %r"
+                               % (path, k, fields[k], want))
+    return text
+
+
+def build_stage(root, stage, profile, plugins, app_digest, zig, pkgs):
     """Create build/vlc-pkg and the tar entry list."""
     if os.path.isdir(stage):
         shutil.rmtree(stage)
     os.makedirs(os.path.join(stage, "libexec"), exist_ok=True)
     os.makedirs(os.path.join(stage, "lib"), exist_ok=True)
 
-    with open(MANIFEST, "r", encoding="utf-8") as f:
-        manifest = f.read()
+    manifest = package_manifest(check_manifest(MANIFEST))
     with open(os.path.join(stage, "manifest"), "w", encoding="utf-8", newline="\n") as f:
         f.write(manifest)
-    app, interp, needed, app_size = build_app(stage, zig)
+
+    boot, boot_info = build_boot(stage, zig)
+
+    # The launcher execs <bundle>/<exec>, and src/wmsrv.c refuses any exec
+    # that is not a bare file name. Both halves are checked here so a broken
+    # manifest can never reach a tarball: a '/' means the desktop will not
+    # launch it, a missing file means the kernel cannot.
+    exec_name = ""
+    for line in manifest.splitlines():
+        key, _, val = line.partition("=")
+        if key.strip() == "exec":
+            exec_name = val.strip()
+    if not exec_name or "/" in exec_name or ".." in exec_name:
+        raise RuntimeError("'exec = %s' is not a bare file name; src/wmsrv.c\n"
+                           "refuses any exec containing '/' or '..'" % exec_name)
+    if not os.path.isfile(os.path.join(stage, exec_name)):
+        raise RuntimeError("the manifest's exec = %s is not in the bundle "
+                           "stage; the tile would be dead" % exec_name)
+    player, player_info = build_player(stage, zig)
+    loader, loader_info, loader_sha, loader_ver = loader_from_apk(pkgs, stage)
 
     libs = collect_libs(root)
     links = plan_symlinks(libs)
+    aliases = soname_aliases(libs)
     entries = []
     entries.append(("manifest", "file", os.path.join(stage, "manifest"), 0o644, ""))
-    entries.append(("bin", "symlink", None, 0o777, "libexec/vlcplayer"))
-    entries.append(("libexec/vlcplayer", "file", app, 0o755, ""))
+    entries.append(("bin", "file", boot, 0o755, ""))
+    entries.append(("libexec/vlcplayer", "file", player, 0o755, ""))
+    # The loader is the only library that must be executable. Its mode in
+    # the tar is what busybox tar restores as root, so 0755 has to be here.
+    entries.append((LOADER_IN_PKG, "file", loader, 0o755, ""))
     for name in sorted(libs):
         dst = os.path.join(stage, "lib", name)
         if name in links:
@@ -776,6 +1145,11 @@ def build_stage(root, stage, profile, plugins, app_digest, zig):
             shutil.copyfile(libs[name], dst)
             os.chmod(dst, 0o644)
             entries.append(("lib/" + name, "file", dst, 0o644, ""))
+
+    # The soname aliases (libvlc.so.5, libvlccore.so.9, ...) are the names
+    # dlopen() and DT_NEEDED use; the versioned files alone are not enough.
+    for name in sorted(aliases):
+        entries.append(("lib/" + name, "symlink", None, 0o777, aliases[name]))
 
     plist = plugin_list(root, profile, plugins)
     base = os.path.join(root, "usr", "lib", "vlc", "plugins")
@@ -789,6 +1163,12 @@ def build_stage(root, stage, profile, plugins, app_digest, zig):
         os.chmod(dst, 0o644)
         entries.append(("lib/vlc/plugins/" + rel, "file", dst, 0o644, ""))
 
+    # Fail before packing if a name the loader will ask for is not in lib/.
+    closure_names = check_closure(
+        libs, aliases,
+        [("libexec/vlcplayer", player)] +
+        [("plugin:" + rel, os.path.join(base, rel)) for rel in plist])
+
     # directories, so an empty lib/vlc tree still exists after unpack
     dirs = set()
     for arc, _kind, _src, _mode, _ln in entries:
@@ -799,13 +1179,26 @@ def build_stage(root, stage, profile, plugins, app_digest, zig):
         entries.append((d, "dir", None, 0o755, ""))
     entries.sort(key=lambda e: (e[0], e[1]))
 
+    libvlc_path = libs.get("libvlc.so.5") or libs.get("libvlc.so.5.6.1")
+    libvlc = elf_full(libvlc_path) if libvlc_path else {}
     info = {
+        "exec": exec_name,
+        "version": PKG_VERSION,
         "profile": profile,
         "app_digest": app_digest,
         "plugins": plist,
-        "app_size": app_size,
-        "interp": interp,
-        "needed": needed,
+        "player_size": player_info["size"],
+        "player_interp": player_info["interp"],
+        "player_needed": player_info["needed"],
+        "player_rpath": player_info["rpath"],
+        "boot_size": boot_info["size"],
+        "loader_size": loader_info["size"],
+        "loader_sha256": loader_sha,
+        "loader_version": loader_ver,
+        "libvlc_soname": libvlc.get("soname", ""),
+        "libs": len(libs),
+        "soname_aliases": len(aliases),
+        "closure_names": closure_names,
     }
     write_json_atomic(os.path.join(stage, ".vlc-pkg.json"), info)
     return entries, info
@@ -1028,6 +1421,21 @@ def main():
               "cannot be compiled into the package", file=sys.stderr)
         return 1
     digest = app_inputs_digest(zig)
+
+    # The image bundle first: it is the small, honest half of this tool.
+    try:
+        stub, stub_info = build_image_stub(zig)
+    except (RuntimeError, OSError) as e:
+        print("error: %s" % e, file=sys.stderr)
+        return 1
+    print("==> image bundle: %s/{manifest,bin}" % IMAGE_BUNDLE)
+    print("    bin: %d bytes, static musl, no PT_INTERP, no DT_NEEDED"
+          % stub_info["size"])
+    if os.path.isdir(OLD_BUNDLE):
+        print("    WARNING: the old bundle %s still exists; two ids would give two\n"
+              "    tiles. Remove it - the id is %r everywhere now."
+              % (OLD_BUNDLE, PKG_NAME), file=sys.stderr)
+
     stage = PKG_STAGE
     pkg_stamp_path = os.path.join("build", "vlc-pkg.stamp")
     tarball = os.path.join(args.repo, PKG_NAME + ".tar.gz")
@@ -1039,36 +1447,47 @@ def main():
                  and sha256_file(tarball) == prev.get("sha256"))
     if cache_hit:
         print("==> package cache hit: %s is up to date" % tarball)
-        info = {"interp": prev.get("interp", "?"), "needed": prev.get("needed", []),
-                "app_size": prev.get("app_size", 0), "plugins": prev.get("plugins", [])}
+        info = prev
         size = prev["size"]
         sha = prev["sha256"]
         usize, ufiles = prev.get("installed", 0), prev.get("files", 0)
     else:
         try:
             entries, info = build_stage(args.dest, stage, args.profile, plugins,
-                                        digest, zig)
+                                        digest, zig, pkgs)
         except (RuntimeError, OSError) as e:
             print("error: %s" % e, file=sys.stderr)
             return 1
         size = pack_tarball(entries, stage, tarball)
         print("==> packed %s: %.2f MB, %d entries, %d libraries, %d plugins"
-              % (tarball, size / 1e6, len(entries) + 1,
-                 len(collect_libs(args.dest)), len(info["plugins"])))
+              % (tarball, size / 1e6, len(entries) + 1, info["libs"],
+                 len(info["plugins"])))
         sha = sha256_file(tarball)
         usize, ufiles = tree_bytes(stage)
-        write_json_atomic(pkg_stamp_path, {
-            "app_digest": digest, "profile": args.profile,
-            "size": size, "sha256": sha, "interp": info["interp"],
-            "needed": info["needed"], "app_size": info["app_size"],
-            "plugins": info["plugins"], "installed": usize, "files": ufiles,
-        })
+        info["size"] = size
+        info["sha256"] = sha
+        info["installed"] = usize
+        info["files"] = ufiles
+        write_json_atomic(pkg_stamp_path, info)
+
     print("==> package: %s  %.2f MB compressed, %.2f MB installed, %d files"
           % (tarball, size / 1e6, usize / 1e6, ufiles + 1))
-    print("    app: %d bytes, dynamic musl ELF, PT_INTERP %s"
-          % (info["app_size"], info["interp"]))
-    print("    app DT_NEEDED: %s" % (", ".join(info["needed"]) or "(none)"))
-    print("    libvlc.so.5 is dlopen()ed from lib/ (no -lvlc at build time)")
+    print("    bin (launcher): %d bytes, static musl, no PT_INTERP"
+          % info.get("boot_size", 0))
+    print("    libexec/vlcplayer: %d bytes, DYNAMIC musl, PT_INTERP %s"
+          % (info.get("player_size", 0), info.get("player_interp", "?")))
+    print("    player DT_NEEDED: %s   RUNPATH: %s"
+          % (", ".join(info.get("player_needed", [])) or "(none)",
+             ", ".join(info.get("player_rpath", [])) or "(none)"))
+    print("    lib/%s: %d bytes from musl %s, SONAME libc.musl-x86_64.so.1"
+          % (os.path.basename(LOADER_IN_PKG), info.get("loader_size", 0),
+             info.get("loader_version", "?")))
+    print("    libvlc.so.5 SONAME: %s (dlopen()ed from lib/, never -lvlc)"
+          % (info.get("libvlc_soname") or "?"))
+    print("    manifest: exec = %s (bare name; version = %s = the index row)"
+          % (info.get("exec", "bin"), info.get("version", PKG_VERSION)))
+    print("    id everywhere: package %r = bundle %r = manifest 'bundle = %s'"
+          % (PKG_NAME, PKG_NAME, PKG_NAME))
     isz, isha = upsert_index(tarball)
     print("    index row: %s %s %d %s..." % (PKG_NAME, PKG_VERSION, isz, isha[:16]))
     return 0

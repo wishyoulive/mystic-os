@@ -44,39 +44,65 @@
 #define FONT_DIR  "/usr/share/fonts"
 #define MAX_WINDOWS 10
 
-/* Every metric that has to follow the text scale. Nothing below is a
- * hardcoded pixel height, which is what made scaling unsafe before. */
-static int title_h(void) { return ui_px(40); }      /* window title bar */
-static int topbar_h(void) { return ui_px(34); }     /* screen top bar   */
+/* Desktop layout metrics live in src/ui.c next to ui_px() and the scale,
+ * because they are functions of the text they hold - not of a pixel count
+ * someone guessed. They are declared here rather than in mystic.h, which is
+ * the app ABI: an app does not own the desktop's title bar. */
+int  ui_line_h(int face, float size);
+int  ui_title_h(void);
+int  ui_topbar_h(void);
+int  ui_tip_h(void);
+int  ui_win_min_w(void);
+int  ui_win_min_h(void);
+int  ui_dock_icon(void);
+int  ui_dock_gap(void);
+int  ui_dock_pad(void);
+int  ui_launcher_cols(int items, int sw, int sh, int label_w);
+void ui_launcher_geom(int items, int sw, int sh, int label_w, int idx,
+                      int *x, int *y, int *w, int *h);
+void ui_launcher_panel(int items, int sw, int sh, int label_w,
+                       int *x, int *y, int *w, int *h);
 
-/* Traffic-light diameter. Fixed on purpose: only its position follows the
- * scale. Draw and click must use the same centre, or the target drifts. */
-#define DOT_SZ 10
+/* The two bands every window is framed by. Each is measured from the line it
+ * draws, so the 21.6 px tooltip line can no longer end up in a 19 px box at
+ * any of the five settings. */
+static int title_h(void) { return ui_title_h(); }    /* window title bar */
+static int topbar_h(void) { return ui_topbar_h(); }  /* screen top bar   */
+
+/* Traffic-light diameter. It follows the text scale like every other metric,
+ * and the position and the click target are derived from the same numbers the
+ * painter uses - the old fixed 10/14/32/50 left the targets behind once the
+ * title bar started growing. */
+static int dot_sz(void) { return ui_px(7); }        /* 10 px at the shipped size */
+/* x of light i: 14, 32, 50 at the shipped size, one dot + air apart */
+static int dot_x(int i) { return ui_px(10 + 13 * i); }
+static int title_x(void) { return dot_x(2) + dot_sz() + ui_px(6); }
 /* F12: the dots, the title text and the click targets all hang off this one
  * vertical centre, so nothing drifts when the text scale changes the bar. */
-static int traffic_y(int bar_h) { return (bar_h - DOT_SZ) / 2; }
+static int traffic_y(int bar_h) { return (bar_h - dot_sz()) / 2; }
 /* A bundle used to be a letter in a box ("C", "F", "2"), which is why the
  * launcher looked unfinished. Each known app now has the same kind of drawn
  * icon the built-ins have; anything unknown still falls back to its initial. */
-static void icon_terminal(Surface*,float,float,float,u32);
-static void icon_folder(Surface*,float,float,float,u32);
-static void icon_gear(Surface*,float,float,float,u32);
-static void icon_clock(Surface*,float,float,float,u32);
-static void icon_paint(Surface*,float,float,float,u32);
-static void icon_life(Surface*,float,float,float,u32);
-static void icon_mandel(Surface*,float,float,float,u32);
-static void icon_sysmon(Surface*,float,float,float,u32);
-static void icon_calc(Surface*,float,float,float,u32);
-static void icon_grid(Surface*,float,float,float,u32);
-static void icon_bars(Surface*,float,float,float,u32);
-static void icon_pencil(Surface*,float,float,float,u32);
-static void icon_web(Surface*,float,float,float,u32);
-static void icon_viewer(Surface*,float,float,float,u32);
-static void icon_docview(Surface*,float,float,float,u32);
-static void icon_player(Surface*,float,float,float,u32);
-static void icon_2048(Surface*,float,float,float,u32);
-static void icon_sysinfo(Surface*,float,float,float,u32);
-typedef void (*IconFn)(Surface *, float, float, float, u32);
+static void icon_terminal(Surface*,float,float,float,u32,u32,const Theme*,double,int);
+static void icon_folder(Surface*,float,float,float,u32,u32,const Theme*,double,int);
+static void icon_gear(Surface*,float,float,float,u32,u32,const Theme*,double,int);
+static void icon_clock(Surface*,float,float,float,u32,u32,const Theme*,double,int);
+static void icon_paint(Surface*,float,float,float,u32,u32,const Theme*,double,int);
+static void icon_life(Surface*,float,float,float,u32,u32,const Theme*,double,int);
+static void icon_mandel(Surface*,float,float,float,u32,u32,const Theme*,double,int);
+static void icon_sysmon(Surface*,float,float,float,u32,u32,const Theme*,double,int);
+static void icon_calc(Surface*,float,float,float,u32,u32,const Theme*,double,int);
+static void icon_grid(Surface*,float,float,float,u32,u32,const Theme*,double,int);
+static void icon_bars(Surface*,float,float,float,u32,u32,const Theme*,double,int);
+static void icon_pencil(Surface*,float,float,float,u32,u32,const Theme*,double,int);
+static void icon_web(Surface*,float,float,float,u32,u32,const Theme*,double,int);
+static void icon_viewer(Surface*,float,float,float,u32,u32,const Theme*,double,int);
+static void icon_docview(Surface*,float,float,float,u32,u32,const Theme*,double,int);
+static void icon_player(Surface*,float,float,float,u32,u32,const Theme*,double,int);
+static void icon_2048(Surface*,float,float,float,u32,u32,const Theme*,double,int);
+static void icon_sysinfo(Surface*,float,float,float,u32,u32,const Theme*,double,int);
+typedef void (*IconFn)(Surface *, float, float, float, u32, u32,
+                       const Theme *, double, int);
 static IconFn icon_for_bundle(const char *id) {
     if (!id)                       return NULL;
     if (!strcmp(id, "clock"))      return icon_clock;
@@ -89,7 +115,12 @@ static IconFn icon_for_bundle(const char *id) {
     if (!strcmp(id, "web"))        return icon_web;
     if (!strcmp(id, "viewer"))     return icon_viewer;
     if (!strcmp(id, "docview"))    return icon_docview;
+    /* The id is 'vlc' everywhere now - the bundle directory, the manifest's
+     * 'bundle =' line, the Store row, the index and mc_open() - so a window
+     * and its launcher tile show the same icon. 'vlcplayer' is kept only so
+     * a window started by a bundle from before the rename still gets it. */
     if (!strcmp(id, "vlcplayer"))  return icon_player;
+    if (!strcmp(id, "vlc"))        return icon_player;
     if (!strcmp(id, "sysinfo"))    return icon_sysinfo;
     if (!strcmp(id, "settings"))   return icon_gear;
     if (!strcmp(id, "monitor"))    return icon_bars;
@@ -105,16 +136,37 @@ static IconFn icon_for_bundle(const char *id) {
  * fits; draw and hit-test both read it, so they cannot disagree. */
 static int dock_pct = 100;
 
-static int dock_isz(void) { return ui_px(40) * dock_pct / 100; }  /* taskbar icon */
-static int dock_gap(void) { return ui_px(16) * dock_pct / 100; }
-static int dock_pad(void) { return ui_px(12); }
+static int dock_isz(void) { return ui_dock_icon() * dock_pct / 100; }  /* taskbar icon */
+static int dock_gap(void) { return ui_dock_gap() * dock_pct / 100; }
+static int dock_pad(void) { return ui_dock_pad(); }
 
 static Display disp;
 static Surface screen;
 static Surface scene;
 static Input   input;
-static Theme   themes[16];   /* ten are shipped; the array used to hold 8 */
+static Theme   themes[16];   /* twelve are shipped; the array used to hold 8 */
 static int     theme_count, theme_index;
+
+/* Settings is a built-in app in this process. It must inspect the display the
+ * compositor has open - opening /dev/fb0 twice would map the panel twice - so
+ * the Display lives here and the app asks for it. */
+Display *desk_display(void) { return &disp; }
+
+/* The UI was authored on a 1280x800 screen. A panel bigger than that gets the
+ * same design, mapped by the display layer (so a 1920x1080 screen does not
+ * shrink every label); a panel smaller than it gets a logical frame its own
+ * size. The result is never larger than the panel, and it is the only size
+ * the compositor allocates. */
+#define DESIGN_W 1280
+#define DESIGN_H 800
+void desk_design_size(int fb_w, int fb_h, int *w, int *h) {
+    int lw = fb_w < DESIGN_W ? fb_w : DESIGN_W;
+    int lh = fb_h < DESIGN_H ? fb_h : DESIGN_H;
+    if (lw < 1) lw = 1;
+    if (lh < 1) lh = 1;
+    *w = lw;
+    *h = lh;
+}
 
 /* ------------------------------------------------------------ windows */
 enum { WIN_TERM = 0, WIN_APP, WIN_CLIENT };
@@ -184,7 +236,26 @@ static int    launcher_open = 0;
 static int    wall_index = 0;
 static double wall_t0 = 0.0;
 static double wall_last = 0.0;
+static double pulse_last = 0.0;
+static double drift_last = 0.0;
 static int    launcher_sel = 0;
+
+/* Black Hole interaction (src/wallpaper.h).
+ *
+ *   wall_drag       a left-button drag that began on the wallpaper, not on a
+ *                   window or the chrome; its mouse_dy is fed to the view knob
+ *   wall_bh_index   the index of the Black Hole wallpaper, found once by name
+ *                   from the same table the rotation reads - no magic 4
+ *
+ * Both knobs are state changes only, so the next wallpaper_draw() picks them
+ * up; while another wallpaper is selected the pointer must not touch them. */
+static int    wall_drag = 0;
+static int    wall_bh_index = -1;
+
+static int wall_view_active(void) {
+    if (wall_bh_index < 0) wall_bh_index = wallpaper_from_name("Black Hole");
+    return wall_bh_index >= 0 && wall_index == wall_bh_index;
+}
 
 static WmClient clients[WM_MAX_CLIENTS];
 static WmApp   bundles[WM_MAX_APPS];
@@ -215,15 +286,26 @@ static int help_open, help_page, dnd_on;
 static int dirty = 1;
 
 /* ------------------------------------------------------------ helpers */
-static long mem_field(const char *key) {
+/* /proc/meminfo is read on the paint path (every compose), so sample it at
+ * most once a second and answer from the snapshot in between. Two fopens
+ * and a formatted walk per frame made a pure-paint function block on I/O. */
+static long   mem_total_kb, mem_avail_kb;
+static time_t mem_sampled_at;
+
+static void mem_sample(void) {
+    time_t t = time(NULL);
+    if (mem_sampled_at == t && mem_sampled_at != 0) return;
+    mem_sampled_at = t;
+    mem_total_kb = mem_avail_kb = 0;
     FILE *f = fopen("/proc/meminfo", "r");
-    if (!f) return 0;
+    if (!f) return;
     char k[64], unit[16];
     long v;
-    while (fscanf(f, "%63s %ld %15s", k, &v, unit) == 3)
-        if (!strcmp(k, key)) { fclose(f); return v; }
+    while (fscanf(f, "%63s %ld %15s", k, &v, unit) == 3) {
+        if (!strcmp(k, "MemTotal:")) mem_total_kb = v;
+        else if (!strcmp(k, "MemAvailable:")) { mem_avail_kb = v; break; }
+    }
     fclose(f);
-    return 0;
 }
 
 static void clock_text(char *out, size_t n) {
@@ -234,162 +316,516 @@ static void clock_text(char *out, size_t n) {
 }
 
 /* ------------------------------------------------------------ icons */
-static void icon_terminal(Surface *s, float x, float y, float sz, u32 fg) {
-    float pad = sz * 0.26f;
-    gfx_line(s, x + pad, y + pad * 1.2f, x + pad + sz * 0.18f, y + sz * 0.5f, sz * 0.09f, fg);
-    gfx_line(s, x + pad + sz * 0.18f, y + sz * 0.5f, x + pad, y + sz - pad * 1.2f, sz * 0.09f, fg);
-    gfx_line(s, x + sz * 0.48f, y + sz - pad, x + sz - pad, y + sz - pad, sz * 0.09f, fg);
+/* The host test extracts the block between the two markers below and builds
+ * it against the real src/gfx.c, so what it renders is this file's icon code.
+ * Keep it self-contained: mystic.h and <math.h>, no desktop state. */
+/* @icons-begin */
+/* ------------------------------------------------------------------
+ *  Icon geometry, theme style and animation.
+ *
+ *  The host harness extracts this block verbatim (build.py) and compiles it
+ *  against the real src/gfx.c, so what it renders is this code. Keep it
+ *  self-contained: mystic.h and <math.h>, no desktop state.
+ *
+ *  One icon function is one drawing; ic_* applies the theme's icon_style. The
+ *  styles are geometry, not a colour change - every one of them still draws
+ *  the deliberate highlight part. The highlight colour is icon_accent for an
+ *  ordinary icon and the BRIGHTER of accent/icon_accent when the icon is
+ *  active (focused, hovered or selected) - on Neon that is body #FF2BD6 with
+ *  highlight #22F0FF:
+ *    solid    - the marks filled, the theme's normal corners
+ *    outline  - the same silhouette as a 1.5 px stroke, no fill
+ *    duotone  - filled marks, secondary parts in icon_accent
+ *    rounded  - duotone with every corner at ~35% of the mark
+ *    sharp    - duotone with 0-1 px corners
+ *    pixel    - duotone snapped to a visible 3 px grid, square ends
+ * ------------------------------------------------------------------ */
+
+typedef void (*IconFn)(Surface *, float, float, float, u32, u32,
+                       const Theme *, double, int);
+
+typedef struct {
+    Surface   *s;
+    const Theme *th;
+    float      x, y, sz;
+    u32        fg, hi;
+    IconStyle  style;
+    AnimKind   anim;
+    float      speed, amp;
+    double     now;
+    int        active;
+} IconDraw;
+
+static IconDraw icon_ctx(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                         const Theme *th, double now, int active) {
+    IconDraw c;
+    c.s = s;
+    c.th = th;
+    c.x = x; c.y = y; c.sz = sz;
+    c.fg = fg; c.hi = hi;
+    c.style = th ? th->icon_style : ICON_STYLE_DUOTONE;
+    c.anim = th ? th->anim : ANIM_NONE;
+    c.speed = th ? th->anim_speed : 0.0f;
+    c.amp = th ? th->anim_amp : 0.0f;
+    c.now = now;
+    c.active = active;
+    if (c.speed <= 0.0f || c.amp <= 0.0f) c.anim = ANIM_NONE;
+    return c;
 }
 
-static void icon_folder(Surface *s, float x, float y, float sz, u32 fg) {
+/* Colour is not a style: every style draws the same two-tone icon, and the
+ * style only changes its geometry. `second` selects the deliberate highlight
+ * part (chevron, tab, hub, hands, nib, tallest bar, inner ring, peak,
+ * meridian, inner square, play triangle, rules). Its colour is icon_accent for
+ * an ordinary icon, and the brighter of accent/icon_accent when the icon is
+ * active; a monochrome look comes from a theme whose two colours are equal (or
+ * that omits icon_accent, which defaults to accent), not from throwing the
+ * highlight away. */
+static u32 ic_col(const IconDraw *c, int second) {
+    return second ? c->hi : c->fg;
+}
+
+static float ic_radius(const IconDraw *c, float w, float h, float r) {
+    switch (c->style) {
+    case ICON_STYLE_ROUNDED: {
+        float m = w < h ? w : h;
+        return m * 0.35f;
+    }
+    case ICON_STYLE_SHARP:
+        return r > 1.0f ? 1.0f : r;
+    case ICON_STYLE_PIXEL:
+        return 0.0f;
+    default:
+        return r;
+    }
+}
+
+/* Snap to the pixel grid, measured from the icon's own origin so the grid is
+ * stable when the icon is drawn at different places. */
+static float ic_grid(const IconDraw *c, float v, float origin) {
+    if (c->style != ICON_STYLE_PIXEL) return v;
+    return origin + floorf((v - origin) / 3.0f + 0.5f) * 3.0f;
+}
+
+/* The one stroke width the outline style uses, and the pixel grid's stroke. */
+#define IC_STROKE 1.5f
+#define IC_PIXEL  3.0f
+
+static void ic_rect(IconDraw *c, float x, float y, float w, float h,
+                    float r, int second) {
+    if (c->style == ICON_STYLE_PIXEL) {
+        float xe = ic_grid(c, x + w, c->x);
+        float ye = ic_grid(c, y + h, c->y);
+        x = ic_grid(c, x, c->x);
+        y = ic_grid(c, y, c->y);
+        w = xe - x; h = ye - y;
+        if (w < IC_PIXEL) w = IC_PIXEL;
+        if (h < IC_PIXEL) h = IC_PIXEL;
+    }
+    float rr = ic_radius(c, w, h, r);
+    if (c->style == ICON_STYLE_OUTLINE)
+        gfx_rrect_aa(c->s, x, y, w, h, rr, 0, ic_col(c, second), IC_STROKE);
+    else
+        gfx_rrect(c->s, x, y, w, h, rr, ic_col(c, second));
+}
+
+/* A ring: the hollow shapes (clock face, globe, gear body, frames). */
+static void ic_ring(IconDraw *c, float cx, float cy, float rad,
+                    float width, int second) {
+    if (c->style == ICON_STYLE_PIXEL) {
+        cx = ic_grid(c, cx, c->x);
+        cy = ic_grid(c, cy, c->y);
+        rad = ic_grid(c, rad, 3.0f);
+        if (rad < IC_PIXEL) rad = IC_PIXEL;
+    }
+    float d = rad * 2.0f;
+    float rr = ic_radius(c, d, d, rad);
+    float w = (c->style == ICON_STYLE_OUTLINE) ? IC_STROKE : width;
+    if (c->style == ICON_STYLE_PIXEL) w = IC_PIXEL;
+    gfx_rrect_aa(c->s, cx - rad, cy - rad, d, d, rr, 0, ic_col(c, second), w);
+}
+
+/* A framed rectangle: the page/frame/panel shapes that are not circles. */
+static void ic_rect_ring(IconDraw *c, float x, float y, float w, float h,
+                         float r, float width, int second) {
+    if (c->style == ICON_STYLE_PIXEL) {
+        float xe = ic_grid(c, x + w, c->x);
+        float ye = ic_grid(c, y + h, c->y);
+        x = ic_grid(c, x, c->x);
+        y = ic_grid(c, y, c->y);
+        w = xe - x; h = ye - y;
+        if (w < IC_PIXEL) w = IC_PIXEL;
+        if (h < IC_PIXEL) h = IC_PIXEL;
+    }
+    float rr = ic_radius(c, w, h, r);
+    float wd = (c->style == ICON_STYLE_OUTLINE) ? IC_STROKE : width;
+    if (c->style == ICON_STYLE_PIXEL) wd = IC_PIXEL;
+    gfx_rrect_aa(c->s, x, y, w, h, rr, 0, ic_col(c, second), wd);
+}
+
+static void ic_disc(IconDraw *c, float cx, float cy, float rad, int second) {
+    if (c->style == ICON_STYLE_PIXEL) {
+        cx = ic_grid(c, cx, c->x);
+        cy = ic_grid(c, cy, c->y);
+        rad = ic_grid(c, rad, 3.0f);
+        if (rad < IC_PIXEL) rad = IC_PIXEL;
+    }
+    if (c->style == ICON_STYLE_OUTLINE) {
+        gfx_rrect_aa(c->s, cx - rad, cy - rad, rad * 2, rad * 2, rad,
+                     0, ic_col(c, second), IC_STROKE);
+    } else {
+        gfx_rrect(c->s, cx - rad, cy - rad, rad * 2, rad * 2, rad,
+                  ic_col(c, second));
+    }
+}
+
+static void ic_line(IconDraw *c, float x0, float y0, float x1, float y1,
+                    float width, int second) {
+    if (c->style == ICON_STYLE_PIXEL) {
+        x0 = ic_grid(c, x0, c->x); y0 = ic_grid(c, y0, c->y);
+        x1 = ic_grid(c, x1, c->x); y1 = ic_grid(c, y1, c->y);
+        width = IC_PIXEL;
+    } else if (c->style == ICON_STYLE_OUTLINE) {
+        width = IC_STROKE;
+    }
+    gfx_line(c->s, x0, y0, x1, y1, width, ic_col(c, second));
+}
+
+static void ic_poly(IconDraw *c, const float *pts, int n, int second) {
+    if (n < 3) return;
+    float tmp[24];
+    if (n > 12) n = 12;
+    if (c->style == ICON_STYLE_PIXEL) {
+        for (int i = 0; i < n; i++) {
+            tmp[i * 2]     = ic_grid(c, pts[i * 2], c->x);
+            tmp[i * 2 + 1] = ic_grid(c, pts[i * 2 + 1], c->y);
+        }
+        pts = tmp;
+    }
+    if (c->style == ICON_STYLE_OUTLINE) {
+        u32 col = ic_col(c, second);
+        for (int i = 0; i < n; i++) {
+            int j = (i + 1) % n;
+            gfx_line(c->s, pts[i * 2], pts[i * 2 + 1],
+                     pts[j * 2], pts[j * 2 + 1], IC_STROKE, col);
+        }
+    } else {
+        gfx_polygon(c->s, pts, n, ic_col(c, second));
+    }
+}
+
+/* Whether the desktop has to keep drawing because a theme-animated item is
+ * active. The three inputs are the only things allowed to open this gate: a
+ * hovered dock icon, a hovered launcher tile, and the launcher's keyboard
+ * selection (which marks a tile active without the pointer being on it).
+ * Nothing else belongs here. In particular the start button's eye is not an
+ * item: an earlier version let it hold the gate open for ANIM_ORBIT themes, so
+ * Aurora and Nebula repainted at 30 fps with the pointer nowhere near an item.
+ * A still theme (anim_speed = 0, anim_amp = 0 or anim = none) never gets past
+ * the first test, so an idle desktop asks for no frames at all. */
+static int anim_gate(AnimKind kind, float speed, float amp,
+                     int dock_item, int tile, int selected_tile) {
+    if (kind == ANIM_NONE || speed <= 0.0f || amp <= 0.0f) return 0;
+    return dock_item || tile || selected_tile;
+}
+
+/* ------------------------------------------------------------ the icons */
+
+static void icon_terminal(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                          const Theme *th, double now, int active) {
+    IconDraw c = icon_ctx(s, x, y, sz, fg, hi, th, now, active);
+    float pad = sz * 0.26f;
+    ic_line(&c, x + pad, y + pad * 1.2f, x + pad + sz * 0.18f, y + sz * 0.5f,
+            sz * 0.09f, 1);
+    ic_line(&c, x + pad + sz * 0.18f, y + sz * 0.5f, x + pad, y + sz - pad * 1.2f,
+            sz * 0.09f, 1);
+    ic_line(&c, x + sz * 0.48f, y + sz - pad, x + sz - pad, y + sz - pad,
+            sz * 0.09f, 0);
+}
+
+static void icon_folder(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                        const Theme *th, double now, int active) {
+    IconDraw c = icon_ctx(s, x, y, sz, fg, hi, th, now, active);
     float w = sz * 0.62f, h = sz * 0.44f;
     float bx = x + (sz - w) * 0.5f, by = y + (sz - h) * 0.5f + sz * 0.04f;
-    gfx_rrect(s, bx - sz * 0.02f, by - sz * 0.14f, w * 0.42f, sz * 0.12f, sz * 0.02f, fg);
-    gfx_rrect_aa(s, bx, by, w, h, sz * 0.06f, fg, 0, 0);
+    ic_rect(&c, bx - sz * 0.02f, by - sz * 0.14f, w * 0.42f, sz * 0.12f,
+            sz * 0.02f, 1);
+    ic_rect(&c, bx, by, w, h, sz * 0.06f, 0);
 }
 
-static void icon_gear(Surface *s, float x, float y, float sz, u32 fg) {
+static void icon_gear(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                      const Theme *th, double now, int active) {
+    IconDraw c = icon_ctx(s, x, y, sz, fg, hi, th, now, active);
     float cx = x + sz * 0.5f, cy = y + sz * 0.5f;
+    /* spin: every tooth is a quad, rotated together. The hub and the ring
+     * stand still, so the icon still reads as a gear. */
+    float spin = (c.anim == ANIM_SPIN && c.active)
+                     ? (float)c.now * c.speed * 1.2f * c.amp : 0.0f;
     for (int i = 0; i < 8; i++) {
-        float a = (float)i * 3.14159265f / 4.0f;
-        gfx_line(s, cx + cosf(a) * sz * 0.24f, cy + sinf(a) * sz * 0.24f,
-                    cx + cosf(a) * sz * 0.40f, cy + sinf(a) * sz * 0.40f, sz * 0.10f, fg);
+        float a = (float)i * 3.14159265f / 4.0f + spin;
+        float ca = cosf(a), sa = sinf(a);
+        float r0 = sz * 0.24f, r1 = sz * 0.40f, hw = sz * 0.055f;
+        float p0x = cx + ca * r0, p0y = cy + sa * r0;
+        float p1x = cx + ca * r1, p1y = cy + sa * r1;
+        float pts[8] = {
+            p0x + sa * hw, p0y - ca * hw,
+            p1x + sa * hw, p1y - ca * hw,
+            p1x - sa * hw, p1y + ca * hw,
+            p0x - sa * hw, p0y + ca * hw,
+        };
+        ic_poly(&c, pts, 4, 0);
     }
-    gfx_rrect_aa(s, cx - sz * 0.19f, cy - sz * 0.19f, sz * 0.38f, sz * 0.38f, sz * 0.19f, 0, fg, sz * 0.08f);
+    ic_ring(&c, cx, cy, sz * 0.19f, sz * 0.08f, 0);
+    ic_disc(&c, cx, cy, sz * 0.09f, 1);       /* hub: the second colour */
 }
 
-static void icon_clock(Surface *s, float x, float y, float sz, u32 fg) {
+static void icon_clock(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                       const Theme *th, double now, int active) {
+    IconDraw c = icon_ctx(s, x, y, sz, fg, hi, th, now, active);
     float cx = x + sz * 0.5f, cy = y + sz * 0.5f, r = sz * 0.36f;
-    gfx_rrect_aa(s, cx - r, cy - r, r * 2, r * 2, r, 0, fg, sz * 0.07f);
-    gfx_line(s, cx, cy, cx, cy - r * 0.62f, sz * 0.07f, fg);
-    gfx_line(s, cx, cy, cx + r * 0.52f, cy + r * 0.18f, sz * 0.07f, fg);
+    ic_ring(&c, cx, cy, r, sz * 0.07f, 0);
+    ic_line(&c, cx, cy, cx, cy - r * 0.62f, sz * 0.07f, 1);
+    ic_line(&c, cx, cy, cx + r * 0.52f, cy + r * 0.18f, sz * 0.07f, 1);
 }
 
-static void icon_paint(Surface *s, float x, float y, float sz, u32 fg) {
+static void icon_paint(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                       const Theme *th, double now, int active) {
+    IconDraw c = icon_ctx(s, x, y, sz, fg, hi, th, now, active);
     float px = x + sz * 0.30f, py = y + sz * 0.72f;
-    gfx_line(s, px, py, x + sz * 0.74f, y + sz * 0.26f, sz * 0.13f, fg);
-    gfx_rrect_aa(s, x + sz * 0.18f, y + sz * 0.62f, sz * 0.16f, sz * 0.16f, sz * 0.08f, fg, 0, 0);
+    ic_line(&c, px, py, x + sz * 0.74f, y + sz * 0.26f, sz * 0.13f, 0);
+    ic_disc(&c, x + sz * 0.26f, y + sz * 0.70f, sz * 0.08f, 1);
 }
 
-static void icon_life(Surface *s, float x, float y, float sz, u32 fg) {
-    float c = sz * 0.11f, g = sz * 0.17f;
-    float ox = x + (sz - (2 * g + c)) / 2, oy = y + (sz - (2 * g + c)) / 2;
+static void icon_life(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                      const Theme *th, double now, int active) {
+    IconDraw c = icon_ctx(s, x, y, sz, fg, hi, th, now, active);
+    float q = sz * 0.11f, g = sz * 0.17f;
+    float ox = x + (sz - (2 * g + q)) / 2, oy = y + (sz - (2 * g + q)) / 2;
     for (int r = 0; r < 3; r++)
         for (int col = 0; col < 3; col++)
             if ((r * 3 + col) % 4 != 1)
-                gfx_rrect(s, ox + col * g, oy + r * g, c, c, c * 0.35f, fg);
+                ic_rect(&c, ox + col * g, oy + r * g, q, q, q * 0.35f, 0);
+    ic_rect(&c, ox + g, oy + g, q, q, q * 0.35f, 1);   /* the live cell */
 }
 
-static void icon_mandel(Surface *s, float x, float y, float sz, u32 fg) {
+static void icon_mandel(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                        const Theme *th, double now, int active) {
+    IconDraw c = icon_ctx(s, x, y, sz, fg, hi, th, now, active);
     float cx = x + sz * 0.42f, cy = y + sz * 0.5f;
     for (int i = 0; i < 3; i++) {
         float r = sz * (0.10f + i * 0.10f);
-        gfx_rrect_aa(s, cx - r, cy - r, r * 2, r * 2, r, 0, fg, sz * 0.055f);
+        ic_ring(&c, cx, cy, r, sz * 0.055f, i == 0 ? 1 : 0);
     }
-    gfx_rrect_aa(s, cx + sz * 0.22f, cy - sz * 0.06f, sz * 0.12f, sz * 0.12f, sz * 0.06f, fg, 0, 0);
+    ic_disc(&c, cx + sz * 0.28f, cy, sz * 0.06f, 0);
 }
 
-static void icon_sysmon(Surface *s, float x, float y, float sz, u32 fg) {
-    gfx_line(s, x + sz * 0.18f, y + sz * 0.66f, x + sz * 0.36f, y + sz * 0.42f, sz * 0.07f, fg);
-    gfx_line(s, x + sz * 0.36f, y + sz * 0.42f, x + sz * 0.54f, y + sz * 0.56f, sz * 0.07f, fg);
-    gfx_line(s, x + sz * 0.54f, y + sz * 0.56f, x + sz * 0.82f, y + sz * 0.30f, sz * 0.07f, fg);
+static void icon_sysmon(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                        const Theme *th, double now, int active) {
+    IconDraw c = icon_ctx(s, x, y, sz, fg, hi, th, now, active);
+    ic_line(&c, x + sz * 0.18f, y + sz * 0.66f, x + sz * 0.36f, y + sz * 0.42f,
+            sz * 0.07f, 0);
+    ic_line(&c, x + sz * 0.36f, y + sz * 0.42f, x + sz * 0.54f, y + sz * 0.56f,
+            sz * 0.07f, 0);
+    ic_line(&c, x + sz * 0.54f, y + sz * 0.56f, x + sz * 0.82f, y + sz * 0.30f,
+            sz * 0.07f, 1);                        /* the peak */
 }
 
-static void icon_calc(Surface *s, float x, float y, float sz, u32 fg) {
-    gfx_rrect_aa(s, x + sz * 0.18f, y + sz * 0.10f, sz * 0.64f, sz * 0.80f, sz * 0.10f,
-                 0, fg, sz * 0.055f);
-    gfx_rrect(s, x + sz * 0.27f, y + sz * 0.19f, sz * 0.46f, sz * 0.16f, sz * 0.03f, fg);
+static void icon_calc(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                      const Theme *th, double now, int active) {
+    IconDraw c = icon_ctx(s, x, y, sz, fg, hi, th, now, active);
+    ic_rect_ring(&c, x + sz * 0.18f, y + sz * 0.10f, sz * 0.64f, sz * 0.80f,
+                 sz * 0.10f, sz * 0.055f, 0);
+    ic_rect(&c, x + sz * 0.27f, y + sz * 0.19f, sz * 0.46f, sz * 0.16f,
+            sz * 0.03f, 1);
     for (int r = 0; r < 3; r++)
-        for (int c = 0; c < 3; c++)
-            gfx_rrect(s, x + sz * (0.27f + c * 0.17f), y + sz * (0.44f + r * 0.15f),
-                      sz * 0.11f, sz * 0.10f, sz * 0.02f, fg);
+        for (int q = 0; q < 3; q++)
+            ic_rect(&c, x + sz * (0.27f + q * 0.17f),
+                    y + sz * (0.44f + r * 0.15f), sz * 0.11f, sz * 0.10f,
+                    sz * 0.02f, 0);
 }
 
-static void icon_grid(Surface *s, float x, float y, float sz, u32 fg) {
+static void icon_grid(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                      const Theme *th, double now, int active) {
+    IconDraw c = icon_ctx(s, x, y, sz, fg, hi, th, now, active);
     float q = sz * 0.30f, gap = sz * 0.12f;
     float ox = x + (sz - 2 * q - gap) / 2, oy = y + (sz - 2 * q - gap) / 2;
     for (int r = 0; r < 2; r++)
-        for (int c = 0; c < 2; c++)
-            gfx_rrect(s, ox + c * (q + gap), oy + r * (q + gap), q, q, q * 0.22f, fg);
+        for (int col = 0; col < 2; col++)
+            ic_rect(&c, ox + col * (q + gap), oy + r * (q + gap), q, q,
+                    q * 0.22f, (r == 0 && col == 0) ? 1 : 0);
 }
 
 /* A page with a picture on it: the Viewer opens images and text. */
-static void icon_viewer(Surface *s, float x, float y, float sz, u32 fg) {
-    gfx_rrect_aa(s, x + sz * 0.16f, y + sz * 0.10f, sz * 0.68f, sz * 0.80f, sz * 0.08f,
-                 0, fg, sz * 0.055f);
-    gfx_rrect(s, x + sz * 0.26f, y + sz * 0.20f, sz * 0.48f, sz * 0.34f, sz * 0.04f, fg);
-    gfx_rrect(s, x + sz * 0.26f, y + sz * 0.62f, sz * 0.48f, sz * 0.06f, sz * 0.02f, fg);
-    gfx_rrect(s, x + sz * 0.26f, y + sz * 0.72f, sz * 0.32f, sz * 0.06f, sz * 0.02f, fg);
+static void icon_viewer(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                        const Theme *th, double now, int active) {
+    IconDraw c = icon_ctx(s, x, y, sz, fg, hi, th, now, active);
+    ic_rect_ring(&c, x + sz * 0.16f, y + sz * 0.10f, sz * 0.68f, sz * 0.80f,
+                 sz * 0.08f, sz * 0.055f, 0);
+    ic_rect(&c, x + sz * 0.26f, y + sz * 0.20f, sz * 0.48f, sz * 0.34f,
+            sz * 0.04f, 1);
+    ic_rect(&c, x + sz * 0.26f, y + sz * 0.62f, sz * 0.48f, sz * 0.06f,
+            sz * 0.02f, 0);
+    ic_rect(&c, x + sz * 0.26f, y + sz * 0.72f, sz * 0.32f, sz * 0.06f,
+            sz * 0.02f, 0);
 }
 
 /* A document with a folded corner: the Documents app. */
-static void icon_docview(Surface *s, float x, float y, float sz, u32 fg) {
-    gfx_rrect_aa(s, x + sz * 0.18f, y + sz * 0.10f, sz * 0.60f, sz * 0.80f, sz * 0.07f,
-                 0, fg, sz * 0.055f);
-    /* the fold: a line across the top-right corner */
-    gfx_line(s, x + sz * 0.56f, y + sz * 0.10f, x + sz * 0.78f, y + sz * 0.32f,
-             sz * 0.055f, fg);
+static void icon_docview(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                         const Theme *th, double now, int active) {
+    IconDraw c = icon_ctx(s, x, y, sz, fg, hi, th, now, active);
+    ic_rect_ring(&c, x + sz * 0.18f, y + sz * 0.10f, sz * 0.60f, sz * 0.80f,
+                 sz * 0.07f, sz * 0.055f, 0);
+    ic_line(&c, x + sz * 0.56f, y + sz * 0.10f, x + sz * 0.78f, y + sz * 0.32f,
+            sz * 0.055f, 0);
     for (int i = 0; i < 3; i++)
-        gfx_rrect(s, x + sz * 0.28f, y + sz * (0.50f + (float)i * 0.12f),
-                  sz * (0.36f - (float)i * 0.06f), sz * 0.05f, sz * 0.02f, fg);
+        ic_rect(&c, x + sz * 0.28f, y + sz * (0.50f + (float)i * 0.12f),
+                sz * (0.36f - (float)i * 0.06f), sz * 0.05f, sz * 0.02f, 1);
 }
 
 /* A play triangle in a disc: the video player. */
-static void icon_player(Surface *s, float x, float y, float sz, u32 fg) {
+static void icon_player(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                        const Theme *th, double now, int active) {
+    IconDraw c = icon_ctx(s, x, y, sz, fg, hi, th, now, active);
     float cx = x + sz * 0.5f, cy = y + sz * 0.5f, r = sz * 0.34f;
-    gfx_rrect_aa(s, cx - r, cy - r, r * 2, r * 2, r, 0, fg, sz * 0.06f);
+    ic_ring(&c, cx, cy, r, sz * 0.06f, 0);
     float tri[6] = { cx - r * 0.28f, cy - r * 0.44f,
                      cx + r * 0.46f, cy,
                      cx - r * 0.28f, cy + r * 0.44f };
-    gfx_polygon(s, tri, 3, fg);
+    ic_poly(&c, tri, 3, 1);
 }
 
-static void icon_web(Surface *s, float x, float y, float sz, u32 fg) {
+static void icon_web(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                     const Theme *th, double now, int active) {
+    IconDraw c = icon_ctx(s, x, y, sz, fg, hi, th, now, active);
     float cx = x + sz * 0.5f, cy = y + sz * 0.5f, r = sz * 0.36f;
-    gfx_rrect_aa(s, cx - r, cy - r, r * 2, r * 2, r, 0, fg, sz * 0.065f);
-    gfx_line(s, cx - r, cy, cx + r, cy, sz * 0.055f, fg);          /* equator */
-    gfx_line(s, cx, cy - r, cx, cy + r, sz * 0.055f, fg);          /* meridian */
-    gfx_line(s, cx - r * 0.62f, cy - r * 0.72f, cx + r * 0.62f, cy - r * 0.72f, sz * 0.05f, fg);
-    gfx_line(s, cx - r * 0.62f, cy + r * 0.72f, cx + r * 0.62f, cy + r * 0.72f, sz * 0.05f, fg);
+    ic_ring(&c, cx, cy, r, sz * 0.065f, 0);
+    ic_line(&c, cx - r, cy, cx + r, cy, sz * 0.055f, 0);          /* equator */
+    ic_line(&c, cx, cy - r, cx, cy + r, sz * 0.055f, 1);          /* meridian */
+    ic_line(&c, cx - r * 0.62f, cy - r * 0.72f,
+            cx + r * 0.62f, cy - r * 0.72f, sz * 0.05f, 0);
+    ic_line(&c, cx - r * 0.62f, cy + r * 0.72f,
+            cx + r * 0.62f, cy + r * 0.72f, sz * 0.05f, 0);
 }
 
-static void icon_sysinfo(Surface *s, float x, float y, float sz, u32 fg) {
+static void icon_sysinfo(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                         const Theme *th, double now, int active) {
+    IconDraw c = icon_ctx(s, x, y, sz, fg, hi, th, now, active);
     /* an info "i" in a rounded panel: the System app is a read-out, not a gear */
-    gfx_rrect_aa(s, x + sz * 0.18f, y + sz * 0.12f, sz * 0.64f, sz * 0.76f, sz * 0.10f,
-                 0, fg, sz * 0.055f);
+    ic_rect_ring(&c, x + sz * 0.18f, y + sz * 0.12f, sz * 0.64f, sz * 0.76f,
+                 sz * 0.10f, sz * 0.055f, 0);
     float cx = x + sz * 0.5f;
-    gfx_rrect(s, cx - sz * 0.035f, y + sz * 0.26f, sz * 0.07f, sz * 0.10f, sz * 0.02f, fg);
-    gfx_rrect(s, cx - sz * 0.035f, y + sz * 0.42f, sz * 0.07f, sz * 0.24f, sz * 0.02f, fg);
+    ic_rect(&c, cx - sz * 0.035f, y + sz * 0.26f, sz * 0.07f, sz * 0.10f,
+            sz * 0.02f, 1);
+    ic_rect(&c, cx - sz * 0.035f, y + sz * 0.42f, sz * 0.07f, sz * 0.24f,
+            sz * 0.02f, 1);
 }
 
-static void icon_2048(Surface *s, float x, float y, float sz, u32 fg) {
+static void icon_2048(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                      const Theme *th, double now, int active) {
+    IconDraw c = icon_ctx(s, x, y, sz, fg, hi, th, now, active);
     float q = sz * 0.27f;
-    float ox = x + (sz - 2 * q - sz * 0.10f) / 2, oy = y + (sz - 2 * q - sz * 0.10f) / 2;
-    gfx_rrect(s, ox, oy, q, q, sz * 0.06f, fg);
-    gfx_rrect(s, ox + q + sz * 0.10f, oy, q, q, sz * 0.06f, fg);
-    gfx_rrect(s, ox, oy + q + sz * 0.10f, q, q, sz * 0.06f, fg);
-    gfx_rrect(s, ox + q + sz * 0.10f, oy + q + sz * 0.10f, q, q, sz * 0.06f, fg);
+    float ox = x + (sz - 2 * q - sz * 0.10f) / 2;
+    float oy = y + (sz - 2 * q - sz * 0.10f) / 2;
+    ic_rect(&c, ox, oy, q, q, sz * 0.06f, 1);
+    ic_rect(&c, ox + q + sz * 0.10f, oy, q, q, sz * 0.06f, 0);
+    ic_rect(&c, ox, oy + q + sz * 0.10f, q, q, sz * 0.06f, 0);
+    ic_rect(&c, ox + q + sz * 0.10f, oy + q + sz * 0.10f, q, q,
+            sz * 0.06f, 0);
 }
 
-static void icon_bars(Surface *s, float x, float y, float sz, u32 fg) {
+static void icon_bars(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                      const Theme *th, double now, int active) {
+    IconDraw c = icon_ctx(s, x, y, sz, fg, hi, th, now, active);
+    /* wave: three bars, each a step behind the previous one. The tallest is
+     * the second colour; the group never grows past the icon box. */
+    float phase = (c.anim == ANIM_WAVE && c.active)
+                      ? (float)c.now * c.speed * 6.2831853f * 0.6f : 0.0f;
     for (int i = 0; i < 3; i++) {
-        float hh = sz * (0.22f + i * 0.16f);
-        gfx_rrect(s, x + sz * (0.24f + i * 0.20f), y + sz - sz * 0.22f - hh, sz * 0.10f, hh, sz * 0.03f, fg);
+        float base = 0.22f + (float)i * 0.16f;
+        if (c.anim == ANIM_WAVE && c.active)
+            base += 0.08f * c.amp * sinf(phase + (float)i * 1.1f);
+        if (base < 0.08f) base = 0.08f;
+        if (base > 0.70f) base = 0.70f;
+        float hh = sz * base;
+        ic_rect(&c, x + sz * (0.24f + (float)i * 0.20f),
+                y + sz - sz * 0.22f - hh, sz * 0.10f, hh, sz * 0.03f,
+                i == 2 ? 1 : 0);
     }
 }
 
-static void icon_pencil(Surface *s, float x, float y, float sz, u32 fg) {
+static void icon_pencil(Surface *s, float x, float y, float sz, u32 fg, u32 hi,
+                        const Theme *th, double now, int active) {
+    IconDraw c = icon_ctx(s, x, y, sz, fg, hi, th, now, active);
     float pts[8] = {
         x + sz * 0.26f, y + sz * 0.74f,
         x + sz * 0.70f, y + sz * 0.30f,
         x + sz * 0.60f, y + sz * 0.20f,
         x + sz * 0.16f, y + sz * 0.64f,
     };
-    gfx_polygon(s, pts, 4, fg);
-    gfx_line(s, x + sz * 0.16f, y + sz * 0.64f, x + sz * 0.20f, y + sz * 0.80f, sz * 0.05f, fg);
+    ic_poly(&c, pts, 4, 0);
+    ic_line(&c, x + sz * 0.16f, y + sz * 0.64f,
+            x + sz * 0.20f, y + sz * 0.80f, sz * 0.05f, 1);   /* the nib */
 }
 
-typedef void (*IconFn)(Surface *, float, float, float, u32);
+/* ------------------------------------------------- animation dispatcher --
+ * Every animation is derived from the theme's anim kind. The ones that move an
+ * item act only on `active` (hovered dock icon, selected launcher tile); drift
+ * is a background decoration and has its own function below. Sizes only ever
+ * shrink, so nothing can leave its tile or hit box.
+ */
+static void icon_draw(IconFn fn, Surface *s, float x, float y, float sz,
+                      u32 fg, u32 hi, const Theme *th, double now, int active) {
+    if (!fn) return;
+    AnimKind kind = th ? th->anim : ANIM_NONE;
+    float amp = th ? th->anim_amp : 0.0f;
+    float speed = th ? th->anim_speed : 0.0f;
+    if (speed <= 0.0f || amp <= 0.0f) kind = ANIM_NONE;
+
+    /* The breathe is the one motion every moving theme has. It shrinks
+     * around the icon's centre, so it can never leave the tile or the dock
+     * hit box; anim_style adds an optional second motion on top. */
+    if (kind != ANIM_NONE && active) {
+        float scale = theme_icon_pulse_scale(th, now);
+        float ns = sz * scale;
+        x += (sz - ns) * 0.5f;
+        y += (sz - ns) * 0.5f;
+        sz = ns;
+    }
+    if (kind == ANIM_GLOW && active && th) {
+        float phase = (float)now * speed * 6.2831853f * 0.5f;
+        float r = sz * (0.62f + 0.12f * sinf(phase)) * (0.6f + 0.4f * amp);
+        gfx_glow(s, x + sz * 0.5f, y + sz * 0.5f, r,
+                 color_alpha(th->glow, 0.55f), 0.55f * amp);
+    }
+
+    fn(s, x, y, sz, fg, hi, th, now, active);
+
+    if (kind == ANIM_ORBIT && active) {
+        float a = (float)now * speed * 1.5f;
+        float rr = sz * 0.44f;
+        float dr = sz * 0.035f;
+        if (dr < 1.5f) dr = 1.5f;
+        gfx_rrect(s, x + sz * 0.5f + cosf(a) * rr - dr,
+                  y + sz * 0.5f + sinf(a) * rr - dr, dr * 2, dr * 2, dr, hi);
+    }
+}
+
+/* ANIM_DRIFT is the one kind that moves the background, never text or hit
+ * boxes: one soft light in the theme's glow colour wanders slowly. It is
+ * called with the desktop surface before any window is drawn. */
+static void anim_drift_backdrop(Surface *s, const Theme *th, double now) {
+    if (!s || !th || th->anim != ANIM_DRIFT ||
+        th->anim_speed <= 0.0f || th->anim_amp <= 0.0f) return;
+    float amp = th->anim_amp;
+    float t = (float)now * th->anim_speed;
+    float minw = (float)(s->w < s->h ? s->w : s->h);
+    float cx = (float)s->w * (0.5f + 0.30f * sinf(t * 0.11f));
+    float cy = (float)s->h * (0.5f + 0.26f * cosf(t * 0.09f));
+    float r = minw * (0.34f + 0.06f * sinf(t * 0.17f));
+    gfx_glow(s, cx, cy, r, color_alpha(th->glow, 0.4f), 0.55f * amp);
+}
+
+/* @icons-end */
 
 /* One table decides an app's icon, wherever it is drawn. There used to be a
  * second table here for the dock, and it disagreed: web and g2048 fell through
@@ -457,8 +893,9 @@ static void window_resized(Window *w) {
     if (!w || !w->used) return;
     int cw = w->w - 2;
     int chh = w->h - title_h() - 2;
-    if (cw < 40) cw = 40;
-    if (chh < 30) chh = 30;
+    /* the floor is a scaled metric like the minimums it protects */
+    if (cw < ui_px(29)) cw = ui_px(29);
+    if (chh < ui_px(21)) chh = ui_px(21);
     if (w->term) {
         term_resize_px(w->term, cw, chh);
     } else if (w->kind == WIN_CLIENT && w->client >= 0) {
@@ -466,6 +903,62 @@ static void window_resized(Window *w) {
     } else if (w->app && w->app->vt && w->app->vt->resize) {
         w->app->vt->resize(w->app, cw, chh);
     }
+}
+
+/* The display can change while the desktop runs: Settings asks the panel for
+ * another mode, and the design size for that panel can be different. The two
+ * compositor surfaces are reallocated here, the window server is told the new
+ * logical screen, and every window is pulled back inside it. Returns 1 when
+ * the size actually changed, so the caller only asks for a repaint then. */
+static int desktop_reflow(int w, int h) {
+    if (w < 1 || h < 1) return 0;
+    if (w == screen.w && h == screen.h) return 0;
+    if (!screen.px || !scene.px) return 0;
+
+    u32 *np = calloc((size_t)w * (size_t)h, sizeof(u32));
+    u32 *ns = calloc((size_t)w * (size_t)h, sizeof(u32));
+    if (!np || !ns) {
+        free(np);
+        free(ns);
+        fprintf(stderr, "display: out of memory for a %dx%d surface\n", w, h);
+        return 0;
+    }
+    free(screen.px);
+    free(scene.px);
+    screen.px = np; screen.w = w; screen.h = h; screen.stride = w;
+    scene = screen; scene.px = ns;
+
+    wms_set_screen(w, h);
+
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        Window *win = &wins[i];
+        if (!win->used) continue;
+        if (win->maxed == 2) {              /* a full-screen window follows */
+            win->x = 0;
+            win->y = topbar_h();
+            win->w = w;
+            win->h = h - topbar_h();
+            if (win->h < ui_win_min_h()) win->h = h;
+        } else {
+            int minw = ui_win_min_w(), minh = ui_win_min_h();
+            if (win->w < minw) win->w = minw;
+            if (win->h < minh) win->h = minh;
+            if (win->w > w) win->w = w;
+            if (win->h > h) win->h = h;
+            if (win->x < 0) win->x = 0;
+            if (win->y < 0) win->y = 0;
+            if (win->x + win->w > w) win->x = w - win->w;
+            if (win->y + win->h > h) win->y = h - win->h;
+        }
+        window_resized(win);
+    }
+    dock_pct = 100;
+    dirty = 1;
+    /* the inverse mapper reads these even before the next present() */
+    disp.src_w = w;
+    disp.src_h = h;
+    fprintf(stderr, "display: logical surface %dx%d\n", w, h);
+    return 1;
 }
 
 /* F9: a drag stores a slot index, and slots are reused. win_reset bumps the
@@ -481,7 +974,8 @@ static void win_reset(Window *w) {
  * ext4 disk so it survives a reboot; stage/init:restore_settings copies them
  * back at boot. Failure here is not fatal (a read-only disk still runs). */
 static void persist_settings(void) {
-    static const char *names[] = { "ui.conf", "wallpaper", "current-theme" };
+    static const char *names[] = { "ui.conf", "wallpaper", "current-theme",
+                                   "display.conf" };
     for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         char src[128], dst[128], buf[512];
         snprintf(src, sizeof(src), "/etc/mystic/%s", names[i]);
@@ -573,16 +1067,29 @@ static Window *win_open(int kind, const char *app_id) {
 
         if (kind == WIN_TERM) {
             w->w = ui_px(640); w->h = ui_px(380);
-            w->x = 60 + (i % 3) * 40;
-            w->y = 70 + (i % 3) * 40;
+            /* 640x380 design px is 832x494 at 1.0 and 1434x851 at 1.6: the
+             * largest text scale no longer fits it on an 800x1280 screen, so
+             * the same screen clamps the app windows get apply here too. */
+            if (w->w > screen.w - ui_px(40)) w->w = screen.w - ui_px(40);
+            {
+                int tmax = screen.h - topbar_h() - ui_px(90);
+                if (w->h > tmax) w->h = tmax;
+                if (w->h < ui_win_min_h()) w->h = ui_win_min_h();
+            }
+            w->x = ui_px(43) + (i % 3) * ui_px(29);
+            w->y = ui_px(50) + (i % 3) * ui_px(29);
             w->term_size = 12;          /* Ctrl+Shift+= / - change it later */
             Font *fmc = font_get(FONT_MONO, w->term_size);
             float cw = font_width(fmc, "M");
             float ch = font_height(fmc);
             if (cw < 4.0f) cw = 4.0f;
             if (ch < 8.0f) ch = 8.0f;
-            int cols = (int)((w->w - 24) / cw);
-            int rows = (int)((w->h - 56) / ch);
+            /* the grid the terminal will actually be drawn into: the window
+             * minus its frame and title bar, not a guessed 24/56 px */
+            int cols = (w->w - 2) / (int)cw;
+            int rows = (w->h - title_h() - 2) / (int)ch;
+            if (cols < 1) cols = 1;
+            if (rows < 1) rows = 1;
             w->term = term_create(cols, rows, "/bin/sh");
             snprintf(w->title, sizeof(w->title), "Terminal");
             if (!w->term) { win_reset(w); return NULL; }
@@ -590,7 +1097,7 @@ static Window *win_open(int kind, const char *app_id) {
             /* The calculator is portrait: the owner asked for it to grow
              * downwards rather than sideways, so it opens tall and narrow.
              * Every other app keeps the wide default. The height is clamped to
-             * the screen because ui_px(520) is 832 px at the largest text
+             * the screen because ui_px(520) is 1165 px at the largest text
              * scale, which would push the title bar above the top edge. */
             if (app_id && !strcmp(app_id, "calc")) {
                 w->w = ui_px(300);
@@ -600,19 +1107,23 @@ static Window *win_open(int kind, const char *app_id) {
                 w->h = ui_px(360);
             }
             {
-                int maxh = disp.h - topbar_h() - ui_px(90);
+                int maxh = screen.h - topbar_h() - ui_px(90);
                 if (w->h > maxh) w->h = maxh;
-                if (w->h < ui_px(240)) w->h = ui_px(240);
-                if (w->w > disp.w - ui_px(40)) w->w = disp.w - ui_px(40);
+                if (w->h < ui_win_min_h()) w->h = ui_win_min_h();
+                if (w->w > screen.w - ui_px(40)) w->w = screen.w - ui_px(40);
+                if (w->w < ui_win_min_w()) w->w = ui_win_min_w();
             }
-            w->x = 140 + (i % 3) * 40;
-            w->y = 110 + (i % 3) * 40;
-            w->app = app_new(app_id, w->w - 2, w->h - 40 - 2);
+            w->x = ui_px(100) + (i % 3) * ui_px(29);
+            w->y = ui_px(79) + (i % 3) * ui_px(29);
+            /* the app is handed its CONTENT box: the frame and the title bar
+             * were a hardcoded 40, which is 26 px wrong at the largest text
+             * scale - the app drew its last row underneath the title bar */
+            w->app = app_new(app_id, w->w - 2, w->h - title_h() - 2);
             if (!w->app) { win_reset(w); return NULL; }
             snprintf(w->title, sizeof(w->title), "%s", app_title(w->app));
         }
-        if (w->x + w->w > disp.w) w->x = disp.w - w->w - 20;
-        if (w->y + w->h > disp.h) w->y = disp.h - w->h - 90;
+        if (w->x + w->w > screen.w) w->x = screen.w - w->w - ui_px(14);
+        if (w->y + w->h > screen.h) w->y = screen.h - w->h - ui_px(64);
         return w;
     }
     return NULL;
@@ -642,17 +1153,31 @@ static int dock_rect(int *dx, int *dy, int *dw, int *dh) {
     dock_pct = 100;
     int isz = dock_isz(), gap = dock_gap();
     int w = n * isz + (n - 1) * gap + pad * 2;
-    while (w > disp.w - 8 && dock_pct > 40) {      /* shrink until it fits */
+    while (w > screen.w - ui_px(6) && dock_pct > 40) {   /* shrink until it fits */
         dock_pct -= 5;
         isz = dock_isz(); gap = dock_gap();
         w = n * isz + (n - 1) * gap + pad * 2;
     }
     int h = isz + pad * 2;
     *dw = w; *dh = h;
-    *dx = (disp.w - w) / 2;
-    if (*dx < 4) *dx = 4;
-    *dy = disp.h - h - 22;
+    *dx = (screen.w - w) / 2;
+    if (*dx < ui_px(3)) *dx = ui_px(3);
+    /* the bar's own gap from the bottom edge of the screen */
+    *dy = screen.h - h - ui_px(16);
     return 1;
+}
+
+/* True over the top bar or the dock: the two bands that are not wallpaper.
+ * The Black Hole's drag and wheel knobs only apply on the wallpaper itself,
+ * so a press on the dock (between its icons) does not start a camera drag. */
+static int over_dock(int mx, int my) {
+    int dx, dy, dw, dh;
+    if (!dock_rect(&dx, &dy, &dw, &dh)) return 0;
+    return mx >= dx && mx < dx + dw && my >= dy && my < dy + dh;
+}
+
+static int over_chrome_at(int mx, int my) {
+    return my < topbar_h() || over_dock(mx, my);
 }
 
 static void draw_launcher(Surface *s, const Theme *th);
@@ -666,6 +1191,8 @@ static void draw_lock_screen(Surface *s, const Theme *th);
  * and opens in 170 ms, which is roughly how a human eye does it.
  *
  * Everything is drawn from geometry: no glyph, no image, crisp at any size.
+ * The mark keeps its designed size (a logo is not text) and is centred on the
+ * bar, which is what keeps it on the bar when the bar grows.
  */
 #define EYE_CX   19
 #define EYE_CY   17
@@ -675,6 +1202,9 @@ static void draw_lock_screen(Surface *s, const Theme *th);
 #define EYE_HIT_Y 3
 #define EYE_HIT_W 30
 #define EYE_HIT_H 28
+
+/* how far the whole mark is shifted down to sit on the middle of the bar */
+static int eye_oy(void) { return (topbar_h() - EYE_HIT_H) / 2 - EYE_HIT_Y; }
 
 static double blink_t0 = -1.0;      /* monotonic seconds, -1 = not blinking */
 
@@ -706,9 +1236,9 @@ static void blend_px(Surface *s, int x, int y, u32 color, float a) {
        |  (u32)(GET_B(color) * a + GET_B(d) * inv);
 }
 
-static void draw_eye(Surface *s, const Theme *th, float open) {
+static void draw_eye(Surface *s, const Theme *th, float open, int oy) {
     int hover = (input.mouse_x >= EYE_HIT_X && input.mouse_x < EYE_HIT_X + EYE_HIT_W &&
-                 input.mouse_y >= EYE_HIT_Y && input.mouse_y < EYE_HIT_Y + EYE_HIT_H);
+                 input.mouse_y >= EYE_HIT_Y + oy && input.mouse_y < EYE_HIT_Y + oy + EYE_HIT_H);
     int active = hover || launcher_open;
 
     u32 ring  = active ? th->accent : color_mix(th->bg_bottom, 0xFF000000u, 0.55f);
@@ -742,24 +1272,24 @@ static void draw_eye(Surface *s, const Theme *th, float open) {
             if (lens > 1.0f) lens = 1.0f;
 
             /* the white of the eye */
-            blend_px(s, x, y, sclera, lens * 0.97f);
+            blend_px(s, x, y + oy, sclera, lens * 0.97f);
 
             /* iris, then pupil, then a highlight - all clipped by the lid */
             float ic = disc_cov(px, py, iris_r);
-            if (ic > 0.0f) blend_px(s, x, y, iris, ic * lens);
+            if (ic > 0.0f) blend_px(s, x, y + oy, iris, ic * lens);
 
             float pc = disc_cov(px, py, iris_r * 0.58f);
-            if (pc > 0.0f) blend_px(s, x, y, pupil, pc * lens);
+            if (pc > 0.0f) blend_px(s, x, y + oy, pupil, pc * lens);
 
             float hx = px + iris_r * 0.36f, hy = py + iris_r * 0.40f;
             float hc = disc_cov(hx, hy, iris_r * 0.19f);
-            if (hc > 0.0f) blend_px(s, x, y, 0xFFFFFFFFu, hc * lens * 0.95f);
+            if (hc > 0.0f) blend_px(s, x, y + oy, 0xFFFFFFFFu, hc * lens * 0.95f);
 
             /* lid outline: only where the lens coverage is partial, i.e. the
              * boundary. (Using 1-lens here paints the whole interior - that
              * mistake turned the eye into a black blob.) */
             if (lens < 0.58f)
-                blend_px(s, x, y, ring, (0.58f - lens) * 2.0f);
+                blend_px(s, x, y + oy, ring, (0.58f - lens) * 2.0f);
         }
     }
 }
@@ -779,7 +1309,14 @@ static void draw_start_button(Surface *s, const Theme *th) {
             open = 1.0f;
         }
     }
-    draw_eye(s, th, open);
+    draw_eye(s, th, open, eye_oy());
+
+    /* The eye does not animate on its own and nothing orbits it. It used to
+     * grow a dot for ANIM_ORBIT themes while hovered or with the launcher up,
+     * which forced a repaint every 33 ms on an otherwise idle desktop and made
+     * the start button the only animated thing on screen. Orbit belongs to the
+     * active dock/launcher icon (icon_draw draws it there); the eye blinks on
+     * a press and is still otherwise. */
 }
 
 /* ------------------------------------------------------------ compose */
@@ -867,6 +1404,10 @@ static void draw_desktop(Surface *s, const Theme *th) {
         }
     }
 
+    /* ANIM_DRIFT is background decoration: one soft light wandering behind
+     * the windows, before any text or hit box exists. */
+    anim_drift_backdrop(s, th, now_sec());
+
     /* ---------------- top bar ---------------- */
     const int bar = topbar_h();
     if (th->blur > 0) gfx_blur_region(s, 0, 0, W, bar, (int)(18 * th->blur));
@@ -883,19 +1424,21 @@ static void draw_desktop(Surface *s, const Theme *th) {
 
     draw_start_button(s, th);
     float brand_w = font_width(f13, "Mystic");
-    font_draw(s, f13, 46, y13, "Mystic", th->text);
+    font_draw(s, f13, (float)ui_px(33), y13, "Mystic", th->text);
 
     char right[128];
     char clock[16];
     clock_text(clock, sizeof(clock));
-    long mem = mem_field("MemTotal:");
-    long avail = mem_field("MemAvailable:");
+    long mem, avail;
+    mem_sample();
+    mem = mem_total_kb;
+    avail = mem_avail_kb;
     long used = mem - avail;
     if (used < 0) used = 0;
     snprintf(right, sizeof(right), "%s%s      %ld MB used of %ld MB",
              dnd_on ? "DND  \xC2\xB7  " : "", clock, used / 1024, mem / 1024);
     float rw = font_width(f11, right);
-    font_draw(s, f11, (float)W - rw - 16, y11, right, th->text_dim);
+    font_draw(s, f11, (float)W - rw - (float)ui_px(11), y11, right, th->text_dim);
 
     Window *top = win_focused();
     if (top) {
@@ -904,9 +1447,9 @@ static void draw_desktop(Surface *s, const Theme *th) {
          * title on the screen centre; on a narrow screen at a large scale the
          * band is lopsided, so use what is left rather than draw nothing.
          * Before this a long title painted straight over both. */
-        const float pad = 12.0f;
-        float band_lo = 46.0f + brand_w + pad;
-        float band_hi = (float)W - rw - 16.0f - pad;
+        const float pad = (float)ui_px(9);
+        float band_lo = (float)ui_px(33) + brand_w + pad;
+        float band_hi = (float)W - rw - (float)ui_px(11) - pad;
         float mid = (float)W * 0.5f;
         float half = mid - band_lo;
         if (band_hi - mid < half) half = band_hi - mid;
@@ -935,7 +1478,9 @@ static void draw_desktop(Surface *s, const Theme *th) {
         last_rank = win_rank(cur);
 
         float cx = th->corner;
-        gfx_shadow(s, (float)cur->x, (float)cur->y, (float)cur->w, (float)cur->h, cx, 24, 0.5f);
+        /* The window body below is opaque, so the shadow under it is
+         * invisible: gfx_shadow_solid skips that interior (F20). */
+        gfx_shadow_solid(s, (float)cur->x, (float)cur->y, (float)cur->w, (float)cur->h, cx, 24, 0.5f);
         /* No per-window backdrop blur: the window body is opaque (theme.c
          * forces the alpha off), so blurring what is underneath could never be
          * seen. It was 1.0-4.3 ms of dead work per window. */
@@ -950,11 +1495,12 @@ static void draw_desktop(Surface *s, const Theme *th) {
          * centre as the title and the click targets (traffic_y) instead of a
          * fixed y+15 that fell out of the bar as it grew. */
         const int dot_y = traffic_y(tb);
-        gfx_rrect_aa(s, (float)cur->x + 14, (float)cur->y + dot_y, DOT_SZ, DOT_SZ, DOT_SZ * 0.5f,
+        const float dsz = (float)dot_sz();
+        gfx_rrect_aa(s, (float)(cur->x + dot_x(0)), (float)cur->y + dot_y, dsz, dsz, dsz * 0.5f,
                      0xFFFF5F57u, 0, 0);
-        gfx_rrect_aa(s, (float)cur->x + 32, (float)cur->y + dot_y, DOT_SZ, DOT_SZ, DOT_SZ * 0.5f,
+        gfx_rrect_aa(s, (float)(cur->x + dot_x(1)), (float)cur->y + dot_y, dsz, dsz, dsz * 0.5f,
                      0xFFFEBC2Eu, 0, 0);
-        gfx_rrect_aa(s, (float)cur->x + 50, (float)cur->y + dot_y, DOT_SZ, DOT_SZ, DOT_SZ * 0.5f,
+        gfx_rrect_aa(s, (float)(cur->x + dot_x(2)), (float)cur->y + dot_y, dsz, dsz, dsz * 0.5f,
                      0xFF28C840u, 0, 0);
 
         /* F10: a title wider than the bar was painted outside the window, over
@@ -962,9 +1508,10 @@ static void draw_desktop(Surface *s, const Theme *th) {
          * F12: centre it on the bar from the real font height. */
         {
             char shown[96];
+            const int tx0 = title_x();
             text_fit(f13, cur->title, shown, sizeof(shown),
-                     (float)cur->w - 72.0f - 12.0f);
-            font_draw(s, f13, (float)cur->x + 72,
+                     (float)cur->w - (float)tx0 - (float)ui_px(9));
+            font_draw(s, f13, (float)cur->x + tx0,
                       (float)cur->y + ((float)tb - font_height(f13)) * 0.5f,
                       shown, th->text);
         }
@@ -1048,7 +1595,10 @@ static void draw_desktop(Surface *s, const Theme *th) {
             const int isz = dock_isz(), gap = dock_gap(), pad = dock_pad();
             int n = taskbar_count();
             Window *focused = win_focused();
-            int near_bar = (input.mouse_y > dy - 110 && input.mouse_y < dy + dh + 20);
+            /* the magnify neighbourhood is a distance, so it scales too;
+             * the Gaussian radius below is the same unit (44 design px) */
+            int near_bar = (input.mouse_y > dy - ui_px(79) &&
+                            input.mouse_y < dy + dh + ui_px(14));
 
             for (int i = 0; i < n; i++) {
                 Window *w = taskbar_at(i);
@@ -1062,39 +1612,69 @@ static void draw_desktop(Surface *s, const Theme *th) {
                 float scale = 1.0f;
                 if (near_bar) {
                     float d = (float)input.mouse_x - cx0;
-                    float t = d / 62.0f;
+                    float t = d / (float)ui_px(44);
                     scale = 1.0f + 0.45f * expf(-t * t * 0.5f);
                 }
-                float sz = isz * scale;
-                float ix = cx0 - sz * 0.5f;
-                float iy = by + (isz - sz) * 0.55f;
-
                 int hovered = (input.mouse_x >= bx && input.mouse_x < bx + isz &&
                                input.mouse_y >= dy && input.mouse_y < dy + dh);
                 int is_focus = (w == focused);
+                /* The tile keeps the magnified size; the icon inside it is
+                 * what the theme animates, so a pulse can only shrink and
+                 * never leave the tile (icon_draw applies it, centred). */
+                float sz = isz * scale;
+                float ix = cx0 - sz * 0.5f;
+                float iy = by + (isz - sz) * 0.55f;
                 u32 bg = is_focus ? color_alpha(th->accent, 0.28f)
                                   : (hovered ? color_alpha(th->accent, 0.18f)
                                              : color_alpha(th->text, 0.07f));
                 gfx_rrect_aa(s, ix, iy, sz, sz, 11.0f * scale, bg, 0, 0);
 
                 IconFn fn = icon_for_window(w);
-                u32 fg = w->hidden ? color_alpha(th->text, 0.45f)
-                                   : (is_focus || hovered ? th->accent : th->text);
-                fn(s, ix, iy, sz, fg);
+                /* Two colours in every state. Hidden windows are faded as a
+                 * pair; an ordinary icon keeps `text` as the body; a focused
+                 * or hovered one is drawn in the theme's two icon colours,
+                 * with the dimmer as the body and the brighter as the
+                 * highlight (theme_icon_pair), so the active icon is never a
+                 * one-colour silhouette again. */
+                u32 fg, hi;
+                if (w->hidden) {
+                    fg = color_alpha(th->text, 0.45f);
+                    hi = color_alpha(th->icon_accent, 0.45f);
+                } else {
+                    IconPair pair = theme_icon_pair(th, th->text,
+                                                    is_focus || hovered);
+                    fg = pair.body;
+                    hi = pair.hi;
+                }
+                icon_draw(fn, s, ix, iy, sz, fg, hi, th, now_sec(), hovered);
 
                 if (is_focus)
                     gfx_rrect_aa(s, cx0 - 7, (float)(dy + dh) - 5, 14, 3, 1.5f, th->accent, 0, 0);
 
                 if (hovered) {
+                    /* The hover label is a text box, so it is measured from
+                     * its own line: the old fixed 19 px pill held a 21.7 px
+                     * line at the shipped size and overflowed it. */
                     Font *ft = font_get(FONT_MEDIUM, 11);
-                    float lw = font_width(ft, w->title);
-                    float tx = cx0 - lw / 2 - 7;
-                    float ty = (float)dy - 26;
-                    if (tx < 4) tx = 4;
-                    if (tx + lw + 14 > (float)s->w) tx = (float)s->w - lw - 18;
-                    gfx_rrect_aa(s, tx, ty, lw + 14, 19, 9,
+                    const int tiph = ui_tip_h();
+                    const float tpad = (float)ui_px(5);
+                    char shown[64];
+                    text_fit(ft, w->title, shown, sizeof(shown),
+                             (float)s->w - 2.0f * tpad - (float)ui_px(8));
+                    float lw = font_width(ft, shown);
+                    float tx = cx0 - lw / 2.0f - tpad;
+                    float ty = (float)dy - (float)tiph - (float)ui_px(5);
+                    if (tx < (float)ui_px(3)) tx = (float)ui_px(3);
+                    if (tx + lw + 2.0f * tpad > (float)s->w - (float)ui_px(3))
+                        tx = (float)s->w - lw - 2.0f * tpad - (float)ui_px(3);
+                    if (ty < (float)topbar_h() + (float)ui_px(2))
+                        ty = (float)topbar_h() + (float)ui_px(2);
+                    gfx_rrect_aa(s, tx, ty, lw + 2.0f * tpad, (float)tiph,
+                                 (float)tiph * 0.5f,
                                  color_alpha(th->window_bg, 0.96f), th->panel_border, 1.0f);
-                    font_draw(s, ft, tx + 7, ty + 4, w->title, th->text);
+                    font_draw(s, ft, tx + tpad,
+                              ty + ((float)tiph - font_height(ft)) * 0.5f,
+                              shown, th->text);
                 }
             }
         }
@@ -1112,7 +1692,13 @@ static void draw_desktop(Surface *s, const Theme *th) {
         int bw = (int)tw + ui_px(28);
         int bh = (int)font_height(fs) + ui_px(14);
         int bx = (s->w - bw) / 2;
-        int by = s->h - ui_px(78) - bh;
+        /* clear the dock by its real height, the same reserve a maximised
+         * window uses: the old ui_px(78) was tuned to the shrunken bar and
+         * let the pill overlap the dock at 1.6 */
+        int bdx, bdy, bdw, bdh;
+        int reserved = dock_rect(&bdx, &bdy, &bdw, &bdh)
+                     ? (s->h - bdy + ui_px(6)) : ui_px(16);
+        int by = s->h - reserved - bh;
         if (by < topbar_h() + ui_px(8)) by = topbar_h() + ui_px(8);
         gfx_shadow(s, (float)bx, (float)by, (float)bw, (float)bh, 9, 12, 0.45f);
         gfx_rrect_aa(s, (float)bx, (float)by, (float)bw, (float)bh, 9,
@@ -1142,61 +1728,115 @@ static void draw_desktop(Surface *s, const Theme *th) {
 typedef struct {
     const char *app_id;      /* NULL = terminal */
     const char *label;
-    void (*icon)(Surface *, float, float, float, u32);
 } LauncherItem;
 
 static const LauncherItem LAUNCHER[] = {
-    { NULL,       "Terminal", icon_terminal },
-    { "files",    "Files",    icon_folder },
-    { "settings", "Settings", icon_gear },
-    { "monitor",  "Monitor",  icon_bars },
-    { "notes",    "Notes",    icon_pencil },
-    { "store",    "Apps",     icon_grid },
-    { "calc",     "Calculator", icon_calc },
-    { "sysinfo",  "System",   icon_gear },
+    { NULL,       "Terminal" },
+    { "files",    "Files" },
+    { "settings", "Settings" },
+    { "monitor",  "Monitor" },
+    { "notes",    "Notes" },
+    { "store",    "Apps" },
+    { "calc",     "Calculator" },
+    { "sysinfo",  "System" },
 };
 #define LAUNCHER_N ((int)(sizeof(LAUNCHER) / sizeof(LAUNCHER[0])))
 
 static int launcher_items(void) { return LAUNCHER_N + bundle_count; }
 
+/* The icon is a function of the app id and nothing else. The launcher used to
+ * carry its own table, which is why the System tile drew a gear while the same
+ * app's dock icon was a chip: two lists, two answers. The unknown-id fallback
+ * is icon_gear here too, exactly what icon_for_id() gives the dock. */
+static IconFn launcher_icon(int idx) {
+    if (idx < 0 || idx >= LAUNCHER_N) return NULL;
+    if (!LAUNCHER[idx].app_id) return icon_terminal;
+    IconFn fn = icon_for_bundle(LAUNCHER[idx].app_id);
+    return fn ? fn : icon_gear;
+}
+
+/* Every cell is at least as wide as the widest label it has to draw, measured
+ * with the face the grid draws it in. */
+static int launcher_label_w(void) {
+    Font *f = font_get(FONT_MEDIUM, 12);
+    float w = 0.0f;
+    for (int i = 0; i < LAUNCHER_N; i++) {
+        float tw = font_width(f, LAUNCHER[i].label);
+        if (tw > w) w = tw;
+    }
+    for (int b = 0; b < bundle_count; b++) {
+        float tw = font_width(f, bundles[b].name);
+        if (tw > w) w = tw;
+    }
+    return (int)(w + 0.5f);
+}
+
+/* One letter stands in for a bundle this build has no drawn icon for. Pick
+ * the largest nominal size whose REAL line fits the box: at 1.6 a 26 pt
+ * initial is 81 px tall and would paint outside its 63 px tile. */
+static Font *initial_font(int box) {
+    int pt = 26;
+    while (pt > 6 && ui_line_h(FONT_SEMIBOLD, (float)pt) > box - 2 * ui_px(2))
+        pt -= 2;
+    return font_get(FONT_SEMIBOLD, (float)pt);
+}
+
+/* One grid for the panel, the tiles and the keyboard: ui.c owns the column
+ * count (it depends on how many apps there are and how tall the screen is),
+ * so a draw, a click and a Right-arrow cannot disagree about which cell is
+ * which. */
 static void launcher_geom(int idx, int *tx, int *ty, int *tw, int *th) {
-    const int cols = 3, tile = ui_px(128), gap = ui_px(18);
-    int rows = (launcher_items() + cols - 1) / cols;
-    if (rows < 1) rows = 1;
-    int gw = cols * tile + (cols - 1) * gap;
-    /* Tiles shrink so the grid fits: with 14 apps at 1.6x a fixed 118px tile
-     * put the first row's icons above the top of the screen. */
-    int avail = disp.h - ui_px(96);
-    int grid_h = (avail - (rows - 1) * gap) / rows;
-    if (grid_h > ui_px(118)) grid_h = ui_px(118);
-    if (grid_h < ui_px(56)) grid_h = ui_px(56);
-    int gh = rows * grid_h + (rows - 1) * gap;
-    int gx = (disp.w - gw) / 2;
-    int gy = (disp.h - gh) / 2;
-    if (gy < ui_px(44)) gy = ui_px(44);
-    int r = idx / cols, c = idx % cols;
-    *tx = gx + c * (tile + gap);
-    *ty = gy + r * (grid_h + gap);
-    *tw = tile;
-    *th = grid_h;
+    ui_launcher_geom(launcher_items(), screen.w, screen.h, launcher_label_w(),
+                     idx, tx, ty, tw, th);
+}
+
+/* True while a theme-animated item is active: a hovered dock icon, a hovered
+ * launcher tile, or the launcher's keyboard selection. Those are the only
+ * three conditions anim_gate() accepts. A still desktop never asks for a frame
+ * because of the pulse - and with anim_speed = 0 the gate closes at its first
+ * test. The eye is not an item: hovering it asks for nothing, so an idle
+ * Aurora or Nebula desktop repaints zero times for icon animation. The eye's
+ * blink has its own schedule, set by a press, further up. */
+static int anim_item_under_pointer(void) {
+    const Theme *th = &themes[theme_index];
+    int dock_item = 0, tile = 0, selected_tile = 0;
+    if (launcher_open) {
+        /* The selected tile is a launcher item even when the pointer is not
+         * over it: keyboard navigation still marks it active, so it has to
+         * breathe (and ask for frames) while the launcher is up. */
+        int total = launcher_items();
+        selected_tile = (launcher_sel >= 0 && launcher_sel < total);
+        for (int i = 0; i < total && !tile; i++) {
+            int tx, ty, tw, th2;
+            launcher_geom(i, &tx, &ty, &tw, &th2);
+            if (input.mouse_x >= tx && input.mouse_x < tx + tw &&
+                input.mouse_y >= ty && input.mouse_y < ty + th2)
+                tile = 1;
+        }
+    } else {
+        int dx, dy, dw, dh;
+        if (dock_rect(&dx, &dy, &dw, &dh)) {
+            int isz = dock_isz();
+            for (int i = 0; i < taskbar_count() && !dock_item; i++) {
+                float bx = (float)(dx + dock_pad() + i * (isz + dock_gap()));
+                if (input.mouse_x >= bx && input.mouse_x < bx + isz &&
+                    input.mouse_y >= dy && input.mouse_y < dy + dh)
+                    dock_item = 1;
+            }
+        }
+    }
+    return anim_gate(th->anim, th->anim_speed, th->anim_amp,
+                     dock_item, tile, selected_tile);
 }
 
 static void draw_launcher(Surface *s, const Theme *th) {
     /* dim everything behind */
     surf_blend(s, 0, 0, s->w, s->h, 0xAA000000u);
 
-    const int cols = 3, tile = ui_px(128), gap = ui_px(18);
-    int rows = (launcher_items() + cols - 1) / cols;
-    if (rows < 1) rows = 1;
-    int gw = cols * tile + (cols - 1) * gap;
-    int avail = s->h - ui_px(96);
-    int grid_h = (avail - (rows - 1) * gap) / rows;
-    if (grid_h > ui_px(118)) grid_h = ui_px(118);
-    if (grid_h < ui_px(56)) grid_h = ui_px(56);
-    int gh = rows * grid_h + (rows - 1) * gap;
-    int px = (s->w - gw) / 2 - 24;
-    int py = (s->h - gh) / 2 - 24;
-    int pw = gw + 48, ph = gh + 48;
+    const int total = launcher_items();
+    const int label_w = launcher_label_w();
+    int px, py, pw, ph;
+    ui_launcher_panel(total, s->w, s->h, label_w, &px, &py, &pw, &ph);
 
     gfx_shadow(s, (float)px, (float)py, (float)pw, (float)ph, 22, 30, 0.55f);
     /* The panel body is opaque, so blurring the wallpaper underneath it was
@@ -1207,63 +1847,74 @@ static void draw_launcher(Surface *s, const Theme *th) {
 
     Font *f12 = font_get(FONT_MEDIUM, 12);
     Font *fd = font_get(FONT_REGULAR, 10);
+    const float pad = (float)ui_px(8);
+    const float label_h = font_height(f12);
 
-    for (int i = 0; i < launcher_items(); i++) {
+    for (int i = 0; i < total; i++) {
         int tx, ty, tw, th2;
         launcher_geom(i, &tx, &ty, &tw, &th2);
         int hovered = (input.mouse_x >= tx && input.mouse_x < tx + tw &&
                        input.mouse_y >= ty && input.mouse_y < ty + th2);
         int selected = launcher_open && (i == launcher_sel);
+        int active = hovered || selected;
         u32 bg = (hovered || selected) ? color_alpha(th->accent, selected ? 0.30f : 0.22f)
                                        : color_alpha(th->text, 0.06f);
         gfx_rrect_aa(s, (float)tx, (float)ty, (float)tw, (float)th2, 14.0f, bg,
                      selected ? th->accent : 0, selected ? 1.5f : 0.0f);
 
-        /* icon and label share the tile: the icon shrinks so the label always
-         * fits underneath, which is what broke at 1.6x */
-        Font *fl = font_get(FONT_MEDIUM, 12);
-        float label_h = font_height(fl) + 4.0f;
-        float isz = (float)grid_h - label_h - 12.0f;
+        /* The label owns the bottom line of the cell; the icon gets what is
+         * left above it and shrinks to fit that, so a cell can always draw
+         * both at every scale. */
+        float label_top = (float)ty + (float)th2 - pad - label_h;
+        float icon_room = label_top - (float)ty - 2.0f * pad;
+        float isz = icon_room;
         if (isz > (float)ui_px(52)) isz = (float)ui_px(52);
         if (isz < 12.0f) isz = 12.0f;
+        float ix = (float)tx + ((float)tw - isz) * 0.5f;
+        float iy = (float)ty + pad + (icon_room - isz) * 0.5f;
+        u32 fg = active ? th->accent : th->text;
+        /* active tiles take the theme's two icon colours with the roles set by
+         * luminance, so the body and the highlight are always different */
+        IconPair pair = theme_icon_pair(th, th->text, active);
+        u32 icon_body = pair.body, hi = pair.hi;
         const char *label;
         if (i < LAUNCHER_N) {
-            LAUNCHER[i].icon(s, (float)tx + (tw - isz) / 2,
-                             (float)ty + 6 + (grid_h - label_h - 12.0f - isz) / 2, isz,
-                             hovered ? th->accent : th->text);
             label = LAUNCHER[i].label;
+            IconFn fn = launcher_icon(i);
+            icon_draw(fn, s, ix, iy, isz, icon_body, hi, th, now_sec(), active);
         } else {
             /* an installed bundle: a real program from /usr/share/mystic/apps */
             int b = i - LAUNCHER_N;
             label = (b >= 0 && b < bundle_count) ? bundles[b].name : "?";
             /* an installed app gets its own drawn icon; the initial is only
              * the fallback for a bundle this build does not know */
-            u32 tile_bg = hovered ? color_alpha(th->accent, 0.34f)
-                                  : color_alpha(th->text, 0.10f);
-            gfx_rrect_aa(s, (float)tx + (tw - isz) / 2, (float)ty + 18, isz, isz, 12,
-                         tile_bg, 0, 0);
+            u32 tile_bg = active ? color_alpha(th->accent, 0.34f)
+                                 : color_alpha(th->text, 0.10f);
+            gfx_rrect_aa(s, ix, iy, isz, isz, 12.0f, tile_bg, 0, 0);
             IconFn fn = (b >= 0 && b < bundle_count) ? icon_for_bundle(bundles[b].id) : NULL;
-            float ix = (float)tx + (tw - isz) / 2, iy = (float)ty + 18;
             if (fn) {
-                fn(s, ix + isz * 0.16f, iy + isz * 0.16f, isz * 0.68f,
-                   hovered ? th->accent : th->text);
+                icon_draw(fn, s, ix + isz * 0.16f, iy + isz * 0.16f,
+                          isz * 0.68f, icon_body, hi, th, now_sec(), active);
             } else {
                 char initial[2] = { (char)(label && label[0] ? label[0] : '?'), 0 };
-                Font *fi = font_get(FONT_SEMIBOLD, 26);
+                Font *fi = initial_font((int)isz);
                 float iw2 = font_width(fi, initial);
-                font_draw(s, fi, (float)tx + (tw - iw2) / 2, (float)ty + 28, initial,
-                          hovered ? th->accent : th->text);
+                font_draw(s, fi, ix + (isz - iw2) * 0.5f,
+                          iy + (isz - font_height(fi)) * 0.5f, initial, fg);
             }
         }
 
-        float lw = font_width(f12, label);
-        font_draw(s, f12, (float)tx + (tw - lw) / 2,
-                  (float)ty + grid_h - label_h - 2, label,
+        /* fit the label to its cell: a bundle may be named anything, and a
+         * name wider than the tile used to run into the neighbouring cell */
+        char shown[64];
+        text_fit(f12, label, shown, sizeof(shown), (float)tw - 2.0f * ui_px(4));
+        float lw = font_width(f12, shown);
+        font_draw(s, f12, (float)tx + ((float)tw - lw) * 0.5f, label_top, shown,
                   hovered ? th->text : th->text_dim);
     }
 
     float hw = font_width(fd, "Super or Esc closes");
-    font_draw(s, fd, (float)(s->w - hw) / 2, (float)(py + ph + 10),
+    font_draw(s, fd, (float)(s->w - hw) / 2, (float)(py + ph + ui_px(7)),
               "Super or Esc closes", color_alpha(th->text, 0.55f));
 }
 
@@ -1293,28 +1944,33 @@ static void draw_lock_screen(Surface *s, const Theme *th) {
     snprintf(clock, sizeof(clock), "%02d:%02d", tmv.tm_hour, tmv.tm_min);
 
     float hw = font_width(fh, clock);
-    font_draw(s, fh, (float)px + (pw - hw) / 2, (float)py + 26, clock, th->text);
+    font_draw(s, fh, (float)px + (pw - hw) / 2, (float)py + ui_px(19), clock, th->text);
 
     float lw = font_width(fr, "Mystic OS is locked");
-    font_draw(s, fr, (float)px + (pw - lw) / 2, (float)py + 58, "Mystic OS is locked",
+    font_draw(s, fr, (float)px + (pw - lw) / 2, (float)py + ui_px(41), "Mystic OS is locked",
               th->text_dim);
 
-    /* password field, one dot per character */
-    int fw = pw - 80, fh2 = 38;
-    int fx = px + 40, fy = py + 92;
+    /* password field, one dot per character; the field is a line plus air,
+     * and its contents are placed from the same inset scale as the panel */
+    int fw = pw - ui_px(57), fh2 = ui_line_h(FONT_MEDIUM, 12) + ui_px(8);
+    int fx = px + ui_px(29), fy = py + ui_px(66);
     gfx_rrect_aa(s, (float)fx, (float)fy, (float)fw, (float)fh2, 9,
                  color_alpha(th->text, 0.08f), th->window_border, 1.0f);
-    float dx = (float)fx + 14;
+    float dx = (float)fx + (float)ui_px(10);
     for (int i = 0; i < pin_len && i < 24; i++) {
-        gfx_rrect_aa(s, dx, (float)fy + 15, 8, 8, 4, th->text, 0, 0);
-        dx += 14;
+        float dsz = (float)ui_px(6);
+        gfx_rrect_aa(s, dx, (float)fy + ((float)fh2 - dsz) * 0.5f, dsz, dsz, dsz * 0.5f,
+                     th->text, 0, 0);
+        dx += (float)ui_px(10);
     }
 
     if (lock_msg[0]) {
         float mw = font_width(fd, lock_msg);
-        font_draw(s, fd, (float)px + (pw - mw) / 2, (float)py + 142, lock_msg, th->accent);
+        font_draw(s, fd, (float)px + (pw - mw) / 2, (float)py + ui_px(101), lock_msg, th->accent);
     }
-    font_draw(s, fd, (float)px + 40, (float)py + 170, "Enter to unlock", color_alpha(th->text, 0.45f));
+    font_draw(s, fd, (float)px + ui_px(29),
+              (float)(py + ph) - (float)ui_px(11) - font_height(fd),
+              "Enter to unlock", color_alpha(th->text, 0.45f));
 }
 
 static void try_unlock(void) {
@@ -1426,9 +2082,9 @@ static void win_toggle_max(Window *w) {
         int top_ = topbar_h();
         int bdx, bdy, bdw, bdh;
         int reserved = dock_rect(&bdx, &bdy, &bdw, &bdh)
-                     ? (disp.h - bdy + ui_px(12)) : ui_px(16);
+                     ? (screen.h - bdy + ui_px(12)) : ui_px(16);
         w->x = 0; w->y = top_;
-        w->w = disp.w; w->h = disp.h - top_ - reserved;
+        w->w = screen.w; w->h = screen.h - top_ - reserved;
         w->maxed = 1;
     } else {
         w->x = w->restore_x; w->y = w->restore_y;
@@ -1454,10 +2110,10 @@ static void win_toggle_max(Window *w) {
 static void desk_area(int *x, int *y, int *w, int *h) {
     int bdx, bdy, bdw, bdh;
     int reserved = dock_rect(&bdx, &bdy, &bdw, &bdh)
-                 ? (disp.h - bdy + ui_px(12)) : ui_px(16);
+                 ? (screen.h - bdy + ui_px(12)) : ui_px(16);
     int top = topbar_h();
-    *x = 0; *y = top; *w = disp.w; *h = disp.h - top - reserved;
-    if (*h < ui_px(160)) *h = disp.h - top;
+    *x = 0; *y = top; *w = screen.w; *h = screen.h - top - reserved;
+    if (*h < ui_px(160)) *h = screen.h - top;
 }
 
 /* ------------------------------------------------------------ status
@@ -1666,8 +2322,8 @@ static void win_grow(Window *w, int dir) {
     int nh = w->h + dir * step;
     if (nw < ui_px(220)) nw = ui_px(220);
     if (nh < ui_px(150)) nh = ui_px(150);
-    if (w->x + nw > disp.w) nw = disp.w - w->x;
-    if (w->y + nh > disp.h) nh = disp.h - w->y;
+    if (w->x + nw > screen.w) nw = screen.w - w->x;
+    if (w->y + nh > screen.h) nh = screen.h - w->y;
     if (nw < ui_px(120)) nw = ui_px(120);
     if (nh < ui_px(100)) nh = ui_px(100);
     if (nw == w->w && nh == w->h) {
@@ -1781,7 +2437,7 @@ static void win_fullscreen(Window *w) {
         w->restore_x = w->x; w->restore_y = w->y;
         w->restore_w = w->w; w->restore_h = w->h;
     }
-    w->x = 0; w->y = 0; w->w = disp.w; w->h = disp.h;
+    w->x = 0; w->y = 0; w->w = screen.w; w->h = screen.h;
     w->maxed = 2;
     window_resized(w);
     dirty = 1;
@@ -1831,9 +2487,9 @@ static void win_move_by(Window *w, int key) {
     if (key == SC_KEY_DOWN)  w->y += step;
     /* never push the title bar where it cannot be grabbed again */
     if (w->y < topbar_h()) w->y = topbar_h();
-    if (w->y > disp.h - ui_px(40)) w->y = disp.h - ui_px(40);
+    if (w->y > screen.h - ui_px(40)) w->y = screen.h - ui_px(40);
     if (w->x + w->w < ui_px(80)) w->x = ui_px(80) - w->w;
-    if (w->x > disp.w - ui_px(80)) w->x = disp.w - ui_px(80);
+    if (w->x > screen.w - ui_px(80)) w->x = screen.w - ui_px(80);
     dirty = 1;
 }
 
@@ -1846,8 +2502,8 @@ static void win_resize_by(Window *w, int key) {
     if (key == SC_KEY_DOWN)  w->h += step;
     if (w->w < ui_px(220)) w->w = ui_px(220);
     if (w->h < ui_px(150)) w->h = ui_px(150);
-    if (w->x + w->w > disp.w) w->w = disp.w - w->x;
-    if (w->y + w->h > disp.h) w->h = disp.h - w->y;
+    if (w->x + w->w > screen.w) w->w = screen.w - w->x;
+    if (w->y + w->h > screen.h) w->h = screen.h - w->y;
     w->maxed = 0;                   /* a resized window is a window again */
     window_resized(w);
     dirty = 1;
@@ -1910,9 +2566,12 @@ static void launch_bundle(const char *id) {
 /* Theme and wallpaper writes use the same files and the same format the
  * Settings app uses, so the desktop's once-a-second re-read and the app
  * cannot disagree about what is on screen. */
+static void theme_runtime_apply(void);   /* fonts + text scale, defined below */
+
 static void theme_apply(int idx) {
     if (idx < 0 || idx >= theme_count) return;
     theme_index = idx;
+    theme_runtime_apply();
     FILE *f = fopen("/etc/mystic/current-theme", "w");
     if (f) { fprintf(f, "%s\n", themes[idx].name); fclose(f); }
     persist_settings();
@@ -2133,8 +2792,8 @@ static void menu_origin(int *x, int *y) {
     int w = menu_width(), h = menu_height();
     *x = menu_x;
     *y = menu_y;
-    if (*x + w > disp.w - 4) *x = disp.w - w - 4;
-    if (*y + h > disp.h - 4) *y = disp.h - h - 4;
+    if (*x + w > screen.w - 4) *x = screen.w - w - 4;
+    if (*y + h > screen.h - 4) *y = screen.h - h - 4;
     if (*x < 4) *x = 4;
     if (*y < topbar_h()) *y = topbar_h();
 }
@@ -2238,6 +2897,94 @@ static int menu_key(int k) {
     return 0;
 }
 
+/* ------------------------------------------------- theme fonts and scale
+ *
+ * The theme owns two font roles and a text-scale multiplier, but the user
+ * owns the last word: /etc/mystic/fonts.conf names a role and wins over the
+ * theme for that role. The file is re-read once a second like ui.conf, so a
+ * Settings click (font_set_role_family + font_save_config, see the report)
+ * changes the desktop without a restart.
+ */
+#define FONTS_CONF "/etc/mystic/fonts.conf"
+
+typedef struct {
+    int  has_ui, has_mono;
+    char ui[48], mono[48];
+} FontConf;
+
+static char *conf_trim(char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' ||
+                 s[n - 1] == '\r' || s[n - 1] == '\n')) s[--n] = 0;
+    return s;
+}
+
+static void font_conf_read(FontConf *fc) {
+    memset(fc, 0, sizeof *fc);
+    FILE *f = fopen(FONTS_CONF, "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char *p = conf_trim(line);
+        if (!*p || *p == '#' || *p == ';') continue;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char *key = conf_trim(p);
+        char *val = conf_trim(eq + 1);
+        size_t vl = strlen(val);
+        if (vl >= 2 && ((val[0] == '"' && val[vl - 1] == '"') ||
+                        (val[0] == '\'' && val[vl - 1] == '\''))) {
+            val[vl - 1] = 0;
+            val++;
+        }
+        if (!*val) continue;
+        if (!strcmp(key, "ui")) {
+            snprintf(fc->ui, sizeof fc->ui, "%s", val);
+            fc->has_ui = 1;
+        } else if (!strcmp(key, "mono")) {
+            snprintf(fc->mono, sizeof fc->mono, "%s", val);
+            fc->has_mono = 1;
+        }
+    }
+    fclose(f);
+}
+
+static int font_conf_same(const FontConf *a, const FontConf *b) {
+    return a->has_ui == b->has_ui && a->has_mono == b->has_mono &&
+           !strcmp(a->ui, b->ui) && !strcmp(a->mono, b->mono);
+}
+
+static float theme_text_scale(void) {
+    float s = themes[theme_index].font_scale;
+    return (s >= 0.8f && s <= 1.6f) ? s : 1.0f;
+}
+
+/* font_scale is a multiplier on top of the user's ui.conf value. ui.c owns
+ * the one global scale every layout reads; load the user's number first so a
+ * theme switch can never compound the multiplier, then apply the theme's. */
+static void apply_text_scale(void) {
+    ui_scale_load("/etc/mystic/ui.conf");
+    float user = ui_scale_get();
+    float want = user * theme_text_scale();
+    ui_scale_set_effective(want);
+    if (fabsf(ui_scale_get() - want) > 0.01f)
+        fprintf(stderr, "theme: font_scale %.2f x user %.2f exceeds the text "
+                        "scale range, using %.2f\n",
+                (double)theme_text_scale(), (double)user, (double)ui_scale_get());
+}
+
+/* Everything a theme contributes outside its colours: family roles (unless
+ * fonts.conf names them) and the text-scale multiplier. */
+static void theme_runtime_apply(void) {
+    FontConf fc;
+    font_conf_read(&fc);
+    theme_apply_fonts(&themes[theme_index], fc.has_ui, fc.has_mono);
+    apply_text_scale();
+    dirty = 1;
+}
+
 /* ui.conf stores the scale RELATIVE to ui.c's baseline, and the same file
  * carries that baseline as its first line. Reading it back is what keeps
  * this file from hardcoding a third copy of the constant. */
@@ -2265,7 +3012,7 @@ static float ui_conf_baseline(void) {
  * and the Settings list in sync with what a chord just did. */
 static void text_size_step(int dir) {
     float base = ui_conf_baseline();
-    float cur = ui_scale_get() / base;
+    float cur = (ui_scale_get() / base) / theme_text_scale();
     int k = (int)((cur - 0.8f) / 0.2f + 0.5f);
     if (k < 0) k = 0;
     if (k > 4) k = 4;
@@ -2286,7 +3033,7 @@ static void text_size_step(int dir) {
     int ok = fputs(text, f) != EOF;
     if (fclose(f) != 0) ok = 0;
     if (!ok) { fprintf(stderr, "shortcuts: ui.conf not written\n"); return; }
-    ui_scale_load("/etc/mystic/ui.conf");
+    apply_text_scale();
     persist_settings();
     fprintf(stderr, "shortcuts: text scale %.1fx\n", (double)rel);
     dirty = 1;
@@ -2476,7 +3223,7 @@ static const ShortcutActions SHORTCUTS = { shortcut_action, NULL };
 
     /* the start button is above everything else in the top bar */
     if (mx >= EYE_HIT_X && mx < EYE_HIT_X + EYE_HIT_W &&
-        my >= EYE_HIT_Y && my < EYE_HIT_Y + EYE_HIT_H) {
+        my >= EYE_HIT_Y + eye_oy() && my < EYE_HIT_Y + eye_oy() + EYE_HIT_H) {
         blink_t0 = now_sec();          /* it blinks on every press */
         launcher_open = !launcher_open;
         return 1;
@@ -2524,21 +3271,25 @@ static const ShortcutActions SHORTCUTS = { shortcut_action, NULL };
 int dot_y = traffic_y(tb);
         /* red closes, yellow maximises, green minimises - the order they are
          * painted in. The green dot had no handler at all and yellow
-         * minimised, so "maximise" and "minimise" were both wrong. */
-        if (ly >= dot_y - 2 && ly < dot_y + DOT_SZ + 2 && lx >= 14 && lx < 24) {
+         * minimised, so "maximise" and "minimise" were both wrong.
+         * The band and the x of each light come from dot_sz()/dot_x(), the
+         * same functions the painter uses, so a target is always on its dot. */
+        const int dsz = dot_sz(), slack = ui_px(1);
+        const int in_band = (ly >= dot_y - slack && ly < dot_y + dsz + slack);
+        if (in_band && lx >= dot_x(0) && lx < dot_x(0) + dsz) {
             win_close(hit);
             return 1;
         }
-        if (ly >= dot_y - 2 && ly < dot_y + DOT_SZ + 2 && lx >= 32 && lx < 42) {
+        if (in_band && lx >= dot_x(1) && lx < dot_x(1) + dsz) {
             win_toggle_max(hit);
             return 1;
         }
-        if (ly >= dot_y - 2 && ly < dot_y + DOT_SZ + 2 && lx >= 50 && lx < 60) {
+        if (in_band && lx >= dot_x(2) && lx < dot_x(2) + dsz) {
             hit->hidden = 1;
             return 1;
         }
         /* bottom-right corner resizes */
-        if (lx >= hit->w - 18 && ly >= hit->h - 18) {
+        if (lx >= hit->w - ui_px(13) && ly >= hit->h - ui_px(13)) {
             resize_win = (int)(hit - wins);
             resize_gen = hit->gen;          /* F9: remember which window, not just the slot */
             resize_ow = hit->w;
@@ -2573,7 +3324,8 @@ int dot_y = traffic_y(tb);
     }
 
     /* empty wallpaper: a right click opens the desktop menu there; a left
-     * click on the desktop does nothing, as before */
+     * click on the desktop starts a Black Hole drag (and does nothing for the
+     * other wallpapers, as before) */
     if (input.buttons & 2) {
         menu_open = 1;
         menu_sel = MENU_TERM;
@@ -2582,15 +3334,260 @@ int dot_y = traffic_y(tb);
         dirty = 1;
         return 1;
     }
+    if ((input.buttons & 1) && wall_view_active() && !over_chrome_at(mx, my)) {
+        wall_drag = 1;
+        dirty = 1;
+        return 1;
+    }
 
     return 0;
 }
 
+/* ------------------------------------------------------------ display choice
+ *
+ * /etc/mystic/display.conf is up to three lines:
+ *     mode=1920x1080      (a mode the device itself reported)
+ *     logical=1024x768    (the canvas; `auto` = the design size for the panel)
+ *     scale=fit
+ * It is read after disp_open() has asked the device for its mode list, so a
+ * saved mode is only ever applied when this device reported it. A mode that
+ * is not in the list, or that the driver refuses, is named on stderr and the
+ * current mode is kept - never one the panel did not report. The canvas line
+ * is independent of the mode list: it works on a device that reports one
+ * mode, which is the only way a resolution choice can do something on QEMU.
+ * /etc/mystic is a RAM rootfs, so Settings also writes
+ * /root/mystic-display.conf and this restores that copy when the RAM one is
+ * missing.
+ */
+#ifndef DISPLAY_CONF
+#define DISPLAY_CONF "/etc/mystic/display.conf"
+#endif
+#ifndef DISPLAY_CONF_SAVED
+#define DISPLAY_CONF_SAVED "/root/mystic-display.conf"
+#endif
+
+/* MYSTIC_DISPLAY_CONF_SECTION_BEGIN
+ * The block below is main.c's whole display.conf reader. The host harness
+ * extracts this exact text (with sed) and links it against a fake panel, so
+ * the parsing and the fallback it proves are the shipping lines. */
+
+static int display_scale_from_key(const char *s, DispScale *out) {
+    if (!strcmp(s, "fit") || !strcmp(s, "Fit")) { *out = DISP_FIT; return 1; }
+    if (!strcmp(s, "stretch") || !strcmp(s, "Stretch")) { *out = DISP_STRETCH; return 1; }
+    if (!strcmp(s, "integer") || !strcmp(s, "Integer")) { *out = DISP_INTEGER; return 1; }
+    if (!strcmp(s, "1:1") || !strcmp(s, "1to1")) { *out = DISP_ONE_TO_ONE; return 1; }
+    return 0;
+}
+
+/* ------------------------------------------------------------ canvas
+ *
+ * The canvas is the logical size the compositor draws before the blit
+ * maps it onto the panel. It is a user choice, not only a policy: on a
+ * device that reports a single mode (every QEMU fbdev) it is the ONLY
+ * display setting that can change the picture. Stored as
+ * `logical=WxH`, or `logical=auto` (absent counts as auto) for "the
+ * design size for this panel".
+ *
+ * The bounds are what the compositor allocates twice (screen + scene)
+ * without pretending: below them no window can be placed, above them a
+ * typo would ask for 64 MB surfaces. A size outside them is clamped and
+ * the caller is told - never silently used.
+ */
+#define LOGICAL_MIN_W 320
+#define LOGICAL_MIN_H 240
+#define LOGICAL_MAX_W 4096
+#define LOGICAL_MAX_H 4096
+
+static int g_logical_auto = 1;                 /* follow the panel */
+static int g_logical_w, g_logical_h;           /* only read when !auto */
+
+int desk_logical_auto(void) { return g_logical_auto; }
+
+/* Clamp a canvas pair in place; 1 when it was already inside the bounds. */
+static int logical_fit(int *w, int *h) {
+    int exact = 1;
+    if (*w < LOGICAL_MIN_W) { *w = LOGICAL_MIN_W; exact = 0; }
+    if (*h < LOGICAL_MIN_H) { *h = LOGICAL_MIN_H; exact = 0; }
+    if (*w > LOGICAL_MAX_W) { *w = LOGICAL_MAX_W; exact = 0; }
+    if (*h > LOGICAL_MAX_H) { *h = LOGICAL_MAX_H; exact = 0; }
+    return exact;
+}
+
+/* Apply the remembered canvas to the display. Called at start and again
+ * after a mode change, because a new panel size changes what "auto"
+ * means. disp_set_logical_size() also moves the inverse mapper, so the
+ * first click after this is mapped through the new blit. */
+void desk_follow_mode(Display *d) {
+    if (!d) return;
+    int lw, lh;
+    if (g_logical_auto) {
+        desk_design_size(d->fb_w, d->fb_h, &lw, &lh);
+    } else {
+        lw = g_logical_w;
+        lh = g_logical_h;
+        logical_fit(&lw, &lh);
+    }
+    disp_set_logical_size(d, lw, lh);
+}
+
+/* Settings' canvas rows: (0,0) = follow the panel; any other pair is the
+ * canvas. Applies now and remembers for the next mode change. Returns 1
+ * when the pair was used as given, 0 when it had to be clamped. */
+int desk_set_logical(Display *d, int w, int h) {
+    if (!d) return 0;
+    int exact = 1;
+    if (w <= 0 || h <= 0) {
+        g_logical_auto = 1;
+    } else {
+        int lw = w, lh = h;
+        exact = logical_fit(&lw, &lh);
+        g_logical_auto = 0;
+        g_logical_w = lw;
+        g_logical_h = lh;
+    }
+    desk_follow_mode(d);
+    return exact;
+}
+
+static void display_restore_saved(void) {
+    if (access(DISPLAY_CONF, R_OK) == 0) return;
+    FILE *in = fopen(DISPLAY_CONF_SAVED, "rb");
+    if (!in) return;
+    char buf[512];
+    size_t n = fread(buf, 1, sizeof(buf), in);
+    int bad = ferror(in);
+    fclose(in);
+    if (bad) return;
+    FILE *out = fopen(DISPLAY_CONF, "wb");
+    if (!out) {
+        fprintf(stderr, "display: cannot restore %s: %s\n", DISPLAY_CONF,
+                strerror(errno ? errno : EIO));
+        return;
+    }
+    int werr = 0;
+    if (fwrite(buf, 1, n, out) != n) werr = errno ? errno : EIO;
+    if (!werr && fflush(out) != 0) werr = errno ? errno : EIO;
+    if (fclose(out) != 0 && !werr) werr = errno ? errno : EIO;
+    if (werr) {
+        fprintf(stderr, "display: cannot write %s: %s\n", DISPLAY_CONF,
+                strerror(werr));
+        return;
+    }
+    fprintf(stderr, "display: restored %s from %s\n", DISPLAY_CONF,
+            DISPLAY_CONF_SAVED);
+}
+
+static void display_load_conf(Display *d) {
+    FILE *f = fopen(DISPLAY_CONF, "r");
+    if (!f) {
+        fprintf(stderr, "display: no %s; using %dx%d, %s\n", DISPLAY_CONF,
+                d->fb_w, d->fb_h, disp_scale_name(disp_get_scale(d)));
+        return;
+    }
+
+    int mw = 0, mh = 0, have_mode = 0, have_scale = 0;
+    DispScale want = disp_get_scale(d);
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '#' || *p == '\n' || *p == '\r') continue;
+        if (sscanf(p, "mode=%dx%d", &mw, &mh) == 2 && mw > 0 && mh > 0) {
+            have_mode = 1;
+            continue;
+        }
+        if (!strncmp(p, "scale=", 6)) {
+            char key[32] = {0};
+            if (sscanf(p + 6, "%31s", key) == 1 && display_scale_from_key(key, &want)) {
+                have_scale = 1;
+            } else {
+                fprintf(stderr, "display: %s names an unknown scale; keeping %s\n",
+                        DISPLAY_CONF, disp_scale_name(disp_get_scale(d)));
+            }
+            continue;
+        }
+        if (!strncmp(p, "logical=", 8)) {
+            char key[32] = {0};
+            if (sscanf(p + 8, "%31s", key) != 1) continue;
+            if (!strcmp(key, "auto")) {
+                g_logical_auto = 1;
+            } else {
+                int lw = 0, lh = 0;
+                if (sscanf(key, "%dx%d", &lw, &lh) == 2 && lw > 0 && lh > 0) {
+                    int cw = lw, ch = lh;
+                    if (!logical_fit(&cw, &ch))
+                        fprintf(stderr, "display: canvas %dx%d is outside %dx%d..%dx%d; "
+                                        "clamped to %dx%d\n", lw, lh,
+                                LOGICAL_MIN_W, LOGICAL_MIN_H,
+                                LOGICAL_MAX_W, LOGICAL_MAX_H, cw, ch);
+                    g_logical_auto = 0;
+                    g_logical_w = cw;
+                    g_logical_h = ch;
+                } else {
+                    fprintf(stderr, "display: %s names an unreadable canvas \"%s\"; "
+                                    "following the panel\n", DISPLAY_CONF, key);
+                    g_logical_auto = 1;
+                }
+            }
+        }
+    }
+    fclose(f);
+
+    if (have_mode) {
+        int idx = -1;
+        for (int i = 0; i < d->nmodes; i++) {
+            if (d->modes[i].w == mw && d->modes[i].h == mh) { idx = i; break; }
+        }
+        if (idx < 0) {
+            fprintf(stderr,
+                    "display: saved mode %dx%d is not offered by this device; "
+                    "keeping %dx%d\n", mw, mh, d->fb_w, d->fb_h);
+        } else {
+            errno = 0;
+            if (disp_set_mode(d, idx) != 0) {
+                int e = errno ? errno : EIO;
+                fprintf(stderr,
+                        "display: saved mode %dx%d refused by the kernel: %s; "
+                        "keeping %dx%d\n", mw, mh, strerror(e), d->fb_w, d->fb_h);
+            } else {
+                fprintf(stderr, "display: mode %dx%d\n", d->fb_w, d->fb_h);
+            }
+        }
+    }
+    if (have_scale) {
+        disp_set_scale(d, want);
+        fprintf(stderr, "display: scaling %s\n", disp_scale_name(disp_get_scale(d)));
+    }
+}
+
+/* Pick the surface size after the mode is known, and tell the journal the
+ * three numbers that matter: what is drawn, what the panel is, and how it is
+ * mapped. The canvas is whatever display.conf chose (or the design size for
+ * this panel when it said `logical=auto` or nothing). */
+static void display_choose_logical(Display *d) {
+    desk_follow_mode(d);
+    fprintf(stderr, "display: %dx%d canvas on a %dx%d panel, %s%s\n",
+            d->w, d->h, d->fb_w, d->fb_h, disp_scale_name(disp_get_scale(d)),
+            g_logical_auto ? " (auto)" : "");
+}
+/* MYSTIC_DISPLAY_CONF_SECTION_END */
+
 /* ------------------------------------------------------------ main */
 int main(void) {
     install_fatal_handlers();
-    wms_set_screen(disp.w, disp.h);   /* client buffers are screen sized */
     if (disp_open(&disp, "/dev/fb0") < 0) return 1;
+    /* Ask the device what it can do before anything asks for a mode. */
+    disp_scan_modes(&disp);
+    /* With no saved choice the design is fitted to the panel, not left in a
+     * corner at 1:1: that is the behaviour this desktop is for. display.conf,
+     * when it exists, overrides this below. */
+    disp_set_scale(&disp, DISP_FIT);
+    display_restore_saved();
+    display_load_conf(&disp);
+    display_choose_logical(&disp);
+
+    int logical_w = disp.w, logical_h = disp.h;
+    wms_set_screen(logical_w, logical_h);  /* client buffers are screen sized */
     /* the text scale must be known before the first font is requested */
     ui_scale_load("/etc/mystic/ui.conf");
     {
@@ -2621,11 +3618,32 @@ int main(void) {
     fprintf(stderr, "ui: scale %.2f", ui_scale_get());
     fputc(10, stderr);
 
-    screen.w = disp.w; screen.h = disp.h; screen.stride = disp.w;
+    screen.w = logical_w; screen.h = logical_h; screen.stride = logical_w;
     screen.px = calloc((size_t)screen.w * screen.h, 4);
     scene = screen;
     scene.px = calloc((size_t)screen.w * screen.h, 4);
-    if (!screen.px || !scene.px) { fprintf(stderr, "out of memory\n"); return 1; }
+    if (!screen.px || !scene.px) {
+        /* A saved canvas can be larger than this machine can hold - a
+         * hand-edited display.conf, or less RAM than last boot. Falling back
+         * to the design size is the difference between a smaller desktop and
+         * no desktop at all; the saved choice is left alone so a machine
+         * with the memory keeps it. */
+        free(screen.px);
+        free(scene.px);
+        int fw = 0, fh = 0;
+        desk_design_size(disp.fb_w, disp.fb_h, &fw, &fh);
+        fprintf(stderr, "display: no memory for a %dx%d canvas; using %dx%d\n",
+                logical_w, logical_h, fw, fh);
+        logical_w = fw;
+        logical_h = fh;
+        disp_set_logical_size(&disp, fw, fh);
+        wms_set_screen(fw, fh);
+        screen.w = fw; screen.h = fh; screen.stride = fw;
+        screen.px = calloc((size_t)fw * (size_t)fh, 4);
+        scene = screen;
+        scene.px = calloc((size_t)fw * (size_t)fh, 4);
+        if (!screen.px || !scene.px) { fprintf(stderr, "out of memory\n"); return 1; }
+    }
 
     theme_count = theme_load_all(themes, 16, THEME_DIR);
     if (theme_count == 0) {
@@ -2634,6 +3652,9 @@ int main(void) {
         themes[0] = t;
         theme_count = 1;
     }
+    /* fonts.conf has been read by font_init(); the theme's roles and scale
+     * are applied on top of it once, before the first frame. */
+    theme_runtime_apply();
 
     if (input_open(&input) < 0) fprintf(stderr, "no input devices\n");
 
@@ -2646,13 +3667,54 @@ int main(void) {
     long last_tick = 0;
 
     while (!quit) {
+        /* Settings can ask the panel for another mode while this loop runs.
+         * The core reports the logical size that mode needs; when it differs
+         * from the surfaces, reallocate them and pull the windows inside. */
+        {
+            int lw = screen.w, lh = screen.h;
+            disp_logical_size(&disp, &lw, &lh);
+            if (lw > 0 && lh > 0 && (lw != screen.w || lh != screen.h)) {
+                if (!desktop_reflow(lw, lh)) {
+                    /* The canvas was asked for but its two surfaces could not
+                     * be allocated. Keep drawing what exists and put the core
+                     * back to the truth, so the page cannot show a size that
+                     * is not on screen and the next frame does not ask again.
+                     * The choice stays in display.conf, so a machine with the
+                     * memory for it can still use it after a restart. */
+                    fprintf(stderr, "display: %dx%d canvas does not fit; "
+                                    "keeping %dx%d\n", lw, lh, screen.w, screen.h);
+                    disp_set_logical_size(&disp, screen.w, screen.h);
+                }
+            }
+        }
+        /* The surface that will be presented is exactly the logical size.
+         * Keeping the inverse mapper's source size in step here covers the
+         * frame in which Settings changes the mode: the next click is already
+         * mapped through the new blit, not the previous one. */
+        disp.src_w = screen.w;
+        disp.src_h = screen.h;
+
         input_frame(&input);
         input_poll(&input);
 
+        /* evdev reports the panel's pixels; everything above this line lives
+         * in the logical frame. Invert the same blit disp_present() uses, so
+         * a click lands on the row under the pointer in every scale mode. */
+        disp_map_input(&input.mouse_x, &input.mouse_y);
+        if (input.mouse_dx || input.mouse_dy) {
+            int bw = disp.geom.bw > 0 ? disp.geom.bw : screen.w;
+            int bh = disp.geom.bh > 0 ? disp.geom.bh : screen.h;
+            if (bw > 0 && bh > 0 && screen.w > 0 && screen.h > 0) {
+                input.mouse_dx = (int)lroundf((float)input.mouse_dx *
+                                              (float)screen.w / (float)bw);
+                input.mouse_dy = (int)lroundf((float)input.mouse_dy *
+                                              (float)screen.h / (float)bh);
+            }
+        }
         if (input.mouse_x < 0) input.mouse_x = 0;
         if (input.mouse_y < 0) input.mouse_y = 0;
-        if (input.mouse_x >= disp.w) input.mouse_x = disp.w - 1;
-        if (input.mouse_y >= disp.h) input.mouse_y = disp.h - 1;
+        if (input.mouse_x >= screen.w) input.mouse_x = screen.w - 1;
+        if (input.mouse_y >= screen.h) input.mouse_y = screen.h - 1;
 
         if (locked) {
             for (int i = 0; i < input.text_len; i++) {
@@ -2709,7 +3771,7 @@ int main(void) {
                 char c = input.text[i];
                 if (c >= '1' && c <= '9') {
                     int idx = c - '1';
-                    if (idx < theme_count) { theme_index = idx; dirty = 1; }
+                    if (idx < theme_count) { theme_index = idx; theme_runtime_apply(); }
                     input.text[i] = 0;      /* consumed */
                 }
             }
@@ -2784,7 +3846,9 @@ int main(void) {
 
             if (launcher_open) {
                 if (k == 105 || k == 106 || k == 103 || k == 108) {
-                    int cols = 3, total = launcher_items(), step = 0;
+                    int cols = ui_launcher_cols(launcher_items(), screen.w, screen.h,
+                                                launcher_label_w());
+                    int total = launcher_items(), step = 0;
                     if (k == 105) step = -1;
                     if (k == 106) step = 1;
                     if (k == 103) step = -cols;
@@ -2925,6 +3989,16 @@ int main(void) {
                     app_wheel(under->app, input.wheel);
                     dirty = 1;
                 }
+            } else if (wall_view_active() &&
+                       !over_chrome_at(input.mouse_x, input.mouse_y) &&
+                       !launcher_open && !menu_open && !help_open) {
+                /* over the wallpaper, and the wallpaper is a black hole: the
+                 * wheel shears the disk. Wallpaper.h documents the unit
+                 * (seconds of disk time per notch), so the knob keeps the
+                 * Keplerian profile instead of rotating it rigidly. */
+                wallpaper_blackhole_spin((float)input.wheel *
+                                         WALLPAPER_BH_SPIN_PER_NOTCH);
+                dirty = 1;
             }
         }
         /* bit 1 is the left button, bit 2 the right (src/input.c maps
@@ -2935,19 +4009,21 @@ int main(void) {
             if (drag_win >= 0 && wins[drag_win].used && wins[drag_win].gen == drag_gen) {
                 Window *w = &wins[drag_win];
                 const int bar = topbar_h();
-                if (w->y <= bar + 6) {                       /* top edge: full width */
-                    w->x = 0; w->y = bar; w->w = disp.w; w->h = disp.h - bar - 90;
-                } else if (w->x <= 8) {                      /* left edge: left half */
-                    w->x = 0; w->y = bar; w->w = disp.w / 2; w->h = disp.h - bar - 90;
-                } else if (w->x + w->w >= disp.w - 8) {      /* right edge: right half */
-                    w->w = disp.w / 2; w->x = disp.w - w->w;
-                    w->y = bar; w->h = disp.h - bar - 90;
+                const int edge = ui_px(6), foot = ui_px(64);
+                if (w->y <= bar + ui_px(4)) {                /* top edge: full width */
+                    w->x = 0; w->y = bar; w->w = screen.w; w->h = screen.h - bar - foot;
+                } else if (w->x <= edge) {                   /* left edge: left half */
+                    w->x = 0; w->y = bar; w->w = screen.w / 2; w->h = screen.h - bar - foot;
+                } else if (w->x + w->w >= screen.w - edge) {   /* right edge: right half */
+                    w->w = screen.w / 2; w->x = screen.w - w->w;
+                    w->y = bar; w->h = screen.h - bar - foot;
                 }
                 window_resized(w);
                 dirty = 1;
             }
             drag_win = -1;
             resize_win = -1;
+            wall_drag = 0;
         }
         if ((input.buttons & 1) && resize_win >= 0) {
             Window *w = &wins[resize_win];
@@ -2956,14 +4032,12 @@ int main(void) {
             else {
                 int nw = input.mouse_x - w->x + 1;
                 int nh = input.mouse_y - w->y + 1;
-                /* Minimums that leave a client app room to draw. The client
-                 * area is h - title bar - 2, and the browser needs about 124
-                 * px at the default scale (196 at the largest) before it has a
-                 * header, a page and a status bar. At 160 px tall the content
-                 * was 118, so a window squeezed to the old minimum rendered
-                 * nothing at all. */
-                if (nw < 320) nw = 320;
-                if (nh < ui_px(200) + title_h()) nh = ui_px(200) + title_h();
+                /* Minimums that leave a client app room to draw. Both the
+                 * width and the height are the desktop's own minimum module:
+                 * the resize clamps, the initial size and a snapped window
+                 * read the same functions, so they cannot disagree. */
+                if (nw < ui_win_min_w()) nw = ui_win_min_w();
+                if (nh < ui_win_min_h()) nh = ui_win_min_h();
                 if (nw != w->w || nh != w->h) {
                     w->w = nw;
                     w->h = nh;
@@ -2979,10 +4053,25 @@ int main(void) {
             else {
                 int nx = input.mouse_x - drag_dx, ny = input.mouse_y - drag_dy;
                 if (nx < 0) nx = 0;
-                if (ny < 0) ny = 34;
-                if (nx + w->w > disp.w) nx = disp.w - w->w;
-                if (ny + w->h > disp.h) ny = disp.h - w->h;
+                /* a title bar cannot be dragged under the top bar; 34 was the
+                 * bar height at the shipped scale and let go at 1.6 */
+                if (ny < topbar_h()) ny = topbar_h();
+                if (nx + w->w > screen.w) nx = screen.w - w->w;
+                if (ny + w->h > screen.h) ny = screen.h - w->h;
                 if (nx != w->x || ny != w->y) { w->x = nx; w->y = ny; dirty = 1; }
+            }
+        }
+        /* A drag that began on the wallpaper is the Black Hole's camera:
+         * the header documents the delta and the clamp, so this only feeds
+         * the pointer's own movement in. If the wallpaper was changed mid
+         * drag the knob is dropped rather than applied to another painting. */
+        if (wall_drag) {
+            if (!(input.buttons & 1) || !wall_view_active()) {
+                wall_drag = 0;
+            } else if (input.mouse_dy) {
+                wallpaper_blackhole_view((float)input.mouse_dy *
+                                         WALLPAPER_BH_YAW_PER_PX);
+                dirty = 1;
             }
         }
         (void)mouse_prev;
@@ -3020,10 +4109,10 @@ int main(void) {
                     w->client = i;
                     w->w = cl->w + 2;
                     w->h = cl->h + title_h() + 2;
-                    w->x = 120 + (i % 4) * 36;
-                    w->y = 90 + (i % 4) * 36;
-                    if (w->x + w->w > disp.w) w->x = disp.w - w->w - 8;
-                    if (w->y + w->h > disp.h) w->y = disp.h - w->h - 100;
+                    w->x = ui_px(86) + (i % 4) * ui_px(26);
+                    w->y = ui_px(64) + (i % 4) * ui_px(26);
+                    if (w->x + w->w > screen.w) w->x = screen.w - w->w - ui_px(6);
+                    if (w->y + w->h > screen.h) w->y = screen.h - w->h - ui_px(71);
                     snprintf(w->title, sizeof(w->title), "%s", cl->title);
                     w->z = ++z_top;
                     cl->win = (int)(w - wins);
@@ -3069,6 +4158,23 @@ int main(void) {
         /* keep repainting while the eye is blinking */
         if (blink_t0 >= 0.0) dirty = 1;
 
+        /* The icon breathe is the one chrome animation the pointer drives.
+         * It asks for frames only while an item is active; 30 fps is plenty
+         * for a breathe of at most 3.5 % and keeps a hover as cheap as the dock
+         * feedback that was already there. anim_speed = 0 never gets here. */
+        int item_active = anim_item_under_pointer();
+        if (item_active) {
+            double pulse_now = now_sec();
+            if (pulse_now - pulse_last >= 0.033) { pulse_last = pulse_now; dirty = 1; }
+        }
+        /* drift is background decoration, and it is held to the same gate: it
+         * advances while an item is active, never on its own. With the pointer
+         * elsewhere the desktop still requests no frames for chrome motion. */
+        if (themes[theme_index].anim == ANIM_DRIFT && item_active) {
+            double drift_now = now_sec();
+            if (drift_now - drift_last >= 0.05) { drift_last = drift_now; dirty = 1; }
+        }
+
         /* animated wallpapers need repaints; a static one must never force
          * them or the CPU would never idle */
         if (wallpaper_animated(wall_index)) {
@@ -3091,11 +4197,26 @@ int main(void) {
             {
                 float before = ui_scale_get();
                 ui_scale_load("/etc/mystic/ui.conf");
+                ui_scale_set_effective(ui_scale_get() * theme_text_scale());
                 if (ui_scale_get() != before) {
                     fprintf(stderr, "ui: scale %.2f -> %.2f", before, ui_scale_get());
                     fputc(10, stderr);
                     dirty = 1;
                     persist_settings();
+                }
+
+                /* the user's font selector is live: a Settings click writes
+                 * fonts.conf, and this re-read is what makes it visible */
+                static FontConf last_fc;
+                static int fc_ready;
+                FontConf fc;
+                font_conf_read(&fc);
+                if (!fc_ready) { fc_ready = 1; last_fc = fc; }
+                else if (!font_conf_same(&fc, &last_fc)) {
+                    last_fc = fc;
+                    font_reload();
+                    theme_apply_fonts(&themes[theme_index], fc.has_ui, fc.has_mono);
+                    dirty = 1;
                 }
 
                 FILE *wf = fopen("/etc/mystic/wallpaper", "r");
@@ -3143,6 +4264,12 @@ int main(void) {
                         _exit(127);
                     }
                 }
+                /* A package install changes /usr/share/mystic/apps, which is
+                 * what the launcher and the dock enumerate. wmsrv rescans and
+                 * says whether the list really changed; without this a fresh
+                 * bundle stayed invisible until the next boot. */
+                if (wms_apps_poll_rescan(bundles, &bundle_count, WM_MAX_APPS))
+                    dirty = 1;
             }
 
             /* another app can ask for a theme by writing this file */
@@ -3152,7 +4279,11 @@ int main(void) {
                     char *nl = strchr(want, '\n');
                     if (nl) *nl = 0;
                     for (int i = 0; i < theme_count; i++)
-                        if (!strcmp(want, themes[i].name)) { theme_index = i; persist_settings(); }
+                        if (!strcmp(want, themes[i].name)) {
+                            theme_index = i;
+                            theme_runtime_apply();
+                            persist_settings();
+                        }
                 }
                 fclose(tf);
             }
@@ -3175,6 +4306,15 @@ int main(void) {
                 }
                 fclose(lr);
                 remove("/run/mystic/launch.request");
+            }
+            /* a launch that failed has a real reason (a missing binary, a
+             * bad manifest) and it used to go nowhere: the tile just did
+             * nothing. wmsrv keeps the last reason; show it as the status
+             * confirmation instead of guessing one here. */
+            {
+                char lerr[192];
+                if (wms_take_launch_error(lerr, sizeof(lerr)))
+                    set_status("%s", lerr);
             }
 
             /* Files asks for a DOCUMENT to be opened. The app is chosen here
@@ -3245,7 +4385,9 @@ int main(void) {
             cur_y = input.mouse_y;
         } else if (cursor_moved) {
             /* put back the 24x26 box the old cursor covered, then draw the
-             * new one. No blur, no shadows, no full-screen copy. */
+             * new one. No blur, no shadows, no full-screen copy. The core
+             * maps this rectangle through the same blit as the full frame,
+             * so the cursor is in the right place in every scale mode. */
             if (cur_x >= 0)
                 copy_rect(&screen, &scene, cur_x - 2, cur_y - 2, 26, 28);
             draw_cursor_at(&screen, input.mouse_x, input.mouse_y);

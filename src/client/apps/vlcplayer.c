@@ -7,33 +7,90 @@
  *  arrived the window says so, and if libVLC reports an error the exact
  *  libvlc_errmsg() string is shown.
  *
- *  Usage, from the Terminal (argv[1] is the media path):
+ *  Usage (argv[1] is the media path):
  *
- *      /root/apps/vlc/bin /root/media/clip.mp4
+ *      Player <media file>     (after: pkg install vlc)
  *
- *  The Terminal runs it in the real root, which is where its lib/ lives.
- *  The DESKTOP launcher cannot run it yet: src/wmsrv.c chroots every app
- *  into /run/mystic/jail/<id>, bind-mounting only the executable at
- *  /bin/app, and a dynamically linked process needs /lib/ld-musl and the
- *  bundle's lib/ inside that jail. docs/MULTIMEDIA.md states the exact
- *  one-line-of-policy change (a read-only bind of /lib, /usr/lib and the
- *  bundle) that would let the launcher start it; until then the honest
- *  launch path is the Terminal. The window, the input and the pixels are
- *  the ordinary Mystic protocol either way.
+ *  THE FILES IN THE BUNDLE, AND WHY THERE ARE THREE OF THEM
+ *  -------------------------------------------------------
+ *  The bundle id is `vlc` everywhere: stage/usr/share/mystic/apps/vlc in
+ *  the image, /root/apps/vlc after an install, the Store row `vlc`, the
+ *  window's app id and the manifest all say the same word. There used to
+ *  be a second id (`vlcplayer`) and a payload that could not load its own
+ *  library; both are gone.
  *
- *  WHY dlopen AND NOT -lvlc
- *  ------------------------
- *  Alpine ships libVLC as shared objects only (no libvlc.a), so a static
- *  executable cannot contain it. A static musl program also cannot dlopen
- *  (musl's dynamic linker is not linked into a static image), so this app
- *  is built by tools/fetch-vlc.py as a *dynamic* musl executable and loads
- *  libvlc.so.5 at run time. The exact symbols resolved are listed in
- *  VpApi below and are bound by name in vp_bind() - nothing is declared
- *  and then left unresolved. On the package layout
- *  (/root/apps/vlc/{bin,libexec,lib}) the app re-executes itself once with
- *  LD_LIBRARY_PATH=<bundle>/lib and VLC_PLUGIN_PATH=<bundle>/lib/vlc/
- *  plugins, because musl reads those variables at process start; the
- *  inherited copy of the variable is the guard that stops a loop.
+ *      bin                      the static player: this file compiled with
+ *                               -DVP_BOOT=1, no PT_INTERP, no DT_NEEDED.
+ *                               It is the manifest's 'exec =', and it must
+ *                               be a BARE FILE NAME: src/wmsrv.c
+ *                               (wms_launch_arg) rejects any exec with a '/'
+ *                               or '..' in it ("unsafe exec"), so
+ *                               'exec = libexec/vlcplayer' is a layout this
+ *                               OS cannot launch. libexec/ is internal: the
+ *                               launcher execs it through the bundled loader.
+ *                               The IMAGE has /lib/ld-musl-x86_64.so.1 from
+ *                               its Alpine base rootfs, but the jail is a
+ *                               chroot that binds only /bin/app, /app (this
+ *                               bundle), the fonts, /dev bits and /proc - no
+ *                               /lib. So inside the jail PT_INTERP cannot
+ *                               resolve and the static launcher is the only
+ *                               file the kernel can start.
+ *      libexec/vlcplayer        the player: dynamic musl, PT_INTERP
+ *                               /lib/ld-musl-x86_64.so.1, RUNPATH
+ *                               $ORIGIN/../lib. dlopen()s libvlc.so.5.
+ *      lib/ld-musl-x86_64.so.1  the musl 1.2.6 loader, copied out of
+ *                               Alpine's musl-1.2.6-r3.apk (670,312 bytes,
+ *                               mode 0755). musl's loader is itself a
+ *                               program that takes --library-path
+ *                               (ldso/dynlink.c, __dls3), so bin execs:
+ *
+ *                                 lib/ld-musl-x86_64.so.1 \
+ *                                   --library-path <bundle>/lib \
+ *                                   <bundle>/libexec/vlcplayer <args...>
+ *
+ *      lib/libvlc.so.5, libvlccore.so.9, ...   the real closure
+ *      lib/vlc/plugins/...                     the plugins a profile needs
+ *
+ *  NO WMSRV CHANGE IS NEEDED for this to start. The window server already
+ *  binds the bundle directory read-only at /app and exports
+ *  MYSTIC_BUNDLE=/app, LD_LIBRARY_PATH=/app/usr/lib:/app/lib and
+ *  HOME=/tmp; bin reads MYSTIC_BUNDLE first, then falls back to
+ *  /proc/self/exe, and passes --library-path plus
+ *  VLC_PLUGIN_PATH=<bundle>/lib/vlc/plugins itself. The player's RUNPATH
+ *  ($ORIGIN/../lib) is the third, independent way to find the same files.
+ *
+ *  In the IMAGE (no libvlc: the playback closure is 100+ MB and is not
+ *  staged) this same source is compiled statically and the window says
+ *  exactly that. It is a placeholder, not a fake player - a static musl
+ *  executable cannot dlopen at all, which the next paragraph proves.
+ *
+ *  WHY THE PLAYER IS NOT STATIC, PROVEN BY BUILDING BOTH WAYS
+ *  ---------------------------------------------------------
+ *  tools/fetch-vlc.py links it twice and reads the result instead of
+ *  trusting a guess:
+ *
+ *    static + libvlc:  zig cc -target x86_64-linux-musl -static ...
+ *                      ... -Lbuild/vlc-root/usr/lib vlcplayer.c -lvlc
+ *                      -> error: unable to find static system library
+ *                         "vlc" using strategy no_fallback. searched paths:
+ *                           build/vlc-root/usr/lib\libvlc.a
+ *                      (the real output of that link in .work/f5-vlc; the
+ *                      closure ships libvlc.so.5 only, and VLC's own module
+ *                      loader is a dlopen() user even if a libvlc.a existed)
+ *    static - libvlc:  builds (this is the image placeholder), but
+ *                      dlopen() is musl's weak stub, whose whole body is
+ *                      __dl_seterr("Dynamic loading not supported")
+ *                      (zig's libc/musl/src/ldso/dlopen.c). That string
+ *                      is present in the static binary's bytes.
+ *    dynamic:          builds, PT_INTERP /lib/ld-musl-x86_64.so.1,
+ *                      DT_NEEDED libc.so only, RUNPATH $ORIGIN/../lib.
+ *                      libvlc.so.5 is dlopen()ed at run time, so the
+ *                      package stays relocatable and -lvlc never
+ *                      appears on a link line.
+ *
+ *  So: dynamic player + the loader it needs, both inside the bundle. The
+ *  exact symbols it resolves are listed in VpApi below and bound by name
+ *  in vp_bind() - nothing is declared and left unresolved.
  *
  *  RV32 IS OUR PIXEL FORMAT - the claim, checked against both sources
  *  ------------------------------------------------------------------
@@ -86,13 +143,59 @@
  *        s stop, f fit/fill scaling, q or Esc quit, click toggles play.
  * ============================================================ */
 
+/* The two sentences the no-argument window can show, in ONE place.
+ *
+ * The window server starts a bundle with no argv, so the first run of the
+ * Player tile is always this card. It must say which fact is true:
+ *
+ *   - libvlc.so.5 is nowhere this build looks: the image bundle is the
+ *     static placeholder, so the fix is the package.
+ *   - libVLC is there: the tile just needs a media file, and it says how.
+ *
+ * Both strings live here so there is no second copy to drift, and the
+ * host harness compiles this file with -DVLC_TILE_MSG_TEST to print the
+ * exact bytes the window draws (nothing else of the file is built then). */
+#define VP_MSG_NO_LIBVLC \
+    "libVLC is not installed - install it with: pkg install vlc"
+#define VP_MSG_NEED_FILE \
+    "give a media file: Player <path>"
+
+/* vp_tile_hint() exists where a card can be drawn: the app build and the
+ * harness build. The static launcher and the host decode test have no
+ * window, so they do not carry it (and must not carry an unused static). */
+#if defined(VLC_TILE_MSG_TEST) || \
+    (!defined(VLC_HOST_TEST) && !(defined(VP_BOOT) && VP_BOOT))
+static const char *vp_tile_hint(int have_file, int lib_ok) {
+    if (have_file) return (const char *)0;  /* a real error is shown instead */
+    return lib_ok ? VP_MSG_NEED_FILE : VP_MSG_NO_LIBVLC;
+}
+#endif
+
+#if defined(VLC_TILE_MSG_TEST)
+/* The harness build contains only vp_tile_hint() and its two strings. */
+#else
+
 /* VLC_HOST_TEST compiles only the libVLC/vmem core below, with no Mystic
  * client and no main(), so .work/vlc/host.c can include this exact file and
- * decode a real file on the host with the same callbacks the player uses. */
+ * decode a real file on the host with the same callbacks the player uses.
+ *
+ * VP_BOOT=1 compiles the static launcher instead: no libVLC table, no vmem
+ * surface, no window - just the bundle lookup and the exec of the bundled
+ * loader (section 5). It is the only part of this file that runs in a jail
+ * whose chroot has no /lib, so it must stay free of any dynamic
+ * dependency. */
 #ifdef VLC_HOST_TEST
 #  define VP_APP 0
 #else
 #  define VP_APP 1
+#endif
+
+#if defined(VP_BOOT) && VP_BOOT
+#  undef VP_APP
+#  define VP_APP 0
+#  define VP_BOOTING 1
+#else
+#  define VP_BOOTING 0
 #endif
 
 #include <pthread.h>
@@ -111,18 +214,26 @@ typedef HMODULE VpLibHandle;
 typedef void *VpLibHandle;
 #endif
 
+#if VP_APP || VP_BOOTING
+#  include <errno.h>
+#  include <fcntl.h>
+#  include <limits.h>
+#  include <sys/stat.h>
+#  include <unistd.h>
+#endif
+
 #if VP_APP
 #  include "../mystic_client.h"
 #  include "../../mystic.h"
 
 #  include <dirent.h>
-#  include <errno.h>
-#  include <fcntl.h>
-#  include <limits.h>
-#  include <sys/stat.h>
 #  include <time.h>
-#  include <unistd.h>
 #endif
+
+/* Everything from here to the end of section 3 talks to libVLC. The static
+ * launcher (VP_BOOTING) must not contain any of it: it cannot dlopen, and a
+ * smaller binary is the whole point of that build. */
+#if !VP_BOOTING
 
 /* ============================================================
  *  1. libVLC 3 ABI, declared here on purpose
@@ -660,6 +771,8 @@ static int vp_query_codec(VpPlayer *p, char *out, size_t n) {
     return found;
 }
 
+#endif /* !VP_BOOTING */
+
 /* ============================================================
  *  4. The Mystic window application
  * ============================================================ */
@@ -692,6 +805,7 @@ typedef struct VpApp {
     char   libver[64];
     int    have_file;
     int    player_ok;
+    int    lib_ok;           /* libvlc.so.5 exists where this build looks */
     int    font_ok;
 
     int    fit;              /* 1 = letterbox, 0 = stretch */
@@ -771,52 +885,43 @@ static void self_dir(char *out, size_t n) {
     snprintf(out, n, "%s", exe);
 }
 
-/* musl resolves LD_LIBRARY_PATH when the process starts, not when dlopen()
- * is called, so the package layout needs one re-exec with the bundle's lib
- * directory on the path. The environment variable is the loop guard. */
-static void try_reexec(int argc, char **argv) {
-    char dir[PATH_MAX], libdir[PATH_MAX], probe[PATH_MAX];
-    const char *old;
+/* The bundle directory. $MYSTIC_BUNDLE wins when the window server set it
+ * (wmsrv binds that directory read-only at /app and exports the variable),
+ * then the directory above .../libexec, then the directory the executable
+ * is in. The static launcher in section 5 uses the same rule, so both entry
+ * points agree on where lib/, libexec/ and the plugins are. Returns 0 when
+ * /proc is unavailable and the environment says nothing. */
+static int bundle_dir(char *out, size_t n) {
+    char dir[PATH_MAX];
+    struct stat st;
+    const char *env = getenv("MYSTIC_BUNDLE");
 
-    (void)argc;
-    if (getenv("MYSTIC_VLC_LDPATH")) return;
+    if (out == NULL || n == 0) return 0;
+    out[0] = 0;
+    if (env && *env && stat(env, &st) == 0 && S_ISDIR(st.st_mode)) {
+        snprintf(out, n, "%s", env);
+        return 1;
+    }
     self_dir(dir, sizeof(dir));
-    if (!dir[0]) return;
-
-    snprintf(libdir, sizeof(libdir), "%s", dir);
-    char *base = strrchr(libdir, '/');
-    if (base && !strcmp(base + 1, "libexec")) {
-        *base = 0;
-        snprintf(libdir, sizeof(libdir), "%s/lib", libdir);
-    } else {
-        snprintf(libdir, sizeof(libdir), "%s/lib", dir);
-    }
-    snprintf(probe, sizeof(probe), "%s/libvlc.so.5", libdir);
-    if (access(probe, R_OK) != 0) {
-        /* an image install may put libvlc beside the executable instead */
-        snprintf(libdir, sizeof(libdir), "%s", dir);
-        snprintf(probe, sizeof(probe), "%s/libvlc.so.5", libdir);
-        if (access(probe, R_OK) != 0) return;   /* default paths will do */
-    }
-
-    old = getenv("LD_LIBRARY_PATH");
-    char ld[PATH_MAX * 2];
-    if (old && *old) snprintf(ld, sizeof(ld), "%s:%s", libdir, old);
-    else snprintf(ld, sizeof(ld), "%s", libdir);
-    setenv("LD_LIBRARY_PATH", ld, 1);
-
-    snprintf(probe, sizeof(probe), "%s/vlc/plugins", libdir);
-    if (access(probe, R_OK) == 0) setenv("VLC_PLUGIN_PATH", probe, 1);
-    setenv("MYSTIC_VLC_LDPATH", "1", 1);
-
-    execv("/proc/self/exe", argv);
-    fprintf(stderr, "vlcplayer: re-exec with %s failed: %s\n", libdir,
-            strerror(errno));
+    if (!dir[0]) return 0;
+    char *slash = strrchr(dir, '/');
+    if (slash && !strcmp(slash + 1, "libexec")) *slash = 0;
+    snprintf(out, n, "%s", dir);
+    return 1;
 }
 
+/* There is deliberately no re-exec here any more. musl reads
+ * LD_LIBRARY_PATH before main(), and this program is started either by the
+ * static launcher (which passes --library-path=<bundle>/lib to the bundled
+ * loader) or by the kernel with RUNPATH $ORIGIN/../lib baked in, so both
+ * routes already give dlopen() the right search path. A re-exec would have
+ * to exec /proc/self/exe, which inside the jail names a file whose
+ * PT_INTERP (/lib/ld-musl-x86_64.so.1) does not exist there. */
+
 /* Where to load libvlc from. $VLC_LIBRARY wins (a test hook, and honest
- * for a user with a nonstandard install); then the package's lib/ then the
- * image's /usr/lib; then the bare soname. */
+ * for a user with a nonstandard install); then the bundle's lib/ (the
+ * package layout), then the image's /usr/lib; then the bare soname, which
+ * lets the loader's --library-path / RUNPATH search finish the job. */
 static void find_libvlc(char *out, size_t n) {
     char dir[PATH_MAX], probe[PATH_MAX];
     const char *env = getenv("VLC_LIBRARY");
@@ -825,13 +930,13 @@ static void find_libvlc(char *out, size_t n) {
         snprintf(out, n, "%s", env);
         return;
     }
-    self_dir(dir, sizeof(dir));
-    if (dir[0]) {
-        snprintf(probe, sizeof(probe), "%s/../lib/libvlc.so.5", dir);
-        if (access(probe, R_OK) == 0 || access(probe, F_OK) == 0) {
-            snprintf(out, n, "%s/../lib/libvlc.so.5", dir);
+    if (bundle_dir(dir, sizeof(dir))) {
+        snprintf(probe, sizeof(probe), "%s/lib/libvlc.so.5", dir);
+        if (access(probe, R_OK) == 0) {
+            snprintf(out, n, "%s", probe);
             return;
         }
+        /* an image install may put libvlc beside the executable instead */
         snprintf(probe, sizeof(probe), "%s/libvlc.so.5", dir);
         if (access(probe, R_OK) == 0) {
             snprintf(out, n, "%s", probe);
@@ -843,6 +948,18 @@ static void find_libvlc(char *out, size_t n) {
         return;
     }
     snprintf(out, n, "libvlc.so.5");
+}
+
+/* Is libVLC actually on this disk? The no-argument card must not say "not
+ * installed" when the package is present, and must not ask for a media file
+ * on an image that has no libVLC at all. The test is the same find_libvlc()
+ * the player uses, so the sentence matches what would happen if a file were
+ * given (a bare soname that only a system loader cache could resolve counts
+ * as absent here - that is the honest answer inside this jail). */
+static int libvlc_present(void) {
+    char lib[PATH_MAX];
+    find_libvlc(lib, sizeof(lib));
+    return lib[0] == '/' && access(lib, R_OK) == 0;
 }
 
 /* Draw text clipped to maxw, with an ellipsis when it had to be cut. The
@@ -923,21 +1040,51 @@ static void draw_error_screen(MClient *c, VpApp *a, Font *f, u32 bg) {
     int x = 34, y = 30;
     int maxw = c->w - 68;
 
+    /* With no argv - which is how the window server starts the tile - this is
+     * not an error screen. It states which fact is true: libVLC is missing
+     * (the image bundle is the static placeholder), or libVLC is there and the
+     * Player needs a file. Both sentences come from vp_tile_hint(), the one
+     * definition the host harness prints verbatim. Nothing here invents a
+     * path: the old card printed Player <media file> on a
+     * machine that had neither, and never mentioned the missing library. */
+    const char *hint = vp_tile_hint(a->have_file, a->lib_ok);
+
+    if (hint) {
+        font_draw(&s, title, (float)x, (float)y,
+                  a->lib_ok ? "VLC Player" : "libVLC is not installed",
+                  a->lib_ok ? RGB(235, 240, 248) : RGB(255, 150, 150));
+        y += (int)font_height(title) + 14;
+        y = draw_para(&s, body, x, y, maxw, 3, hint,
+                      a->lib_ok ? RGB(238, 243, 250) : RGB(255, 196, 196));
+        y += 8;
+        if (!a->lib_ok) {
+            y = draw_para(&s, body, x, y, maxw, 6,
+                          "This bundle is the image's placeholder: it is a static "
+                          "musl program and cannot dlopen, so it could not load "
+                          "libVLC even if one were present. The package supplies "
+                          "the dynamic player, the loader and the whole closure "
+                          "inside the bundle.",
+                          RGB(150, 160, 175));
+        } else {
+            y = draw_para(&s, body, x, y, maxw, 4,
+                          "Open a media file from Files, or start the Player with "
+                          "the file's path as the first argument.",
+                          RGB(150, 160, 175));
+        }
+        y += 12;
+        font_draw(&s, body, (float)x, (float)y, "q quits.", RGB(150, 160, 175));
+        mc_present(c);
+        (void)f;
+        (void)bg;
+        return;
+    }
+
     font_draw(&s, title, (float)x, (float)y, "Video could not start", RGB(255, 150, 150));
     y += (int)font_height(title) + 12;
 
-    if (!a->have_file) {
-        font_draw(&s, body, (float)x, (float)y,
-                  "Give a media file as the first argument:", RGB(235, 240, 248));
-        y += (int)font_height(body) + 8;
-        font_draw(&s, font_get(FONT_MONO, 11), (float)x, (float)y,
-                  "vlcplayer /root/media/clip.mp4", RGB(150, 210, 255));
-        y += (int)font_height(body) + 16;
-    } else {
-        draw_clipped(&s, body, x, y, maxw, a->path, RGB(235, 240, 248));
-        y += (int)font_height(body) + 10;
-    }
-    if (a->err[0]) y = draw_para(&s, body, x, y, maxw, 6, a->err, RGB(255, 190, 190));
+    draw_clipped(&s, body, x, y, maxw, a->path, RGB(235, 240, 248));
+    y += (int)font_height(body) + 10;
+    if (a->err[0]) y = draw_para(&s, body, x, y, maxw, 9, a->err, RGB(255, 190, 190));
 
     y += 14;
     font_draw(&s, body, (float)x, (float)y,
@@ -1115,6 +1262,33 @@ static void toggle_pause(VpApp *a) {
     }
 }
 
+/* Turn the two failures a user can actually cause into a sentence that says
+ * what to do, keeping the loader's own words at the end. Anything else is
+ * passed through untouched - that is the honest libVLC error text, and the
+ * screen shows it verbatim. */
+static void explain_open_error(char *out, size_t n, const char *raw) {
+    if (!out || n == 0) return;
+    if (!raw) raw = "";
+    if (strstr(raw, "Dynamic loading not supported")) {
+        snprintf(out, n,
+                 "This is a static build. musl's dlopen() is a stub whose "
+                 "whole answer is 'Dynamic loading not supported', so a "
+                 "static executable cannot load libVLC's shared objects. "
+                 "The playable build ships in the vlc package: run "
+                 "pkg install vlc, then open the Player tile or "
+                 "/root/apps/vlc/bin <file>.\n\n%s", raw);
+        return;
+    }
+    if (strstr(raw, "cannot load") && strstr(raw, "libvlc")) {
+        snprintf(out, n,
+                 "libVLC is not installed where this build looks. The vlc "
+                 "package carries libvlc.so.5, libvlccore.so.9 and the "
+                 "plugins: run pkg install vlc.\n\n%s", raw);
+        return;
+    }
+    snprintf(out, n, "%s", raw);
+}
+
 int main(int argc, char **argv) {
     MClient c;
     VpApp a;
@@ -1132,8 +1306,6 @@ int main(int argc, char **argv) {
     a.len = -1;
     a.codec_try_at = 0;
 
-    try_reexec(argc, argv);
-
     a.have_file = argc > 1 && argv[1] && argv[1][0];
     if (a.have_file) {
         snprintf(a.path, sizeof(a.path), "%s", argv[1]);
@@ -1141,7 +1313,7 @@ int main(int argc, char **argv) {
         snprintf(a.name, sizeof(a.name), "%s", slash ? slash + 1 : a.path);
     }
 
-    if (mc_open(&c, "vlc", "Video", VP_WIN_W, VP_WIN_H) < 0) {
+    if (mc_open(&c, "vlc", "VLC Player", VP_WIN_W, VP_WIN_H) < 0) {
         fprintf(stderr, "vlcplayer: cannot connect to the window server (%s)\n",
                 getenv("MYSTIC_SOCKET") ? getenv("MYSTIC_SOCKET")
                                         : "/run/mystic/wm.sock");
@@ -1168,6 +1340,10 @@ int main(int argc, char **argv) {
         a.no_audio_once = 1;
     }
 
+    /* For the no-argument card: it must say "install the package" only when
+     * libVLC really is absent, and ask for a file when it is present. */
+    a.lib_ok = libvlc_present();
+
     if (a.have_file) {
         char lib[PATH_MAX], err[512];
         find_libvlc(lib, sizeof(lib));
@@ -1176,7 +1352,7 @@ int main(int argc, char **argv) {
                      VP_MAXW, VP_MAXH);
         } else if (vp_player_open(&a.pl, &a.vmem, lib, a.path,
                                   !a.audio_device, err, sizeof(err)) != 0) {
-            snprintf(a.err, sizeof(a.err), "%s", err);
+            explain_open_error(a.err, sizeof(a.err), err);
         } else {
             a.player_ok = 1;
             const char *lv = a.pl.api.version();
@@ -1275,3 +1451,251 @@ int main(int argc, char **argv) {
 }
 
 #endif /* VP_APP */
+
+/* ============================================================
+ *  5. The static launcher (VP_BOOT=1)
+ *
+ *  This is the only file in the bundle the kernel can exec inside a jail
+ *  whose chroot has no /lib: it is static, so it has no PT_INTERP and no
+ *  DT_NEEDED. (The image itself has /lib/ld-musl-x86_64.so.1 from the
+ *  Alpine base; the jail does not, because wmsrv binds only the payload,
+ *  the bundle, the fonts, /dev bits and /proc.)
+ *  It finds the bundle and replaces itself with the bundled musl loader
+ *  running the dynamic player. Nothing here touches libvlc, so when the
+ *  closure is missing the message is the truth ("pkg install vlc")
+ *  instead of a window that pretends to be a player.
+ *
+ *  musl's loader accepts being run as a program and consumes options
+ *  before the program path (ldso/dynlink.c, __dls3: --list, --library-path,
+ *  --preload, --argv0), which is what makes a self-contained bundle
+ *  possible without a system /lib.
+ * ============================================================ */
+#if VP_BOOTING
+
+#define VP_BOOT_LOADER "lib/ld-musl-x86_64.so.1"
+#define VP_BOOT_PLAYER "libexec/vlcplayer"
+#define VP_BOOT_LIBVLC "lib/libvlc.so.5"
+
+static int vp_file_ok(const char *path) {
+    struct stat st;
+    return path && *path && stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static int vp_dir_ok(const char *path) {
+    struct stat st;
+    return path && *path && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+/* setenv() is POSIX; the host test is a Windows binary, where the libc
+ * spelling is _putenv("K=V"). Only the boot section needs this. */
+static int vp_setenv(const char *k, const char *v) {
+#if defined(_WIN32)
+    char buf[PATH_MAX * 2 + 64];
+    if ((size_t)snprintf(buf, sizeof(buf), "%s=%s", k, v) >= sizeof(buf))
+        return -1;
+    return _putenv(buf);
+#else
+    return setenv(k, v, 1);
+#endif
+}
+
+/* Full path of the running launcher, or "" when /proc is not mounted.
+ * VP_TEST_SELF is the host test hook: it lets the Windows harness exercise
+ * the same path arithmetic with a POSIX-shaped path. */
+static void vp_self(char *out, size_t n) {
+    char exe[PATH_MAX];
+    ssize_t k;
+    if (out == NULL || n == 0) return;
+    out[0] = 0;
+#ifdef VP_BOOT_TEST
+    {
+        const char *fake = getenv("VP_TEST_SELF");
+        if (fake && *fake) {
+            snprintf(out, n, "%s", fake);
+            return;
+        }
+    }
+#endif
+#if defined(_WIN32)
+    /* There is no /proc here; the test supplies VP_TEST_SELF and the real
+     * launcher is only ever built for Linux. */
+    (void)exe;
+    (void)k;
+#else
+    k = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (k <= 0) return;
+    exe[k] = 0;
+    snprintf(out, n, "%s", exe);
+#endif
+}
+
+/* A directory is the bundle when it holds the player or its libvlc. */
+static int vp_is_bundle(const char *dir) {
+    char probe[PATH_MAX];
+    if (!vp_dir_ok(dir)) return 0;
+    snprintf(probe, sizeof(probe), "%s/" VP_BOOT_PLAYER, dir);
+    if (vp_file_ok(probe)) return 1;
+    snprintf(probe, sizeof(probe), "%s/" VP_BOOT_LIBVLC, dir);
+    return vp_file_ok(probe);
+}
+
+/* Strip a trailing /libexec, so both ".../vlc/bin" and a bin symlink that
+ * resolves to ".../vlc/libexec/vlcplayer" name the bundle root. */
+static void vp_strip_libexec(char *dir) {
+    char *slash = strrchr(dir, '/');
+    if (slash && !strcmp(slash + 1, "libexec")) *slash = 0;
+}
+
+/* Find the bundle: $MYSTIC_BUNDLE (wmsrv exports it as /app), then the
+ * directory of /proc/self/exe, then the directory of argv[0], then the jail
+ * convention /app. Returns 1 when a directory that looks like a bundle was
+ * found; returns 0 with the best existing candidate in out otherwise, so
+ * the caller's error message can name a real path. */
+static int vp_find_bundle(char *out, size_t n, int argc, char **argv) {
+    char cand[PATH_MAX], exe[PATH_MAX];
+    const char *env = getenv("MYSTIC_BUNDLE");
+
+    if (out == NULL || n == 0) return 0;
+    out[0] = 0;
+    if (env && *env && vp_is_bundle(env)) {
+        snprintf(out, n, "%s", env);
+        return 1;
+    }
+    vp_self(exe, sizeof(exe));
+    if (exe[0]) {
+        char *slash = strrchr(exe, '/');
+        if (slash) {
+            *slash = 0;
+            snprintf(cand, sizeof(cand), "%s", exe);
+            vp_strip_libexec(cand);
+            if (vp_is_bundle(cand)) {
+                snprintf(out, n, "%s", cand);
+                return 1;
+            }
+        }
+    }
+    if (argc > 0 && argv && argv[0]) {
+        const char *a = argv[0];
+        const char *slash = strrchr(a, '/');
+        if (slash && (size_t)(slash - a) < sizeof(cand)) {
+            memcpy(cand, a, (size_t)(slash - a));
+            cand[slash - a] = 0;
+            vp_strip_libexec(cand);
+            if (vp_is_bundle(cand)) {
+                snprintf(out, n, "%s", cand);
+                return 1;
+            }
+        }
+    }
+    if (vp_is_bundle("/app")) {
+        snprintf(out, n, "/app");
+        return 1;
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    char bundle[PATH_MAX], loader[PATH_MAX], player[PATH_MAX];
+    char lib[PATH_MAX], plugins[PATH_MAX], libvlc[PATH_MAX];
+    char ld[PATH_MAX * 2];
+    const char *old;
+    char **av;
+    int i, k;
+
+    if (!vp_find_bundle(bundle, sizeof(bundle), argc, argv)) {
+        char self[PATH_MAX] = "";
+        vp_self(self, sizeof(self));
+        fprintf(stderr,
+                "vlc: cannot find a bundle with " VP_BOOT_PLAYER ".\n"
+                "     MYSTIC_BUNDLE=%s\n"
+                "     /proc/self/exe=%s\n"
+                "     argv[0]=%s   /app=%s\n"
+                "     On Mystic OS the window server exports MYSTIC_BUNDLE=/app.\n",
+                getenv("MYSTIC_BUNDLE") ? getenv("MYSTIC_BUNDLE") : "(unset)",
+                self[0] ? self : "(unreadable)",
+                (argc > 0 && argv && argv[0]) ? argv[0] : "(none)",
+                vp_is_bundle("/app") ? "a bundle"
+                    : (vp_dir_ok("/app") ? "exists but is not a bundle" : "missing"));
+        return 127;
+    }
+    snprintf(loader,  sizeof(loader),  "%s/" VP_BOOT_LOADER, bundle);
+    snprintf(player,  sizeof(player),  "%s/" VP_BOOT_PLAYER, bundle);
+    snprintf(libvlc,  sizeof(libvlc),  "%s/" VP_BOOT_LIBVLC, bundle);
+    snprintf(lib,     sizeof(lib),     "%s/lib", bundle);
+    snprintf(plugins, sizeof(plugins), "%s/lib/vlc/plugins", bundle);
+
+    /* Order matters for the message: a bundle with no closure is the case a
+     * user can fix, and it must not be reported as a broken executable. */
+    if (!vp_file_ok(libvlc)) {
+        fprintf(stderr,
+                "vlc: libVLC is not installed (%s is missing).\n"
+                "     On Mystic OS: pkg install vlc\n"
+                "     The package carries libvlc.so.5, libvlccore.so.9 and the\n"
+                "     plugins this player needs; this bundle has %s.\n",
+                libvlc, bundle);
+        return 127;
+    }
+    if (!vp_file_ok(player)) {
+        fprintf(stderr,
+                "vlc: %s is missing - the bundle is incomplete.\n"
+                "     Reinstall it: pkg install --force vlc\n", player);
+        return 127;
+    }
+    if (!vp_file_ok(loader)) {
+        /* The image has /lib/ld-musl-x86_64.so.1 from its Alpine base, even
+         * though the jail normally does not bind it. Prefer the bundle's own
+         * copy, but do not refuse to start when the system has one. */
+        const char *sysloader = "/lib/ld-musl-x86_64.so.1";
+        if (vp_file_ok(sysloader)) {
+            snprintf(loader, sizeof(loader), "%s", sysloader);
+        } else {
+            fprintf(stderr,
+                    "vlc: no dynamic loader: %s is missing and so is %s.\n"
+                    "     Reinstall it: pkg install --force vlc\n",
+                    loader, sysloader);
+            return 127;
+        }
+    }
+
+    old = getenv("LD_LIBRARY_PATH");
+    if (old && *old) snprintf(ld, sizeof(ld), "%s:%s", lib, old);
+    else             snprintf(ld, sizeof(ld), "%s", lib);
+    vp_setenv("LD_LIBRARY_PATH", ld);
+    vp_setenv("VLC_PLUGIN_PATH", plugins);
+    /* Informational: the player no longer re-execs. It documents that this
+     * process already came through the launcher. */
+    vp_setenv("MYSTIC_VLC_LDPATH", "1");
+
+    /* loader --library-path <bundle>/lib <bundle>/libexec/vlcplayer args... */
+    av = (char **)calloc((size_t)(argc > 0 ? argc : 1) + 4, sizeof(*av));
+    if (!av) {
+        fprintf(stderr, "vlc: out of memory building the loader command\n");
+        return 127;
+    }
+    k = 0;
+    av[k++] = loader;
+    av[k++] = (char *)"--library-path";
+    av[k++] = lib;
+    av[k++] = player;
+    for (i = 1; i < argc; i++) av[k++] = argv[i];
+    av[k] = NULL;
+
+#ifdef VP_BOOT_TEST
+    printf("bundle=%s\nloader=%s\nplayer=%s\nlibvlc=%s\nlib=%s\nplugins=%s\n",
+           bundle, loader, player, libvlc, lib, plugins);
+    printf("LD_LIBRARY_PATH=%s\nVLC_PLUGIN_PATH=%s\n",
+           getenv("LD_LIBRARY_PATH"), getenv("VLC_PLUGIN_PATH"));
+    for (i = 0; i < k; i++) printf("argv[%d]=%s\n", i, av[i]);
+    free(av);
+    return 0;
+#else
+    execv(loader, av);
+    fprintf(stderr, "vlc: cannot run %s: %s\n", loader, strerror(errno));
+    free(av);
+    return 127;
+#endif
+}
+
+#endif /* VP_BOOTING */
+
+#endif /* !VLC_TILE_MSG_TEST */

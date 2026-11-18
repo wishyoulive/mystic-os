@@ -53,7 +53,6 @@
 /* One generation every 100 ms -> about 10 a second. */
 #define TICK_NS 100000000ull
 
-#define MARGIN 12
 
 /* Colours: the sheet is darker than the window so the live cells
  * read as light on a recessed panel. */
@@ -217,18 +216,76 @@ static int board_resize(int cols, int rows) {
     return board_pop(cells);
 }
 
+/* ------------------------------------------------------------ text */
+
+/* Length of the longest prefix of buf[0..len) that does not end in the
+ * middle of a UTF-8 codepoint (the error text is strerror output). */
+static size_t utf8_trim(const char *buf, size_t len) {
+    if (len == 0) return 0;
+    size_t i = len;
+    while (i > 0 && ((unsigned char)buf[i - 1] & 0xC0) == 0x80) i--;
+    if (i == 0) return len;
+    unsigned char c = (unsigned char)buf[i - 1];
+    int need = 1;
+    if (c >= 0xC2 && c <= 0xDF) need = 2;
+    else if (c >= 0xE0 && c <= 0xEF) need = 3;
+    else if (c >= 0xF0 && c <= 0xF4) need = 4;
+    if (len - (i - 1) >= (size_t)need) return len;
+    return i - 1;
+}
+
+/* The only text entry point: every string is measured against the width
+ * it is given and truncated with an ellipsis. The hint, the error and a
+ * long title can no longer paint outside the window. */
+static void draw_fit(Surface *s, Font *f, float x, float y, float maxw,
+                     const char *text, u32 color) {
+    if (!f || !text || !text[0] || maxw < 4.0f) return;
+    char buf[160];
+    snprintf(buf, sizeof(buf), "%s", text);
+    if (font_width(f, buf) <= maxw) {
+        font_draw(s, f, x, y, buf, color);
+        return;
+    }
+    const char *ell = "\xE2\x80\xA6";
+    float dots = font_width(f, ell);
+    size_t len = strlen(buf);
+    if (len > sizeof(buf) - 4) len = sizeof(buf) - 4;
+    while (len > 0) {
+        len = utf8_trim(buf, len);
+        buf[len] = 0;
+        if (font_width(f, buf) + dots <= maxw) break;
+        if (len == 0) break;
+        len--;
+    }
+    if (len == 0) return;
+    memcpy(buf + len, ell, 3);
+    buf[len + 3] = 0;
+    font_draw(s, f, x, y, buf, color);
+}
+
 /* ------------------------------------------------------------ layout */
 
 static void layout_for(int vw, int vh, Layout *L, int *cols, int *rows) {
-    L->title_y = MARGIN;
-    L->foot_y  = vh - MARGIN - 18;
-    L->hint_y  = vh - MARGIN - 2;
+    Font *ft = font_get(FONT_SEMIBOLD, 13);
+    Font *fb = font_get(FONT_REGULAR, 11);
+    Font *fs = font_get(FONT_REGULAR, 10);
+    int m = ui_px(8);
+    int th = ft ? (int)(font_height(ft) + 0.5f) : 26;
+    int bh = fb ? (int)(font_height(fb) + 0.5f) : 22;
+    int sh = fs ? (int)(font_height(fs) + 0.5f) : 20;
 
-    int top = MARGIN + 26;
-    int bot = L->foot_y - 10;
+    /* every band is one line box tall, and the three bands are stacked
+     * with one spacing unit between them: the hint can never land on the
+     * footer, and neither can fall below the pixels the server gave us */
+    L->title_y = m;
+    L->hint_y  = vh - m - sh;
+    L->foot_y  = L->hint_y - bh - ui_px(4);
+
+    int top = L->title_y + th + ui_px(6);
+    int bot = L->foot_y - ui_px(6);
     if (bot < top + CELL) bot = top + CELL;
 
-    int avail_w = vw - 2 * MARGIN;
+    int avail_w = vw - 2 * m;
     int avail_h = bot - top;
     if (avail_w > vw) avail_w = vw;
     if (avail_h > vh) avail_h = vh;
@@ -278,7 +335,7 @@ static void layout_for(int vw, int vh, Layout *L, int *cols, int *rows) {
 static void draw(MClient *c, int vw, int vh, const Layout *L,
                  Font *ft, Font *fb, Font *fs, const State *st) {
     if (vw <= 0 || vh <= 0) return;
-    Surface s = { c->px, vw, vh, c->stride };
+    Surface s = { c->px, vw, vh, c->stride, 0, 0, 0, 0 };
 
     gfx_gradient(&s, 0, 0, vw, vh, COL_WIN_TOP, COL_WIN_BOT);
 
@@ -304,15 +361,18 @@ static void draw(MClient *c, int vw, int vh, const Layout *L,
         }
     }
 
-    /* header */
-    font_draw(&s, ft, (float)MARGIN, (float)L->title_y,
-              "Conway's Game of Life", COL_TITLE);
-
+    /* header: the title and the state share one line, both measured */
     const char *mode = st->paused ? "paused" : "running";
     u32 mode_col = st->paused ? COL_PAUSED : COL_RUNNING;
     float mw = font_width(fb, mode);
-    if ((float)MARGIN + mw < (float)vw)
-        font_draw(&s, fb, (float)vw - MARGIN - mw,
+    int m = ui_px(8);
+    float title_max = (float)vw - 2.0f * (float)m;
+    if (mw + (float)ui_px(6) < title_max) title_max -= mw + (float)ui_px(6);
+    else { mw = 0; }
+    draw_fit(&s, ft, (float)m, (float)L->title_y, title_max,
+             "Conway's Game of Life", COL_TITLE);
+    if (mw > 0.0f)
+        font_draw(&s, fb, (float)vw - (float)m - mw,
                   (float)L->title_y + (font_height(ft) - font_height(fb)) * 0.5f,
                   mode, mode_col);
 
@@ -320,24 +380,28 @@ static void draw(MClient *c, int vw, int vh, const Layout *L,
     char line[128];
     snprintf(line, sizeof(line), "gen %ld   pop %d   fps %.1f",
              st->gen, st->pop, st->fps);
-    font_draw(&s, fb, (float)MARGIN, (float)L->foot_y, line, COL_DIM);
 
     char dims[32];
     snprintf(dims, sizeof(dims), "%dx%d cells", gcols, grows);
     float dw = font_width(fs, dims);
-    float limit = (float)MARGIN + font_width(fb, line) + 12;
-    if ((float)vw - MARGIN - dw > limit)
-        font_draw(&s, fs, (float)vw - MARGIN - dw,
+    float line_max = (float)vw - 2.0f * (float)m;
+    if (dw + (float)ui_px(6) < line_max) line_max -= dw + (float)ui_px(6);
+    else dw = 0;
+    draw_fit(&s, fb, (float)m, (float)L->foot_y, line_max, line, COL_DIM);
+    if (dw > 0.0f)
+        font_draw(&s, fs, (float)vw - (float)m - dw,
                   (float)L->foot_y + (font_height(fb) - font_height(fs)),
                   dims, COL_FAINT);
 
-    /* hint line, or the real reason seeding failed */
+    /* hint line, or the real reason seeding failed - fitted to the band */
     if (st->err[0]) {
-        font_draw(&s, fs, (float)MARGIN, (float)L->hint_y, st->err, COL_ERROR);
+        draw_fit(&s, fs, (float)m, (float)L->hint_y,
+                 (float)vw - 2.0f * (float)m, st->err, COL_ERROR);
     } else {
-        font_draw(&s, fs, (float)MARGIN, (float)L->hint_y,
-                  "space pause   s step   r reseed   click a cell   q quit",
-                  COL_DIM);
+        draw_fit(&s, fs, (float)m, (float)L->hint_y,
+                 (float)vw - 2.0f * (float)m,
+                 "space pause   s step   r reseed   click a cell   q quit",
+                 COL_DIM);
     }
 }
 

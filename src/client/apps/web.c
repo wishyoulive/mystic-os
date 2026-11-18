@@ -75,6 +75,10 @@
 #include "../../mystic.h"
 #include "../tls.h"
 #include "../../css.h"
+/* Img is embedded in PageImg even in the WEB_HOST_TEST build, where img.c
+ * is not compiled in; without this the bare -DWEB_HOST_TEST translation
+ * unit does not know the type. */
+#include "../../img.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -103,6 +107,16 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #endif
+#endif
+
+#if defined(WEB_HOST_TEST)
+/* This switch builds a library, not a program: a harness #includes this
+ * file and calls the fetch/parser/layout code itself. Compiled on its own
+ * with -c, nothing calls those statics yet, so the unused warnings would
+ * only say that no harness is attached. Silenced for this switch alone;
+ * the OS build and WEB_DRAW_ONLY keep every warning on. */
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wunused-const-variable"
 #endif
 
 /* ------------------------------------------------------------
@@ -219,14 +233,27 @@ typedef struct {
 #define AF_GLUE    1     /* sits tight against the previous atom  */
 #define AF_BREAK   2     /* starts a new line                     */
 #define AF_LINKNUM 4     /* a "[3]" link marker: drawn dim        */
+#define AF_IMAGE   8     /* an inline <img> box: text is empty    */
+#define AF_ALT    16     /* the alt text, laid out only if the    */
+                         /* image could not be fetched/decoded    */
+#define AF_HARD   32     /* a real newline (pre) or blank line    */
 
 typedef struct {
     char text[WEB_ATOM_TEXT];
     u8   level;                      /* 0 body, 1..6 heading          */
     u8   flags;                      /* AF_*                          */
     u8   gap;                        /* px of space above, with AF_BREAK */
+    /* The resolved run style. css.c computes these per element; carrying
+     * them on the atom is what lets one paragraph contain bold, italic,
+     * underlined and struck words instead of one face for the block. */
+    u16  weight;                     /* 100..900; >=600 -> semibold   */
+    u8   italic;                     /* synthesised by shear (no face)*/
+    u8   decoration;                 /* CSS_TD_* bits                 */
+    u8   ws;                         /* CSS_WS_* at this run          */
+    u8   mono;                       /* pre/code/kbd/samp/tt          */
     u16  block;                      /* enclosing block, 0xFFFF none  */
     int16_t link;                    /* index into Doc.link, -1 none  */
+    int16_t img;                     /* index into Doc.img, -1 none   */
 } Atom;
 
 typedef struct {
@@ -245,6 +272,7 @@ typedef struct {
     u16 th;                          /* tallest face on the line     */
     u16 gap;                         /* space above the line         */
     u16 block;                       /* block whose column it sits in */
+    u16 x0, x1;                      /* the column this line was wrapped in */
 } Line;
 
 /* One block box: the part of CSS that is real vertical space, a real
@@ -260,6 +288,9 @@ typedef struct {
 
     int16_t margin_top, margin_bottom; /* design px                   */
     int16_t pad_top, pad_bottom;       /* design px                   */
+    /* margin-left/padding-left and their right twin are one column's
+     * inset: the box starts this far in and wraps that much earlier. */
+    u16 inset_left, inset_right;     /* design px, margin + padding   */
     u16 width, max_width;            /* design px; 0 = auto/none      */
     u16 width_pct, max_width_pct;    /* 0..1000; 0 = unset            */
 
@@ -278,11 +309,31 @@ typedef struct {
     u8  has_top;                     /* box_y0 already fixed          */
     u8  is_body;                     /* <body>: its background is the canvas */
     u8  has_color;                   /* the page (or an ancestor) set colour */
+    u16 indent;                      /* design px from ul/ol/blockquote/dd */
 } Block;
 
 typedef struct {
     char url[WEB_PATH_MAX];
 } Link;
+
+/* Every stylesheet the document references, in document order: either a
+ * <style> element's text (an offset into the collected buffer) or an
+ * external <link rel=stylesheet> still to be fetched. The browser walks
+ * this list after the first parse pass, so a sheet that appears after a
+ * <style> in the source also cascades after it - which is what "later
+ * wins" means for two rules of equal specificity. */
+typedef struct {
+    int  is_link;                   /* 1: fetch url; 0: css[off..off+len) */
+    int  off, len;                  /* <style> bytes in the text buffer   */
+    char url[WEB_PATH_MAX];         /* <link href>, already absolute      */
+    char media[32];                 /* <link media=...>                   */
+} CssSrc;
+
+/* WEB_MAX_CSSSRC bounds one document's stylesheet references. A real site
+ * links two or three; eight is the cap the browser states in its footer
+ * when it stops. */
+#define WEB_MAX_CSSSRC   8
+#define WEB_CSS_BYTES    (256 * 1024)   /* total fetched sheet bytes      */
 
 #define WEB_MAX_IMGS 8
 
@@ -293,7 +344,6 @@ typedef struct {
     char  alt[96];
     Img   pic;          /* decoded; pic.px == NULL until it is fetched   */
     int   tried;        /* fetch attempted - do not retry every frame    */
-    int   w, h;         /* drawn size at the current width               */
 } PageImg;
 
 typedef struct {
@@ -307,6 +357,9 @@ typedef struct {
     int  nblock;
     Link link[WEB_MAX_LINKS];
     int  nlink;
+    CssSrc csssrc[WEB_MAX_CSSSRC];
+    int  ncsssrc;
+    u8   css_capped;                 /* a sheet reference was dropped  */
     u32  doc_h;
     int  truncated;                  /* a cap was hit; say so in the footer */
     PageImg img[WEB_MAX_IMGS];
@@ -318,8 +371,13 @@ typedef struct {
  * so the wrap points it reports are the real ones. */
 typedef struct {
     void *ctx;
-    float (*text_w)(void *ctx, int level, const char *s, int n);
-    float (*line_h)(void *ctx, int level);
+    float (*text_w)(void *ctx, const Atom *a, const char *s, int n);
+    float (*line_h)(void *ctx, const Atom *a);
+    /* Ink a run paints past its upright advance. A synthesised italic is
+     * sheared, so its glyph tops lean right of the advance font_width()
+     * reports; layout has to reserve that or the next word is touched.
+     * NULL or 0 for an upright run. */
+    float (*overhang)(void *ctx, const Atom *a);
 } WebMetrics;
 
 /* ------------------------------------------------------------
@@ -686,29 +744,47 @@ static int http_parse(char *raw, long rawlen, HttpResponse *r, char **body, long
 
     long hdr_end = -1;
     long sep_len = 4;
-    for (long i = 0; i + 3 < rawlen; i++) {
-        if (raw[i] == '\r' && raw[i + 1] == '\n' && raw[i + 2] == '\r' && raw[i + 3] == '\n') {
-            hdr_end = i;
-            sep_len = 4;
-            break;
+    long base = 0;
+    /* A server may send one or more 1xx interim responses before the real
+     * one (100 Continue, 103 Early Hints). Each has its own header block;
+     * skip it and parse the next, instead of reading the interim block as
+     * if it were the final response. */
+    for (;;) {
+        hdr_end = -1;
+        sep_len = 4;
+        for (long i = base; i + 3 < rawlen; i++) {
+            if (raw[i] == '\r' && raw[i + 1] == '\n' &&
+                raw[i + 2] == '\r' && raw[i + 3] == '\n') {
+                hdr_end = i;
+                sep_len = 4;
+                break;
+            }
+            if (raw[i] == '\n' && raw[i + 1] == '\n') {
+                hdr_end = i;
+                sep_len = 2;
+                break;
+            }
         }
-        if (raw[i] == '\n' && raw[i + 1] == '\n') {
-            hdr_end = i;
-            sep_len = 2;
-            break;
-        }
-    }
-    if (hdr_end < 0) return -1;
-    if (rawlen < 5 || strncmp(raw, "HTTP/", 5)) return -1;
+        if (hdr_end < 0) return -1;
+        if (hdr_end - base < 5 || strncmp(raw + base, "HTTP/", 5)) return -1;
 
-    long sp = 5;
-    while (sp < hdr_end && raw[sp] != ' ') sp++;
-    if (sp >= hdr_end) return -1;
-    r->status = atoi(raw + sp + 1);
-    if (r->status < 100 || r->status > 599) return -1;
+        long sp = base + 5;
+        while (sp < hdr_end && raw[sp] != ' ') sp++;
+        if (sp >= hdr_end) return -1;
+        r->status = atoi(raw + sp + 1);
+        if (r->status < 100 || r->status > 599) return -1;
+        if (r->status >= 100 && r->status < 200) {
+            base = hdr_end + sep_len;
+            if (base >= rawlen) return -1;
+            memset(r, 0, sizeof(*r));
+            r->content_length = -1;
+            continue;
+        }
+        break;
+    }
 
     /* position just past the status line: the first header */
-    long pos = 0;
+    long pos = base;
     while (pos < hdr_end && raw[pos] != '\n') pos++;
     pos++;
 
@@ -1066,9 +1142,11 @@ typedef struct {
     /* What TLS said, copied out of the session before it is closed.
      * tls is 0 for plain http, where these strings stay empty. */
     int   tls;
+    int   tls_chain_ok;
     char  tls_version[16];
     char  tls_cipher[48];
     char  tls_cn[128];
+    char  tls_subject[200];
     char  tls_expiry[32];
 } Fetch;
 
@@ -1086,9 +1164,11 @@ static void web_fetch(Fetch *f, const WebTransport *tr, Url *u, char *raw) {
          * previous one survives it: an https -> http redirect must not be
          * drawn with the padlock earned by the page that sent it. */
         f->tls = 0;
+        f->tls_chain_ok = 0;
         f->tls_version[0] = 0;
         f->tls_cipher[0] = 0;
         f->tls_cn[0] = 0;
+        f->tls_subject[0] = 0;
         f->tls_expiry[0] = 0;
         f->truncated = 0;
         f->status = 0;
@@ -1106,6 +1186,7 @@ static void web_fetch(Fetch *f, const WebTransport *tr, Url *u, char *raw) {
 
         WebStream *st = tr->open(u->host, u->port, u->https, err, sizeof(err));
         if (!st) {
+            f->elapsed_ms += now_ms() - t0;
             snprintf(f->error, sizeof(f->error), "%s", err[0] ? err : "cannot connect");
             return;
         }
@@ -1114,13 +1195,16 @@ static void web_fetch(Fetch *f, const WebTransport *tr, Url *u, char *raw) {
         const TlsInfo *ti = tr->tls ? tr->tls(st) : NULL;
         if (ti) {
             f->tls = 1;
+            f->tls_chain_ok = ti->chain_ok;
             snprintf(f->tls_version, sizeof(f->tls_version), "%s", ti->version);
             snprintf(f->tls_cipher, sizeof(f->tls_cipher), "%s", ti->cipher);
             snprintf(f->tls_cn, sizeof(f->tls_cn), "%s", ti->cn);
+            snprintf(f->tls_subject, sizeof(f->tls_subject), "%s", ti->subject);
             snprintf(f->tls_expiry, sizeof(f->tls_expiry), "%s", ti->not_after);
         }
         if (tr->send(st, req, (long)strlen(req), err, sizeof(err)) < 0) {
             tr->close(st);
+            f->elapsed_ms += now_ms() - t0;
             snprintf(f->error, sizeof(f->error), "%s", err[0] ? err : "cannot send the request");
             return;
         }
@@ -1132,6 +1216,8 @@ static void web_fetch(Fetch *f, const WebTransport *tr, Url *u, char *raw) {
             long n = tr->recv(st, raw + total, WEB_RAW_MAX - 1 - total, err, sizeof(err));
             if (n < 0) {
                 tr->close(st);
+                f->elapsed_ms += now_ms() - t0;
+                f->raw_bytes += total;
                 snprintf(f->error, sizeof(f->error), "%s", err[0] ? err : "cannot read the response");
                 return;
             }
@@ -1140,8 +1226,11 @@ static void web_fetch(Fetch *f, const WebTransport *tr, Url *u, char *raw) {
         }
         tr->close(st);
 
-        f->elapsed_ms = now_ms() - t0;
-        f->raw_bytes = total;
+        /* Every leg of a redirect, and every read, is added to the same
+         * totals: the footer describes the whole load, not the last
+         * response. */
+        f->elapsed_ms += now_ms() - t0;
+        f->raw_bytes += total;
         f->truncated = truncated;
         raw[total] = 0;
 
@@ -1305,6 +1394,9 @@ typedef struct {
      * buffers are wider than CSS_CLASS_MAX/CSS_ID_MAX on purpose. */
     char cls[96];
     char id[48];
+    char rel[32];                /* <link rel=stylesheet>          */
+    char media[32];              /* <link media=screen>            */
+    char style[256];             /* the inline style="..." element */
     int  align;                  /* align= hint: 0/1/2/3 = left/center/right/justify */
 } Tag;
 
@@ -1399,6 +1491,17 @@ static int parse_tag(const char *s, long n, long *used, Tag *t) {
             } else if (!strcmp(an, "id") && vl < (long)sizeof(t->id)) {
                 memcpy(t->id, s + vs, (size_t)vl);
                 t->id[vl] = 0;
+            } else if (!strcmp(an, "rel") && vl < (long)sizeof(t->rel)) {
+                memcpy(t->rel, s + vs, (size_t)vl);
+                t->rel[vl] = 0;
+            } else if (!strcmp(an, "media") && vl < (long)sizeof(t->media)) {
+                memcpy(t->media, s + vs, (size_t)vl);
+                t->media[vl] = 0;
+            } else if (!strcmp(an, "style") && vl < (long)sizeof(t->style)) {
+                /* The inline style is applied to the element's resolved
+                 * style in html_elem_push(), as the author's last word. */
+                memcpy(t->style, s + vs, (size_t)vl);
+                t->style[vl] = 0;
             } else if (!strcmp(an, "align")) {
                 if (ci_eq(s + vs, vl, "center")) t->align = 1;
                 else if (ci_eq(s + vs, vl, "right")) t->align = 2;
@@ -1412,6 +1515,7 @@ typedef struct {
     char   tag[CSS_TAG_MAX];
     char   cls[96];
     char   id[48];
+    unsigned hidden;             /* display:none here or on an ancestor */
     CssNode node;                /* style resolved with its ancestors */
 } HtmlElem;
 
@@ -1419,6 +1523,7 @@ typedef struct {
     char tag[CSS_TAG_MAX];
     int  block;                  /* index into Doc.block, -1 if capped */
     int  elem;                   /* index into Html.elem, -1 if capped */
+    int  ordinal;                /* li counter, for ol/ul elements     */
 } HtmlOpen;
 
 typedef struct {
@@ -1440,9 +1545,23 @@ typedef struct {
     int         pending_break;
     int         pending_gap;
     int         pending_space;
+    int         glue_next;       /* the next atom continues a split run */
+    int         pre_seen;        /* a <pre> line has content      */
+    int         pre_break;       /* a hard break was emitted      */
+    int         pre_col;         /* character column in a pre line,
+                                  * so a tab reaches the next CSS
+                                  * tab stop (tab-size: 8)        */
     char        word[WEB_ATOM_TEXT];
     int         wlen;
     int         overflow;        /* a cap was hit                 */
+    /* display:none. `hidden` is the number of open elements whose own
+     * resolved display is none plus every hidden ancestor: a subtree is
+     * hidden by the topmost element that says so, and every descendant
+     * inherits that without a rule of its own. Text, pictures, link
+     * markers and block boxes inside it are not created at all. */
+    int         hidden;
+    int         style_off;       /* css offset where the open <style> began */
+    int         style_open;      /* <style> body currently being collected */
     HtmlElem    elem[WEB_BLOCK_DEPTH];
     int         nelem;
     HtmlOpen    open[WEB_BLOCK_DEPTH];
@@ -1455,24 +1574,96 @@ static int is_heading_tag(const char *n) {
     return n[0] == 'h' && n[1] >= '1' && n[1] <= '6' && !n[2];
 }
 
+/* The innermost enclosing block box. Inline elements now live on the same
+ * open stack (that is what lets one word be bold and the next regular),
+ * so "the current block" is the nearest entry that owns one. */
 static int html_block_cur(const Html *h) {
-    return h->nopen > 0 ? h->open[h->nopen - 1].block : -1;
+    for (int i = h->nopen - 1; i >= 0; i--)
+        if (h->open[i].block >= 0) return h->open[i].block;
+    return -1;
 }
 
-static void html_atom(Html *h, const char *text, long len, int flags, int link) {
+static const CssStyle *html_top_style(const Html *h) {
+    if (h->nelem <= 0) return NULL;
+    return &h->elem[h->nelem - 1].node.style;
+}
+
+/* Is the innermost open element inside a display:none subtree? Text and
+ * boxes inside one are never created, which is what makes
+ * `display:none` hide a whole nav block instead of one line of it. */
+static int html_hidden(const Html *h) {
+    return h->nelem > 0 && h->elem[h->nelem - 1].hidden;
+}
+
+static int html_white_space(const Html *h) {
+    const CssStyle *cs = html_top_style(h);
+    return cs ? cs->white_space : CSS_WS_NORMAL;
+}
+
+/* white-space values that keep literal spaces and tabs (pre, pre-wrap). */
+static int html_keeps_spaces(const Html *h) {
+    int ws = html_white_space(h);
+    return ws == CSS_WS_PRE || ws == CSS_WS_PRE_WRAP;
+}
+
+/* white-space values that keep newlines (pre, pre-wrap, pre-line). */
+static int html_keeps_lines(const Html *h) {
+    int ws = html_white_space(h);
+    return ws == CSS_WS_PRE || ws == CSS_WS_PRE_WRAP || ws == CSS_WS_PRE_LINE;
+}
+
+/* Fill one atom. Style is read from the innermost open element, so a run
+ * created inside <b><i> carries both facts to the painter. A zero-length
+ * atom is a box, not text, and only two flags make one: a hard line break
+ * (AF_BREAK) and an inline picture (AF_IMAGE). Treating the image box as
+ * empty text dropped it, so a picture in the middle of a line had no box
+ * at the <img> position and its alt text was printed even though the
+ * pixels had been decoded. */
+static void html_atom(Html *h, const char *text, long len, int flags,
+                      int link, int img) {
     Doc *d = h->d;
-    if (len <= 0) return;
+    if (len < 0) return;
+    if (html_hidden(h)) return;              /* display:none subtree */
+    if (len == 0 && !(flags & (AF_BREAK | AF_IMAGE))) return;
     if (len >= WEB_ATOM_TEXT) len = WEB_ATOM_TEXT - 1;
     if (d->natom >= WEB_MAX_ATOMS) { h->overflow = 1; d->truncated = 1; return; }
     Atom *a = &d->atom[d->natom++];
-    memcpy(a->text, text, (size_t)len);
+    if (len > 0) memcpy(a->text, text, (size_t)len);
     a->text[len] = 0;
-    /* The innermost block owns the type face and the column. A heading
-     * block carries its level directly; every other block maps its CSS
-     * font-size onto the same seven faces the whole renderer uses. */
+
+    /* The innermost block owns the type size; the innermost element owns
+     * weight, slant, decoration, white-space and the monospace face. */
     int bi = html_block_cur(h);
     a->level = (u8)(bi >= 0 ? d->block[bi].level : (h->level ? h->level : 0));
+    const CssStyle *cs = html_top_style(h);
+    int w = cs ? cs->weight : CSS_WEIGHT_NORMAL;
+    if (w < 100) w = 100;
+    if (w > 900) w = 900;
+    /* Atom.weight is a u16 because CSS weights are 100..900: narrowing
+     * this through a u8 truncated 400 to 144 and 700 to 188, so every
+     * run failed font_for_atom()'s >= 600 test and bold never existed. */
+    a->weight = (u16)w;
+    a->italic = (u8)(cs && cs->italic);
+    /* css.c resolves text-decoration for one element and *assigns* it, so
+     * a nested element that declares its own bit erases the outer one:
+     * `<u><s>x</s></u>` came out line-through only, and a link inside <s>
+     * lost the strike. CSS does not inherit text-decoration; it
+     * propagates the ancestor's decoration into the inline subtree and no
+     * descendant can cancel it. Union the open element chain here, where
+     * the run that will be painted is formed. */
+    int dec = cs ? cs->decoration : 0;
+    for (int i = 0; i < h->nopen; i++) {
+        int ei = h->open[i].elem;
+        if (ei >= 0) dec |= h->elem[ei].node.style.decoration;
+    }
+    a->decoration = (u8)dec;
+    a->ws = (u8)(cs ? cs->white_space : CSS_WS_NORMAL);
+    a->mono = (u8)(cs && cs->monospace);
     a->flags = (u8)flags;
+    if (h->glue_next) {
+        a->flags |= AF_GLUE;
+        h->glue_next = 0;
+    }
     int gap = 0;
     if (flags & AF_BREAK) {
         gap = h->pending_gap;
@@ -1481,6 +1672,7 @@ static void html_atom(Html *h, const char *text, long len, int flags, int link) 
     a->gap = (u8)gap;
     a->block = (u16)(bi < 0 ? 0xFFFF : bi);
     a->link = (int16_t)link;
+    a->img = (int16_t)img;
 }
 
 /* Ending a word is where the break/space state is spent. */
@@ -1492,14 +1684,24 @@ static void html_end_word(Html *h, int glued) {
     /* no whitespace before this word means it is glued to the previous
      * one: "lists</a>," must not put a space before the comma */
     else if (glued || !h->pending_space) flags |= AF_GLUE;
-    html_atom(h, h->word, h->wlen, flags, h->in_link);
+    html_atom(h, h->word, h->wlen, flags, h->in_link, -1);
     h->wlen = 0;
     h->pending_break = 0;
     h->pending_gap = 0;
     h->pending_space = 0;
 }
 
+/* Flush the pending word at an opening inline tag without eating the
+ * space that came before the tag: "foo <b>bar" must still read with one
+ * space, and the word after </b> must not be glued to the one before. */
+static void html_flush_before_inline(Html *h) {
+    int space = h->pending_space;
+    html_end_word(h, 0);
+    if (space) h->pending_space = 1;
+}
+
 static void html_put(Html *h, const char *bytes, long len) {
+    if (html_hidden(h)) return;              /* display:none subtree */
     for (long i = 0; i < len; i++) {
         if (h->wlen >= WEB_ATOM_TEXT - 2) {
             /* one word too long for one atom: continue it in the next,
@@ -1507,11 +1709,12 @@ static void html_put(Html *h, const char *bytes, long len) {
             h->word[h->wlen] = 0;
             int flags = 0;
             if (h->pending_break) flags |= AF_BREAK;
-            html_atom(h, h->word, h->wlen, flags, h->in_link);
+            html_atom(h, h->word, h->wlen, flags, h->in_link, -1);
             h->wlen = 0;
             h->pending_break = 0;
             h->pending_gap = 0;
             h->pending_space = 0;
+            h->glue_next = 1;
             h->word[h->wlen++] = bytes[i];
             continue;
         }
@@ -1522,7 +1725,14 @@ static void html_put(Html *h, const char *bytes, long len) {
 static void html_break(Html *h, int gap) {
     html_end_word(h, 0);
     h->pending_break = 1;
+    h->pre_col = 0;              /* whatever starts now is column 0 */
     if (gap > h->pending_gap) h->pending_gap = gap;
+}
+
+/* A real newline inside a pre block: an atom, not a pending flag, so a
+ * blank line is distinguishable from a line that has not started. */
+static void html_hard_break(Html *h) {
+    html_atom(h, "", 0, AF_BREAK | AF_HARD, -1, -1);
 }
 
 /* <title> text. The text scanner calls this once per character, so it
@@ -1547,14 +1757,14 @@ static void html_atom_word(Html *h, const char *text, long len, int link, int gl
     int flags = 0;
     if (h->pending_break) flags |= AF_BREAK;
     else if (glue || !h->pending_space) flags |= AF_GLUE;
-    html_atom(h, text, len, flags, link);
+    html_atom(h, text, len, flags, link, -1);
     h->pending_break = 0;
     h->pending_gap = 0;
     h->pending_space = 0;
 }
 
 /* Text between tags: decode entities, collapse whitespace, transcode
- * Latin-1 when the server said so. */
+ * Latin-1 when the server said so, and preserve it all inside pre. */
 static void html_text(Html *h, const char *s, long n) {
     if (h->skip) {
         /* A <style> body IS the stylesheet: keep it (bounded), and keep
@@ -1571,6 +1781,9 @@ static void html_text(Html *h, const char *s, long n) {
         return;
     }
 
+    const int keep_spaces = html_keeps_spaces(h);
+    const int keep_lines = html_keeps_lines(h);
+
     long i = 0;
     while (i < n) {
         unsigned char c = (unsigned char)s[i];
@@ -1581,10 +1794,17 @@ static void html_text(Html *h, const char *s, long n) {
             if (entity_decode(s + i, n - i, dec, sizeof(dec), &used, &outlen)) {
                 if (h->in_title) html_title_put(h, dec, outlen);
                 else if (outlen == 1 && dec[0] == ' ') {
-                    html_end_word(h, 0);        /* &nbsp; ends the word */
-                    h->pending_space = 1;
+                    if (keep_spaces) {
+                        html_put(h, " ", 1);        /* &nbsp; is a real space */
+                        h->pre_seen = 1;
+                        h->pre_col++;
+                    } else {
+                        html_end_word(h, 0);        /* &nbsp; ends the word */
+                        h->pending_space = 1;
+                    }
                 } else {
                     html_put(h, dec, outlen);
+                    if (keep_spaces) { h->pre_seen = 1; h->pre_col++; }
                 }
                 i += used;
                 continue;
@@ -1596,11 +1816,55 @@ static void html_text(Html *h, const char *s, long n) {
         }
 
         if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v') {
-            if (h->in_title) html_title_put(h, " ", 1);
-            else {
-                html_end_word(h, 0);            /* end the word, then */
-                h->pending_space = 1;           /* space the next one */
+            if (h->in_title) {
+                html_title_put(h, " ", 1);
+                i++;
+                continue;
             }
+            if (c == '\n' || c == '\r') {
+                if (keep_lines) {
+                    if (c == '\r' && i + 1 < n && s[i + 1] == '\n') i++;
+                    h->pre_col = 0;          /* a new line starts at column 0 */
+                    if (h->pre_seen || h->wlen > 0) {
+                        html_end_word(h, 0);
+                        html_hard_break(h);
+                        h->pre_seen = 0;
+                        h->pre_break = 1;
+                    } else if (h->pre_break) {
+                        /* the previous newline ended a line, so this one is
+                         * a blank line and must keep its height */
+                        html_hard_break(h);
+                    } else {
+                        /* the newline right after <pre> is not a line */
+                        h->pre_break = 1;
+                    }
+                    i++;
+                    continue;
+                }
+                html_end_word(h, 0);
+                h->pending_space = 1;
+                i++;
+                continue;
+            }
+            if (keep_spaces) {
+                /* white-space: pre keeps every space, and a tab advances to
+                 * the next tab stop. CSS's initial tab-size is 8 spaces, so
+                 * one column counter is enough in the monospace face a pre
+                 * block is set in; it is counted in characters, which is what
+                 * tab-size means. */
+                int count = 1;
+                if (c == '\t') {
+                    count = 8 - (h->pre_col % 8);
+                    if (count <= 0) count = 8;
+                }
+                for (int k = 0; k < count; k++) html_put(h, " ", 1);
+                h->pre_seen = 1;
+                h->pre_col += count;
+                i++;
+                continue;
+            }
+            html_end_word(h, 0);                /* end the word, then */
+            h->pending_space = 1;               /* space the next one */
             i++;
             continue;
         }
@@ -1611,6 +1875,7 @@ static void html_text(Html *h, const char *s, long n) {
             if (h->in_title) html_title_put(h, (const char *)&c, 1);
             else html_put(h, (const char *)&c, 1);
             i++;
+            if (keep_spaces) { h->pre_seen = 1; h->pre_col++; }
             continue;
         }
 
@@ -1621,6 +1886,7 @@ static void html_text(Html *h, const char *s, long n) {
             if (h->in_title) html_title_put(h, u, 2);
             else html_put(h, u, 2);
             i++;
+            if (keep_spaces) { h->pre_seen = 1; h->pre_col++; }
             continue;
         }
 
@@ -1629,6 +1895,7 @@ static void html_text(Html *h, const char *s, long n) {
         if (h->in_title) html_title_put(h, s + i, len);
         else html_put(h, s + i, len);
         i += len;
+        if (keep_spaces) { h->pre_seen = 1; h->pre_col++; }
     }
 }
 
@@ -1645,8 +1912,72 @@ static int is_block_tag(const char *n) {
     return 0;
 }
 
+/* Elements with no end tag. They never go on the open stack. */
+static int is_void_tag(const char *n) {
+    static const char *voids[] = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr", NULL
+    };
+    for (int i = 0; voids[i]; i++)
+        if (!strcmp(n, voids[i])) return 1;
+    return 0;
+}
+
+/* Does a <link media> / <style media> value apply to a screen? Same
+ * policy as css.c's @media: media TYPES only, and a query that narrows on
+ * a viewport feature is not one a text browser can honour, so it is not
+ * applied. */
+static int media_ok(const char *m) {
+    /* One policy, shared with css.c's @media evaluator: a <link media>
+     * is the same question as an @media block. */
+    return css_media_matches(m);
+}
+
+/* Record one stylesheet reference in document order. A <style> element
+ * passes the byte range its body occupies in the collected text; a <link>
+ * passes the absolute URL. Returns 1 if the reference was kept. */
+static int html_add_csssrc(Html *h, int is_link, int off, int len,
+                           const char *url, const char *media) {
+    Doc *d = h->d;
+    if (d->ncsssrc >= WEB_MAX_CSSSRC) { d->css_capped = 1; return 0; }
+    CssSrc *s = &d->csssrc[d->ncsssrc++];
+    s->is_link = is_link;
+    s->off = off;
+    s->len = len;
+    s->url[0] = 0;
+    s->media[0] = 0;
+    if (url) snprintf(s->url, sizeof(s->url), "%s", url);
+    if (media) snprintf(s->media, sizeof(s->media), "%s", media);
+    return 1;
+}
+
+/* <link rel=stylesheet href=...>. The href is resolved against the page
+ * it came from by url_resolve(), the resolver the rest of the document
+ * uses (relative, absolute and //host/x.css all land on a real address);
+ * the bytes are fetched after the first parse pass, because the browser
+ * has one connection and the document is what names them. */
+static void html_add_stylesheet(Html *h, const Tag *t) {
+    if (!t->href[0]) return;
+    /* A stylesheet is a resource, not content: a <link> inside <head> -
+     * which the built-in sheet hides with display:none - still has to be
+     * fetched. Only the media it applies to can exclude it. */
+    /* rel is a space-separated token list: "stylesheet", "alternate
+     * stylesheet", "preload". Anything without the word is not a sheet. */
+    if (!ci_has(t->rel, (long)strlen(t->rel), "stylesheet")) return;
+    if (ci_has(t->rel, (long)strlen(t->rel), "alternate")) return;
+    if (!media_ok(t->media)) return;
+
+    char abs[WEB_PATH_MAX];
+    char err[64];
+    err[0] = 0;
+    url_resolve(h->base, t->href, abs, sizeof(abs), err, sizeof(err));
+    if (!abs[0]) return;
+    html_add_csssrc(h, 1, 0, 0, abs, t->media);
+}
+
 static void html_add_link(Html *h, const Tag *t) {
     if (h->in_link >= 0) return;              /* nested <a>: keep the outer */
+    if (html_hidden(h)) { h->in_link = -1; return; }
     if (h->d->nlink >= WEB_MAX_LINKS) { h->in_link = -1; return; }
     if (!t->href[0]) { h->in_link = -1; return; }
 
@@ -1661,21 +1992,76 @@ static void html_add_link(Html *h, const Tag *t) {
     h->in_link = idx;
 }
 
-/* ------------------------------------------------------------ boxes
- * A block element opens a box. The box records the resolved style, the
- * atom range it covers and the metrics doc_layout needs; layout turns
- * the metrics into real vertical space, and the painter into a real
- * background and real rules. Inline elements do not open a box: this
- * text renderer does not claim to place them.
- *
- * The ancestor stack is kept as copies of tag/class/id, because the CssNode
- * that css_for() matches against must outlive the Tag it came from. */
-static void html_block_open(Html *h, const Tag *t, int level)
-{
-    Doc *d = h->d;
-    html_end_word(h, 0);
+/* The marker for one list item. Decimal, the alphabets and the roman
+ * numerals are all in css.h's list-style-type; the three bullet shapes
+ * are the ones the built-in sheet asks for. */
+static void list_marker(int style, int n, char *out, size_t cap) {
+    static const char *roman[][2] = {
+        { "M", "1000" }, { "CM", "900" }, { "D", "500" }, { "CD", "400" },
+        { "C", "100" }, { "XC", "90" }, { "L", "50" }, { "XL", "40" },
+        { "X", "10" }, { "IX", "9" }, { "V", "5" }, { "IV", "4" },
+        { "I", "1" }, { NULL, NULL }
+    };
+    static const int rval[] = { 1000, 900, 500, 400, 100, 90, 50, 40,
+                                10, 9, 5, 4, 1 };
+    out[0] = 0;
+    switch (style) {
+        case CSS_LIST_DISC:   snprintf(out, cap, "\xE2\x80\xA2"); break;
+        case CSS_LIST_CIRCLE: snprintf(out, cap, "\xE2\x88\x98"); break;
+        case CSS_LIST_SQUARE: snprintf(out, cap, "\xE2\x96\xAA"); break;
+        case CSS_LIST_DECIMAL: snprintf(out, cap, "%d.", n); break;
+        case CSS_LIST_LOWER_ALPHA:
+        case CSS_LIST_UPPER_ALPHA: {
+            char a[16];
+            int k = 0, v = n > 0 ? n : 1;
+            while (v > 0 && k < (int)sizeof(a) - 1) {
+                a[k++] = (char)('a' + (v - 1) % 26);
+                v = (v - 1) / 26;
+            }
+            char b[20];
+            int j = 0;
+            while (k > 0) b[j++] = a[--k];
+            b[j++] = '.';
+            b[j] = 0;
+            if (style == CSS_LIST_UPPER_ALPHA)
+                for (int i = 0; b[i]; i++)
+                    if (b[i] >= 'a' && b[i] <= 'z') b[i] = (char)(b[i] - 'a' + 'A');
+            snprintf(out, cap, "%s", b);
+            break;
+        }
+        case CSS_LIST_LOWER_ROMAN:
+        case CSS_LIST_UPPER_ROMAN: {
+            char b[32];
+            size_t o = 0;
+            int v = n > 0 ? n : 1;
+            if (v > 3999) v = 3999;
+            for (int i = 0; rval[i] && o + 6 < sizeof(b); i++) {
+                while (v >= rval[i]) {
+                    size_t l = strlen(roman[i][0]);
+                    memcpy(b + o, roman[i][0], l);
+                    o += l;
+                    v -= rval[i];
+                }
+            }
+            b[o++] = '.';
+            b[o] = 0;
+            if (style == CSS_LIST_UPPER_ROMAN)
+                for (size_t i = 0; b[i]; i++)
+                    if (b[i] >= 'a' && b[i] <= 'z') b[i] = (char)(b[i] - 'a' + 'A');
+            snprintf(out, cap, "%s", b);
+            break;
+        }
+        default: break;
+    }
+}
 
-    int bi = -1, ei = -1;
+/* Open one element: always a style node, plus a block box when the tag
+ * asks for one. Inline elements share the same stack, which is what makes
+ * `foo<b>bar</b>baz` carry two different weights to the atom level. */
+static void html_elem_push(Html *h, const Tag *t, int make_block, int level) {
+    Doc *d = h->d;
+    int ei = -1, bi = -1;
+
     if (h->nopen < WEB_BLOCK_DEPTH && h->nelem < WEB_BLOCK_DEPTH) {
         ei = h->nelem++;
         HtmlElem *e = &h->elem[ei];
@@ -1690,85 +2076,156 @@ static void html_block_open(Html *h, const Tag *t, int level)
         const CssNode *up = ei > 0 ? &h->elem[ei - 1].node : NULL;
         css_node_init(&e->node, e->tag, e->cls[0] ? e->cls : NULL,
                       e->id[0] ? e->id : NULL, attrs, up, h->sheet);
-        const CssStyle *cs = &e->node.style;
-
-        if (d->nblock < WEB_MAX_BLOCKS) {
-            bi = d->nblock++;
-            Block *b = &d->block[bi];
-            memset(b, 0, sizeof *b);
-            b->atom_start = (u16)d->natom;
-            b->atom_end = (u16)d->natom;
-            b->line_start = 0xFFFF;
-            b->line_end = 0xFFFF;
-            b->parent = (u16)(h->nopen > 0 && h->open[h->nopen - 1].block >= 0
-                              ? h->open[h->nopen - 1].block : 0xFFFF);
-            /* A block tag with no margin in the sheet keeps the spacing
-             * the reader is used to (GAP_BLOCK_D); a sheet that says 0
-             * gets 0, because CSS_SET_MARGIN_* is then set. */
-            b->margin_top = (int16_t)((cs->set & CSS_SET_MARGIN_TOP) ? cs->margin_top : GAP_BLOCK_D);
-            b->margin_bottom = (int16_t)((cs->set & CSS_SET_MARGIN_BOTTOM) ? cs->margin_bottom : GAP_BLOCK_D);
-            b->pad_top = (int16_t)cs->pad_top;
-            b->pad_bottom = (int16_t)cs->pad_bottom;
-            b->width = (u16)(cs->width < 0 ? 0 : cs->width > 10000 ? 10000 : cs->width);
-            b->max_width = (u16)(cs->max_width < 0 ? 0 : cs->max_width > 10000 ? 10000 : cs->max_width);
-            b->width_pct = (u16)(cs->width_pct < 0 ? 0 : cs->width_pct);
-            b->max_width_pct = (u16)(cs->max_width_pct < 0 ? 0 : cs->max_width_pct);
-            b->background = cs->background;
-            b->color = cs->color;
-            b->has_color = (u8)((cs->set & CSS_SET_COLOR) != 0 ||
-                                (b->parent != 0xFFFF && d->block[b->parent].has_color));
-            b->border_top_w = (u8)(cs->border_top_w > 0 ? cs->border_top_w : 0);
-            b->border_bottom_w = (u8)(cs->border_bottom_w > 0 ? cs->border_bottom_w : 0);
-            b->border_top_style = (u8)cs->border_top_style;
-            b->border_bottom_style = (u8)cs->border_bottom_style;
-            b->border_top_color = cs->border_top_color;
-            b->border_bottom_color = cs->border_bottom_color;
-            b->align = (u8)cs->align;
-            b->is_body = (u8)(!strcmp(t->name, "body"));
-            b->level = (u8)(level > 0 ? level : level_for_px(cs->font_size));
-            b->line_height = (u16)(cs->line_height > 60000 ? 60000 :
-                                   cs->line_height < 0 ? 0 : cs->line_height);
-        }
+        /* The author's last word on this element is its own style="..."
+         * attribute: it beats every sheet rule, and the descendants that
+         * inherit from this element see the result. */
+        if (t->style[0])
+            css_inline_for(&e->node.style, t->style, strlen(t->style),
+                           up ? &up->style : NULL);
+        e->hidden = (unsigned)(ei > 0 ? h->elem[ei - 1].hidden : 0);
+        if (e->node.style.display == CSS_DISPLAY_NONE) e->hidden = 1;
     }
 
-    if (h->nopen < WEB_BLOCK_DEPTH) {
+    const CssStyle *cs = ei >= 0 ? &h->elem[ei].node.style
+                                 : html_top_style(h);
+
+    /* display:none hides the whole subtree, so a hidden element does not
+     * open a box either: nothing inside it can produce a line. */
+    if (make_block && html_hidden(h)) bi = -1;
+    /* `display:block` on a tag that is inline by default really is a
+     * block box - nav links written as <a> are the usual case. */
+    else if (!make_block && cs && (cs->display == CSS_DISPLAY_BLOCK ||
+                                   cs->display == CSS_DISPLAY_LIST_ITEM))
+        make_block = 1;
+
+    if (make_block && d->nblock < WEB_MAX_BLOCKS) {
+        bi = d->nblock++;
+        Block *b = &d->block[bi];
+        memset(b, 0, sizeof *b);
+        b->atom_start = (u16)d->natom;
+        b->atom_end = (u16)d->natom;
+        b->line_start = 0xFFFF;
+        b->line_end = 0xFFFF;
+        int parent_block = html_block_cur(h);
+        b->parent = (u16)(parent_block >= 0 ? parent_block : 0xFFFF);
+        /* A block tag with no margin in the sheet keeps the spacing
+         * the reader is used to (GAP_BLOCK_D); a sheet that says 0
+         * gets 0, because CSS_SET_MARGIN_* is then set. */
+        b->margin_top = (int16_t)((cs && (cs->set & CSS_SET_MARGIN_TOP)) ? cs->margin_top : GAP_BLOCK_D);
+        b->margin_bottom = (int16_t)((cs && (cs->set & CSS_SET_MARGIN_BOTTOM)) ? cs->margin_bottom : GAP_BLOCK_D);
+        b->pad_top = (int16_t)(cs ? cs->pad_top : 0);
+        b->pad_bottom = (int16_t)(cs ? cs->pad_bottom : 0);
+        /* The horizontal half of the box: margin-left and padding-left
+         * (and their right twins) become the column's insets. Nothing is
+         * invented for a border: this renderer draws the top and bottom
+         * rules, and a vertical rule would need a second axis. */
+        int il = cs ? cs->margin_left + cs->pad_left : 0;
+        int ir = cs ? cs->margin_right + cs->pad_right : 0;
+        if (il < 0) il = 0;
+        if (ir < 0) ir = 0;
+        b->inset_left = (u16)(il > 10000 ? 10000 : il);
+        b->inset_right = (u16)(ir > 10000 ? 10000 : ir);
+        b->width = (u16)(!cs || cs->width < 0 ? 0 : cs->width > 10000 ? 10000 : cs->width);
+        b->max_width = (u16)(!cs || cs->max_width < 0 ? 0 : cs->max_width > 10000 ? 10000 : cs->max_width);
+        b->width_pct = (u16)(!cs || cs->width_pct < 0 ? 0 : cs->width_pct);
+        b->max_width_pct = (u16)(!cs || cs->max_width_pct < 0 ? 0 : cs->max_width_pct);
+        b->background = cs ? cs->background : 0;
+        b->color = cs ? cs->color : 0;
+        b->has_color = (u8)((cs && (cs->set & CSS_SET_COLOR)) ||
+                            (parent_block >= 0 && d->block[parent_block].has_color));
+        b->border_top_w = (u8)(cs && cs->border_top_w > 0 ? cs->border_top_w : 0);
+        b->border_bottom_w = (u8)(cs && cs->border_bottom_w > 0 ? cs->border_bottom_w : 0);
+        b->border_top_style = (u8)(cs ? cs->border_top_style : CSS_BORDER_NONE);
+        b->border_bottom_style = (u8)(cs ? cs->border_bottom_style : CSS_BORDER_NONE);
+        b->border_top_color = cs ? cs->border_top_color : 0;
+        b->border_bottom_color = cs ? cs->border_bottom_color : 0;
+        b->align = (u8)(cs ? cs->align : CSS_ALIGN_LEFT);
+        b->is_body = (u8)(!strcmp(t->name, "body"));
+        b->level = (u8)(level > 0 ? level : level_for_px(cs ? cs->font_size : CSS_BASE_FONT_SIZE));
+        b->line_height = (u16)(!cs || cs->line_height > 60000 ? 60000 :
+                               cs->line_height < 0 ? 0 : cs->line_height);
+        b->indent = (u16)(!cs || cs->indent < 0 ? 0 : cs->indent > 10000 ? 10000 : cs->indent);
+    }
+
+    if (ei >= 0) {
         HtmlOpen *o = &h->open[h->nopen++];
         snprintf(o->tag, sizeof o->tag, "%s", t->name);
         o->block = bi;
         o->elem = ei;
+        o->ordinal = 0;
+    } else if (bi >= 0) {
+        /* No room to track it: the box is real but empty. */
+        d->block[bi].atom_end = (u16)d->natom;
     }
 
-    h->level = level;
-    h->pending_break = 1;
-    h->pending_gap = 0;
-    h->pending_space = 0;
+    if (make_block) {
+        h->level = level;
+        h->pending_break = 1;
+        h->pending_gap = 0;
+        h->pending_space = 0;
+        h->pre_seen = 0;
+        h->pre_break = 0;
+        h->pre_col = 0;
+    }
 }
 
-/* Close the named box. Mismatched markup (“<b><div></b></div>”) closes the
- * inner boxes too, so the stack can never leak a box into the next page. */
-static void html_block_close(Html *h, const char *tag)
-{
+/* Close the named element. Mismatched markup (“<b><div></b></div>”)
+ * closes the inner elements too, so the stack can never leak a run into
+ * the next page. An inline close never starts a new line; it only ends
+ * the current word so the two sides can keep different faces. */
+static void html_elem_close(Html *h, const char *tag, int is_block) {
+    /* Flush the last word while the closing element still supplies its
+     * style; a block close must also end its word before its atom_end is
+     * stamped, or the last word of every heading lands in the next block. */
     html_end_word(h, 0);
     int k = -1;
     for (int i = h->nopen - 1; i >= 0; i--)
         if (!strcmp(h->open[i].tag, tag)) { k = i; break; }
     if (k < 0) {
-        h->pending_break = 1;
-        h->pending_gap = 0;
+        if (is_block) {
+            h->pending_break = 1;
+            h->pending_gap = 0;
+        }
         return;
     }
+    int had_block = 0;
     while (h->nopen > k) {
         HtmlOpen *o = &h->open[--h->nopen];
         if (o->block >= 0) {
             Block *b = &h->d->block[o->block];
             b->atom_end = (u16)h->d->natom;
+            had_block = 1;
         }
-        if (o->elem >= 0 && o->elem == h->nelem - 1) h->nelem--;
+        if (o->elem >= 0) h->nelem = o->elem;
     }
-    h->pending_break = 1;
-    h->pending_gap = 0;
-    h->pending_space = 0;
+    /* An inline tag that the cascade turned into a block box still ends
+     * like a block: the next text starts on a new line. */
+    if (is_block || had_block) {
+        h->pending_break = 1;
+        h->pending_gap = 0;
+        h->pending_space = 0;
+    }
     if (h->nopen == 0) h->level = 0;
+}
+
+static void html_block_open(Html *h, const Tag *t, int level) {
+    html_end_word(h, 0);
+    html_elem_push(h, t, 1, level);
+}
+
+static void html_block_close(Html *h, const char *tag) {
+    html_elem_close(h, tag, 1);
+}
+
+/* The enclosing list element and its resolved style, or NULL. */
+static HtmlOpen *html_list_open(Html *h) {
+    for (int i = h->nopen - 1; i >= 0; i--) {
+        const char *n = h->open[i].tag;
+        if (!strcmp(n, "ul") || !strcmp(n, "ol") ||
+            !strcmp(n, "menu") || !strcmp(n, "dir"))
+            return &h->open[i];
+    }
+    return NULL;
 }
 
 static void html_tag(Html *h, const Tag *t) {
@@ -1778,11 +2235,21 @@ static void html_tag(Html *h, const Tag *t) {
     if (t->closing) {
         if (!strcmp(n, "title")) {
             h->in_title = 0;
+            html_elem_close(h, "title", 0);
             return;
         }
         if (!strcmp(n, "script") || !strcmp(n, "style")) {
+            /* The <style> body has been collected by html_text(); record
+             * where it sits in the buffer so the cascade can read it in
+             * document order, after the sheets that preceded it. */
+            if (!strcmp(n, "style") && h->style_open && h->css && h->css_len) {
+                int len = (int)*h->css_len - h->style_off;
+                if (len > 0) html_add_csssrc(h, 0, h->style_off, len, NULL, NULL);
+            }
+            h->style_open = 0;
             h->skip = 0;
             h->in_style = 0;
+            html_elem_close(h, n, 0);
             return;
         }
         if (!strcmp(n, "a")) {
@@ -1790,19 +2257,28 @@ static void html_tag(Html *h, const Tag *t) {
                 char num[16];
                 int idx = h->in_link;
                 h->in_link = -1;
-                snprintf(num, sizeof(num), "[%d]", idx + 1);
                 html_end_word(h, 0);
+                html_elem_close(h, "a", 0);
+                snprintf(num, sizeof(num), "[%d]", idx + 1);
                 html_atom_word(h, num, (long)strlen(num), idx, 1);
                 /* no space is forced after the marker: "lists</a>,"
                  * has to read "lists[3],", while "</a> word" still
                  * gets its space from the whitespace in the page */
                 h->pending_space = 0;
+            } else {
+                html_elem_close(h, "a", 0);
             }
             return;
         }
-        if (!strcmp(n, "li")) { html_break(h, GAP_LI_D); return; }
+        if (!strcmp(n, "li")) {
+            html_end_word(h, 0);
+            html_elem_close(h, "li", 0);
+            html_break(h, GAP_LI_D);
+            return;
+        }
         if (!strcmp(n, "td") || !strcmp(n, "th")) {
             html_end_word(h, 0);
+            html_elem_close(h, n, 0);
             h->pending_space = 1;
             return;
         }
@@ -1812,56 +2288,135 @@ static void html_tag(Html *h, const Tag *t) {
             return;
         }
         if (is_block_tag(n)) { html_block_close(h, n); return; }
+        html_elem_close(h, n, 0);
         return;
     }
 
     /* open tags */
-    if (h->in_title && (!strcmp(n, "body") || is_block_tag(n) || is_heading_tag(n)))
+    if (h->in_title && (!strcmp(n, "body") || is_block_tag(n) || is_heading_tag(n))) {
         h->in_title = 0;
-    if (!strcmp(n, "title")) { h->in_title = 1; return; }
-    if (!strcmp(n, "script") || !strcmp(n, "style")) {
-        h->skip = 1;
-        h->in_style = !strcmp(n, "style");
+        html_elem_close(h, "title", 0);
+    }
+    if (!strcmp(n, "title")) {
+        html_elem_push(h, t, 0, 0);
+        h->in_title = 1;
         return;
     }
-    if (!strcmp(n, "a")) { html_end_word(h, 0); html_add_link(h, t); return; }
+    if (!strcmp(n, "script") || !strcmp(n, "style")) {
+        html_elem_push(h, t, 0, 0);
+        h->skip = 1;
+        /* A print-only <style> body is not part of this document's
+         * cascade, so it is not collected at all. */
+        h->in_style = !strcmp(n, "style") && media_ok(t->media);
+        h->style_open = h->in_style;
+        h->style_off = (h->style_open && h->css_len) ? (int)*h->css_len : 0;
+        return;
+    }
+    if (!strcmp(n, "link")) {
+        html_add_stylesheet(h, t);
+        return;
+    }
+    if (!strcmp(n, "a")) {
+        html_flush_before_inline(h);
+        html_elem_push(h, t, 0, 0);
+        html_add_link(h, t);
+        return;
+    }
     if (!strcmp(n, "li")) {
-        /* The bullet and its tight rhythm are the list styling this
-         * renderer already had; the enclosing ul/ol is the block box. */
-        html_break(h, GAP_LI_D);
+        /* The marker comes from the enclosing list's resolved
+         * list-style-type: decimal really counts 1. 2. 3., and the
+         * ul/ol indent is what lays the nesting out. */
         html_end_word(h, 0);
-        h->pending_break = 1;
-        html_atom(h, "\xE2\x80\xA2", 3, AF_BREAK, -1);   /* a real bullet */
-        h->pending_break = 0;
-        h->pending_gap = 0;
-        h->pending_space = 1;
+        html_elem_push(h, t, 0, 0);
+        html_break(h, GAP_LI_D);
+
+        HtmlOpen *lo = html_list_open(h);
+        int ordinal = 0;
+        if (lo) ordinal = ++lo->ordinal;
+        const CssStyle *cs = html_top_style(h);
+        int ls = cs ? cs->list_style : CSS_LIST_DISC;
+        char mark[32];
+        list_marker(ls, ordinal, mark, sizeof(mark));
+        if (mark[0]) {
+            html_atom(h, mark, (long)strlen(mark), AF_BREAK, -1, -1);
+            h->pending_break = 0;
+            h->pending_gap = 0;
+            h->pending_space = 1;
+        } else {
+            h->pending_break = 1;
+            h->pending_space = 0;
+        }
         return;
     }
     if (is_heading_tag(n)) {
         html_block_open(h, t, n[1] - '0');
         return;
     }
-    if (!strcmp(n, "br")) { html_break(h, 0); return; }
+    if (!strcmp(n, "br")) {
+        /* In a preformatted block a <br> is a real line break, exactly like
+         * a newline: emitting an atom, not only a pending flag, is what
+         * makes <br><br> leave the blank line box between the two breaks.
+         * In ordinary text the pending-break path is enough. */
+        if (html_keeps_lines(h)) {
+            html_end_word(h, 0);
+            html_hard_break(h);
+            h->pending_break = 1;
+            h->pending_space = 0;
+            h->pre_seen = 0;
+            h->pre_break = 1;
+            h->pre_col = 0;
+        } else {
+            html_break(h, 0);
+        }
+        return;
+    }
     if (!strcmp(n, "td") || !strcmp(n, "th")) {
         html_end_word(h, 0);
+        html_elem_push(h, t, 0, 0);
         h->pending_space = 1;
         return;
     }
     if (!strcmp(n, "img")) {
-        /* Keep the real source: images are fetched and decoded once the body
-         * is in, then drawn in their own band under the text. The placeholder
-         * word keeps the reading order honest when a fetch or a decode fails. */
-        fprintf(stderr, "web: img tag src='%.60s' nimg=%d\n", t->src, h->d->nimg);
-        if (t->src[0] && h->d->nimg < WEB_MAX_IMGS) {
-            PageImg *pi = &h->d->img[h->d->nimg++];
+        /* The picture is an inline box at exactly this atom. Its alt text
+         * is laid out only when the image cannot be fetched or decoded;
+         * an image that is drawn suppresses that atom in doc_layout(), so
+         * the words never appear twice and never stand in for a picture
+         * that is really there. */
+        html_end_word(h, 0);
+        int img = -1;
+        if (t->src[0] && h->d->nimg < WEB_MAX_IMGS && !html_hidden(h)) {
+            PageImg *pi = &h->d->img[h->d->nimg];
             snprintf(pi->url, sizeof(pi->url), "%s", t->src);
             snprintf(pi->alt, sizeof(pi->alt), "%s", t->alt);
+            pi->pic.px = NULL;
+            pi->tried = 0;
+            img = h->d->nimg++;
         }
-        char alt[128];
-        if (t->alt[0]) snprintf(alt, sizeof(alt), "[%s]", t->alt);
-        else snprintf(alt, sizeof(alt), "[image]");
-        html_end_word(h, 0);
-        html_atom_word(h, alt, (long)strlen(alt), h->in_link, 0);
+        int flags = 0;
+        if (h->pending_break) flags |= AF_BREAK;
+        else if (!h->pending_space) flags |= AF_GLUE;
+        html_atom(h, "", 0, flags | AF_IMAGE, h->in_link, img);
+        h->pending_break = 0;
+        h->pending_gap = 0;
+        h->pending_space = 0;
+
+        /* The alternative text exists whenever there is a picture the
+         * reader might have expected, including one the fixed image table
+         * had no room for (img < 0): layout suppresses this atom when the
+         * picture is really drawn, so it only ever stands in for a
+         * missing picture, and it is emitted once. */
+        if (t->src[0] || t->alt[0]) {
+            char alt[128];
+            if (t->alt[0]) snprintf(alt, sizeof(alt), "[%s]", t->alt);
+            else snprintf(alt, sizeof(alt), "[image]");
+            /* The alternative text takes the picture's own place in the
+             * flow: glued when the picture was glued to the word before
+             * it, spaced when it was spaced. Forcing AF_GLUE here printed
+             * "broken[picture]" instead of "broken [picture]". */
+            int afl = AF_ALT | (flags & AF_GLUE);
+            html_atom(h, alt, (long)strlen(alt), afl, h->in_link, img);
+            h->pending_space = 0;
+        }
         return;
     }
     if (!strcmp(n, "hr")) {
@@ -1873,6 +2428,12 @@ static void html_tag(Html *h, const Tag *t) {
         return;
     }
     if (is_block_tag(n)) { html_block_open(h, t, 0); return; }
+    if (is_void_tag(n)) return;
+    /* Any other element is an inline box. Flushing the current word on
+     * the boundary is what keeps its style from leaking into the text on
+     * the other side of the tag. */
+    html_flush_before_inline(h);
+    html_elem_push(h, t, 0, 0);
 }
 
 /* Turn a body of HTML into atoms. `title` receives the <title> text
@@ -1886,6 +2447,9 @@ static int html_build(Doc *d, const char *s, long n, const Url *base,
     d->nline = 0;
     d->nblock = 0;
     d->nlink = 0;
+    d->nimg = 0;
+    d->ncsssrc = 0;
+    d->css_capped = 0;
     d->doc_h = 0;
     d->truncated = 0;
 
@@ -1933,7 +2497,7 @@ static int html_build(Doc *d, const char *s, long n, const Url *base,
     while (h.nopen > 0) {
         char tag[CSS_TAG_MAX];
         snprintf(tag, sizeof(tag), "%s", h.open[h.nopen - 1].tag);
-        html_block_close(&h, tag);
+        html_elem_close(&h, tag, is_block_tag(tag));
     }
     while (h.title_len > 0 && title[h.title_len - 1] == ' ') h.title_len--;
     title[h.title_len] = 0;
@@ -1946,13 +2510,13 @@ static int html_build(Doc *d, const char *s, long n, const Url *base,
 
 /* Bytes of s that fit in `avail` px, always at least one character so
  * a word wider than the line makes progress instead of looping. */
-static int fit_prefix(const WebMetrics *m, int level, const char *s, int n, float avail) {
+static int fit_prefix(const WebMetrics *m, const Atom *a, const char *s, int n, float avail) {
     float w = 0;
     int i = 0;
     while (i < n) {
         int cl = utf8_len((unsigned char)s[i]);
         if (cl > n - i) cl = n - i;
-        float cw = m->text_w(m->ctx, level, s + i, cl);
+        float cw = m->text_w(m->ctx, a, s + i, cl);
         if (i > 0 && w + cw > avail) break;
         w += cw;
         i += cl;
@@ -1962,6 +2526,23 @@ static int fit_prefix(const WebMetrics *m, int level, const char *s, int n, floa
         if (i > n) i = n;
     }
     return i;
+}
+
+/* The drawn size of a picture inside a column `avail` px wide. The
+ * painter and the layout both call this, so the box that was reserved and
+ * the pixels that are drawn can never disagree. */
+static void img_fit(const PageImg *pi, float avail, int *ww, int *hh) {
+    int w = pi->pic.w, h = pi->pic.h;
+    int maxw = (int)avail;
+    if (maxw < 1) maxw = 1;
+    if (w <= 0 || h <= 0 || !pi->pic.px) { *ww = 0; *hh = 0; return; }
+    if (w > maxw) {
+        h = (int)((long)h * maxw / w);
+        w = maxw;
+    }
+    if (h < 1) h = 1;
+    *ww = w;
+    *hh = h;
 }
 
 typedef struct {
@@ -1980,25 +2561,31 @@ typedef struct {
     int nopen;
     int next_block;                /* next Doc.block to open           */
     int pending_margin;            /* design px waiting to be applied  */
+    int hard_pending;              /* the previous atom was a hard \n  */
+    int skip_alt;                  /* the next AF_ALT is already drawn */
 } Layout;
 
-static void lay_emit(Layout *L, int ai, int start, int len, float x, float w, int level) {
+/* One placed run. `a` supplies the face, the weight, the slant and the
+ * decoration; the segment is stored in page coordinates, which is what
+ * the painter, the link hit test and text-align all need. */
+static void lay_emit(Layout *L, const Atom *a, int ai, int start, int len,
+                     float x, float w) {
     Doc *d = L->d;
     if (d->nseg >= WEB_MAX_SEGS) { d->truncated = 1; return; }
     Seg *s = &d->seg[d->nseg];
     s->atom = (u16)ai;
     s->start = (u16)start;
     s->len = (u16)len;
-    /* x is the offset inside the block's column; the segment itself is
-     * stored in page coordinates, which is what the painter, the link
-     * hit test and text-align all need. */
     s->x = (u16)(L->x + x + 0.5f);
     s->w = (u16)(w + 0.5f);
     if (L->first_seg < 0) L->first_seg = d->nseg;
     d->nseg++;
     L->segs_in_line++;
-    int lh = (int)(L->m->line_h(L->m->ctx, level) + 0.5f);
-    if (lh > L->height) L->height = lh;
+    /* An image contributes its own box height; its "face" is the picture. */
+    if (!(a->flags & AF_IMAGE)) {
+        int lh = (int)(L->m->line_h(L->m->ctx, a) + 0.5f);
+        if (lh > L->height) L->height = lh;
+    }
 }
 
 /* A design gap in screen pixels. This is the only place where the
@@ -2007,6 +2594,24 @@ static void lay_emit(Layout *L, int ai, int start, int len, float x, float w, in
 static int layout_gap(int design) {
     if (design <= 0) return 0;
     return ui_px(design);
+}
+
+/* Fix the tops of every box that is still waiting for its first line.
+ * Called from both flush paths, so an empty line (a blank line inside a
+ * <pre>) still anchors the boxes around it in the right place. */
+static void lay_anchor_boxes(Layout *L) {
+    Doc *d = L->d;
+    if (L->pending_margin > 0) {
+        L->y += (u32)layout_gap(L->pending_margin);
+        L->pending_margin = 0;
+    }
+    for (int k = 0; k < L->nopen; k++) {
+        Block *ab = &d->block[L->stack[k]];
+        if (!ab->has_top) {
+            ab->box_y0 = ab->content_y0 = L->y;
+            ab->has_top = 1;
+        }
+    }
 }
 
 static void lay_flush(Layout *L) {
@@ -2019,21 +2624,13 @@ static void lay_flush(Layout *L) {
          * line it really produces, so its margin and its background start
          * in one place. Every still-deferred ancestor gets the same y:
          * that is a margin collapsing through the boxes. */
-        if (L->pending_margin > 0) {
-            L->y += (u32)layout_gap(L->pending_margin);
-            L->pending_margin = 0;
-        }
-        for (int k = 0; k < L->nopen; k++) {
-            Block *ab = &d->block[L->stack[k]];
-            if (!ab->has_top) {
-                ab->box_y0 = ab->content_y0 = L->y;
-                ab->has_top = 1;
-            }
-        }
+        lay_anchor_boxes(L);
 
         /* text-align shifts the finished line inside the block's column,
          * never the wrapping: a centred line is wrapped at the same width
-         * as a left one, which is how CSS defines it. */
+         * as a left one, which is how CSS defines it. Justified lines are
+         * spread after the whole document, where the last line of each
+         * block is known. */
         float used = 0.0f;
         for (int j = 0; j < L->segs_in_line; j++) {
             Seg *sg = &d->seg[L->first_seg + j];
@@ -2067,6 +2664,8 @@ static void lay_flush(Layout *L) {
         ln->th = (u16)(L->height > 0 ? L->height : 12);
         ln->h = (u16)h;
         ln->block = (u16)(bi < 0 ? 0xFFFF : bi);
+        ln->x0 = (u16)(L->x + 0.5f);
+        ln->x1 = (u16)(L->x + L->width + 0.5f);
         /* The document starts flush with the content rectangle: a heading
          * gap at the very top is not a margin, it is an offset. */
         ln->gap = (u16)(d->nline == 1 ? 0 : layout_gap(L->gap));
@@ -2083,10 +2682,36 @@ static void lay_flush(Layout *L) {
     L->gap = 0;
 }
 
+/* An empty line box, which is what a blank line inside <pre> is. It has
+ * no segments, so the painter draws nothing, but it takes the height of
+ * the face and keeps the vertical rhythm - the difference between
+ * "a\n\nb" and "a\nb". */
+static void lay_empty_line(Layout *L, const Atom *a) {
+    Doc *d = L->d;
+    if (d->nline >= WEB_MAX_LINES) { d->truncated = 1; return; }
+    lay_anchor_boxes(L);
+    int bi = L->nopen > 0 ? L->stack[L->nopen - 1] : -1;
+    int h = (int)(L->m->line_h(L->m->ctx, a) + 0.5f);
+    if (h < 1) h = 12;
+    Line *ln = &d->line[d->nline++];
+    ln->first = (u32)d->nseg;
+    ln->n = 0;
+    ln->th = (u16)h;
+    ln->h = (u16)h;
+    ln->block = (u16)(bi < 0 ? 0xFFFF : bi);
+    ln->x0 = (u16)(L->x + 0.5f);
+    ln->x1 = (u16)(L->x + L->width + 0.5f);
+    ln->gap = 0;
+    ln->y = L->y;
+    L->y += (u32)h;
+}
+
 /* Enter a box: resolve its column and add its top margin, border and
  * padding to the flow. Width and max-width are CSS lengths (design pixels
  * here); a percentage is against the parent's content width. Any block
- * narrower than its parent is centred in it. */
+ * narrower than its parent is centred in it. `indent` is the CSS-derived
+ * nesting step of ul/ol/blockquote/dd; it narrows the column from the
+ * left, which is what makes a nested list visibly nested. */
 static void lay_open_block(Layout *L, int bi) {
     Doc *d = L->d;
     Block *b = &d->block[bi];
@@ -2111,6 +2736,41 @@ static void lay_open_block(Layout *L, int bi) {
     if (w > parent_w) w = parent_w;      /* one column, never a sideways scroll */
     float x = parent_x;
     if (w < parent_w) x = parent_x + (parent_w - w) * 0.5f;
+
+    /* The list/quote indent is inside the block's own column, and it is
+     * the step this box adds to its parent's, not the whole inherited
+     * value. css.c inherits `indent`, so a <p> inside an <li> carries the
+     * list's 24 px as well; applying the inherited number again put that
+     * paragraph 24 px past the bullet, and a nested <ul> (24 inherited +
+     * 24 of its own) at 72 px instead of 48. The column already starts
+     * where the parent's indent put it. */
+    int parent_ind = L->nopen > 0 ? (int)d->block[L->stack[L->nopen - 1]].indent : 0;
+    float ind = (float)layout_gap((int)b->indent > parent_ind ?
+                                  (int)b->indent - parent_ind : 0);
+    if (ind > 0.0f) {
+        x += ind;
+        w -= ind;
+        if (w < 1.0f) w = 1.0f;
+    }
+
+    /* margin-left + padding-left and their right twins: the horizontal
+     * half of the CSS box, as an inset of the one column this renderer
+     * has. A box that asks for more inset than there is room for keeps a
+     * readable minimum rather than collapsing to zero width. */
+    float l = (float)layout_gap((int)b->inset_left);
+    float r = (float)layout_gap((int)b->inset_right);
+    if (l < 0.0f) l = 0.0f;
+    if (r < 0.0f) r = 0.0f;
+    if (l + r > w - 16.0f) {
+        float slack = w > 16.0f ? w - 16.0f : 0.0f;
+        float sum = l + r;
+        if (sum > 0.0f) { l = l * slack / sum; r = r * slack / sum; }
+    }
+    if (l > 0.0f || r > 0.0f) {
+        x += l;
+        w -= l + r;
+        if (w < 1.0f) w = 1.0f;
+    }
 
     b->box_x0 = (u16)(x + 0.5f);
     b->box_x1 = (u16)(x + w + 0.5f);
@@ -2187,6 +2847,39 @@ static void lay_close_block(Layout *L, int bi) {
     }
 }
 
+/* Spread a justified line to both edges. CSS justifies every line of a
+ * block except its last one, which is why this runs after the document is
+ * laid out and block->line_end is known. */
+static void lay_justify(Doc *d) {
+    for (int i = 0; i < d->nline; i++) {
+        Line *ln = &d->line[i];
+        if (ln->n < 2 || ln->block == 0xFFFF) continue;
+        Block *b = &d->block[ln->block];
+        if (b->align != CSS_ALIGN_JUSTIFY) continue;
+        if (i + 1 >= (int)b->line_end) continue;      /* last line of the block */
+        int used = 0;
+        int preserved = 0;
+        for (int j = 0; j < (int)ln->n; j++) {
+            Seg *sg = &d->seg[ln->first + j];
+            int right = (int)sg->x + (int)sg->w;
+            if (right > used) used = right;
+            /* A preserved line (white-space: pre) ends at a real newline,
+             * which CSS never justifies, and stretching it would destroy
+             * the indentation that is the reason the author used pre. */
+            if (d->atom[sg->atom].ws == CSS_WS_PRE) preserved = 1;
+        }
+        if (preserved) continue;
+        int avail = (int)ln->x1 - (int)ln->x0;
+        int extra = avail - (used - (int)ln->x0);
+        if (extra <= 1) continue;
+        int gaps = (int)ln->n - 1;
+        for (int j = 1; j < (int)ln->n; j++) {
+            Seg *sg = &d->seg[ln->first + j];
+            sg->x = (u16)((int)sg->x + extra * j / gaps);
+        }
+    }
+}
+
 static void doc_layout(Doc *d, const WebMetrics *m, int width) {
     d->nseg = 0;
     d->nline = 0;
@@ -2220,23 +2913,83 @@ static void doc_layout(Doc *d, const WebMetrics *m, int width) {
         if (ai >= d->natom) break;
 
         const Atom *a = &d->atom[ai];
-        int level = a->level;
         int len = (int)strlen(a->text);
-        if (len <= 0) continue;
+
+        /* The alt text of an image that was drawn inline has already had
+         * its place taken by the picture; never print it twice. The flag
+         * covers exactly one atom: an alt atom is emitted directly after
+         * its picture, so any other atom means the picture had no alt (or
+         * the atom cap dropped it) and a later broken image must still be
+         * able to print its own. */
+        if ((a->flags & AF_ALT) && L.skip_alt) {
+            L.skip_alt = 0;
+            continue;
+        }
+        L.skip_alt = 0;
 
         if (a->flags & AF_BREAK) {
+            int had = L.segs_in_line > 0;
             lay_flush(&L);
             L.gap = a->gap;
+            if (a->flags & AF_HARD) {
+                /* A hard break with no text before it is a blank line, not
+                 * just the end of the previous one. HTML strips the newline
+                 * directly after <pre>, so the first hard break of a pre
+                 * block can already be a blank line and must keep its box. */
+                if (!had) lay_empty_line(&L, a);
+                L.hard_pending = 1;
+            }
+            /* An empty text atom is only a line break. An image box has
+             * no text either, but it is a real inline box: an <img> that
+             * starts a paragraph carries AF_BREAK, and skipping it here
+             * left a hole where the picture should be and printed the alt
+             * text instead. */
+            if (len <= 0 && !(a->flags & AF_IMAGE)) continue;
+        }
+        L.hard_pending = 0;
+
+        if (a->flags & AF_IMAGE) {
+            if (a->img >= 0 && a->img < d->nimg &&
+                d->img[a->img].pic.px && d->img[a->img].pic.w > 0) {
+                int ww = 0, hh = 0;
+                img_fit(&d->img[a->img], L.width, &ww, &hh);
+                if (ww > 0 && hh > 0) {
+                    float sp = (L.segs_in_line > 0 && !(a->flags & AF_GLUE))
+                               ? m->text_w(m->ctx, a, " ", 1) : 0.0f;
+                    if (L.segs_in_line > 0 && L.pen + sp + (float)ww > L.width)
+                        lay_flush(&L);
+                    lay_emit(&L, a, ai, 0, 0, L.pen + sp, (float)ww);
+                    L.pen += sp + (float)ww;
+                    if (hh > L.height) L.height = hh;
+                    L.skip_alt = 1;
+                }
+            }
+            continue;                    /* broken: the AF_ALT atom follows */
         }
 
-        float space = m->text_w(m->ctx, level, " ", 1);
+        if (len <= 0) continue;
+
+        /* white-space: pre and nowrap mean one thing to a text renderer:
+         * do not break this run because the column ended. The painter
+         * clips whatever passes the right edge; nothing is invented or
+         * reordered. pre-wrap is not in that list: it keeps the spaces
+         * and the newlines but still wraps, so a long preserved line
+         * stays readable instead of being cut off at the column edge. */
+        int nowrap = (a->ws == CSS_WS_NOWRAP || a->ws == CSS_WS_PRE);
+
+        /* A slanted run leans past its upright advance. Reserve that ink
+         * on the line, once per atom, so "italic upright" keeps a gap
+         * instead of the italic tail landing on the next word. */
+        float lean = m->overhang ? m->overhang(m->ctx, a) : 0.0f;
+
+        float space = m->text_w(m->ctx, a, " ", 1);
         int start = 0;
         while (start < len) {
-            float wfull = m->text_w(m->ctx, level, a->text + start, len - start);
+            float wfull = m->text_w(m->ctx, a, a->text + start, len - start) + lean;
             float sp = (L.segs_in_line > 0 && !(a->flags & AF_GLUE)) ? space : 0.0f;
 
-            if (L.pen + sp + wfull <= L.width) {
-                lay_emit(&L, ai, start, len - start, L.pen + sp, wfull, level);
+            if (nowrap || L.pen + sp + wfull <= L.width) {
+                lay_emit(&L, a, ai, start, len - start, L.pen + sp, wfull);
                 L.pen += sp + wfull;
                 break;
             }
@@ -2246,14 +2999,16 @@ static void doc_layout(Doc *d, const WebMetrics *m, int width) {
             }
             /* A word wider than the whole line: this is the one case
              * where breaking a word is the only honest thing to do. */
-            int k = fit_prefix(m, level, a->text + start, len - start, L.width);
-            float kw = m->text_w(m->ctx, level, a->text + start, k);
-            lay_emit(&L, ai, start, k, 0.0f, kw, level);
+            int k = fit_prefix(m, a, a->text + start, len - start,
+                               L.width - lean > 1.0f ? L.width - lean : 1.0f);
+            float kw = m->text_w(m->ctx, a, a->text + start, k) + lean;
+            lay_emit(&L, a, ai, start, k, 0.0f, kw);
             lay_flush(&L);
             start += k;
         }
     }
     lay_flush(&L);
+    lay_justify(d);
     d->doc_h = L.y;
 }
 
@@ -2295,17 +3050,37 @@ static int style_size(int level) {
     return sizes[level];
 }
 
-static int style_face(int level) {
-    return level ? FONT_SEMIBOLD : FONT_REGULAR;
+/* The face a run is set in. There are four installed roles - regular,
+ * medium, semibold and mono - and no italic file at all, which is why
+ * italic is synthesised by shear in draw_run() below instead of being
+ * faked by picking another upright family. The weight threshold is the
+ * one css.h documents: 600 and up is the semibold face. */
+static Font *font_for_atom(const Atom *a) {
+    float size = (float)style_size(a ? a->level : 0);
+    if (a && a->mono) return font_get(FONT_MONO, size);
+    return font_get((a && a->weight >= 600) ? FONT_SEMIBOLD : FONT_REGULAR, size);
 }
 
-static Font *font_for(int level) {
-    return font_get(style_face(level), (float)style_size(level));
+/* tan(12 deg): the slant of a synthesised oblique. The installed set has
+ * no italic file at all, so draw_italic() shifts every scanline of the
+ * upright glyphs right by this fraction of its height above the baseline.
+ * The same number is what layout reserves as a slanted run's overhang. */
+#define ITALIC_SHEAR 0.2126f
+
+/* How far the ink of a sheared run reaches past its advance. One lean per
+ * atom, not per character: font_width() already measures the upright text,
+ * and the shear moves the rightmost glyph's top by this much. */
+static float real_overhang(void *ctx, const Atom *a) {
+    (void)ctx;
+    if (!a || !a->italic) return 0.0f;
+    Font *f = font_for_atom(a);
+    return f ? ITALIC_SHEAR * font_height(f) : 0.0f;
 }
 
-/* Metrics handed to layout: the real font_width of the real face. */
-static float real_text_w(void *ctx, int level, const char *s, int n) {
-    Font *f = font_for(level);
+/* Metrics handed to layout: the real font_width of the real face, with
+ * the same face selection the painter will use for the glyphs. */
+static float real_text_w(void *ctx, const Atom *a, const char *s, int n) {
+    Font *f = font_for_atom(a);
     if (!f || n <= 0) return 0;
     char buf[WEB_ATOM_TEXT + 8];
     if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
@@ -2315,13 +3090,14 @@ static float real_text_w(void *ctx, int level, const char *s, int n) {
     return font_width(f, buf);
 }
 
-static float real_line_h(void *ctx, int level) {
-    Font *f = font_for(level);
+static float real_line_h(void *ctx, const Atom *a) {
+    Font *f = font_for_atom(a);
     (void)ctx;
     return f ? font_height(f) : 16.0f;
 }
 
-static const WebMetrics real_metrics = { NULL, real_text_w, real_line_h };
+static const WebMetrics real_metrics = { NULL, real_text_w, real_line_h,
+                                        real_overhang };
 
 /* ============================================================
  *  The app itself: window, drawing, input.
@@ -2338,12 +3114,20 @@ typedef struct {
 
     char raw[WEB_RAW_MAX];
     Doc  doc;
-    CssSheet  sheet;           /* the page's own CSS, applied by colour   */
+    CssSheet  sheet;           /* the page's own CSS, in document order  */
     int       css_ready;
     u32       col_text;        /* resolved from the sheet, not invented   */
     u32       col_link;
     u32       col_head;
-    char      css_raw[8192];
+    /* Every <style> body that was collected, plus the room the fetched
+     * sheets are parsed from. WEB_CSS_BYTES is the same cap the fetched
+     * total is held to, so the buffer can always hold what is accepted. */
+    char      css_raw[WEB_CSS_BYTES];
+    /* What really arrived, for the footer: sheets parsed, bytes fetched,
+     * and whether a cap stopped anything. */
+    int       css_sheets;
+    long      css_bytes;
+    int       css_capped;
 
     Url  cur;
     char url[WEB_PATH_MAX];       /* the address actually on screen    */
@@ -2365,6 +3149,7 @@ typedef struct {
     char tls_version[16];
     char tls_cipher[48];
     char tls_cn[128];
+    char tls_subject[200];
     char tls_expiry[32];
 
     int  scroll, max_scroll;
@@ -2483,7 +3268,24 @@ static int addr_field_rect(const Web *w, float *fx, float *fy,
     return 1;
 }
 
-/* Draw text, cut with ".." when it cannot fit in maxw pixels. */
+/* Length of the longest prefix of buf[0..len) that does not end inside a
+ * UTF-8 codepoint. Error text carries host names, which may be non-ASCII. */
+static size_t draw_utf8_trim(const char *buf, size_t len) {
+    if (len == 0) return 0;
+    size_t i = len;
+    while (i > 0 && ((unsigned char)buf[i - 1] & 0xC0) == 0x80) i--;
+    if (i == 0) return len;
+    unsigned char c = (unsigned char)buf[i - 1];
+    int need = 1;
+    if (c >= 0xC2 && c <= 0xDF) need = 2;
+    else if (c >= 0xE0 && c <= 0xEF) need = 3;
+    else if (c >= 0xF0 && c <= 0xF4) need = 4;
+    if (len - (i - 1) >= (size_t)need) return len;
+    return i - 1;
+}
+
+/* Draw text, cut with ".." when it cannot fit in maxw pixels. This is the
+ * only single-line entry point: every error, hint and caption is measured. */
 static void draw_fit(Surface *s, Font *f, float x, float y, float maxw,
                      const char *text, u32 color) {
     if (!f || !text || !text[0] || maxw < 6.0f) return;
@@ -2495,9 +3297,12 @@ static void draw_fit(Surface *s, Font *f, float x, float y, float maxw,
     }
     float dots = font_width(f, "..");
     size_t len = strlen(buf);
+    if (len > sizeof(buf) - 3) len = sizeof(buf) - 3;   /* room for the dots */
     while (len > 0) {
+        len = draw_utf8_trim(buf, len);
         buf[len] = 0;
         if (font_width(f, buf) + dots <= maxw) break;
+        if (len == 0) break;
         len--;
     }
     if (len == 0) return;
@@ -2505,6 +3310,30 @@ static void draw_fit(Surface *s, Font *f, float x, float y, float maxw,
     buf[len + 1] = '.';
     buf[len + 2] = 0;
     font_draw(s, f, x, y, buf, color);
+}
+
+/* Bytes of one word that fit in maxw, always at least one whole
+ * character so the caller that loops makes progress. */
+static int wrap_prefix(Font *f, const char *s, int n, float maxw) {
+    float w = 0;
+    int i = 0;
+    while (i < n) {
+        int cl = utf8_len((unsigned char)s[i]);
+        if (cl > n - i) cl = n - i;
+        char one[8];
+        if (cl >= (int)sizeof(one)) cl = (int)sizeof(one) - 1;
+        memcpy(one, s + i, (size_t)cl);
+        one[cl] = 0;
+        float cw = font_width(f, one);
+        if (i > 0 && w + cw > maxw) break;
+        w += cw;
+        i += cl;
+    }
+    if (i == 0) {
+        i = utf8_len((unsigned char)s[0]);
+        if (i > n) i = n;
+    }
+    return i;
 }
 
 /* Word-wrap a plain string (error text, hints) into a rectangle.
@@ -2528,15 +3357,60 @@ static int draw_wrapped(Surface *v, Font *f, float x, float y, float maxw,
         int wl = (int)(p - w);
         if (wl == 0) break;
 
+        /* One word can be wider than the whole column - a URL or host name
+         * in an error message is the usual case. Break it by measurement
+         * whichever word of the line it is: committing it and painting it
+         * at full length runs it across the window (the case the earlier
+         * "first word only" test still missed was "cannot connect to
+         * <long-url>", where the URL is the second word). */
+        char word[512];
+        int wc = wl;
+        if (wc > (int)sizeof(word) - 1) wc = (int)sizeof(word) - 1;
+        memcpy(word, w, (size_t)wc);
+        word[wc] = 0;
+        if (wc < wl || font_width(f, word) > maxw) {
+            if (olen > 0) {
+                font_draw(v, f, x, y + (float)line * lh, out, color);
+                line++;
+                olen = 0;
+                out[0] = 0;
+            }
+            int off = 0;
+            while (off < wl && line < maxlines) {
+                int k = wrap_prefix(f, w + off, wl - off, maxw);
+                if (k <= 0) break;
+                char piece[512];
+                int pc = k;
+                if (pc > (int)sizeof(piece) - 1) pc = (int)sizeof(piece) - 1;
+                memcpy(piece, w + off, (size_t)pc);
+                piece[pc] = 0;
+                font_draw(v, f, x, y + (float)line * lh, piece, color);
+                line++;
+                off += k;
+            }
+            continue;
+        }
+
         char probe[512];
         int n = 0;
         if (olen > 0) {
-            memcpy(probe, out, (size_t)olen);
-            n = olen;
-            probe[n++] = ' ';
+            if (olen > (int)sizeof(probe) - 2) {
+                /* No room for the space that joins the next word: draw this
+                 * line and start the next one, rather than writing past
+                 * probe[]. */
+                font_draw(v, f, x, y + (float)line * lh, out, color);
+                line++;
+                olen = 0;
+                out[0] = 0;
+            } else {
+                memcpy(probe, out, (size_t)olen);
+                n = olen;
+                probe[n++] = ' ';
+            }
         }
         int copy = wl;
         if (n + copy >= (int)sizeof(probe)) copy = (int)sizeof(probe) - n - 1;
+        if (copy < 0) copy = 0;
         memcpy(probe + n, w, (size_t)copy);
         n += copy;
         probe[n] = 0;
@@ -2563,39 +3437,142 @@ static u32 color_for_link(int isnum) {
     return isnum ? C_LINKNUM : C_LINK;
 }
 
-/* The pictures the page carried, drawn in one band under the text, scaled
- * to the column. Same geometry function as the scroll range, so the scroll
- * bar can never lie about how much is below the fold. */
-static int img_band_h(const Web *w, int width);
+/* ------------------------------------------------------------ styled text
+ * The CSS cascade gives every run a weight, a slant and a decoration.
+ * The installed font set has regular, medium, semibold and mono files and
+ * no italic file at all, so a declared italic is synthesised the way a
+ * typesetter's oblique is: each scanline of the upright glyphs is shifted
+ * right by an amount proportional to its height above the baseline. The
+ * scratch surface below is the only allocation this costs, it is reused
+ * for every run in every frame, and if it cannot be allocated the run is
+ * drawn upright rather than vanishing. */
 
-static void draw_page_images(Surface *v, Web *w, int top) {
-    int y = top;
-    for (int i = 0; i < w->doc.nimg; i++) {
-        PageImg *pi = &w->doc.img[i];
-        if (!pi->pic.px) continue;
-        int ww = pi->pic.w, hh = pi->pic.h;
-        if (ww <= 0) continue;
-        if (ww > w->view_w) { hh = hh * w->view_w / ww; ww = w->view_w; }
-        for (int row = 0; row < hh; row++) {
-            int dy = y + row;
-            if (dy < 0 || dy >= v->h) continue;
-            int sy = row * pi->pic.h / (hh ? hh : 1);
-            u32 *drow = v->px + (size_t)dy * v->stride;
-            const u32 *srow = pi->pic.px + (size_t)sy * pi->pic.w;
-            for (int col = 0; col < ww; col++) {
-                int dx = col;
-                if (dx < 0 || dx >= v->w) continue;
-                int sx = col * pi->pic.w / (ww ? ww : 1);
-                drow[dx] = srow[sx];
-            }
+static u32   *ital_buf;
+static size_t ital_cap;
+
+static int ital_reserve(size_t n) {
+    if (n <= ital_cap) return 1;
+    u32 *p = (u32 *)realloc(ital_buf, n * sizeof *p);
+    if (!p) return 0;
+    ital_buf = p;
+    ital_cap = n;
+    return 1;
+}
+
+/* Composite one pixel with coverage `cov` (the same arithmetic font_draw
+ * uses for a glyph, and the one the old image band was missing). */
+static void blend_cov(Surface *s, int x, int y, u32 col, float cov) {
+    if ((unsigned)x >= (unsigned)s->w || (unsigned)y >= (unsigned)s->h) return;
+    if (s->cx1 > s->cx0 &&
+        (x < s->cx0 || x >= s->cx1 || y < s->cy0 || y >= s->cy1)) return;
+    if (cov <= 0.004f) return;
+    u32 *row = s->px + (size_t)y * s->stride;
+    if (cov >= 0.996f) { row[x] = col | 0xFF000000u; return; }
+    u32 d = row[x];
+    float inv = 1.0f - cov;
+    row[x] = 0xFF000000u
+           | ((u32)(GET_R(col) * cov + GET_R(d) * inv) << 16)
+           | ((u32)(GET_G(col) * cov + GET_G(d) * inv) << 8)
+           |  (u32)(GET_B(col) * cov + GET_B(d) * inv);
+}
+
+static void draw_italic(Surface *v, Font *f, float x, float y,
+                        const char *text, u32 col) {
+    float fw = font_width(f, text);
+    int h = (int)(font_height(f) + 2.0f);
+    int w = (int)(fw + ITALIC_SHEAR * (float)h + 4.0f);
+    if (w <= 0 || h <= 0 || !ital_reserve((size_t)w * (size_t)h)) {
+        font_draw(v, f, x, y, text, col);
+        return;
+    }
+    memset(ital_buf, 0, (size_t)w * (size_t)h * sizeof *ital_buf);
+    Surface t;
+    t.px = ital_buf;
+    t.w = w;
+    t.h = h;
+    t.stride = w;
+    surf_unclip(&t);
+    /* White on a transparent buffer: the red channel is then exactly the
+     * glyph coverage, independent of the colour the run is drawn in. */
+    font_draw(&t, f, 2.0f, 1.0f, text, 0xFFFFFFFFu);
+    int ox = (int)x - 2, oy = (int)y - 1;
+    for (int row = 0; row < h; row++) {
+        int shift = (int)(ITALIC_SHEAR * (float)(h - 1 - row) + 0.5f);
+        const u32 *sr = ital_buf + (size_t)row * w;
+        for (int cx = 0; cx < w; cx++) {
+            u8 cov = GET_R(sr[cx]);
+            if (!cov) continue;
+            blend_cov(v, ox + cx + shift, oy + row, col, (float)cov / 255.0f);
         }
-        y += hh;
-        Font *fc = font_get(FONT_REGULAR, 10);
-        if (fc && y + 2 < v->h + 20) {
-            const char *cap = pi->alt[0] ? pi->alt : "image";
-            font_draw(v, fc, 0, (float)y + 4, cap, color_alpha(C_TEXT, 0.7f));
+    }
+}
+
+static void draw_run(Surface *v, Font *f, const Atom *a, const char *text,
+                     float x, float y, u32 col) {
+    if (a->italic) draw_italic(v, f, x, y, text, col);
+    else font_draw(v, f, x, y, text, col);
+}
+
+/* underline / line-through / overline, per placed segment. A link is
+ * underlined only when its cascade says so - the built-in sheet gives
+ * `a` an underline, and `a { text-decoration: none }` removes it. */
+static void draw_decoration(Surface *v, Font *f, const Atom *a, const Seg *sg,
+                            int ty, u32 col) {
+    if (!a->decoration) return;
+    int th = ui_px(1);
+    if (th < 1) th = 1;
+    int asc = (int)font_ascent(f);
+    /* A rule runs along the baseline, so it spans the upright advance of
+     * the segment. Seg.w also carries the slant's overhang (layout had to
+     * reserve it); that ink is at the top of the glyphs, not at the rule,
+     * so take it off here or an italic link gets a rule past its last
+     * letter. */
+    int rw = (int)sg->w;
+    if (a->italic) {
+        int lean = (int)(ITALIC_SHEAR * font_height(f) + 0.5f);
+        rw -= lean;
+        if (rw < 1) rw = 1;
+    }
+    u32 ink = color_alpha(col, 0.85f);
+    if (a->decoration & CSS_TD_UNDERLINE) {
+        int uy = ty + asc + ui_px(2);
+        surf_fill(v, sg->x, uy, rw, th, ink);
+    }
+    if (a->decoration & CSS_TD_LINE_THROUGH) {
+        /* Line-through sits through the MIDDLE of the x-height, not at its
+         * top: Lato's x-height is about 0.5 em and font_height() is
+         * size*1.4, so 0.5*sqrt-ish lands at ~0.196*font_height above
+         * the baseline. The old 0.32 factor put the rule on the first
+         * x-height row, which reads as an overline on a word with no
+         * ascenders ("minimum"). */
+        int sy = ty + asc - (int)(font_height(f) * 0.196f);
+        surf_fill(v, sg->x, sy, rw, th, ink);
+    }
+    if (a->decoration & CSS_TD_OVERLINE) {
+        surf_fill(v, sg->x, ty + 1, rw, th, ink);
+    }
+}
+
+/* One picture at the box the segment reserved for it. The source is
+ * sampled with its own pixel grid; alpha is honoured, so a PNG with
+ * transparency does not turn into a black rectangle. */
+static void draw_img_seg(Surface *v, const PageImg *pi, int x, int y,
+                         int ww, int hh) {
+    if (!pi->pic.px || ww <= 0 || hh <= 0) return;
+    for (int row = 0; row < hh; row++) {
+        int dy = y + row;
+        if ((unsigned)dy >= (unsigned)v->h) continue;
+        int sy = row * pi->pic.h / hh;
+        const u32 *srow = pi->pic.px + (size_t)sy * pi->pic.w;
+        for (int col = 0; col < ww; col++) {
+            int dx = x + col;
+            if ((unsigned)dx >= (unsigned)v->w) continue;
+            int sx = col * pi->pic.w / ww;
+            u32 sp = srow[sx];
+            float a = (float)GET_A(sp) / 255.0f;
+            if (a <= 0.004f) continue;
+            blend_cov(v, dx, dy, sp, a);
         }
-        y += ui_px(28);
     }
 }
 
@@ -2668,10 +3645,7 @@ static void draw_page_boxes(Surface *v, Web *w) {
 static void draw_page_lines(Surface *v, Web *w) {
     Doc *d = &w->doc;
     draw_page_boxes(v, w);
-    if (d->nline <= 0) {
-        draw_page_images(v, w, 0);
-        return;
-    }
+    if (d->nline <= 0) return;
 
     int first = line_at(d, (u32)w->scroll);
     for (int i = first; i < d->nline; i++) {
@@ -2686,7 +3660,22 @@ static void draw_page_lines(Surface *v, Web *w) {
         for (int j = 0; j < (int)ln->n; j++) {
             Seg *sg = &d->seg[ln->first + j];
             Atom *a = &d->atom[sg->atom];
-            Font *f = font_for(a->level);
+
+            if (a->flags & AF_IMAGE) {
+                if (a->img >= 0 && a->img < d->nimg) {
+                    PageImg *pi = &d->img[a->img];
+                    int ww = (int)sg->w;
+                    if (pi->pic.px && pi->pic.w > 0 && ww > 0) {
+                        int hh = (int)((long)pi->pic.h * ww / pi->pic.w);
+                        int iy = ly + ((int)ln->h - hh) / 2;
+                        draw_img_seg(v, pi, (int)sg->x, iy, ww, hh);
+                    }
+                }
+                continue;
+            }
+            if (sg->len == 0) continue;
+
+            Font *f = font_for_atom(a);
             if (!f) continue;
             int len = sg->len;
             char tmp[WEB_ATOM_TEXT + 4];
@@ -2707,12 +3696,8 @@ static void draw_page_lines(Surface *v, Web *w) {
             else if (a->level) col = w->col_head ? w->col_head : C_HEAD;
             else col = w->col_text ? w->col_text : C_TEXT;
 
-            font_draw(v, f, (float)sg->x, (float)ty, tmp, col);
-
-            if (a->link >= 0) {
-                int uy = ty + (int)font_ascent(f) + ui_px(2);
-                surf_fill(v, sg->x, uy, (int)sg->w, 1, color_alpha(col, 0.45f));
-            }
+            draw_run(v, f, a, tmp, (float)sg->x, (float)ty, col);
+            draw_decoration(v, f, a, sg, ty, col);
         }
     }
 }
@@ -2865,10 +3850,24 @@ static void draw_footer(Surface *s, Web *w) {
         snprintf(left, sizeof(left), "%s", w->error);
     else if (w->state == ST_START)
         snprintf(left, sizeof(left), "ready - http and https, no scripts");
-    else
-        snprintf(left, sizeof(left), "HTTP %d  %ld bytes  %ld ms%s",
-                 w->status, w->body_bytes, w->elapsed_ms,
+    else {
+        /* body_bytes is this document; raw_bytes/elapsed_ms are totals
+         * across every redirect leg, every stylesheet and every image
+         * fetch. Saying which is which is the only honest way to print
+         * one line. The stylesheet count and size are what really
+         * arrived through <link rel=stylesheet>, and `cap` is printed only
+         * when one of the two caps actually stopped a sheet. */
+        char css[48];
+        css[0] = 0;
+        if (w->css_sheets > 0 || w->css_capped)
+            snprintf(css, sizeof(css), "  css %d sheet%s %ldK%s",
+                     w->css_sheets, w->css_sheets == 1 ? "" : "s",
+                     (w->css_bytes + 1023) / 1024,
+                     w->css_capped ? " (cap)" : "");
+        snprintf(left, sizeof(left), "HTTP %d  %ld bytes total  %ld ms total%s%s",
+                 w->status, w->raw_bytes, w->elapsed_ms, css,
                  (w->truncated || w->doc.truncated) ? "  (truncated)" : "");
+    }
 
     char right[64];
     if (w->doc.nline > 0 && w->state == ST_PAGE) {
@@ -2888,11 +3887,19 @@ static void draw_footer(Surface *s, Web *w) {
     float fy = (float)bottom_top + ((float)lh - font_height(fd)) * 0.5f;
 
     if (foot_lines(w) == 2) {
+        /* Never print the requested hostname as if it were the certificate
+         * subject. The leaf either has a CN, a real subject string, or only
+         * SANs - in which case the handshake still proved the name, so
+         * that is exactly what the line says. */
+        char cert[256];
+        if (w->tls_cn[0]) snprintf(cert, sizeof(cert), "CN=%s", w->tls_cn);
+        else if (w->tls_subject[0]) snprintf(cert, sizeof(cert), "%s", w->tls_subject);
+        else snprintf(cert, sizeof(cert), "matched by SAN");
         char tls[WEB_ERR_MAX + 96];
-        snprintf(tls, sizeof(tls), "%s  %s  CN=%s  expires %s",
+        snprintf(tls, sizeof(tls), "%s  %s  %s  expires %s",
                  w->tls_version[0] ? w->tls_version : "TLS",
                  w->tls_cipher[0] ? w->tls_cipher : "?",
-                 w->tls_cn[0] ? w->tls_cn : w->cur.host,
+                 cert,
                  w->tls_expiry[0] ? w->tls_expiry : "(unknown)");
         int top = bottom_top - lh;
         float ty = (float)top + ((float)lh - font_height(fd)) * 0.5f;
@@ -3078,7 +4085,7 @@ static void render(Web *w) {
     SINK.h = 0;
     if (w->state == ST_START)      w->content_h = draw_start(&SINK, w, 0);
     else if (w->state == ST_ERROR) w->content_h = draw_error(&SINK, w, 0);
-    else                           w->content_h = (int)w->doc.doc_h + img_band_h(w, tw);
+    else                           w->content_h = (int)w->doc.doc_h;
 
     w->max_scroll = w->content_h - ch;
     if (w->max_scroll < 0) w->max_scroll = 0;
@@ -3104,8 +4111,6 @@ static void render(Web *w) {
         else if (w->state == ST_ERROR) draw_error(&v, w, -w->scroll);
         else                           draw_page_lines(&v, w);
 
-        if (w->state == ST_PAGE)
-            draw_page_images(&v, w, (int)w->doc.doc_h - w->scroll);
         draw_scrollbar(&v, w);
     }
     draw_footer(&s, w);
@@ -3121,6 +4126,17 @@ static void web_clear_page(Web *w) {
     w->doc.nlink = 0;
     w->doc.doc_h = 0;
     w->doc.truncated = 0;
+    /* Images belonged to the page that is being discarded. They were left in
+     * place, so the next site inherited them - a logo from a previously
+     * visited page appeared under a different site - and their pixels were
+     * never freed either. */
+    for (int i = 0; i < w->doc.nimg; i++) {
+        img_free(&w->doc.img[i].pic);
+        w->doc.img[i].tried = 0;
+        w->doc.img[i].url[0] = 0;
+        w->doc.img[i].alt[0] = 0;
+    }
+    w->doc.nimg = 0;
     w->title[0] = 0;
     w->status = 0;
     w->raw_bytes = 0;
@@ -3135,6 +4151,7 @@ static void web_clear_page(Web *w) {
     w->tls_version[0] = 0;
     w->tls_cipher[0] = 0;
     w->tls_cn[0] = 0;
+    w->tls_subject[0] = 0;
     w->tls_expiry[0] = 0;
 }
 
@@ -3181,8 +4198,6 @@ static void web_go(Web *w, const char *addr, int push_history) {
     w->state = ST_LOADING;
 }
 
-#ifndef WEB_DRAW_ONLY
-
 /* An <img src> resolved against the page it came from. Absolute URLs pass
  * through; "/x" and "x" both land on the page's own host. */
 static void img_url(const Url *base, const char *src, char *out, size_t n) {
@@ -3220,11 +4235,6 @@ static void img_url(const Url *base, const char *src, char *out, size_t n) {
  * can honour, and pretending would be worse than saying so. Falls back to
  * the built-in palette when the page sets nothing. */
 static void css_apply(Web *w) {
-    if (!w->css_ready) {
-        memset(&w->sheet, 0, sizeof(w->sheet));
-        if (w->css_raw[0]) css_parse(w->css_raw, strlen(w->css_raw), &w->sheet);
-        w->css_ready = 1;
-    }
     CssStyle body = css_for(&w->sheet, "body", NULL, NULL, NULL);
     CssStyle link = css_for(&w->sheet, "a", NULL, NULL, NULL);
     CssStyle head = css_for(&w->sheet, "h1", NULL, NULL, NULL);
@@ -3233,14 +4243,86 @@ static void css_apply(Web *w) {
     w->col_head = (head.set & CSS_SET_COLOR) ? head.color : C_HEAD;
 }
 
+/* Build the page's cascade: every stylesheet the document referenced, in
+ * document order, inline <style> bodies and fetched .css files in one
+ * sheet. `src` is the document the first parse pass produced, whose
+ * csssrc[] list names them in source order.
+ *
+ * This is the step that made CSS "not work on real sites": a real site
+ * puts its rules in <link rel=stylesheet> files, and there was no <link>
+ * handler at all, so the sheet was always empty. The two caps are the
+ * browser's own (WEB_MAX_CSSSRC references, WEB_CSS_BYTES fetched bytes)
+ * and both are reported, not silently applied.
+ *
+ * The transport is a parameter for the same reason load_images() takes
+ * one: a host harness runs this exact function over captured bytes. */
+static void load_stylesheets(Web *w, const Doc *src, const WebTransport *tr) {
+    static char scratch[WEB_RAW_MAX];
+
+    css_sheet_init(&w->sheet);
+    w->css_sheets = 0;
+    w->css_bytes = 0;
+    w->css_capped = src->css_capped ? 1 : 0;
+
+    for (int i = 0; i < src->ncsssrc; i++) {
+        const CssSrc *s = &src->csssrc[i];
+        if (!s->is_link) {
+            if (s->len > 0 && s->off >= 0 &&
+                (size_t)s->off + (size_t)s->len <= sizeof(w->css_raw)) {
+                css_parse(w->css_raw + s->off, (size_t)s->len, &w->sheet);
+                w->css_sheets++;
+            }
+            continue;
+        }
+        if (w->css_capped || w->css_bytes >= WEB_CSS_BYTES ||
+            w->css_sheets >= WEB_MAX_CSSSRC) {
+            w->css_capped = 1;
+            continue;
+        }
+        Url u;
+        char err[128];
+        err[0] = 0;
+        if (url_parse(s->url, &u, err, sizeof(err)) != 0) continue;
+        if (!url_fetchable(&u, err, sizeof(err))) continue;
+
+        Fetch f;
+        web_fetch(&f, tr, &u, scratch);
+        /* The footer's totals are the page's load: a stylesheet is part of
+         * it, exactly like an image. */
+        w->raw_bytes += f.raw_bytes;
+        w->elapsed_ms += f.elapsed_ms;
+        /* A 404 body is not a stylesheet: only a 2xx answer with bytes is
+         * parsed. The request itself is still counted in raw_bytes above,
+         * because it really crossed the wire. */
+        if (!f.ok || f.status < 200 || f.status >= 300) continue;
+        if (!f.body || f.body_len <= 0) continue;
+
+        long room = WEB_CSS_BYTES - w->css_bytes;
+        long take = f.body_len < room ? f.body_len : room;
+        if (take < f.body_len) w->css_capped = 1;
+        if (take <= 0) { w->css_capped = 1; continue; }
+        css_parse(f.body, (size_t)take, &w->sheet);
+        w->css_bytes += take;
+        w->css_sheets++;
+    }
+    w->css_ready = 1;
+}
+
 /* Fetch and decode the images the page referenced. Called once per load,
  * after the body is in: the browser has exactly one connection in flight at
  * a time, so this is the only place it can happen. A failure is recorded on
- * that image and never stops the page from rendering. */
-static void load_images(Web *w) {
-    fprintf(stderr, "web: load_images n=%d\n", w->doc.nimg);
+ * that image and never stops the page from rendering.
+ *
+ * The transport is a parameter, not a global: the accounting below is the
+ * only place where a picture's bytes and milliseconds reach the footer, and
+ * a host harness has to be able to run this very function over a transport
+ * of its own to prove that it does. */
+static void load_images(Web *w, const WebTransport *tr) {
     char abs[WEB_PATH_MAX];
-    static char scratch[WEB_IMG_MAX];
+    /* web_fetch() is allowed to fill WEB_RAW_MAX bytes, so the buffer must
+     * be that large; it used to be WEB_IMG_MAX, which let a large response
+     * run past the end of the scratch buffer. */
+    static char scratch[WEB_RAW_MAX];
     for (int i = 0; i < w->doc.nimg; i++) {
         PageImg *pi = &w->doc.img[i];
         if (pi->tried) continue;
@@ -3251,38 +4333,27 @@ static void load_images(Web *w) {
         if (url_parse(abs, &u, err, sizeof(err)) != 0) continue;
         if (!url_fetchable(&u, err, sizeof(err))) continue;
         Fetch f;
-        web_fetch(&f, &net_transport, &u, scratch);
-        if (!f.ok || !f.body || f.body_len <= 0) {
-            fprintf(stderr, "web: fetch failed for %.80s: %s\n", abs, f.error);
-            continue;
-        }
-        fprintf(stderr, "web: fetched %.60s %ld bytes\n", abs, f.body_len);
+        web_fetch(&f, tr, &u, scratch);
+        /* The footer totals include the picture fetches: a 125 ms page
+         * plus three images is not a 0 ms load. */
+        w->raw_bytes += f.raw_bytes;
+        w->elapsed_ms += f.elapsed_ms;
+        if (!f.ok || !f.body || f.body_len <= 0) continue;
+        if (f.body_len > WEB_IMG_MAX) continue;   /* decoder cap, stated */
         char derr[128] = {0};
         if (img_decode((const unsigned char *)f.body, (size_t)f.body_len,
                        &pi->pic, derr, sizeof(derr)) != 0) {
-            fprintf(stderr, "web: image %.60s: %s\n", abs, derr);
             pi->pic.px = NULL;
         }
     }
 }
 
-/* Height of the image band at this width: what both the painter and the
- * scroll range must agree on. */
-static int img_band_h(const Web *w, int width) {
-    int y = 0, shown = 0;
-    for (int i = 0; i < w->doc.nimg; i++) {
-        const PageImg *pi = &w->doc.img[i];
-        if (!pi->pic.px) continue;
-        int ww = pi->pic.w, hh = pi->pic.h;
-        if (ww > width) { hh = hh * width / (ww ? ww : 1); ww = width; }
-        y += hh + ui_px(28);        /* picture plus its caption line */
-        shown++;
-    }
-    (void)shown;
-    return y;
-}
 
+#ifndef WEB_DRAW_ONLY            /* nothing below runs without a socket */
 
+/* Load one address. The only part of the page path that needs a real
+ * socket: everything above (the request, the totals, the parser, the
+ * images) takes its transport as an argument. */
 static void web_load(Web *w) {
     char addr[WEB_PATH_MAX];
     snprintf(addr, sizeof(addr), "%s", w->pending);
@@ -3322,13 +4393,26 @@ static void web_load(Web *w) {
         return;
     }
 
+    /* The page that is about to be replaced owns the old pictures: free
+     * them before the document is rebuilt, or a logo from the previous
+     * site would sit in this page's image table with live pixels. */
+    web_clear_page(w);
+    /* web_clear_page() zeroed the counters; the page's real measurements
+     * still belong to this load. */
+    w->raw_bytes = f.raw_bytes;
+    w->elapsed_ms = f.elapsed_ms;
+    w->truncated = f.truncated;
+
     w->cur = u;
     snprintf(w->url, sizeof(w->url), "%s", f.url);
     snprintf(w->edit, sizeof(w->edit), "%s", f.url);
-    w->tls_ok = f.tls;
+    /* The padlock is earned by a verified chain, not merely by a session
+     * object existing. */
+    w->tls_ok = f.tls && f.tls_chain_ok;
     snprintf(w->tls_version, sizeof(w->tls_version), "%s", f.tls_version);
     snprintf(w->tls_cipher, sizeof(w->tls_cipher), "%s", f.tls_cipher);
     snprintf(w->tls_cn, sizeof(w->tls_cn), "%s", f.tls_cn);
+    snprintf(w->tls_subject, sizeof(w->tls_subject), "%s", f.tls_subject);
     snprintf(w->tls_expiry, sizeof(w->tls_expiry), "%s", f.tls_expiry);
     w->status = f.status;
     w->body_bytes = f.body_bytes;
@@ -3336,19 +4420,17 @@ static void web_load(Web *w) {
     snprintf(w->charset, sizeof(w->charset), "%s", f.charset);
 
     char title[WEB_TITLE_MAX];
-    /* nothing to parse yet: the sheet is filled by css_apply() and the
-     * parser reads it through the same struct, so block tags can ask for
-     * their size and margin as they are met */
-    /* Two passes, because <style> lives in <head> and the block tags in
-     * <body> need to know their size and margin as they are met. The first
-     * pass collects the stylesheet only; the sheet is then parsed and the
-     * second pass lays out with it. */
-    memset(&w->sheet, 0, sizeof(w->sheet));
+    /* Two passes, because the stylesheets live in <head> and the block
+     * tags in <body> need their size and margin as they are met. The first
+     * pass collects the sheet references only - every <style> body and
+     * every <link rel=stylesheet href> in document order; load_stylesheets()
+     * then fetches the external ones and builds one cascade; the second
+     * pass lays the document out with that cascade. */
     size_t css_len = 0;
     Doc scratch;
     html_build(&scratch, f.body, f.body_len, &w->cur, f.latin1, title, sizeof(title),
                w->css_raw, sizeof(w->css_raw), &css_len, NULL);
-    if (css_len) css_parse(w->css_raw, css_len, &w->sheet);
+    load_stylesheets(w, &scratch, &net_transport);
     css_apply(w);
     html_build(&w->doc, f.body, f.body_len, &w->cur, f.latin1, title, sizeof(title),
                w->css_raw, sizeof(w->css_raw), &css_len, &w->sheet);
@@ -3357,7 +4439,7 @@ static void web_load(Web *w) {
     w->scroll = 0;
     w->laid_w = 0;                 /* force a fresh layout at this width */
     w->state = ST_PAGE;
-    load_images(w);
+    load_images(w, &net_transport);
 }
 
 
@@ -3371,7 +4453,7 @@ static void web_load(Web *w) {
  * below is proved without a window. */
 
 static int scroll_step(void) {
-    Font *f = font_for(0);
+    Font *f = font_get(FONT_REGULAR, (float)style_size(0));
     int h = f ? (int)font_height(f) : 16;
     return h < 8 ? 8 : h;
 }
@@ -3596,7 +4678,7 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     font_init("/usr/share/fonts");
 
-    if (!font_for(0)) {
+    if (!font_get(FONT_REGULAR, (float)style_size(0))) {
         render_fatal(&c, "web: no fonts", "install the Lato TrueType files in /usr/share/fonts");
         usleep(1500 * 1000);
         mc_close(&c);

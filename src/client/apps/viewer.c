@@ -2055,8 +2055,22 @@ static void tx_fit(char *out, size_t osz, Font *f, const char *t, int maxw) {
             if (font_width(f, out) <= (float)budget) break;
             cut--;
         }
-        /* never end in the middle of a UTF-8 sequence */
-        while (cut > 0 && ((unsigned char)out[cut - 1] & 0xC0u) == 0x80u) cut--;
+        /* never end in the middle of a UTF-8 sequence: drop the partial
+         * codepoint, including a lead byte whose tail was just cut. A
+         * Cyrillic/Japanese name used to leave a bare lead byte before the
+         * dots, and font_draw() then ate the dots as one codepoint. */
+        {
+            size_t i = cut;
+            while (i > 0 && ((unsigned char)out[i - 1] & 0xC0u) == 0x80u) i--;
+            if (i > 0) {
+                unsigned char c = (unsigned char)out[i - 1];
+                int need = 1;
+                if (c >= 0xC2u && c <= 0xDFu) need = 2;
+                else if (c >= 0xE0u && c <= 0xEFu) need = 3;
+                else if (c >= 0xF0u && c <= 0xF4u) need = 4;
+                if (cut - (i - 1) < (size_t)need) cut = i - 1;
+            }
+        }
         if (cut + 2 >= osz) cut = osz - 3;
         memcpy(out + cut, "..", 3);
     }
@@ -2500,12 +2514,12 @@ static void layout_build(VLayout *L, Viewer *v, int w, int h) {
     L->footer_h = vceil(font_height(L->f.small)) + 2 * L->gap;
 
     /* Bands. A short window gives up the footer band before it gives up
-     * content: below four rows of air the footer's one line costs more
-     * than it is worth, so the page keeps the space. The header stays
-     * longest, because the file's name is the last thing to go. */
+     * content, but not before two rows of air are left: at 380x280/1.6
+     * that keeps the one-line footer (bytes/encoding/zoom facts) on screen
+     * instead of silently removing the only place they are shown. */
     {
         int body_h = h - L->header_h - L->footer_h - 2 * L->gap;
-        if (body_h < 4 * L->row_h) {
+        if (body_h < L->row_h) {
             L->footer_h = 0;
             body_h = h - L->header_h - L->gap;
         }

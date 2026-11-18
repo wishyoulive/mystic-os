@@ -69,10 +69,17 @@ prints `I:` and calls it "compressed"; `tools/fetch-vlc.py` prints both, labelle
 Two of those matter more than they look:
 
 - **The desktop is static and the image already contains musl.** The base is an
-  Alpine minirootfs, so `ld-musl-x86_64.so.1` and busybox are already in the
+  Alpine minirootfs, so `/lib/ld-musl-x86_64.so.1` (670,312 bytes, verified in
+  `alpine-minirootfs-3.24.4-x86_64.tar.gz`) and busybox are already in the
   image. A dynamically linked libVLC therefore adds its own libraries, not a C
   library. That is why the profiles in section 3.6 count `vlc-libs` and the
   codec libraries, not `musl`.
+- **The JAIL does not have it.** `src/wmsrv.c` runs each app in a chroot at
+  `/run/mystic/jail/<id>` and binds only `/bin/app`, the bundle at `/app`, the
+  fonts, `/dev` bits and `/proc` - no `/lib`. A dynamic ELF's PT_INTERP
+  therefore cannot resolve inside the jail even though the image has the
+  loader. That is why the package's `bin` is a static launcher that execs the
+  bundle's own `lib/ld-musl-x86_64.so.1`; see section 9.
 - **The window blit ignores alpha.** `RV32` has an unused top byte; our
   compositor does not look at it. No conversion, no `0xFF000000` fix-up, no
   blend. This is the whole reason the display path is cheap.
@@ -548,26 +555,54 @@ from the host.
 ## 9. Using `tools/fetch-vlc.py`
 
 ```
-python tools/fetch-vlc.py                       # dry run: the full vlc closure
-python tools/fetch-vlc.py --profile minimal     # dry run: libvlc + vmem, no codec libs
-python tools/fetch-vlc.py --profile trim        # dry run: libvlc + vmem + libavcodec
-python tools/fetch-vlc.py --profile minimal --download
-python tools/fetch-vlc.py --list --profile trim # every package in the closure
+python tools/fetch-vlc.py                 # build: image bundle + package + index row
+python tools/fetch-vlc.py --dry-run       # resolve and print; build nothing
+python tools/fetch-vlc.py --profile minimal
+python tools/fetch-vlc.py --force         # ignore the caches
 ```
 
-- **Dry run is the default.** Nothing is downloaded until `--download`. The one
-  exception: a plugin profile fetches `vlc` + `vlc-libs` (6.04 MB, cached) so it
-  can read the real `DT_NEEDED` out of the plugin binaries - it says so when it
-  does.
-- **A plan over `--max-download-mb` (default 300) is refused** unless `--force`,
-  and it prints both numbers before it starts anything. Be aware the cap is on
-  *download* size: the full closure is 184.68 MB of download but **502.88 MB
-  installed**, so the cap alone would not stop it - that is what "dry run by
-  default" is for. `--max-download-mb 100` makes the guard bite on that case.
+- **It builds by default.** The expensive steps are cached: `build/vlc-index/`
+  (APKINDEX), `build/vlc-apks/` (the `.apk` files), `build/vlc-root/` (a
+  signature stamp, so a second run makes no network call) and the package
+  itself (`build/vlc-pkg.stamp`, keyed on the app sources, the manifest and
+  this script). `--dry-run` downloads nothing beyond the two vlc packages it
+  must read `DT_NEEDED` from, and says so.
+- Output 1, the **image bundle**: `stage/usr/share/mystic/apps/vlc/{manifest,bin}`.
+  `bin` there is the player compiled statically (171,152 bytes). It cannot
+  dlopen, so its window says libVLC is not installed and that `pkg install vlc`
+  brings it: a placeholder with the truth in it, never a fake player.
+- Output 2, the **package** `build/repo/vlc.tar.gz` (38.79 MB compressed /
+  38,792,152 bytes, 103.39 MB installed / 103,387,892 bytes) plus the `vlc`
+  row in `build/repo/index.tsv`:
+  `manifest`; `bin` (static launcher, 29,128 bytes, no PT_INTERP);
+  `libexec/vlcplayer` (dynamic, 531,520 bytes, PT_INTERP
+  `/lib/ld-musl-x86_64.so.1`, RUNPATH `$ORIGIN/../lib`);
+  `lib/ld-musl-x86_64.so.1` (from Alpine's musl apk, 670,312 bytes, mode 0755);
+  and the closure - 129 regular files under `lib/` (128 shared objects plus
+  the loader), 113 soname/version symlinks, 27 plugin modules in 7 plugin
+  directories, and the soname aliases
+  `libvlc.so.5` and `libvlccore.so.9` that `dlopen()`/`DT_NEEDED` actually use.
+- Why three files: the image has `/lib/ld-musl-x86_64.so.1` from the Alpine
+  base, but the jail is a chroot that binds only `/bin/app`, `/app` (the
+  bundle), the fonts, `/dev` bits and `/proc`. PT_INTERP cannot resolve there,
+  so `bin` is static and runs the bundled loader explicitly:
+  `lib/ld-musl-x86_64.so.1 --library-path <bundle>/lib <bundle>/libexec/vlcplayer`.
+- The manifest's `exec` is a **bare file name**, and it has to be: `wmsrv`
+  rejects any `exec` containing `/` or `..` (`wms_launch_arg`, "unsafe exec"),
+  so `exec = libexec/vlcplayer` is not a layout Mystic can launch and no
+  document should suggest it. `exec = bin` names the static launcher at the
+  bundle root; `libexec/vlcplayer` and `lib/` are internal paths the
+  launcher (and its `$ORIGIN/../lib` RUNPATH) use. The one line `wmsrv`
+  could add does **not** change that:
+  `mount("/lib", "<jail>/lib", NULL, MS_BIND | MS_RDONLY, NULL);` would only
+  matter for a dynamic executable in the jail, and it is not needed -
+  `wmsrv` already exports `MYSTIC_BUNDLE=/app` and
+  `LD_LIBRARY_PATH=/app/usr/lib:/app/lib`, which is what `bin` reads.
 - `--root` adds a package or a versioned provide (`--root so:libvpx.so.11`); a
   name the index does not know is reported instead of being ignored.
-- Caches: `build/vlc-index/`, `build/vlc-apks/`. Destination: `build/vlc-root/`.
-- It reads `S:` for download size and `I:` for installed size and prints both.
+- A plan over `--max-download-mb` (default 300) is refused unless `--force`.
+  The full closure is 184.68 MB of download but 502.88 MB installed, so the cap
+  alone would not stop it - that is what `--dry-run` is for.
 
 ---
 

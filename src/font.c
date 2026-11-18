@@ -61,6 +61,7 @@ typedef struct {
     int   xoff, yoff;
     float advance;
     int   used;
+    int   src;           /* faces[] index that drew it; -1 = no face covers it */
     unsigned last_use;   /* Font.use_clock value of the last hit: the LRU key */
 } Glyph;
 
@@ -154,6 +155,256 @@ static int has_font_ext(const char *name) {
     if (n < 4) return 0;
     const char *ext = name + n - 4;
     return ci_equal(ext, ".ttf") || ci_equal(ext, ".otf");
+}
+
+/* ------------------------------------------------------------
+ *  Unicode: cell width, a strict UTF-8 walk, and what a face covers
+ *
+ *  How many terminal cells a codepoint occupies is a property of the
+ *  CHARACTER, not of the face that happens to draw it, so the tables
+ *  live here beside the other character data instead of inside the
+ *  terminal. src/term.c asks font_cell_width() how far the cursor
+ *  moves; src/apps/files.c and src/client/apps/viewer.c ask it how
+ *  many columns a line of text really takes.
+ *
+ *  WIDE   the East Asian Wide and Fullwidth ranges (Unicode
+ *         EastAsianWidth property W and F) and the emoji blocks that
+ *         terminals draw two cells wide.
+ *  ZERO   the combining marks (general categories Mn and Me), the
+ *         zero-width space and joiner controls, and the Hangul Jamo
+ *         medial/final ranges, which sit on the previous cell.
+ *
+ *  Both tables are the ones in Markus Kuhn's public-domain wcwidth()
+ *  - which encode the Unicode data - narrowed to the ranges named
+ *  above; a codepoint in neither table is one cell wide. Nothing here
+ *  is guessed from a glyph's advance: a CJK ideograph is two cells
+ *  even in a face that draws it narrower, because that is what the
+ *  column grid in a terminal means.
+ * ------------------------------------------------------------ */
+typedef struct { u32 lo, hi; } CpRange;
+
+static const CpRange CP_WIDE[] = {
+    { 0x1100, 0x115F },   /* Hangul Jamo initial consonants  */
+    { 0x231A, 0x231B }, { 0x2329, 0x232A }, { 0x23E9, 0x23EC },
+    { 0x23F0, 0x23F0 }, { 0x23F3, 0x23F3 }, { 0x25FD, 0x25FE },
+    { 0x2614, 0x2615 }, { 0x2648, 0x2653 }, { 0x267F, 0x267F },
+    { 0x2693, 0x2693 }, { 0x26A1, 0x26A1 }, { 0x26AA, 0x26AB },
+    { 0x26BD, 0x26BE }, { 0x26C4, 0x26C5 }, { 0x26CE, 0x26CE },
+    { 0x26D4, 0x26D4 }, { 0x26EA, 0x26EA }, { 0x26F2, 0x26F3 },
+    { 0x26F5, 0x26F5 }, { 0x26FA, 0x26FA }, { 0x26FD, 0x26FD },
+    { 0x2705, 0x2705 }, { 0x270A, 0x270B }, { 0x2728, 0x2728 },
+    { 0x274C, 0x274C }, { 0x274E, 0x274E }, { 0x2753, 0x2755 },
+    { 0x2757, 0x2757 }, { 0x2795, 0x2797 }, { 0x27B0, 0x27B0 },
+    { 0x27BF, 0x27BF }, { 0x2B1B, 0x2B1C }, { 0x2B50, 0x2B50 },
+    { 0x2B55, 0x2B55 },
+    { 0x2E80, 0x2E99 }, { 0x2E9B, 0x2EF3 }, { 0x2F00, 0x2FD5 },
+    { 0x2FF0, 0x2FFB }, { 0x3000, 0x303E }, { 0x3041, 0x3096 },
+    { 0x3099, 0x30FF }, { 0x3105, 0x312D }, { 0x3131, 0x318E },
+    { 0x3190, 0x31BA }, { 0x31C0, 0x31E3 }, { 0x31F0, 0x321E },
+    { 0x3220, 0x3247 }, { 0x3250, 0x32FE }, { 0x3300, 0x4DBF },
+    { 0x4E00, 0xA48C }, { 0xA490, 0xA4C6 }, { 0xA960, 0xA97C },
+    { 0xAC00, 0xD7A3 },   /* Hangul syllables               */
+    { 0xF900, 0xFAFF }, { 0xFE10, 0xFE19 }, { 0xFE30, 0xFE52 },
+    { 0xFE54, 0xFE66 }, { 0xFE68, 0xFE6B }, { 0xFF01, 0xFF60 },
+    { 0xFFE0, 0xFFE6 }, { 0x16FE0, 0x16FE0 }, { 0x17000, 0x187EC },
+    { 0x18800, 0x18AF2 }, { 0x1B000, 0x1B001 },
+    { 0x1F004, 0x1F004 }, { 0x1F0CF, 0x1F0CF }, { 0x1F18E, 0x1F18E },
+    { 0x1F191, 0x1F19A }, { 0x1F200, 0x1F202 }, { 0x1F210, 0x1F23B },
+    { 0x1F240, 0x1F248 }, { 0x1F250, 0x1F251 }, { 0x1F300, 0x1F320 },
+    { 0x1F32D, 0x1F335 }, { 0x1F337, 0x1F37C }, { 0x1F37E, 0x1F393 },
+    { 0x1F3A0, 0x1F3CA }, { 0x1F3CF, 0x1F3D3 }, { 0x1F3E0, 0x1F3F0 },
+    { 0x1F3F4, 0x1F3F4 }, { 0x1F3F8, 0x1F43E }, { 0x1F440, 0x1F440 },
+    { 0x1F442, 0x1F4FC }, { 0x1F4FF, 0x1F53D }, { 0x1F54B, 0x1F54E },
+    { 0x1F550, 0x1F567 }, { 0x1F57A, 0x1F57A }, { 0x1F595, 0x1F596 },
+    { 0x1F5A4, 0x1F5A4 }, { 0x1F5FB, 0x1F64F }, { 0x1F680, 0x1F6C5 },
+    { 0x1F6CC, 0x1F6CC }, { 0x1F6D0, 0x1F6D2 }, { 0x1F6EB, 0x1F6EC },
+    { 0x1F6F4, 0x1F6F6 }, { 0x1F910, 0x1F91E }, { 0x1F920, 0x1F927 },
+    { 0x1F930, 0x1F930 }, { 0x1F933, 0x1F93E }, { 0x1F940, 0x1F94B },
+    { 0x1F950, 0x1F95E }, { 0x1F980, 0x1F991 }, { 0x1F9C0, 0x1F9C0 },
+    { 0x20000, 0x2FFFD }, { 0x30000, 0x3FFFD }
+};
+
+static const CpRange CP_ZERO[] = {
+    { 0x0300, 0x036F },   /* combining diacritical marks     */
+    { 0x0483, 0x0489 }, { 0x0591, 0x05BD }, { 0x05BF, 0x05BF },
+    { 0x05C1, 0x05C2 }, { 0x05C4, 0x05C5 }, { 0x05C7, 0x05C7 },
+    { 0x0610, 0x061A }, { 0x064B, 0x065F }, { 0x0670, 0x0670 },
+    { 0x06D6, 0x06DC }, { 0x06DF, 0x06E4 }, { 0x06E7, 0x06E8 },
+    { 0x06EA, 0x06ED }, { 0x0711, 0x0711 }, { 0x0730, 0x074A },
+    { 0x07A6, 0x07B0 }, { 0x07EB, 0x07F3 }, { 0x0816, 0x0819 },
+    { 0x081B, 0x0823 }, { 0x0825, 0x0827 }, { 0x0829, 0x082D },
+    { 0x0859, 0x085B }, { 0x08E3, 0x0902 }, { 0x093A, 0x093A },
+    { 0x093C, 0x093C }, { 0x0941, 0x0948 }, { 0x094D, 0x094D },
+    { 0x0951, 0x0957 }, { 0x0962, 0x0963 }, { 0x0981, 0x0981 },
+    { 0x09BC, 0x09BC }, { 0x09C1, 0x09C4 }, { 0x09CD, 0x09CD },
+    { 0x09E2, 0x09E3 }, { 0x0A01, 0x0A02 }, { 0x0A3C, 0x0A3C },
+    { 0x0A41, 0x0A42 }, { 0x0A47, 0x0A48 }, { 0x0A4B, 0x0A4D },
+    { 0x0A51, 0x0A51 }, { 0x0A70, 0x0A71 }, { 0x0A75, 0x0A75 },
+    { 0x0A81, 0x0A82 }, { 0x0ABC, 0x0ABC }, { 0x0AC1, 0x0AC5 },
+    { 0x0AC7, 0x0AC8 }, { 0x0ACD, 0x0ACD }, { 0x0AE2, 0x0AE3 },
+    { 0x0B01, 0x0B01 }, { 0x0B3C, 0x0B3C }, { 0x0B3F, 0x0B3F },
+    { 0x0B41, 0x0B44 }, { 0x0B4D, 0x0B4D }, { 0x0B56, 0x0B56 },
+    { 0x0B62, 0x0B63 }, { 0x0B82, 0x0B82 }, { 0x0BC0, 0x0BC0 },
+    { 0x0BCD, 0x0BCD }, { 0x0C00, 0x0C00 }, { 0x0C3E, 0x0C40 },
+    { 0x0C46, 0x0C48 }, { 0x0C4A, 0x0C4D }, { 0x0C55, 0x0C56 },
+    { 0x0C62, 0x0C63 }, { 0x0C81, 0x0C81 }, { 0x0CBC, 0x0CBC },
+    { 0x0CBF, 0x0CBF }, { 0x0CC6, 0x0CC6 }, { 0x0CCC, 0x0CCD },
+    { 0x0CE2, 0x0CE3 }, { 0x0D01, 0x0D01 }, { 0x0D41, 0x0D44 },
+    { 0x0D4D, 0x0D4D }, { 0x0D62, 0x0D63 }, { 0x0DCA, 0x0DCA },
+    { 0x0DD2, 0x0DD4 }, { 0x0DD6, 0x0DD6 }, { 0x0E31, 0x0E31 },
+    { 0x0E34, 0x0E3A }, { 0x0E47, 0x0E4E }, { 0x0EB1, 0x0EB1 },
+    { 0x0EB4, 0x0EB9 }, { 0x0EBB, 0x0EBC }, { 0x0EC8, 0x0ECD },
+    { 0x0F18, 0x0F19 }, { 0x0F35, 0x0F35 }, { 0x0F37, 0x0F37 },
+    { 0x0F39, 0x0F39 }, { 0x0F71, 0x0F7E }, { 0x0F80, 0x0F84 },
+    { 0x0F86, 0x0F87 }, { 0x0F8D, 0x0F97 }, { 0x0F99, 0x0FBC },
+    { 0x0FC6, 0x0FC6 }, { 0x102D, 0x1030 }, { 0x1032, 0x1037 },
+    { 0x1039, 0x103A }, { 0x103D, 0x103E }, { 0x1058, 0x1059 },
+    { 0x105E, 0x1060 }, { 0x1071, 0x1074 }, { 0x1082, 0x1082 },
+    { 0x1085, 0x1086 }, { 0x108D, 0x108D }, { 0x109D, 0x109D },
+    { 0x1160, 0x11FF },   /* Hangul Jamo medial + final     */
+    { 0x135D, 0x135F }, { 0x1712, 0x1714 }, { 0x1732, 0x1734 },
+    { 0x1752, 0x1753 }, { 0x1772, 0x1773 }, { 0x17B4, 0x17B5 },
+    { 0x17B7, 0x17BD }, { 0x17C6, 0x17C6 }, { 0x17C9, 0x17D3 },
+    { 0x17DD, 0x17DD }, { 0x180B, 0x180E }, { 0x18A9, 0x18A9 },
+    { 0x1920, 0x1922 }, { 0x1927, 0x1928 }, { 0x1932, 0x1932 },
+    { 0x1939, 0x193B }, { 0x1A17, 0x1A18 }, { 0x1A1B, 0x1A1B },
+    { 0x1A56, 0x1A56 }, { 0x1A58, 0x1A5E }, { 0x1A60, 0x1A60 },
+    { 0x1A62, 0x1A62 }, { 0x1A65, 0x1A6C }, { 0x1A73, 0x1A7C },
+    { 0x1A7F, 0x1A7F }, { 0x1AB0, 0x1ABE }, { 0x1B00, 0x1B03 },
+    { 0x1B34, 0x1B34 }, { 0x1B36, 0x1B3A }, { 0x1B3C, 0x1B3C },
+    { 0x1B42, 0x1B42 }, { 0x1B6B, 0x1B73 }, { 0x1B80, 0x1B81 },
+    { 0x1BA2, 0x1BA5 }, { 0x1BA8, 0x1BA9 }, { 0x1BAB, 0x1BAD },
+    { 0x1BE6, 0x1BE6 }, { 0x1BE8, 0x1BE9 }, { 0x1BED, 0x1BED },
+    { 0x1BEF, 0x1BF1 }, { 0x1C2C, 0x1C33 }, { 0x1C36, 0x1C37 },
+    { 0x1CD0, 0x1CD2 }, { 0x1CD4, 0x1CE0 }, { 0x1CE2, 0x1CE8 },
+    { 0x1CED, 0x1CED }, { 0x1CF4, 0x1CF4 }, { 0x1CF8, 0x1CF9 },
+    { 0x1DC0, 0x1DF5 }, { 0x1DFC, 0x1DFF },
+    { 0x200B, 0x200F },   /* ZWSP, ZWNJ, ZWJ, LRM, RLM      */
+    { 0x202A, 0x202E },   /* bidi embedding controls        */
+    { 0x2060, 0x2064 }, { 0x2066, 0x206F }, { 0x20D0, 0x20F0 },
+    { 0x2CEF, 0x2CF1 }, { 0x2D7F, 0x2D7F }, { 0x2DE0, 0x2DFF },
+    { 0x302A, 0x302D }, { 0x3099, 0x309A }, { 0xA66F, 0xA672 },
+    { 0xA674, 0xA67D }, { 0xA69E, 0xA69F }, { 0xA6F0, 0xA6F1 },
+    { 0xA802, 0xA802 }, { 0xA806, 0xA806 }, { 0xA80B, 0xA80B },
+    { 0xA825, 0xA826 }, { 0xA8C4, 0xA8C5 }, { 0xA8E0, 0xA8F1 },
+    { 0xA926, 0xA92D }, { 0xA947, 0xA951 }, { 0xA980, 0xA982 },
+    { 0xA9B3, 0xA9B3 }, { 0xA9B6, 0xA9B9 }, { 0xA9BC, 0xA9BC },
+    { 0xA9E5, 0xA9E5 }, { 0xAA29, 0xAA2E }, { 0xAA31, 0xAA32 },
+    { 0xAA35, 0xAA36 }, { 0xAA43, 0xAA43 }, { 0xAA4C, 0xAA4C },
+    { 0xAA7C, 0xAA7C }, { 0xAAB0, 0xAAB0 }, { 0xAAB2, 0xAAB4 },
+    { 0xAAB7, 0xAAB8 }, { 0xAABE, 0xAABF }, { 0xAAC1, 0xAAC1 },
+    { 0xAAEC, 0xAAED }, { 0xAAF6, 0xAAF6 }, { 0xABE5, 0xABE5 },
+    { 0xABE8, 0xABE8 }, { 0xABED, 0xABED }, { 0xFB1E, 0xFB1E },
+    { 0xFE00, 0xFE0F },   /* variation selectors            */
+    { 0xFE20, 0xFE2F }, { 0xFEFF, 0xFEFF }, { 0xFFF9, 0xFFFB },
+    { 0x101FD, 0x101FD }, { 0x102E0, 0x102E0 },
+    { 0x10376, 0x1037A }, { 0x10A01, 0x10A03 }, { 0x10A05, 0x10A06 },
+    { 0x10A0C, 0x10A0F }, { 0x10A38, 0x10A3A }, { 0x10A3F, 0x10A3F },
+    { 0x10AE5, 0x10AE6 }, { 0x11001, 0x11001 }, { 0x11038, 0x11046 },
+    { 0x1107F, 0x11081 }, { 0x110B3, 0x110B6 }, { 0x110B9, 0x110BA },
+    { 0x11100, 0x11102 }, { 0x11127, 0x1112B }, { 0x1112D, 0x11134 },
+    { 0x11173, 0x11173 }, { 0x11180, 0x11181 }, { 0x111B6, 0x111BE },
+    { 0x111CA, 0x111CC }, { 0x1122F, 0x11231 }, { 0x11234, 0x11234 },
+    { 0x11236, 0x11237 }, { 0x112DF, 0x112DF }, { 0x112E3, 0x112EA },
+    { 0x11300, 0x11301 }, { 0x1133C, 0x1133C }, { 0x11340, 0x11340 },
+    { 0x11366, 0x1136C }, { 0x11370, 0x11374 }, { 0x114B3, 0x114B8 },
+    { 0x114BA, 0x114BA }, { 0x114BF, 0x114C0 }, { 0x114C2, 0x114C3 },
+    { 0x115B2, 0x115B5 }, { 0x115BC, 0x115BD }, { 0x115BF, 0x115C0 },
+    { 0x115DC, 0x115DD }, { 0x11633, 0x1163A }, { 0x1163D, 0x1163D },
+    { 0x1163F, 0x11640 }, { 0x116AB, 0x116AB }, { 0x116AD, 0x116AD },
+    { 0x116B0, 0x116B5 }, { 0x116B7, 0x116B7 }, { 0x1171D, 0x1171F },
+    { 0x11722, 0x11725 }, { 0x11727, 0x1172B }, { 0x16AF0, 0x16AF4 },
+    { 0x16B30, 0x16B36 }, { 0x16F8F, 0x16F92 }, { 0x1BC9D, 0x1BC9E },
+    { 0x1D167, 0x1D169 }, { 0x1D17B, 0x1D182 }, { 0x1D185, 0x1D18B },
+    { 0x1D1AA, 0x1D1AD }, { 0x1D242, 0x1D244 },
+    { 0x1DA00, 0x1DA36 }, { 0x1DA3B, 0x1DA6C }, { 0x1DA75, 0x1DA75 },
+    { 0x1DA84, 0x1DA84 }, { 0x1DA9B, 0x1DA9F }, { 0x1DAA1, 0x1DAAF },
+    { 0x1E8D0, 0x1E8D6 }, { 0xE0100, 0xE01EF },
+    { 0xD7B0, 0xD7FF }    /* Hangul Jamo extended medial/final */
+};
+
+/* Sorted lookup. The tables are small enough (a few hundred entries) that a
+ * binary search costs about eight compares - less than the glyph lookup that
+ * follows it, and it keeps the data as the one thing to check. */
+static int cp_in(const CpRange *t, size_t n, u32 cp) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (cp < t[mid].lo) hi = mid;
+        else if (cp > t[mid].hi) lo = mid + 1;
+        else return 1;
+    }
+    return 0;
+}
+
+int font_cell_width(u32 cp) {
+    /* C0, DEL and C1 are not printable: a terminal has already acted on them,
+     * and nothing they could occupy belongs in the grid. Everything below
+     * U+0300 is one cell (the combining blocks all start at U+0300). */
+    if (cp < 0x20u || (cp >= 0x7Fu && cp < 0xA0u)) return 0;
+    if (cp < 0x0300u) return 1;
+    if (cp_in(CP_ZERO, sizeof CP_ZERO / sizeof CP_ZERO[0], cp)) return 0;
+    if (cp_in(CP_WIDE, sizeof CP_WIDE / sizeof CP_WIDE[0], cp)) return 2;
+    return 1;
+}
+
+/* Decode one UTF-8 sequence from s[0..len). Returns the codepoint, or -1 when
+ * the bytes are not a valid sequence (a stray continuation byte, an overlong
+ * form, a surrogate, or a value above U+10FFFF); *bytes is always at least 1,
+ * so every walk of a string advances and none can loop.
+ *
+ * The decoder in font_draw() used to accept the first byte of a 2-4 byte
+ * sequence plus whatever followed it, which is how a name cut in the middle of
+ * a Cyrillic letter made the dots after it vanish into one wrong glyph. */
+int font_utf8_next(const char *s, size_t len, int *bytes) {
+    const unsigned char *p = (const unsigned char *)s;
+    if (bytes) *bytes = 1;
+    if (!s || len == 0) return -1;
+    unsigned c = p[0];
+    if (c < 0x80u) return (int)c;
+
+    int need;
+    u32 cp, min;
+    if (c >= 0xC2u && c <= 0xDFu)      { need = 1; cp = c & 0x1Fu; min = 0x80u; }
+    else if (c >= 0xE0u && c <= 0xEFu) { need = 2; cp = c & 0x0Fu; min = 0x800u; }
+    else if (c >= 0xF0u && c <= 0xF4u) { need = 3; cp = c & 0x07u; min = 0x10000u; }
+    else return -1;
+
+    if ((size_t)need + 1u > len) return -1;
+    for (int i = 1; i <= need; i++) {
+        if ((p[i] & 0xC0u) != 0x80u) return -1;
+        cp = (cp << 6) | (u32)(p[i] & 0x3Fu);
+    }
+    if (cp < min || cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu)) return -1;
+    if (bytes) *bytes = need + 1;
+    return (int)cp;
+}
+
+/* The largest k <= n for which s[0..k) is a whole number of codepoints: the
+ * cut a string may be shortened to without ever splitting a character. A
+ * string that is already valid up to n comes back as n. */
+size_t font_utf8_boundary(const char *s, size_t n) {
+    if (!s) return 0;
+    size_t total = strlen(s);
+    if (n >= total) return total;
+    size_t i = 0;
+    while (i < n) {
+        int step = 1;
+        if (total - i >= 1u) font_utf8_next(s + i, total - i, &step);
+        if (step < 1) step = 1;
+        if (i + (size_t)step > n) break;      /* would split this character */
+        i += (size_t)step;
+    }
+    return i;
+}
+
+/* The start of the codepoint that ends at n (n > 0): the previous cut a
+ * shorten-by-one loop may take. */
+size_t font_utf8_prev(const char *s, size_t n) {
+    if (!s || n == 0) return 0;
+    size_t i = n - 1;
+    while (i > 0 && ((unsigned char)s[i] & 0xC0u) == 0x80u) i--;
+    return i;
 }
 
 static void tag_str(const u8 *p, char out[5]) {
@@ -1159,6 +1410,7 @@ static void font_rebind(Font *f, int source) {
         f->cache[i].xoff = f->cache[i].yoff = 0;
         f->cache[i].advance = 0;
         f->cache[i].used = 0;
+        f->cache[i].src = -1;
         f->cache[i].last_use = 0;
     }
     f->use_clock = 0;
@@ -1220,16 +1472,71 @@ static unsigned next_use(Font *f) {
     return ++f->use_clock;
 }
 
-static void glyph_rasterise(Font *f, Glyph *g, int cp) {
-    int glyph_index = stbtt_FindGlyphIndex(&f->info, cp);
+/* ------------------------------------------------------------
+ *  Which installed face can draw this codepoint?
+ *
+ *  The old lookup asked the role's face only: stbtt_FindGlyphIndex()
+ *  returning 0 meant the index of glyph 0, .notdef, which is the box
+ *  the owner saw where a Cyrillic or Japanese letter should be - even
+ *  with a face installed that had the letter.  So a miss now walks the
+ *  whole face list (the same list the roles were chosen from) and the
+ *  first face with real ink in the glyph wins; a face that maps the
+ *  codepoint to an empty outline (a colour-emoji layer, a space) is
+ *  kept only as a last resort, because an empty bitmap looks exactly
+ *  like a missing glyph.
+ *
+ *  The answer is recorded in the glyph cache entry, including "nowhere"
+ *  (-1), so the walk happens once per codepoint per size, not once per
+ *  paint.  The face list is sorted by file name at scan time, so the
+ *  choice is the same on every run.
+ * ------------------------------------------------------------ */
+static int face_has_cp(int fi, int cp) {
+    if (fi < 0 || fi >= face_count) return 0;
+    return stbtt_FindGlyphIndex(&faces[fi].info, cp) != 0;
+}
+
+/* Does this face put ink on paper for cp at this pixel size? A codepoint can
+ * map to a glyph whose outline is empty (U+00A0, U+200B, a COLR emoji base),
+ * and choosing that face would draw nothing at all. */
+static int face_has_ink(int fi, int cp, float size) {
+    if (fi < 0 || fi >= face_count) return 0;
+    int gi = stbtt_FindGlyphIndex(&faces[fi].info, cp);
+    if (gi == 0) return 0;
+    float scale = stbtt_ScaleForPixelHeight(&faces[fi].info, size);
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    stbtt_GetGlyphBitmapBox(&faces[fi].info, gi, scale, scale, &x0, &y0, &x1, &y1);
+    return (x1 > x0 && y1 > y0);
+}
+
+static int face_pick(Font *f, int cp) {
+    if (face_has_cp(f->source, cp)) return f->source;
+    int empty = -1;
+    for (int i = 0; i < face_count; i++) {
+        if (i == f->source || !face_has_cp(i, cp)) continue;
+        if (face_has_ink(i, cp, f->size)) return i;
+        if (empty < 0) empty = i;
+    }
+    return empty;              /* -1: no installed face has this codepoint */
+}
+
+static void glyph_rasterise(Font *f, Glyph *g, int cp, int src) {
+    const stbtt_fontinfo *info = &f->info;
     float scale = f->scale;
+    if (src >= 0 && src != f->source && src < face_count) {
+        /* A fallback face is rasterised at the SAME pixel height as the role's
+         * face (that is what keeps the text on one baseline), which is why the
+         * scale is derived from this font's size and not from the face. */
+        info = &faces[src].info;
+        scale = stbtt_ScaleForPixelHeight(info, f->size);
+    }
+    int glyph_index = stbtt_FindGlyphIndex(info, cp);
 
     int advance_width, left_bearing;
-    stbtt_GetGlyphHMetrics(&f->info, glyph_index, &advance_width, &left_bearing);
+    stbtt_GetGlyphHMetrics(info, glyph_index, &advance_width, &left_bearing);
     g->advance = advance_width * scale;
 
     int x0, y0, x1, y1;
-    stbtt_GetGlyphBitmapBox(&f->info, glyph_index, scale, scale, &x0, &y0, &x1, &y1);
+    stbtt_GetGlyphBitmapBox(info, glyph_index, scale, scale, &x0, &y0, &x1, &y1);
     g->w = x1 - x0;
     g->h = y1 - y0;
     g->xoff = x0;
@@ -1241,7 +1548,7 @@ static void glyph_rasterise(Font *f, Glyph *g, int cp) {
     if (g->w > 512 || g->h > 512) { g->w = g->h = 0; return; }
     g->bitmap = malloc((size_t)g->w * g->h);
     if (!g->bitmap) { g->w = g->h = 0; return; }
-    stbtt_MakeGlyphBitmap(&f->info, g->bitmap, g->w, g->h, g->w, scale, scale, glyph_index);
+    stbtt_MakeGlyphBitmap(info, g->bitmap, g->w, g->h, g->w, scale, scale, glyph_index);
 }
 
 static Glyph *glyph_get(Font *f, int cp) {
@@ -1275,7 +1582,7 @@ static Glyph *glyph_get(Font *f, int cp) {
         slot->used = 0;
     }
 
-    glyph_rasterise(f, slot, cp);
+    glyph_rasterise(f, slot, cp, face_pick(f, cp));
     slot->last_use = next_use(f);
     return slot;
 }
@@ -1338,15 +1645,15 @@ float font_draw(Surface *s, Font *f, float x, float y, const char *text, u32 col
                 for (int xx = 0; xx < g->w; xx++) {
                     int dx = gx + xx;
                     if ((unsigned)dx >= (unsigned)s->w) continue;
-                /* Honour the surface clip. Glyphs wrote straight into the
-                 * framebuffer and ignored it, so any text an app drew outside
-                 * its own rect - a label wider than the window, a heading in a
-                 * narrow pane - appeared over the wallpaper or the app beside
-                 * it. Every other primitive respected the clip; this is the
-                 * one that leaked. */
-                if (s->cx1 > s->cx0 &&
-                    (dx < s->cx0 || dx >= s->cx1 || dy < s->cy0 || dy >= s->cy1))
-                    continue;
+                    /* Honour the surface clip. Glyphs wrote straight into the
+                     * framebuffer and ignored it, so any text an app drew
+                     * outside its own rect - a label wider than the window, a
+                     * heading in a narrow pane - appeared over the wallpaper or
+                     * the app beside it. Every other primitive respected the
+                     * clip; this is the one that leaked. */
+                    if (s->cx1 > s->cx0 &&
+                        (dx < s->cx0 || dx >= s->cx1 || dy < s->cy0 || dy >= s->cy1))
+                        continue;
                     float cov = (src[xx] / 255.0f) * ca;
                     if (cov <= 0.004f) continue;
                     u32 d = row[dx];

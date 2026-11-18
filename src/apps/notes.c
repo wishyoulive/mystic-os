@@ -62,6 +62,21 @@
  *  layout_build()/grid_of(), so the whole app grows and shrinks with the
  *  global text scale and the click handler, the painter and the scroll
  *  window cannot drift.
+ *
+ *  DISK METADATA CACHE. The stat() of the open document and the stat()
+ *  of each visible sidebar row are real reads, but a file's size and
+ *  mtime cannot change unless this app or another process writes it, so
+ *  re-reading them on every frame only measures how often the compositor
+ *  redraws. They are refreshed at most once a second (NOTES_STAT_TTL),
+ *  and immediately when something here does change the disk or the set
+ *  of rows on screen: a save, a document open, a create/rename/delete
+ *  (docs_scan), a filter change (search_all) or a scroll that reveals
+ *  new rows marks the cache stale. A resize does not - the window size
+ *  cannot change a file, and the desktop calls resize() on every mouse
+ *  move while an edge is dragged. Between refreshes the list shows the
+ *  sizes from the last real stat of those rows, so a value is never
+ *  invented and never older than the sweep that last covered it.
+ *
  *  The wheel scrolls the list when the pointer is over the sidebar (the
  *  last pointer position the desktop reported) and the text otherwise;
  *  the list view keeps its selection on screen instead of running off.
@@ -99,6 +114,9 @@
 #define MAX_HITS      160
 #define SNIP_LEN      120
 #define AUTOSAVE_SECS 4
+#define NOTES_STAT_TTL 1.0  /* seconds a stat() result is reused; a file's
+                             * size/mtime only changes when someone writes it,
+                             * so per-frame stats measure redraws, not truth */
 #define MD_TOK_MAX    192
 #define ERR_COLOR     0xFFFF7B72u
 #define OK_COLOR      0xFF7ED6A5u
@@ -128,12 +146,21 @@ typedef struct {
     char   snip[SNIP_LEN];
 } Hit;
 
+/* The disk-metadata cache: one monotonic timestamp and one flag, not a copy
+ * of the data - the sizes stay in Doc, where the list already reads them. */
+typedef struct {
+    double at;      /* CLOCK_MONOTONIC of the last stat sweep, 0 = none */
+    int    stale;   /* something in this app changed the disk / the view */
+} NotesFsCache;
+
 typedef struct {
     char  *buf;                 /* fixed 64 KB: the open document     */
     char  *scan;                /* fixed 64 KB: search / replace work */
     int    len, cur;
     int    w, h;
     int    dirty;
+    NotesFsCache fsc;
+    int    last_dtop, last_htop; /* first visible rows of the last draw      */
     int    saved_here;
     time_t saved_at;
     time_t disk_mtime;
@@ -225,6 +252,9 @@ static void clip_text(char *out, size_t cap, Font *f, const char *in, float maxw
     char tmp[224];
     while (len > 0) {
         len--;
+        /* never cut inside a UTF-8 codepoint: the whole point of the
+         * helper is that the result is still drawable text */
+        while (len > 0 && ((unsigned char)in[len] & 0xC0) == 0x80) len--;
         snprintf(tmp, sizeof(tmp), "%.*s..", (int)len, in);
         if (font_width(f, tmp) <= maxw) {
             snprintf(out, cap, "%s", tmp);
@@ -724,11 +754,42 @@ static void default_note_name(char *out, size_t cap) {
 }
 
 /* ------------------------------------------------------------
+ *  Disk-metadata cache (see NOTES_STAT_TTL above)
+ * ------------------------------------------------------------ */
+static double notes_mono(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* Ask for a stat sweep on the next frame. Called only by code that has just
+ * changed the disk or the set of visible rows. */
+static void docs_stat_stale(Notes *n) {
+    n->fsc.stale = 1;
+}
+
+/* Returns 1 when this frame should stat. A failed clock refreshes rather
+ * than trust an unbounded age; a backwards clock refreshes too. */
+static int docs_stat_due(Notes *n) {
+    double now = notes_mono();
+    if (n->fsc.stale || n->fsc.at <= 0.0 || now <= 0.0 || now < n->fsc.at ||
+        now - n->fsc.at >= NOTES_STAT_TTL) {
+        n->fsc.at = now > 0.0 ? now : 0.0;
+        n->fsc.stale = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------
  *  The document list: a real directory scan
  * ------------------------------------------------------------ */
 static void docs_scan(Notes *n) {
     char keep[NAME_LEN];
     int  have = (n->cur_doc >= 0 && n->cur_doc < n->ndocs);
+    /* The directory may have gained or lost files; the next draw must not
+     * serve row sizes from before this scan. */
+    docs_stat_stale(n);
     keep[0] = 0;
     if (have) snprintf(keep, sizeof(keep), "%s", n->docs[n->cur_doc].name);
 
@@ -851,6 +912,7 @@ static int doc_load(Notes *n, int idx) {
     if (n->pv_off < 0) n->pv_off = 0;
     n->find_open = 0;
     snprintf(n->path, sizeof(n->path), "%s", path);
+    docs_stat_stale(n);       /* the list row for this file just changed */
     return 1;
 }
 
@@ -957,6 +1019,7 @@ static int doc_save(Notes *n, int autosave) {
             n->docs[n->cur_doc].mtime = st.st_mtime;
         }
     }
+    docs_stat_stale(n);       /* a save rewrites size and mtime */
     return 1;
 }
 
@@ -1335,6 +1398,9 @@ static void search_all(Notes *n) {
     n->hits_more = 0;
     n->hsel = 0;
     n->htop = 0;
+    /* The filter changed which rows are visible (clearing it too), so the
+     * next draw re-stats the rows it is about to show. */
+    docs_stat_stale(n);
     if (n->filter_len <= 0) return;
 
     for (int di = 0; di < n->ndocs && n->nhits < MAX_HITS; di++) {
@@ -2012,6 +2078,23 @@ static float md_pass(Notes *n, MdCtx *c) {
                 pen = content_x;
                 lead2 = 0.0f;
             }
+            /* A token can be wider than the whole column (a URL, a hash, a
+             * path: md_emit() caps a word at 55 bytes, not at the column).
+             * The old test only wrapped when the line was already non-empty,
+             * so that token was painted straight past the right margin, the
+             * scrollbar and the band. Fit it to the room that is left. */
+            float room = right - pen - lead2;
+            if (tk[k].w > room) {
+                if (md_visible(c, y, lh)) {
+                    Font *f = md_font(tk[k].style, body, bold, c->fm);
+                    float ty = md_sy(c, y) + (lh - ink_h(f)) * 0.5f;
+                    draw_fit(c->s, f, pen + lead2, ty,
+                             room > 0.0f ? room : 0.0f, tk[k].txt,
+                             tk[k].style == 3 ? c->th->accent : col);
+                }
+                pen = right;
+                continue;
+            }
             if (md_visible(c, y, lh)) {
                 Font *f = md_font(tk[k].style, body, bold, c->fm);
                 float ty = md_sy(c, y) + (lh - ink_h(f)) * 0.5f;
@@ -2088,7 +2171,8 @@ static void draw_hit_row(Notes *n, Surface *s, const Layout *L, Font *fd,
 }
 
 static void draw_sidebar(Notes *n, Surface *s, const Layout *L,
-                         Font *fr, Font *fb, Font *fd, const Theme *th) {
+                         Font *fr, Font *fb, Font *fd, const Theme *th,
+                         int stat_now) {
     surf_fill(s, 0, 0, L->sbw, n->h, color_mix(th->window_bg, 0xFF000000u, 0.10f));
     surf_blend(s, L->sbw, 0, 1, n->h, color_alpha(th->panel_border, 0.65f));
 
@@ -2176,10 +2260,10 @@ static void draw_sidebar(Notes *n, Surface *s, const Layout *L,
                 int tx = L->flt_x + ui_px(6);
                 int right = list_r - ui_px(2);
 
-                /* Visible rows are re-stat'd, so an external write or a
-                 * save in this window can never leave a stale size in the
-                 * list. Only the rows on screen are touched. */
-                {
+                /* Visible rows are re-stat'd when the metadata cache is due
+                 * (once a second, or after a save/open/filter change), so an
+                 * external write is picked up without a stat per frame. */
+                if (stat_now) {
                     char dpath[PATH_LEN];
                     struct stat dst;
                     if (doc_path(n, n->docs[i].name, dpath, sizeof(dpath)) &&
@@ -3275,9 +3359,25 @@ static void notes_draw(App *a, Surface *s, int x, int y, int w, int h, const The
 
     autosave_tick(n);
 
-    /* The real file, every frame: the only source of truth for what is
-     * on the disk. */
-    if (n->cur_doc >= 0 && n->path[0]) {
+    Layout L;
+    layout_build(n, &L, fr, fd);
+    list_clamp(n, &L);
+
+    /* A row that has just scrolled into view has not been stat'd by any
+     * sweep yet. Ask for one instead of showing a size from an older
+     * directory scan; scrolling is a user action, so the cost is bounded by
+     * the gesture and not by the frame rate. */
+    if (n->dtop != n->last_dtop || n->htop != n->last_htop) {
+        docs_stat_stale(n);
+        n->last_dtop = n->dtop;
+        n->last_htop = n->htop;
+    }
+
+    /* The document's size and mtime, re-read when the metadata cache is due.
+     * The values are still the real st_size/st_mtime of the real file - they
+     * are just no more than a second old, instead of one stat per frame. */
+    int stat_now = docs_stat_due(n);
+    if (stat_now && n->cur_doc >= 0 && n->path[0]) {
         struct stat st;
         if (stat(n->path, &st) == 0) {
             n->disk_len = (long)st.st_size;
@@ -3290,10 +3390,6 @@ static void notes_draw(App *a, Surface *s, int x, int y, int w, int h, const The
             n->disk_len = -1;
         }
     }
-
-    Layout L;
-    layout_build(n, &L, fr, fd);
-    list_clamp(n, &L);
 
     if (n->fitted_w != w || n->fitted_h != h) {
         ensure_visible(n, fr, fd);
@@ -3333,7 +3429,7 @@ static void notes_draw(App *a, Surface *s, int x, int y, int w, int h, const The
 
     surf_fill(&view, 0, 0, w, h, color_mix(th->window_bg, 0xFF000000u, 0.18f));
 
-    draw_sidebar(n, &view, &L, fr, fb, fd, th);
+    draw_sidebar(n, &view, &L, fr, fb, fd, th, stat_now);
     draw_editor(n, &view, &L, fr, fd, th);
     draw_modal(n, &view, fr, fd, th);
 }
