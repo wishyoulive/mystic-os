@@ -2,11 +2,27 @@
  *  Mystic OS - apps/sysinfo.c
  *
  *  The "System" panel: a read-only report of what this machine
- *  actually is. Every number on screen was read from the kernel on
- *  the frame it is shown, or from a directory listing that was taken
- *  within the last second. Nothing is invented, nothing is remembered
+ *  actually is. Every number on screen is a real read: from a file in
+ *  /proc or /sys, from sysconf(), from statvfs(), or from an lstat()
+ *  walk of the app directory. Nothing is invented, nothing is remembered
  *  from a previous boot, and a source that cannot be opened says so
  *  ("unreadable") instead of printing a zero that looks like a fact.
+ *
+ *  SAMPLING. The panel reads at two rates, both one second:
+ *
+ *    - the static facts (kernel, host, CPU model, mount, framebuffer,
+ *      bundle walk) are read once a second (FACTS_TTL) - a recursive
+ *      directory walk per frame would be waste, not accuracy;
+ *    - the values that do move (uptime, load average, meminfo, free
+ *      space) used to be read on every frame. They are now cached the
+ *      same way (LIVE_TTL, 1 s): /proc/meminfo cannot change faster
+ *      than the panel can be read, and four opens per redraw is the
+ *      compositor's frame rate, not the kernel's. A cached value is
+ *      the last value actually read from that file, at most one second
+ *      old; 'r' forces both caches to refresh immediately. A resize
+ *      does not, because the window size cannot change a fact and the
+ *      desktop calls resize() on every mouse move while an edge is
+ *      dragged.
  *
  *  Sources, all real:
  *
@@ -86,6 +102,10 @@
 #define MAX_WALK_DEPTH 8
 #define MAX_WALK_FILES 4096
 #define FACTS_TTL      1.0     /* seconds a "does not change per frame" fact lives */
+#define LIVE_TTL       1.0     /* seconds a volatile reading (uptime, load,
+                                * meminfo, free space) lives; one second is
+                                * finer than the panel can be read and coarse
+                                * enough that a redraw does no I/O          */
 
 /* ------------------------------------------------------------
  *  CARDS - one visual language for sysinfo, monitor and sysmon.
@@ -148,7 +168,10 @@ static void crd_fit(Font *f, const char *text, char *out, size_t cap, float maxw
     size_t n = strlen(tmp);
     while (n > 0) {
         n--;
-        snprintf(out, cap, "%.*s..", (int)n, tmp);
+        /* never split a UTF-8 sequence: back up to its first byte, then cut
+         * with a real ellipsis (U+2026), which Lato carries */
+        while (n > 0 && ((unsigned char)tmp[n] & 0xC0) == 0x80) n--;
+        snprintf(out, cap, "%.*s…", (int)n, tmp);
         if (font_width(f, out) <= maxw) return;
     }
     out[0] = 0;
@@ -177,10 +200,10 @@ static float crd_row_y(const CrdRect *c, const CrdMetrics *m, int i) {
 }
 
 /* The panel, its title and the hairline under the title. `meta` is optional
- * right-aligned text on the title line (a count, or "delta over 0.42 s"); it
+ * right-aligned text on the title line (a count, or "delta 0.42 s"); it
  * is dropped rather than overlapped when the card is too narrow for both. */
 static void crd_begin(Surface *s, const CrdRect *c, const CrdMetrics *m,
-                      const CrdStyle *st, Font *ft,
+                      const CrdStyle *st, Font *ft, Font *fs,
                       const char *title, const char *meta, int meta_warn) {
     float r = st->corner;
     float lim = (c->w < c->h ? c->w : c->h) * 0.5f;
@@ -191,11 +214,16 @@ static void crd_begin(Surface *s, const CrdRect *c, const CrdMetrics *m,
     font_draw(s, ft, c->x + m->pad, crd_top(ft, base), title,
               color_alpha(st->accent, 0.92f));
     if (meta && meta[0]) {
-        float mw = font_width(ft, meta);
-        if (mw + m->pad * 2.0f + font_width(ft, title) <= c->w)
-            font_draw(s, ft, c->x + c->w - m->pad - mw, crd_top(ft, base), meta,
+        /* The note beside the title is the SMALL face, one step down the type
+         * scale, so a narrow card still holds the title and the note together.
+         * It is dropped rather than overlapped if even that fails. */
+        float mw = font_width(fs, meta);
+        if (mw + m->pad * 2.0f + font_width(ft, title) <= c->w) {
+            float mb = crd_base(fs, c->y + m->pad, m->title_h);
+            font_draw(s, fs, c->x + c->w - m->pad - mw, crd_top(fs, mb), meta,
                       meta_warn ? color_alpha(st->warn, 0.95f)
                                 : color_alpha(st->text, 0.45f));
+        }
     }
     float ry = c->y + m->pad + m->title_h;
     surf_blend(s, (int)(c->x + m->pad), (int)ry,
@@ -290,6 +318,26 @@ typedef struct {
     double at;          /* CLOCK_MONOTONIC of the last refresh */
 } Facts;
 
+/* meminfo is several values from one file, so it is read in one pass. The
+ * ok bits are per value: a kernel without MemAvailable must say so for that
+ * row only, not replace the whole panel with a placeholder. */
+enum { MEM_TOTAL = 1, MEM_FREE = 2, MEM_AVAIL = 4, MEM_CACHED = 8,
+       MEM_SWAP = 16, MEM_SWAP_FREE = 32 };
+typedef struct {
+    long total, free_kb, avail, cached, swap_total, swap_free;
+    int  ok;
+} Mem;
+
+/* The volatile half: real readings, just not on every frame. `at` is the
+ * CLOCK_MONOTONIC time of the read that filled the struct. */
+typedef struct {
+    double uptime;      int uptime_ok;
+    double l1, l5, l15; int run, threads; int load_ok;
+    Mem    mem;
+    struct statvfs vfs; int vfs_ok;
+    double at;
+} Live;
+
 typedef struct {
     int   w, h;
     float scroll;        /* pixels the cards are scrolled up from the top  */
@@ -297,6 +345,7 @@ typedef struct {
     float content_h;     /* total height of the card grid, measured there  */
     float row_h;         /* one fact row, for the wheel and the keys       */
     Facts facts;
+    Live  live;
 } SysInfo;
 
 static double mono_now(void) {
@@ -367,16 +416,6 @@ static void fmt_uptime(char *out, size_t cap, double secs) {
 }
 
 /* ------------------------------------------------------------ /proc readers */
-
-/* meminfo is several values from one file, so it is read in one pass. The
- * ok bits are per value: a kernel without MemAvailable must say so for that
- * row only, not replace the whole panel with a placeholder. */
-enum { MEM_TOTAL = 1, MEM_FREE = 2, MEM_AVAIL = 4, MEM_CACHED = 8,
-       MEM_SWAP = 16, MEM_SWAP_FREE = 32 };
-typedef struct {
-    long total, free_kb, avail, cached, swap_total, swap_free;
-    int  ok;
-} Mem;
 
 static void mem_read(Mem *m) {
     memset(m, 0, sizeof(*m));
@@ -589,10 +628,33 @@ static void facts_refresh(Facts *f, int force) {
     facts_read(f);
 }
 
+/* The volatile half: four real reads (uptime, loadavg, meminfo, statvfs).
+ * Every one keeps its own ok flag, so a source that fails still says
+ * "unreadable" for its row after the value is cached. */
+static void live_read(Live *l) {
+    memset(l, 0, sizeof(*l));
+    l->uptime_ok = uptime_read(&l->uptime) == 0;
+    if (!l->uptime_ok) l->uptime = -1.0;
+    l->load_ok = loadavg_read(&l->l1, &l->l5, &l->l15, &l->run, &l->threads) == 0;
+    if (!l->load_ok) { l->run = -1; l->threads = -1; }
+    mem_read(&l->mem);
+    l->vfs_ok = statvfs(SI_DISK, &l->vfs) == 0;
+    l->at = mono_now();
+}
+
+/* Same TTL rule as the facts: a failed or backwards clock refreshes rather
+ * than trust an unbounded age. */
+static void live_refresh(Live *l, int force) {
+    double now = mono_now();
+    if (!force && l->at > 0.0 && now >= l->at && now - l->at < LIVE_TTL) return;
+    live_read(l);
+}
+
 /* ------------------------------------------------------------ report builder */
 
-/* Build the cards. Everything volatile is read here, on this frame. */
-static void report_build(Report *rep, const Facts *f) {
+/* Build the cards. Every value comes from the two caches, which hold the
+ * last real read of each source (facts: 1 s TTL, live: 1 s TTL). */
+static void report_build(Report *rep, const Facts *f, const Live *l) {
     memset(rep, 0, sizeof(*rep));
     char v[160], a[64], b[64];
     long online = sysconf(_SC_NPROCESSORS_ONLN);
@@ -601,8 +663,7 @@ static void report_build(Report *rep, const Facts *f) {
     if (c) {
         card_row_add(c, "Host", f->host);
         card_row_add(c, "Kernel", f->kernel);
-        double up = -1.0;
-        if (uptime_read(&up) != 0) up = -1.0;
+        double up = l->uptime_ok ? l->uptime : -1.0;
         fmt_uptime(v, sizeof(v), up);
         card_row_add(c, "Uptime", v);
         card_row_add(c, "Framebuffer", f->fb);
@@ -623,10 +684,13 @@ static void report_build(Report *rep, const Facts *f) {
         card_row_add(c, "Cores", v);
         double l1, l5, l15;
         int run = -1, threads = -1;
-        if (loadavg_read(&l1, &l5, &l15, &run, &threads) == 0)
+        if (l->load_ok) {
+            l1 = l->l1; l5 = l->l5; l15 = l->l15;
+            run = l->run; threads = l->threads;
             snprintf(v, sizeof(v), "%.2f  %.2f  %.2f", l1, l5, l15);
-        else
+        } else {
             snprintf(v, sizeof(v), "unreadable");
+        }
         card_row_add(c, "Load 1/5/15", v);
         if (run >= 0 && threads >= 0)
             snprintf(v, sizeof(v), "%d running, %d threads", run, threads);
@@ -637,32 +701,31 @@ static void report_build(Report *rep, const Facts *f) {
 
     c = card_new(rep, "MEMORY");
     if (c) {
-        Mem m;
-        mem_read(&m);
-        long used = (m.ok & (MEM_TOTAL | MEM_AVAIL)) ? m.total - m.avail : -1;
+        const Mem *m = &l->mem;
+        long used = (m->ok & (MEM_TOTAL | MEM_AVAIL)) ? m->total - m->avail : -1;
         if (used < 0) used = -1;
         if (used >= 0) {
             fmt_kb(a, sizeof(a), used);
-            fmt_kb(b, sizeof(b), m.total);
+            fmt_kb(b, sizeof(b), m->total);
             snprintf(v, sizeof(v), "%s of %s", a, b);
         } else {
             snprintf(v, sizeof(v), "unreadable");
         }
         card_row_add(c, "In use", v);
-        if (m.ok & MEM_FREE) fmt_kb(v, sizeof(v), m.free_kb); else snprintf(v, sizeof(v), "unreadable");
+        if (m->ok & MEM_FREE) fmt_kb(v, sizeof(v), m->free_kb); else snprintf(v, sizeof(v), "unreadable");
         card_row_add(c, "Free", v);
-        if (m.ok & MEM_AVAIL) fmt_kb(v, sizeof(v), m.avail); else snprintf(v, sizeof(v), "unreadable");
+        if (m->ok & MEM_AVAIL) fmt_kb(v, sizeof(v), m->avail); else snprintf(v, sizeof(v), "unreadable");
         card_row_add(c, "Available", v);
-        if (m.ok & MEM_CACHED) fmt_kb(v, sizeof(v), m.cached); else snprintf(v, sizeof(v), "unreadable");
+        if (m->ok & MEM_CACHED) fmt_kb(v, sizeof(v), m->cached); else snprintf(v, sizeof(v), "unreadable");
         card_row_add(c, "Cached", v);
-        if ((m.ok & (MEM_SWAP | MEM_SWAP_FREE)) != (MEM_SWAP | MEM_SWAP_FREE))
+        if ((m->ok & (MEM_SWAP | MEM_SWAP_FREE)) != (MEM_SWAP | MEM_SWAP_FREE))
             snprintf(v, sizeof(v), "unreadable");
-        else if (m.swap_total <= 0) snprintf(v, sizeof(v), "none");
+        else if (m->swap_total <= 0) snprintf(v, sizeof(v), "none");
         else {
-            long swap_used = m.swap_total - m.swap_free;
+            long swap_used = m->swap_total - m->swap_free;
             if (swap_used < 0) swap_used = 0;
             fmt_kb(a, sizeof(a), swap_used);
-            fmt_kb(b, sizeof(b), m.swap_total);
+            fmt_kb(b, sizeof(b), m->swap_total);
             snprintf(v, sizeof(v), "%s of %s", a, b);
         }
         card_row_add(c, "Swap", v);
@@ -674,7 +737,9 @@ static void report_build(Report *rep, const Facts *f) {
         card_row_add(c, "Device", f->fs_dev);
         card_row_add(c, "Filesystem", f->fs_type);
         struct statvfs vfs;
-        int vfs_ok = statvfs(SI_DISK, &vfs) == 0;
+        int vfs_ok = l->vfs_ok;
+        if (vfs_ok) vfs = l->vfs;
+        else memset(&vfs, 0, sizeof(vfs));
         unsigned long long frs = vfs_ok ? (unsigned long long)vfs.f_frsize : 0;
         if (vfs_ok && frs == 0) frs = (unsigned long long)vfs.f_bsize;
         if (vfs_ok && frs > 0) {
@@ -794,14 +859,16 @@ static void sysinfo_draw(App *a, Surface *s, int x, int y, int w, int h, const T
     st->w = w;
     st->h = h;
 
-    Font *ft = font_get(FONT_MEDIUM, 11);   /* card title   */
+    Font *ft = font_get(FONT_SEMIBOLD, 12); /* card title: same face and size as
+                                              monitor.c and sysmon.c */
     Font *fr = font_get(FONT_REGULAR, 11);  /* label/value  */
     Font *fd = font_get(FONT_REGULAR, 10);  /* footer       */
     if (!ft || !fr || !fd) return;
 
     facts_refresh(&st->facts, 0);
+    live_refresh(&st->live, 0);
     Report rep;
-    report_build(&rep, &st->facts);
+    report_build(&rep, &st->facts, &st->live);
     if (rep.n < 1) return;
 
     const CrdMetrics m = crd_metrics(ft, fr, fd);
@@ -845,7 +912,7 @@ static void sysinfo_draw(App *a, Surface *s, int x, int y, int w, int h, const T
         c.x += (float)x;
         c.y -= st->scroll;
         if (c.y > (float)list.h || c.y + c.h < 0.0f) continue;
-        crd_begin(&list, &c, &m, &sty, ft, rep.card[i].title, NULL, 0);
+        crd_begin(&list, &c, &m, &sty, ft, fd, rep.card[i].title, NULL, 0);
         for (int r = 0; r < rep.card[i].nrows; r++)
             crd_row(&list, &c, &m, &sty, fr, r,
                     rep.card[i].row[r].label, rep.card[i].row[r].value);
@@ -916,7 +983,12 @@ static void sysinfo_key(App *a, const char *bytes, int n) {
         else if (c == 'k') scroll_by(st, -st->row_h);
         else if (c == 'g') st->scroll = 0.0f;
         else if (c == 'G') scroll_by(st,  st->content_h);
-        else if (c == 'r') facts_refresh(&st->facts, 1);
+        else if (c == 'r') {
+            /* Explicit reload: the user asked for the files to be read
+             * again, so both caches are refilled now. */
+            facts_refresh(&st->facts, 1);
+            live_refresh(&st->live, 1);
+        }
     }
 }
 
@@ -928,7 +1000,14 @@ static void sysinfo_wheel(App *a, int notches) {
 
 static void sysinfo_resize(App *a, int w, int h) {
     SysInfo *s = a->state;
-    if (s) { s->w = w; s->h = h; }
+    if (s) {
+        /* No cache invalidation here on purpose: a window size cannot change
+         * a fact or a meminfo reading, and the desktop calls resize() on
+         * every mouse move while an edge is dragged - refilling the 78-call
+         * facts sweep there would put it back on a per-frame path. */
+        s->w = w;
+        s->h = h;
+    }
 }
 
 const AppVT app_vt_sysinfo = {

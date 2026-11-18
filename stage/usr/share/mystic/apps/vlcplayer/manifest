@@ -1,5 +1,0 @@
-name = Player
-desc = Video and audio player (needs the vlc package)
-exec = bin
-network = host
-audio = yes

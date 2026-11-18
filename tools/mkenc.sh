@@ -35,6 +35,9 @@
 #    ./tools/mkenc.sh test         boot-path simulation (fake /dev, real init)
 #    ./tools/mkenc.sh key          print the current key fingerprint
 #    ./tools/mkenc.sh new-key      replace the boot half (old disks stop opening)
+#    ./tools/mkenc.sh seal [rounds]  seal the boot half with the lock-screen password
+#                                  so a boot has to ask for it (see docs/ENCRYPTION.md)
+#    ./tools/mkenc.sh unseal       put the plaintext half back (no boot prompt)
 #    ./tools/mkenc.sh reset-disk   move build/disk.img aside so the next boot
 #                                  creates an encrypted one
 #    ./tools/mkenc.sh elf <file>   print an ELF file's program headers and fail
@@ -47,8 +50,8 @@ set -eu
 cd "$(dirname "$0")/.."
 
 CACHE=${MYSTIC_CACHE:-build/cache}
-STAGE=stage
-WORK=build/mkenc
+STAGE=${MYSTIC_STAGE:-stage}   # MYSTIC_STAGE lets a harness seal/unseal a copy of stage/
+WORK=${MYSTIC_WORK:-build/mkenc}   # MYSTIC_WORK lets a harness build outside the tree
 ZIG=${ZIG:-zig}
 MODULES="
 kernel/drivers/md/dm-mod.ko
@@ -141,6 +144,9 @@ emit_source() {
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#ifndef _WIN32
+#include <termios.h>   /* echo off for the boot passphrase prompt */
+#endif
 
 #if defined(MYSTIC_HOSTTEST) && defined(_WIN32)
 /* the host-test build exists to run the hash, the table string and the header
@@ -493,6 +499,545 @@ static int key_read(const char *path, unsigned char half[HALF])
     return 0;
 }
 
+/* ============================================================
+ *  The sealed boot key
+ *
+ *  The 32-byte boot half of the disk key normally sits in the
+ *  initramfs in the clear. When the owner sets a passphrase it is
+ *  stored as a 112-byte blob instead:
+ *
+ *    0x00  8  "MYSTICKS"
+ *    0x08  4  version (1)
+ *    0x0c  4  PBKDF2-HMAC-SHA256 rounds
+ *    0x10 16  salt
+ *    0x20 12  ChaCha20 nonce (RFC 8439, 96-bit)
+ *    0x2c  4  flags (0)
+ *    0x30 32  ChaCha20 ciphertext of the 32-byte boot half
+ *    0x50 32  HMAC-SHA256(mac_key, bytes 0x00..0x4f)
+ *
+ *  PBKDF2-HMAC-SHA256(passphrase, salt, rounds) produces 64 bytes:
+ *  the first 32 encrypt, the last 32 authenticate (encrypt-then-MAC).
+ *  All three primitives are from published standards and are checked
+ *  against their published test vectors in selftest, so this is
+ *  standard cryptography written small, not a new construction. What
+ *  it is worth is discussed in docs/ENCRYPTION.md section 6.
+ * ============================================================ */
+#define SEAL_MAGIC "MYSTICKS"
+#define SEAL_VERSION 1u
+#define SEAL_BYTES 112u
+#define SEAL_ROUNDS 50000u         /* see docs/ENCRYPTION.md 6: the lock-screen
+                                    * file (20000 rounds) is the cheaper verifier
+                                    * whenever both leaked, so a bigger number here
+                                    * would only slow the honest boot */
+#define SEAL_MAXROUNDS 20000000u   /* refuse a blob that would hang the boot */
+#define O_S_VERSION 0x08
+#define O_S_ROUNDS 0x0c
+#define O_S_SALT 0x10
+#define S_SALT 16
+#define O_S_NONCE 0x20
+#define S_NONCE 12
+#define O_S_FLAGS 0x2c
+#define O_S_CIPHER 0x30
+#define O_S_TAG 0x50
+/* a marker in the header, set only after a filesystem was created inside the
+ * mapping. It is what lets init tell "never formatted" (mkfs is safe) from
+ * "was formatted once, the mount failed" (never touch it) even when the
+ * filesystem inside is not ext4. */
+#define O_FSMARK 0x58
+#define FSMARK_MAGIC "MYSTICFS"
+#define FSMARK_VERSION 1u
+
+/* attach / unseal failures as shell exit codes, distinct so that stage/init
+ * can report the real cause instead of blaming the key for a console */
+#define EXIT_SEALBAD 5      /* the blob did not authenticate: wrong passphrase or damage */
+#define EXIT_SEALFORMAT 6   /* not a sealed key at all */
+#define EXIT_NOPASS 7       /* no passphrase could be read */
+#define EXIT_NOPASSWD 8     /* passphrase is not the lock-screen password */
+
+static uint32_t rotl32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+
+/* RFC 8439 section 2.3: 20 rounds of the ChaCha quarter round on a
+ * 16-word state. The constants are the ASCII of "expand 32-byte k". */
+static void chacha20_block(const unsigned char key[32], const unsigned char nonce[12],
+                           uint32_t counter, unsigned char out[64])
+{
+    static const char sigma[17] = "expand 32-byte k";
+    uint32_t st[16], x[16];
+    int i, j;
+    for (i = 0; i < 4; i++) st[i] = get_le32((const unsigned char *)sigma + 4 * i);
+    for (i = 0; i < 8; i++) st[4 + i] = get_le32(key + 4 * i);
+    st[12] = counter;
+    for (i = 0; i < 3; i++) st[13 + i] = get_le32(nonce + 4 * i);
+    memcpy(x, st, sizeof x);
+    for (i = 0; i < 10; i++) {
+#define QR(a, b, c, d)                    \
+        a += b; d = rotl32(d ^ a, 16);    \
+        c += d; b = rotl32(b ^ c, 12);    \
+        a += b; d = rotl32(d ^ a, 8);     \
+        c += d; b = rotl32(b ^ c, 7)
+        QR(x[0], x[4], x[8],  x[12]);
+        QR(x[1], x[5], x[9],  x[13]);
+        QR(x[2], x[6], x[10], x[14]);
+        QR(x[3], x[7], x[11], x[15]);
+        QR(x[0], x[5], x[10], x[15]);
+        QR(x[1], x[6], x[11], x[12]);
+        QR(x[2], x[7], x[8],  x[13]);
+        QR(x[3], x[4], x[9],  x[14]);
+#undef QR
+    }
+    for (j = 0; j < 16; j++) put_le32(out + 4 * j, x[j] + st[j]);
+    wipe(st, sizeof st);
+    wipe(x, sizeof x);
+}
+
+static void chacha20_xor(const unsigned char key[32], const unsigned char nonce[12],
+                         uint32_t counter, unsigned char *buf, size_t len)
+{
+    unsigned char block[64];
+    size_t i = 0;
+    while (i < len) {
+        size_t n = (len - i) < 64 ? (len - i) : 64, j;
+        chacha20_block(key, nonce, counter, block);
+        for (j = 0; j < n; j++) buf[i + j] ^= block[j];
+        counter++;
+        i += n;
+    }
+    wipe(block, sizeof block);
+}
+
+/* HMAC-SHA256 (RFC 2104) over a||b, so PBKDF2 can hash salt||INT(i)
+ * without copying either into a temporary buffer. */
+static void hmac_sha256_parts(const unsigned char *key, size_t keylen,
+                              const unsigned char *a, size_t alen,
+                              const unsigned char *b, size_t blen,
+                              unsigned char out[FPRINT])
+{
+    unsigned char k[64], pad[64], inner[FPRINT];
+    struct sha256 s;
+    size_t i;
+    if (keylen > sizeof k) {
+        sha256_buf(key, keylen, k);
+        memset(k + FPRINT, 0, sizeof k - FPRINT);
+    } else {
+        memcpy(k, key, keylen);
+        memset(k + keylen, 0, sizeof k - keylen);
+    }
+    for (i = 0; i < sizeof pad; i++) pad[i] = (unsigned char)(k[i] ^ 0x36);
+    sha256_init(&s);
+    sha256_update(&s, pad, sizeof pad);
+    if (a && alen) sha256_update(&s, a, alen);
+    if (b && blen) sha256_update(&s, b, blen);
+    sha256_final(&s, inner);
+    for (i = 0; i < sizeof pad; i++) pad[i] = (unsigned char)(k[i] ^ 0x5c);
+    sha256_init(&s);
+    sha256_update(&s, pad, sizeof pad);
+    sha256_update(&s, inner, FPRINT);
+    sha256_final(&s, out);
+    wipe(k, sizeof k);
+    wipe(pad, sizeof pad);
+    wipe(inner, sizeof inner);
+}
+
+/* PBKDF2-HMAC-SHA256 (RFC 8018). Returns -1 for a round count that is zero
+ * or absurd: a sealed blob must not be able to hang the boot. */
+static int pbkdf2_sha256(const char *pass, size_t passlen,
+                         const unsigned char *salt, size_t saltlen,
+                         uint32_t rounds, unsigned char *out, size_t outlen)
+{
+    unsigned char u[FPRINT], v[FPRINT], t[FPRINT], be[4];
+    uint32_t i, c;
+    size_t have = 0;
+    if (rounds == 0 || rounds > SEAL_MAXROUNDS) return -1;
+    for (i = 1; have < outlen; i++) {
+        size_t take, j;
+        be[0] = (unsigned char)(i >> 24);
+        be[1] = (unsigned char)(i >> 16);
+        be[2] = (unsigned char)(i >> 8);
+        be[3] = (unsigned char)i;
+        hmac_sha256_parts((const unsigned char *)pass, passlen, salt, saltlen, be, 4, u);
+        memcpy(t, u, FPRINT);
+        for (c = 1; c < rounds; c++) {
+            hmac_sha256_parts((const unsigned char *)pass, passlen, u, FPRINT, NULL, 0, v);
+            memcpy(u, v, FPRINT);
+            for (j = 0; j < FPRINT; j++) t[j] ^= v[j];
+        }
+        take = (outlen - have) < FPRINT ? (outlen - have) : FPRINT;
+        memcpy(out + have, t, take);
+        have += take;
+    }
+    wipe(u, sizeof u);
+    wipe(v, sizeof v);
+    wipe(t, sizeof t);
+    return 0;
+}
+
+/* One line, no echo. A too-long passphrase is refused rather than truncated:
+ * silently using 128 of 200 characters would create a key nobody can reopen. */
+static int read_line_fd(int fd, char *out, size_t cap)
+{
+    size_t n = 0;
+    for (;;) {
+        unsigned char ch;
+        ssize_t r = read(fd, &ch, 1);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (r == 0 || ch == '\n') break;
+        if (ch == '\r') continue;
+        if (ch == 0x7f || ch == 0x08) {
+            if (n) out[--n] = 0;
+            continue;
+        }
+        if (n + 1 >= cap) return -1;
+        out[n++] = (char)ch;
+    }
+    out[n] = 0;
+    return (int)n;
+}
+
+/* Reads a passphrase from the console when prompt is set, otherwise from
+ * stdin (tools/mkenc.sh and the boot simulation drive it that way). The
+ * shipping boot path never passes the passphrase through argv or a pipe. */
+static int read_passphrase(int prompt, const char *console_path, char *out, size_t cap)
+{
+    int fd = 0, close_fd = 0, rc;
+#ifndef _WIN32
+    struct termios old, quiet;
+    int tty = 0;
+#endif
+    if (prompt) {
+        const char *p = (console_path && *console_path) ? console_path : "/dev/console";
+        fd = open(p, O_RDONLY);
+        if (fd < 0) fd = 0;
+        else close_fd = 1;
+        fprintf(stderr, "passphrase: ");
+        fflush(stderr);
+    }
+#ifndef _WIN32
+    if (close_fd && tcgetattr(fd, &old) == 0) {
+        quiet = old;
+        quiet.c_lflag &= (tcflag_t)~ECHO;
+        if (tcsetattr(fd, TCSANOW, &quiet) == 0) tty = 1;
+    }
+#endif
+    rc = read_line_fd(fd, out, cap);
+#ifndef _WIN32
+    if (tty) {
+        tcsetattr(fd, TCSANOW, &old);
+        fprintf(stderr, "\n");   /* the Enter was not echoed either */
+    }
+#endif
+    if (close_fd) close(fd);
+    if (rc <= 0) {
+        wipe(out, cap);
+        return -1;
+    }
+    return 0;
+}
+
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int hex_decode(const char *in, unsigned char *out, int max)
+{
+    int n = 0;
+    while (in[0] && in[1] && n < max) {
+        int hi = hex_nibble(in[0]), lo = hex_nibble(in[1]);
+        if (hi < 0 || lo < 0) return -1;
+        out[n++] = (unsigned char)((hi << 4) | lo);
+        in += 2;
+    }
+    return n;
+}
+
+/* Byte-for-byte the derivation in src/sha256.c mystic_hash_password(), so the
+ * passphrase checked here is the one the desktop lock screen accepts. */
+static void hash_password(const unsigned char *salt, size_t salt_len,
+                          const char *password, uint32_t rounds, unsigned char out[FPRINT])
+{
+    unsigned char buf[64 + 32];
+    size_t plen = strlen(password);
+    uint32_t i;
+    if (plen > 64) plen = 64;
+    memcpy(buf, salt, salt_len);
+    memcpy(buf + salt_len, password, plen);
+    sha256_buf(buf, salt_len + plen, out);
+    for (i = 1; i < rounds; i++) {
+        memcpy(buf, out, FPRINT);
+        memcpy(buf + FPRINT, salt, salt_len);
+        sha256_buf(buf, FPRINT + salt_len, out);
+    }
+    wipe(buf, sizeof buf);
+}
+
+/* 1 match, 0 mismatch, -1 unreadable/unparseable. Format: salt:rounds:hash */
+static int check_password_line(const char *line, const char *password)
+{
+    char salt_hex[80];
+    const char *p = line;
+    int i = 0, rounds = 0, salt_len;
+    unsigned char salt[32], want[FPRINT], got[FPRINT];
+    unsigned diff = 0;
+    while (*p && *p != ':' && i < (int)sizeof salt_hex - 1) salt_hex[i++] = *p++;
+    salt_hex[i] = 0;
+    if (*p != ':') return -1;
+    p++;
+    while (*p >= '0' && *p <= '9') { rounds = rounds * 10 + (*p - '0'); p++; }
+    if (*p != ':') return -1;
+    p++;
+    if (rounds <= 0) rounds = 1;
+    salt_len = hex_decode(salt_hex, salt, 32);
+    if (salt_len <= 0) return -1;
+    if (hex_decode(p, want, FPRINT) != FPRINT) return -1;
+    hash_password(salt, (size_t)salt_len, password, (uint32_t)rounds, got);
+    /* constant time: the loop always runs the full length */
+    for (i = 0; i < FPRINT; i++) diff |= (unsigned)(got[i] ^ want[i]);
+    wipe(got, sizeof got);
+    return diff == 0;
+}
+
+static int check_password_file(const char *path, const char *password)
+{
+    char line[256];
+    int fd = open(path, O_RDONLY), n;
+    if (fd < 0) return -1;
+    n = (int)read(fd, line, sizeof line - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    line[n] = 0;
+    n = check_password_line(line, password);
+    wipe(line, sizeof line);
+    return n;
+}
+
+/* Reads and validates a sealed-key blob. Returns 0, or -1 with err set. */
+static int seal_read(const char *path, unsigned char blob[SEAL_BYTES], uint32_t *rounds,
+                     char *err, size_t errcap)
+{
+    int fd = open(path, O_RDONLY);
+    ssize_t n;
+    if (fd < 0) {
+        snprintf(err, errcap, "cannot open %s: %s", path, strerror(errno));
+        return -1;
+    }
+    n = read(fd, blob, SEAL_BYTES + 1);
+    close(fd);
+    if (n < 0) {
+        snprintf(err, errcap, "cannot read %s: %s", path, strerror(errno));
+        return -1;
+    }
+    if ((size_t)n != SEAL_BYTES) {
+        snprintf(err, errcap, "%s is %ld bytes, not %u - not a sealed key", path, (long)n,
+                 (unsigned)SEAL_BYTES);
+        return -1;
+    }
+    if (memcmp(blob, SEAL_MAGIC, 8) != 0) {
+        snprintf(err, errcap, "%s does not start with %s", path, SEAL_MAGIC);
+        return -1;
+    }
+    if (get_le32(blob + O_S_VERSION) != SEAL_VERSION) {
+        snprintf(err, errcap, "%s is sealed-key version %u, this helper speaks %u", path,
+                 (unsigned)get_le32(blob + O_S_VERSION), (unsigned)SEAL_VERSION);
+        return -1;
+    }
+    if (get_le32(blob + O_S_FLAGS) != 0) {
+        snprintf(err, errcap, "%s has unknown flags set - refusing to guess", path);
+        return -1;
+    }
+    *rounds = get_le32(blob + O_S_ROUNDS);
+    if (*rounds == 0 || *rounds > SEAL_MAXROUNDS) {
+        snprintf(err, errcap, "%s asks for %u KDF rounds (limit %u)", path, (unsigned)*rounds,
+                 (unsigned)SEAL_MAXROUNDS);
+        return -1;
+    }
+    return 0;
+}
+
+/* Derives the 64-byte key pair and fills blob[O_S_CIPHER..] and the tag. */
+static int seal_build(unsigned char blob[SEAL_BYTES], const unsigned char boot[HALF],
+                      const char *pass, uint32_t rounds)
+{
+    unsigned char dk[64], tag[FPRINT];
+    if (urandom_read(blob + O_S_SALT, S_SALT) < 0 || urandom_read(blob + O_S_NONCE, S_NONCE) < 0)
+        return -1;
+    if (pbkdf2_sha256(pass, strlen(pass), blob + O_S_SALT, S_SALT, rounds, dk, sizeof dk) < 0)
+        return -1;
+    memcpy(blob + O_S_CIPHER, boot, HALF);
+    chacha20_xor(dk, blob + O_S_NONCE, 1, blob + O_S_CIPHER, HALF);
+    hmac_sha256_parts(dk + 32, 32, blob, O_S_TAG, NULL, 0, tag);
+    memcpy(blob + O_S_TAG, tag, FPRINT);
+    wipe(dk, sizeof dk);
+    wipe(tag, sizeof tag);
+    return 0;
+}
+
+static int cmd_seal(const char *keypath, const char *sealpath, const char *passwd_file,
+                    uint32_t rounds)
+{
+    unsigned char boot[HALF], blob[SEAL_BYTES];
+    char pass[192], hex[17];
+    int fd, v;
+    if (rounds == 0) rounds = SEAL_ROUNDS;
+    if (rounds > SEAL_MAXROUNDS) return die("round count is above the limit", NULL, NULL);
+    if (key_read(keypath, boot) != 0) return EXIT_KEYFILE;
+    if (read_passphrase(0, NULL, pass, sizeof pass) != 0) {
+        wipe(boot, sizeof boot);
+        return die("no passphrase on stdin", NULL, NULL);
+    }
+    if (passwd_file && *passwd_file) {
+        v = check_password_file(passwd_file, pass);
+        if (v < 0) {
+            wipe(boot, sizeof boot);
+            wipe(pass, sizeof pass);
+            return die("cannot read the lock-screen password file %s", passwd_file, NULL);
+        }
+        if (v == 0) {
+            wipe(boot, sizeof boot);
+            wipe(pass, sizeof pass);
+            fprintf(stderr, "%s: that passphrase does not match %s - sealing it would "
+                            "lock the disk away from the lock screen\n", prog, passwd_file);
+            return EXIT_NOPASSWD;
+        }
+    }
+    memset(blob, 0, sizeof blob);
+    memcpy(blob, SEAL_MAGIC, 8);
+    put_le32(blob + O_S_VERSION, SEAL_VERSION);
+    put_le32(blob + O_S_ROUNDS, rounds);
+    if (seal_build(blob, boot, pass, rounds) < 0) {
+        wipe(boot, sizeof boot);
+        wipe(pass, sizeof pass);
+        return die_errno("cannot build the sealed key", "");
+    }
+    fd = open(sealpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        wipe(boot, sizeof boot);
+        wipe(pass, sizeof pass);
+        return die_errno("cannot create", sealpath);
+    }
+    if (write_all(fd, blob, sizeof blob) < 0 || fsync(fd) < 0) {
+        int e = errno;
+        close(fd);
+        wipe(boot, sizeof boot);
+        wipe(pass, sizeof pass);
+        errno = e;
+        return die_errno("cannot write", sealpath);
+    }
+    close(fd);
+    {
+        unsigned char d[FPRINT];
+        sha256_buf(boot, HALF, d);
+        to_hex(d, 8, hex);
+    }
+    printf("sealed %s as %s: %u rounds, key fingerprint %s\n", keypath, sealpath,
+           (unsigned)rounds, hex);
+    wipe(boot, sizeof boot);
+    wipe(pass, sizeof pass);
+    wipe(blob, sizeof blob);
+    return 0;
+}
+
+static int cmd_unseal(const char *sealpath, const char *keypath, int prompt,
+                      const char *console_path, const char *passwd_file)
+{
+    unsigned char blob[SEAL_BYTES], dk[64], want[FPRINT], boot[HALF];
+    char pass[192], err[256];
+    uint32_t rounds = 0;
+    unsigned diff = 0;
+    int fd, i, v, pw_ok = -1;   /* -1 no lock-screen file, 0 mismatch, 1 match */
+    if (seal_read(sealpath, blob, &rounds, err, sizeof err) != 0) {
+        fprintf(stderr, "%s: %s\n", prog, err);
+        return EXIT_SEALFORMAT;
+    }
+    if (read_passphrase(prompt, console_path, pass, sizeof pass) != 0) {
+        fprintf(stderr, "%s: no passphrase could be read\n", prog);
+        return EXIT_NOPASS;
+    }
+    /* The lock-screen file is only consulted to explain a failure: after the
+     * owner changes the lock-screen password, the seal still opens with the
+     * passphrase it was made with, and that must not become unreachable data.
+     * So a mismatch warns, and only decides the message when the tag fails. */
+    if (passwd_file && *passwd_file && access(passwd_file, R_OK) == 0) {
+        v = check_password_file(passwd_file, pass);
+        if (v >= 0) pw_ok = v;
+    }
+    if (pbkdf2_sha256(pass, strlen(pass), blob + O_S_SALT, S_SALT, rounds, dk, sizeof dk) < 0) {
+        wipe(pass, sizeof pass);
+        fprintf(stderr, "%s: %s asks for unusable KDF rounds\n", prog, sealpath);
+        return EXIT_SEALFORMAT;
+    }
+    hmac_sha256_parts(dk + 32, 32, blob, O_S_TAG, NULL, 0, want);
+    for (i = 0; i < (int)FPRINT; i++) diff |= (unsigned)(want[i] ^ blob[O_S_TAG + i]);
+    if (diff) {
+        wipe(dk, sizeof dk);
+        wipe(pass, sizeof pass);
+        if (pw_ok == 0) {
+            fprintf(stderr, "%s: that is not the lock-screen password\n", prog);
+            return EXIT_NOPASSWD;
+        }
+        fprintf(stderr, "%s: %s did not authenticate - wrong passphrase or damaged seal\n",
+                prog, sealpath);
+        return EXIT_SEALBAD;
+    }
+    if (pw_ok == 0)
+        fprintf(stderr, "%s: note: the seal opened, but this passphrase no longer matches %s\n",
+                prog, passwd_file);
+    memcpy(boot, blob + O_S_CIPHER, HALF);
+    chacha20_xor(dk, blob + O_S_NONCE, 1, boot, HALF);
+    fd = open(keypath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        wipe(dk, sizeof dk);
+        wipe(pass, sizeof pass);
+        wipe(boot, sizeof boot);
+        return die_errno("cannot create the unsealed key", keypath);
+    }
+    (void)chmod(keypath, 0600);
+    if (write_all(fd, boot, HALF) < 0 || fsync(fd) < 0) {
+        int e = errno;
+        close(fd);
+        wipe(dk, sizeof dk);
+        wipe(pass, sizeof pass);
+        wipe(boot, sizeof boot);
+        errno = e;
+        return die_errno("cannot write the unsealed key to", keypath);
+    }
+    close(fd);
+    (void)chmod(keypath, 0600);
+    printf("unsealed %s -> %s (%u rounds)\n", sealpath, keypath, (unsigned)rounds);
+    wipe(dk, sizeof dk);
+    wipe(pass, sizeof pass);
+    wipe(boot, sizeof boot);
+    wipe(blob, sizeof blob);
+    return 0;
+}
+
+static int cmd_verify(const char *passwd_file, int prompt, const char *console_path)
+{
+    char pass[192];
+    int v;
+    if (read_passphrase(prompt, console_path, pass, sizeof pass) != 0) {
+        fprintf(stderr, "%s: no passphrase could be read\n", prog);
+        return EXIT_NOPASS;
+    }
+    v = check_password_file(passwd_file, pass);
+    wipe(pass, sizeof pass);
+    if (v < 0) {
+        fprintf(stderr, "%s: cannot read or parse %s\n", prog, passwd_file);
+        return EXIT_NOPASS;
+    }
+    if (!v) {
+        fprintf(stderr, "%s: wrong password\n", prog);
+        return 1;
+    }
+    printf("password matches %s\n", passwd_file);
+    return 0;
+}
+
 static int keygen(const char *path)
 {
     unsigned char half[HALF];
@@ -534,6 +1079,7 @@ struct disk_info {
     uint32_t key_bytes;
     unsigned char disk_half[HALF];
     unsigned char fingerprint[FPRINT];
+    int fs_marked;      /* header marker: a filesystem was created in the mapping */
 };
 
 static void header_build(unsigned char hdr[HDR_BYTES], const unsigned char material[KEY_MATERIAL])
@@ -577,6 +1123,8 @@ static int probe_dev(const char *dev, struct disk_info *di)
         di->key_bytes = get_le32(buf + O_KEYBYTES);
         memcpy(di->disk_half, buf + O_DISKHALF, HALF);
         memcpy(di->fingerprint, buf + O_FINGERPRINT, FPRINT);
+        di->fs_marked = memcmp(buf + O_FSMARK, FSMARK_MAGIC, 8) == 0 &&
+                        get_le32(buf + O_FSMARK + 8) == FSMARK_VERSION;
         if (di->version != HDR_VERSION || di->key_bytes != KEY_MATERIAL ||
             di->offset_sectors < 8 || (di->offset_sectors % 8) != 0) {
             fprintf(stderr, "%s: %s header is not version %u / 64-byte key / aligned offset\n",
@@ -602,6 +1150,46 @@ static int probe_dev(const char *dev, struct disk_info *di)
      * exactly like this, so the only safe answer is "I do not know". */
     di->state = DEV_UNKNOWN;
     return DEV_UNKNOWN;
+}
+
+/* exit 0 marked, 1 not marked, 2 no readable MYSTICC1 header */
+static int cmd_hasfs(const char *dev)
+{
+    struct disk_info di;
+    int st = probe_dev(dev, &di);
+    if (st != DEV_CRYPT) return 2;
+    return di.fs_marked ? 0 : 1;
+}
+
+/* Set the "a filesystem was created inside this mapping" marker. Written
+ * after mkfs+mount succeed, so the next boot can never confuse "formatted
+ * once, mount failed" with "never formatted". */
+static int cmd_markfs(const char *dev)
+{
+    unsigned char hdr[HDR_BYTES];
+    int fd = open(dev, O_RDWR);
+    if (fd < 0) return die_errno("cannot open", dev);
+    if (read_exact(fd, hdr, sizeof hdr) < 0) {
+        int e = errno;
+        close(fd);
+        errno = e;
+        return die_errno("cannot read the header of", dev);
+    }
+    if (memcmp(hdr, HDR_MAGIC, 8) != 0) {
+        close(fd);
+        return die("%s has no MYSTICC1 header", dev, NULL);
+    }
+    memcpy(hdr + O_FSMARK, FSMARK_MAGIC, 8);
+    put_le32(hdr + O_FSMARK + 8, FSMARK_VERSION);
+    if (lseek(fd, 0, SEEK_SET) < 0 || write_all(fd, hdr, sizeof hdr) < 0 || fsync(fd) < 0) {
+        int e = errno;
+        close(fd);
+        errno = e;
+        return die_errno("cannot write the header of", dev);
+    }
+    close(fd);
+    printf("marked %s: a filesystem was created inside its mapping\n", dev);
+    return 0;
 }
 
 /* ---------------- dm-ioctl ---------------- */
@@ -1014,6 +1602,143 @@ static int cmd_selftest(void)
             unlink(keyf);
         }
     }
+    {   /* HMAC-SHA256, RFC 4231 test case 2 */
+        static const char *want = "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843";
+        unsigned char d2[FPRINT];
+        char h2[FPRINT * 2 + 1];
+        hmac_sha256_parts((const unsigned char *)"Jefe", 4,
+                          (const unsigned char *)"what do ya want for nothing?", 28,
+                          NULL, 0, d2);
+        to_hex(d2, FPRINT, h2);
+        printf("%s hmac-sha256 (RFC 4231 case 2)\n", strcmp(h2, want) ? "FAIL" : "ok  ");
+        if (strcmp(h2, want)) fails++;
+    }
+    {   /* PBKDF2-HMAC-SHA256, the published vectors for P="password" S="salt" */
+        static const struct { unsigned r; const char *want; } v[] = {
+            {1u,    "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"},
+            {2u,    "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"},
+            {4096u, "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"},
+        };
+        int k;
+        for (k = 0; k < 3; k++) {
+            unsigned char dk[32];
+            char h2[65];
+            if (pbkdf2_sha256("password", 8, (const unsigned char *)"salt", 4, v[k].r, dk, 32) < 0) {
+                printf("FAIL  pbkdf2-hmac-sha256 rounds %u refused\n", v[k].r);
+                fails++;
+                continue;
+            }
+            to_hex(dk, 32, h2);
+            printf("%s pbkdf2-hmac-sha256 rounds %u\n", strcmp(h2, v[k].want) ? "FAIL" : "ok  ",
+                   v[k].r);
+            if (strcmp(h2, v[k].want)) fails++;
+        }
+    }
+    {   /* ChaCha20, RFC 8439 section 2.4.2: the sunscreen plaintext/ciphertext
+         * pair, and the keystream block it starts with, both reproduced by
+         * OpenSSL's ChaCha20 for the same key, nonce and counter. */
+        static const char *pt =
+            "Ladies and Gentlemen of the class of '99: If I could offer you only one tip "
+            "for the future, sunscreen would be it.";
+        static const char *want_ct =
+            "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0b"
+            "f91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d8"
+            "07ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937"
+            "365af90bbf74a35be6b40b8eedf2785e42874d";
+        static const char *want_ks =
+            "224f51f3401bd9e12fde276fb8631ded8c131f823d2c06e27e4fcaec9ef3cf78"
+            "8a3b0aa372600a92b57974cded2b9334794cba40c63e34cdea212c4cf07d41b7";
+        unsigned char key[32], nonce[S_NONCE], buf[512];
+        char h2[2 * sizeof buf + 1];
+        size_t plen = strlen(pt);
+        for (i = 0; i < 32; i++) key[i] = (unsigned char)i;
+        memset(nonce, 0, sizeof nonce);
+        nonce[7] = 0x4a;
+        memset(buf, 0, 64);
+        chacha20_xor(key, nonce, 1, buf, 64);
+        to_hex(buf, 64, h2);
+        printf("%s chacha20 keystream, counter 1\n", strcmp(h2, want_ks) ? "FAIL" : "ok  ");
+        if (strcmp(h2, want_ks)) fails++;
+        memcpy(buf, pt, plen);
+        chacha20_xor(key, nonce, 1, buf, plen);
+        to_hex(buf, plen, h2);
+        printf("%s chacha20 of the RFC 8439 plaintext\n", strcmp(h2, want_ct) ? "FAIL" : "ok  ");
+        if (strcmp(h2, want_ct)) fails++;
+    }
+    {   /* seal -> open with the right passphrase, and fail with the wrong one */
+        unsigned char boot[HALF], blob[SEAL_BYTES], dk[64], tag[FPRINT], got[HALF];
+        const char *good = "correct horse battery staple";
+        const char *bad = "correct horse battery stapl";
+        unsigned diff;
+        int k, ok = 1;
+        for (k = 0; k < HALF; k++) boot[k] = (unsigned char)(0xA0 + k);
+        memset(blob, 0, sizeof blob);
+        memcpy(blob, SEAL_MAGIC, 8);
+        put_le32(blob + O_S_VERSION, SEAL_VERSION);
+        put_le32(blob + O_S_ROUNDS, 1000);   /* fast: the vectors above cover the KDF */
+        if (seal_build(blob, boot, good, 1000) < 0) {
+            printf("FAIL  seal_build failed\n");
+            fails++;
+            ok = 0;
+        }
+        if (ok) {
+            pbkdf2_sha256(good, strlen(good), blob + O_S_SALT, S_SALT, 1000, dk, sizeof dk);
+            hmac_sha256_parts(dk + 32, 32, blob, O_S_TAG, NULL, 0, tag);
+            diff = 0;
+            for (k = 0; k < (int)FPRINT; k++) diff |= (unsigned)(tag[k] ^ blob[O_S_TAG + k]);
+            printf("%s the sealed key authenticates with the right passphrase\n",
+                   diff ? "FAIL" : "ok  ");
+            if (diff) fails++;
+            memcpy(got, blob + O_S_CIPHER, HALF);
+            chacha20_xor(dk, blob + O_S_NONCE, 1, got, HALF);
+            printf("%s it decrypts back to the same 32 bytes\n",
+                   memcmp(got, boot, HALF) ? "FAIL" : "ok  ");
+            if (memcmp(got, boot, HALF)) fails++;
+            pbkdf2_sha256(bad, strlen(bad), blob + O_S_SALT, S_SALT, 1000, dk, sizeof dk);
+            hmac_sha256_parts(dk + 32, 32, blob, O_S_TAG, NULL, 0, tag);
+            diff = 0;
+            for (k = 0; k < (int)FPRINT; k++) diff |= (unsigned)(tag[k] ^ blob[O_S_TAG + k]);
+            printf("%s the wrong passphrase does not authenticate\n", diff ? "ok  " : "FAIL");
+            if (!diff) fails++;
+            blob[O_S_CIPHER + 3] ^= 0x01;
+            pbkdf2_sha256(good, strlen(good), blob + O_S_SALT, S_SALT, 1000, dk, sizeof dk);
+            hmac_sha256_parts(dk + 32, 32, blob, O_S_TAG, NULL, 0, tag);
+            diff = 0;
+            for (k = 0; k < (int)FPRINT; k++) diff |= (unsigned)(tag[k] ^ blob[O_S_TAG + k]);
+            printf("%s one flipped ciphertext byte is detected\n", diff ? "ok  " : "FAIL");
+            if (!diff) fails++;
+            blob[O_S_CIPHER + 3] ^= 0x01;
+            blob[O_S_ROUNDS] ^= 0x01;      /* tamper with the work factor too */
+            pbkdf2_sha256(good, strlen(good), blob + O_S_SALT, S_SALT, 1001, dk, sizeof dk);
+            hmac_sha256_parts(dk + 32, 32, blob, O_S_TAG, NULL, 0, tag);
+            diff = 0;
+            for (k = 0; k < (int)FPRINT; k++) diff |= (unsigned)(tag[k] ^ blob[O_S_TAG + k]);
+            printf("%s a tampered round count is detected\n", diff ? "ok  " : "FAIL");
+            if (!diff) fails++;
+        }
+        wipe(boot, sizeof boot);
+        wipe(blob, sizeof blob);
+        wipe(dk, sizeof dk);
+    }
+    {   /* the lock-screen password check, on the format used by
+         * /etc/mystic/passwd: salt:rounds:hash. tools/mkenc.sh test also
+         * cross-checks hash_password() against src/sha256.c itself. */
+        unsigned char salt[4] = {0xde, 0xad, 0xbe, 0xef};
+        unsigned char dg[FPRINT];
+        char salthex[9], hashhex[FPRINT * 2 + 1], line[128];
+        int yes, no_;
+        hash_password(salt, sizeof salt, "mystic", 7, dg);
+        to_hex(salt, sizeof salt, salthex);
+        to_hex(dg, FPRINT, hashhex);
+        snprintf(line, sizeof line, "%s:7:%s", salthex, hashhex);
+        yes = check_password_line(line, "mystic");
+        no_ = check_password_line(line, "mysti");
+        printf("%s check_password_line() accepts the password it was derived from\n",
+               yes == 1 ? "ok  " : "FAIL");
+        if (yes != 1) fails++;
+        printf("%s and rejects a one-character-shorter one\n", no_ == 0 ? "ok  " : "FAIL");
+        if (no_ != 0) fails++;
+    }
     printf("%s %d check(s) failed\n", fails ? "FAIL" : "ok  ", fails);
     return fails ? 1 : 0;
 }
@@ -1030,7 +1755,16 @@ static void usage(void)
             "                                    exit 2 key file, 3 wrong key, 4 dm error\n"
             "  detach <name>                     remove the mapping\n"
             "  status <name>                     exit 0 if the mapping exists\n"
-            "  selftest                          hash / table / header checks\n",
+            "  hasfs <dev>                       exit 0 mapping was formatted, 1 not, 2 no header\n"
+            "  markfs <dev>                      record that a filesystem exists in the mapping\n"
+            "  seal <key> <out> [--passwd-file P] [--rounds N]\n"
+            "                                    passphrase (stdin) seals the 32-byte key\n"
+            "  unseal <seal> <out> [--prompt [--console C]] [--passwd-file P]\n"
+            "                                    exit 5 bad seal/passphrase, 6 bad file,\n"
+            "                                    7 no passphrase, 8 not the lock-screen one\n"
+            "  verify <passwd-file> [--prompt [--console C]]\n"
+            "                                    check a passphrase against /etc/mystic/passwd\n"
+            "  selftest                          hash / KDF / cipher / table / header checks\n",
             prog);
 }
 
@@ -1127,6 +1861,40 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "attach") && (argc == 5 || argc == 6)) {
         return cmd_attach(argv[2], argv[3], argv[4], argc == 6 && !strcmp(argv[5], "--table"));
     }
+    if (!strcmp(cmd, "hasfs") && argc == 3) return cmd_hasfs(argv[2]);
+    if (!strcmp(cmd, "markfs") && argc == 3) return cmd_markfs(argv[2]);
+    if (!strcmp(cmd, "seal") && argc >= 4) {
+        const char *passwd_file = NULL;
+        uint32_t rounds = 0;
+        int i;
+        for (i = 4; i < argc; i++) {
+            if (!strcmp(argv[i], "--passwd-file") && i + 1 < argc) passwd_file = argv[++i];
+            else if (!strcmp(argv[i], "--rounds") && i + 1 < argc) rounds = (uint32_t)strtoul(argv[++i], NULL, 10);
+            else return die("unknown seal option %s", argv[i], NULL);
+        }
+        return cmd_seal(argv[2], argv[3], passwd_file, rounds);
+    }
+    if (!strcmp(cmd, "unseal") && argc >= 4) {
+        const char *passwd_file = NULL, *console_path = NULL;
+        int prompt = 0, i;
+        for (i = 4; i < argc; i++) {
+            if (!strcmp(argv[i], "--prompt")) prompt = 1;
+            else if (!strcmp(argv[i], "--console") && i + 1 < argc) console_path = argv[++i];
+            else if (!strcmp(argv[i], "--passwd-file") && i + 1 < argc) passwd_file = argv[++i];
+            else return die("unknown unseal option %s", argv[i], NULL);
+        }
+        return cmd_unseal(argv[2], argv[3], prompt, console_path, passwd_file);
+    }
+    if (!strcmp(cmd, "verify") && argc >= 3) {
+        int prompt = 0, i;
+        const char *console_path = NULL;
+        for (i = 3; i < argc; i++) {
+            if (!strcmp(argv[i], "--prompt")) prompt = 1;
+            else if (!strcmp(argv[i], "--console") && i + 1 < argc) console_path = argv[++i];
+            else return die("unknown verify option %s", argv[i], NULL);
+        }
+        return cmd_verify(argv[2], prompt, console_path);
+    }
     if (!strcmp(cmd, "detach") && argc == 3) {
 #ifdef MYSTIC_HOSTTEST
         (void)cmd;
@@ -1199,6 +1967,37 @@ build_host_helper() {
     printf '%s\n' "$exe"
 }
 
+# The passphrase scenarios need a /etc/mystic/passwd line. Making one with the
+# shipping implementation (src/sha256.c) rather than a second copy of the
+# algorithm is the point: the helper's own check then has to agree with the
+# code the desktop lock screen runs, or the test fails.
+build_pwline() {
+    exe=$WORK/mystic-pwline.exe
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) ;;
+        *) exe=$WORK/mystic-pwline ;;
+    esac
+    cat > "$WORK/mystic-pwline.c" <<'MYSTIC_PWLINE_C_EOF'
+#include "mystic.h"
+#include <stdio.h>
+#include <stdlib.h>
+int main(int argc, char **argv)
+{
+    unsigned char salt[16];
+    char line[256];
+    int i;
+    if (argc != 3) { fprintf(stderr, "usage: pwline <password> <rounds>\n"); return 2; }
+    for (i = 0; i < (int)sizeof salt; i++) salt[i] = (unsigned char)(0x10 + i * 7);
+    mystic_make_password_line(salt, (int)sizeof salt, argv[1], atoi(argv[2]), line, sizeof line);
+    printf("%s\n", line);
+    return 0;
+}
+MYSTIC_PWLINE_C_EOF
+    $ZIG cc -Isrc "$WORK/mystic-pwline.c" src/sha256.c -o "$exe" \
+        || die "compiling src/sha256.c for the password cross-check failed"
+    printf '%s\n' "$exe"
+}
+
 # ====================================================================
 #  3. the boot half of the key
 # ====================================================================
@@ -1215,6 +2014,17 @@ stage_key() {
         [ "$size" = 32 ] || die "$STAGE/etc/mystic/luks.key is $size bytes, not 32 - \
 move it away and run './tools/mkenc.sh new-key'"
         say "key: reusing $STAGE/etc/mystic/luks.key (fp $(key_fingerprint))"
+        if [ -f "$STAGE/etc/mystic/luks.key.sealed" ]; then
+            warn "$STAGE/etc/mystic/luks.key.sealed is also present; the plaintext"
+            warn "file wins at boot, so the seal is not doing anything. Remove the"
+            warn "plaintext file (./tools/mkenc.sh seal) or the seal (./tools/mkenc.sh unseal)."
+        fi
+    elif [ -f "$STAGE/etc/mystic/luks.key.sealed" ]; then
+        # Creating a new plaintext key here would quietly defeat the seal and
+        # leave a sealed blob that no longer matches the disk.
+        say "key: using the sealed key $STAGE/etc/mystic/luks.key.sealed"
+        say "     (the plaintext half is intentionally absent; the boot passphrase"
+        say "     is the one in $STAGE/etc/mystic/passwd)"
     else
         "$HOST" keygen "$STAGE/etc/mystic/luks.key" || die "cannot create the key"
         say "key: created $STAGE/etc/mystic/luks.key (fp $(key_fingerprint))"
@@ -1314,8 +2124,18 @@ verify() {
         printf '    packed as : /etc/mystic/luks.key, mode 0644 (tools/mkimage.py clears\n'
         printf '                the mode of non-executable files; the boot half is not\n'
         printf '                secret from root, only from a copy of the disk image)\n'
+    elif [ -f "$STAGE/etc/mystic/luks.key.sealed" ]; then
+        seal_bytes=$(wc -c < "$STAGE/etc/mystic/luks.key.sealed" | tr -d ' ')
+        printf '    file      : %s\n' "$STAGE/etc/mystic/luks.key.sealed"
+        printf '    length    : %s bytes (%s)\n' "$seal_bytes" \
+            "$([ "$seal_bytes" = 112 ] && echo 'the only valid size' || echo 'WRONG: must be 112')"
+        printf '    packed as : /etc/mystic/luks.key.sealed; the boot sequence asks for\n'
+        printf '                the lock-screen passphrase and unseals it into RAM\n'
+        head -c 8 "$STAGE/etc/mystic/luks.key.sealed" | grep -q 'MYSTICKS' \
+            || { warn "the sealed key does not start with MYSTICKS"; bad=1; }
+        [ "$seal_bytes" = 112 ] || bad=1
     else
-        warn "no $STAGE/etc/mystic/luks.key"; bad=1
+        warn "no $STAGE/etc/mystic/luks.key and no luks.key.sealed"; bad=1
     fi
     return $bad
 }
@@ -1337,7 +2157,15 @@ cmd_status() {
         printf 'helper         : MISSING - run ./tools/mkenc.sh\n'
     fi
     if [ -f "$STAGE/etc/mystic/luks.key" ]; then
-        printf 'boot key half  : stage/etc/mystic/luks.key (fp %s)\n' "$(key_fingerprint)"
+        printf 'boot key half  : %s (fp %s, plaintext)\n' \
+            "$STAGE/etc/mystic/luks.key" "$(key_fingerprint)"
+    elif [ -f "$STAGE/etc/mystic/luks.key.sealed" ]; then
+        seal_rounds=$(python -c "import sys,struct; d=open(sys.argv[1],'rb').read(); print(struct.unpack('<I', d[12:16])[0] if len(d)==112 else '?')" \
+            "$STAGE/etc/mystic/luks.key.sealed" 2>/dev/null || echo '?')
+        printf 'boot key half  : %s (sealed, %s PBKDF2-HMAC-SHA256 rounds)\n' \
+            "$STAGE/etc/mystic/luks.key.sealed" "$seal_rounds"
+        printf '                 the boot asks for the lock-screen passphrase\n'
+        printf '                 in probe mode it cannot prompt, so /root stays unmounted\n'
     else
         printf 'boot key half  : MISSING\n'
     fi
@@ -1407,12 +2235,95 @@ cmd_new_key() {
     warn "Put it back as stage/etc/mystic/luks.key if you want the next image to open them."
 }
 
+# ====================================================================
+#  6b. the passphrase seal on the boot half
+# ====================================================================
+# Reads the passphrase without echoing it. MYSTIC_SEAL_PASS_FILE exists so
+# that a harness or a scripted install can drive this; it is not for people,
+# because a passphrase in a file on the build host is not a secret.
+read_seal_passphrase() {   # read_seal_passphrase <why>
+    pw=""
+    pw2=""
+    if [ -n "${MYSTIC_SEAL_PASS_FILE:-}" ]; then
+        [ -f "$MYSTIC_SEAL_PASS_FILE" ] || die "MYSTIC_SEAL_PASS_FILE=$MYSTIC_SEAL_PASS_FILE does not exist"
+        warn "reading the passphrase from $MYSTIC_SEAL_PASS_FILE (automation only)"
+        pw=$(cat "$MYSTIC_SEAL_PASS_FILE")
+        return 0
+    fi
+    [ -t 0 ] || die "no terminal to ask for the passphrase - set MYSTIC_SEAL_PASS_FILE for a scripted run"
+    printf '%s (the lock-screen password): ' "$1" >&2
+    IFS= read -r -s pw
+    printf '\n' >&2
+    if [ "$1" = "passphrase" ]; then
+        printf 'again: ' >&2
+        IFS= read -r -s pw2
+        printf '\n' >&2
+        [ "$pw" = "$pw2" ] || die "the two passphrases differ - nothing was written"
+        pw2=""
+    fi
+    [ -n "$pw" ] || die "an empty passphrase is not a passphrase"
+}
+
+cmd_seal() {
+    if [ ! -f "$STAGE/etc/mystic/luks.key" ]; then
+        if [ -f "$STAGE/etc/mystic/luks.key.sealed" ]; then
+            die "already sealed: $STAGE/etc/mystic/luks.key.sealed (run ./tools/mkenc.sh unseal to undo)"
+        fi
+        die "no key at $STAGE/etc/mystic/luks.key - run ./tools/mkenc.sh first"
+    fi
+    [ -f "$STAGE/etc/mystic/passwd" ] || die "no $STAGE/etc/mystic/passwd - \
+the lock screen has no password, so a sealed key could never be opened. \
+Set one in Settings > Users first."
+    HOST=$(build_host_helper)
+    trap 'rm -f "$HOST" "${HOST%.exe}.pdb"' EXIT
+    read_seal_passphrase passphrase
+    printf '%s\n' "$pw" | "$HOST" verify "$STAGE/etc/mystic/passwd" >/dev/null \
+        || die "that is not the lock-screen password - nothing was sealed"
+    fp=$(key_fingerprint)
+    if [ -n "${1:-}" ]; then
+        printf '%s\n' "$pw" | "$HOST" seal "$STAGE/etc/mystic/luks.key" \
+            "$STAGE/etc/mystic/luks.key.sealed" --passwd-file "$STAGE/etc/mystic/passwd" \
+            --rounds "$1" \
+            || die "sealing failed - $STAGE/etc/mystic/luks.key is unchanged"
+    else
+        printf '%s\n' "$pw" | "$HOST" seal "$STAGE/etc/mystic/luks.key" \
+            "$STAGE/etc/mystic/luks.key.sealed" --passwd-file "$STAGE/etc/mystic/passwd" \
+            || die "sealing failed - $STAGE/etc/mystic/luks.key is unchanged"
+    fi
+    pw=""
+    rm -f "$STAGE/etc/mystic/luks.key"
+    say "sealed: $STAGE/etc/mystic/luks.key.sealed (key fp $fp)"
+    say "the plaintext half is gone; the next boot asks for the passphrase before"
+    say "mounting /root. Rebuild the image (./image.sh) so the initramfs gets it."
+    warn "an encrypted disk keeps opening: the seal holds the same 32 bytes."
+    warn "changing the lock-screen password does NOT re-seal: run seal again after it."
+}
+
+cmd_unseal() {   # put the plaintext half back and turn the boot prompt off
+    [ -f "$STAGE/etc/mystic/luks.key.sealed" ] \
+        || die "no $STAGE/etc/mystic/luks.key.sealed - nothing is sealed"
+    [ ! -f "$STAGE/etc/mystic/luks.key" ] \
+        || die "$STAGE/etc/mystic/luks.key already exists - move it away first"
+    HOST=$(build_host_helper)
+    trap 'rm -f "$HOST" "${HOST%.exe}.pdb"' EXIT
+    read_seal_passphrase passphrase
+    printf '%s\n' "$pw" | "$HOST" unseal "$STAGE/etc/mystic/luks.key.sealed" \
+        "$STAGE/etc/mystic/luks.key" --passwd-file "$STAGE/etc/mystic/passwd" \
+        || die "could not unseal - nothing was changed"
+    pw=""
+    rm -f "$STAGE/etc/mystic/luks.key.sealed"
+    say "unsealed: $STAGE/etc/mystic/luks.key (fp $(key_fingerprint))"
+    say "the boot no longer asks for a passphrase; the initramfs carries the key"
+}
+
 cmd_reset_disk() {
     # Moving a disk away is only safe advice if the next boot can open the new
     # one. After a git clean (stage/sbin/ and stage/lib/modules/ are ignored)
     # it cannot, and a fresh disk would come back unencrypted without a word.
     missing=""
-    [ -f "$STAGE/etc/mystic/luks.key" ] || missing="$missing key"
+    if [ ! -f "$STAGE/etc/mystic/luks.key" ] && [ ! -f "$STAGE/etc/mystic/luks.key.sealed" ]; then
+        missing="$missing key"
+    fi
     [ -f "$STAGE/sbin/mystic-dmcrypt" ] || missing="$missing helper"
     for f in $MODULES; do
         [ -f "$KO_DST/$f" ] || missing="$missing $(basename "$f")"
@@ -1441,12 +2352,18 @@ cmd_reset_disk() {
 # script decides before those ioctls is covered.
 cmd_test() {
     HOST=$(build_host_helper)
-    trap 'rm -f "$HOST" "${HOST%.exe}.pdb"' EXIT
+    PWL=$(build_pwline)
+    trap 'rm -f "$HOST" "${HOST%.exe}.pdb" "$PWL" "${PWL%.exe}.pdb"' EXIT
     say "selftest of the host build (hash vectors, table string, header codec)"
     "$HOST" selftest || die "host selftest failed"
     SIM=$WORK/sim
     rm -rf "$SIM"
     mkdir -p "$SIM"
+    # The passphrase used by the sealed-key scenarios, and the passwd line for
+    # it, generated by src/sha256.c (the lock screen's own code).
+    SIM_PASS='correct horse battery staple'
+    "$PWL" "$SIM_PASS" 20000 > "$WORK/sim.passwd" || die "pwline failed"
+    say "passphrase cross-check: $WORK/sim.passwd was written by src/sha256.c"
     cat > "$SIM/run.sh" <<'MYSTIC_SIM_EOF'
 #!/bin/sh
 # generated by: ./tools/mkenc.sh test
@@ -1566,6 +2483,16 @@ open(sys.argv[1], 'wb').write(d)
 PYEOF
 }
 mount_will_fail() { : > "$ST/mount-fails"; }
+ext4_inside() {   # the decrypted view of a volume that already holds ext4
+    python - "$MAP" <<'PYEOF'
+import sys, os
+f = open(sys.argv[1], 'r+b' if os.path.exists(sys.argv[1]) else 'wb')
+f.seek(1080)
+f.write(bytes([0x53, 0xEF]))
+f.close()
+PYEOF
+}
+typed() { printf '%s\n' "$1" > "$ST/console"; }   # stands in for /dev/console
 
 out=""
 run_setup() {    # run_setup [real-block-check 0|1] [helper-path]
@@ -1575,8 +2502,11 @@ run_setup() {    # run_setup [real-block-check 0|1] [helper-path]
         export PATH="$BIN:$PATH"
         export MYSTIC_INIT_LIB=1 MYSTIC_DISK="$DISK" MYSTIC_KEY="$KEY" \
                MYSTIC_DMCRYPT="$helper" MYSTIC_DM_CONTROL="$ST/control" \
-               MYSTIC_MKFS="$BIN/mkfs.ext4" MYSTIC_CRYPT_LOG="$ST/crypt.log" \
+               MYSTIC_MKFS="$MKFS_BIN" MYSTIC_CRYPT_LOG="$ST/crypt.log" \
                MYSTIC_MAP=mystic-root MYSTIC_MAP_PATH="$MAP" \
+               MYSTIC_SEAL="$SEAL" MYSTIC_RAMKEY="$ST/ram/luks.key" \
+               MYSTIC_CONSOLE="$CONSOLE" MYSTIC_PASSWD="$PASSWD" \
+               MYSTIC_CMDLINE="$CMDLINE" \
                FAKE_STATE="$ST" FAKE_MOUNT_FAIL="$ST/mount-fails"
         . "$INIT"
         if [ "$real" != 1 ]; then
@@ -1593,6 +2523,26 @@ show() { printf '%s\n' "$out" | sed 's/^/        | /'; }
 KEY=$SIM/luks.key
 rm -f "$KEY"
 "$DMCRYPT" keygen "$KEY" >/dev/null || { echo "cannot create the test key" >&2; exit 1; }
+
+# the passphrase side: a /etc/mystic/passwd line made by the SHIPPING code
+# (src/sha256.c), a sealed copy of the same boot half, and the paths init uses
+PASSWD=${SIM_PASSWD:-}
+PASSPHRASE=${SIM_PASS:-}
+SEAL=$SIM/luks.key.sealed
+CONSOLE=$ST/console
+CMDLINE=$SIM/cmdline
+MKFS_BIN=$BIN/mkfs.ext4
+if [ -n "$PASSWD" ] && [ -f "$PASSWD" ]; then
+    rm -f "$SEAL" "$SIM/sealkey"
+    "$DMCRYPT" keygen "$SIM/sealkey" >/dev/null 2>&1
+    printf '%s\n' "$PASSPHRASE" | "$DMCRYPT" seal "$SIM/sealkey" "$SEAL" \
+        --passwd-file "$PASSWD" > "$SIM/seal.log" 2>&1 \
+        || { echo "cannot seal the test key:" >&2; cat "$SIM/seal.log" >&2; exit 1; }
+    echo "seal: $(cat "$SIM/seal.log")"
+else
+    echo "seal: no passwd file supplied, the sealed-key scenarios are skipped" >&2
+fi
+: > "$CMDLINE"
 
 # ---------------------------------------------------------------- 1
 echo
@@ -1613,10 +2563,11 @@ reset_boot
 run_setup
 show
 check "disk: created dm-crypt volume on $DISK (aes-xts-plain64)"
-check "disk: dm-crypt unlocked, no ext4 inside - creating one"
+check "disk: dm-crypt unlocked, no filesystem inside - creating one"
 check "disk: formatted ext4 inside dm-crypt and mounted on /root"
 check "mounted: $MAP"
 check "status: aes-xts-plain64, key "
+check "crypt: marked $DISK: a filesystem was created inside its mapping"
 hdr=$("$DMCRYPT" probe "$DISK" 2>&1)
 printf '        | header now: %s\n' "$hdr"
 case "$hdr" in
@@ -1643,7 +2594,7 @@ show
 check "disk: dm-crypt unlocked, formatted ext4 mounted on /root"
 check "mounted: $MAP"
 check_not "created dm-crypt volume"
-check_not "no ext4 inside"
+check_not "no filesystem inside"
 
 # ---------------------------------------------------------------- 4
 echo
@@ -1654,7 +2605,7 @@ reset_boot
 before=$(cksum "$DISK")
 run_setup
 show
-check "disk: $DISK has no encryption header and is not blank"
+check "disk: $DISK has no encryption header, so it is not encrypted"
 check "disk: mounted $DISK (ext4) on /root"
 check_not "created dm-crypt volume"
 check_not "creating ext4 filesystem"
@@ -1695,18 +2646,20 @@ KEY=$SIM/luks.key
 
 # ---------------------------------------------------------------- 7
 echo
-echo "== 7. blank disk, no key in the image =="
+echo "== 7. blank disk, no key in the image at all =="
 DISK=$DEV/fresh
 new_disk "$DISK" 8192
 KEY=$SIM/absent.key
+SEAL=$SIM/no-seal-either
 rm -f "$KEY"
 reset_boot
 run_setup
 show
-check "disk: no encryption key at $KEY - using plain ext4"
+check "disk: this image has no boot key, so $DISK stays UNENCRYPTED"
 check "disk: formatted ext4 and mounted on /root"
 check_not "created dm-crypt volume"
 KEY=$SIM/luks.key
+SEAL=$SIM/luks.key.sealed
 
 # ---------------------------------------------------------------- 8
 echo
@@ -1717,6 +2670,7 @@ reset_boot
 run_setup 0 "$SIM/no-such-helper"
 show
 check "disk: dm-crypt unavailable - no $SIM/no-such-helper in the image"
+check "disk: $DISK is blank, so this creates an UNENCRYPTED /root"
 check "disk: formatted ext4 and mounted on /root"
 check_not "created dm-crypt volume"
 
@@ -1730,7 +2684,7 @@ reset_boot
 rm -f "$MAP"                                   # ...and no filesystem inside it
 run_setup
 show
-check "disk: dm-crypt unlocked, no ext4 inside - creating one"
+check "disk: dm-crypt unlocked, no filesystem inside - creating one"
 check "disk: formatted ext4 inside dm-crypt and mounted on /root"
 
 # ---------------------------------------------------------------- 10
@@ -1744,7 +2698,7 @@ run_setup
 show
 check "disk: dm-crypt unlocked, ext4 is there but did not mount - refusing to format it"
 check "disk: nothing was written; the volume is intact"
-check_not "no ext4 inside"
+check_not "no filesystem inside"
 check_not "formatted ext4"
 same "$MAP" "$before" "the unmountable volume was not reformatted"
 
@@ -1824,15 +2778,18 @@ echo "== 15. encrypted disk whose boot key file is gone =="
 DISK=$DEV/vda
 reset_boot
 KEY=$SIM/gone.key
+SEAL=$SIM/no-seal-either
 rm -f "$KEY"
 before=$(cksum "$DISK")
 run_setup
 show
-check "disk: cannot read the boot key $KEY - $DISK is left untouched"
-check "status: locked (no usable key)"
+check "disk: no key at $KEY and no sealed key at $SEAL"
+check "disk: refusing to touch $DISK, /root stays on the RAM filesystem"
+check "status: locked (no key)"
 check_not "key does not match"
 same "$DISK" "$before" "the encrypted disk was not written to"
 KEY=$SIM/luks.key
+SEAL=$SIM/luks.key.sealed
 
 echo
 echo "== 16. an unrecognised disk with no helper in the image =="
@@ -1847,12 +2804,191 @@ check "disk: $DISK did not mount and is not blank - refusing to format it"
 check_not "creating ext4 filesystem"
 same "$DISK" "$before" "the unrecognised disk was not written to"
 
+# ---------------------------------------------------------------- 17
+# P0-2 on the plain path: the old code formatted whenever the mount failed,
+# including a real ext4 that merely would not mount.
+echo
+echo "== 17. a plain ext4 disk whose mount fails = "
+DISK=$DEV/plainsick
+plain_disk "$DISK"
+reset_boot
+mount_will_fail
+before=$(cksum "$DISK")
+run_setup
+show
+check "disk: $DISK has no encryption header, so it is not encrypted"
+check "disk: $DISK has an ext4 superblock but did not mount - refusing to format it"
+check_not "creating ext4 filesystem"
+same "$DISK" "$before" "the unmountable plain ext4 was not reformatted"
+
+# ---------------------------------------------------------------- 18
+# P0-1's last hole: the helper writes the header, then reports failure.
+# The header is on the disk from that moment and mkfs must never follow it.
+echo
+echo "== 18. the helper writes the header, then reports failure =="
+DISK=$DEV/halffail
+new_disk "$DISK" 8192
+cp "$DMCRYPT" "$SIM/init-then-fail.real"
+cat > "$SIM/init-then-fail" <<'FMT_EOF'
+#!/bin/sh
+# a real 'init' (so a real header lands on the disk), followed by the failure
+# that used to send stage/init down the "using plain ext4" path
+case "$1" in
+    init) "$0.real" "$@"; rc=$?
+          [ "$rc" -eq 0 ] && { echo "mystic-dmcrypt: simulated failure after writing the header" >&2; exit 1; }
+          exit "$rc" ;;
+    *) exec "$0.real" "$@" ;;
+esac
+FMT_EOF
+chmod +x "$SIM/init-then-fail" "$SIM/init-then-fail.real"
+reset_boot
+run_setup 0 "$SIM/init-then-fail"
+show
+check "disk: could not create the encrypted volume - $DISK is left untouched"
+check "disk: the MYSTICC1 header is on the disk; it will not be formatted"
+check "status: not created (header written, mapping failed)"
+check_not "creating ext4 filesystem"
+case "$("$DMCRYPT" probe "$DISK" 2>&1)" in
+    "crypt 1 "*) ok "the header is still on the disk after the failure" ;;
+    *)           no "the header was destroyed by a plain mkfs" ;;
+esac
+
+# ---------------------------------------------------------------- 19
+if [ -f "$SEAL" ]; then
+echo
+echo "== 19. sealed key, correct passphrase, first boot =="
+DISK=$DEV/sealednew
+new_disk "$DISK" 8192
+KEY=$SIM/no-plaintext.key     # a sealed image has no plaintext half
+reset_boot
+typed "$PASSPHRASE"
+run_setup
+show
+check "key: unsealed $SEAL into $ST/ram/luks.key (RAM only)"
+check "key: $ST/ram/luks.key (unsealed earlier in this boot)"
+check "disk: created dm-crypt volume on $DISK (aes-xts-plain64)"
+check "disk: formatted ext4 inside dm-crypt and mounted on /root"
+check "mounted: $MAP"
+if [ -f "$ST/ram/luks.key" ]; then
+    no "the unsealed key is still on the ramfs after attach"
+else
+    ok "the unsealed key was wiped after attach"
+fi
+
+# ---------------------------------------------------------------- 20
+echo
+echo "== 20. sealed key, wrong passphrase =="
+DISK=$DEV/sealedwrong
+new_disk "$DISK" 8192
+KEY=$SIM/no-plaintext.key
+reset_boot
+typed "this is not the password"
+before=$(cksum "$DISK")
+run_setup
+show
+check "disk: that is not the lock-screen password (attempt 1 of 3)"
+check "disk: giving up after 3 attempts - the volume stays locked"
+check "status: locked (passphrase refused)"
+check_not "created dm-crypt volume"
+same "$DISK" "$before" "the blank disk was not written to"
+
+# ---------------------------------------------------------------- 21
+echo
+echo "== 21. sealed key, no console to prompt on =="
+DISK=$DEV/vda
+reset_boot
+CONSOLE=$SIM/no-console
+before=$(cksum "$DISK")
+run_setup
+show
+check "disk: $SEAL needs the passphrase, and there is no console at $SIM/no-console"
+check "status: locked (no usable key)"
+check_not "created dm-crypt volume"
+same "$DISK" "$before" "the encrypted disk was not written to"
+CONSOLE=$ST/console
+
+# ---------------------------------------------------------------- 22
+echo
+echo "== 22. sealed key, probe mode (nobody there to type) =="
+printf 'mystic.probe=1\n' > "$CMDLINE"
+reset_boot
+typed "$PASSPHRASE"
+before=$(cksum "$DISK")
+run_setup
+show
+check "disk: $SEAL needs the passphrase; probe mode does not prompt"
+check "status: locked (no usable key)"
+same "$DISK" "$before" "the encrypted disk was not written to"
+: > "$CMDLINE"
+
+# ---------------------------------------------------------------- 23
+echo
+echo "== 23. the header says a filesystem was created, but no ext4 magic =="
+# A volume created normally (so the header records the filesystem), then its
+# ext4 magic zeroed: this is what a damaged or non-ext4 filesystem inside the
+# volume looks like, and it must not be reformatted.
+DISK=$DEV/marked
+KEY=$SIM/luks.key
+new_disk "$DISK" 8192
+reset_boot
+run_setup >/dev/null 2>&1          # create it, marker included
+if "$DMCRYPT" hasfs "$DISK"; then
+    ok "a freshly created volume records its filesystem in the header"
+else
+    no "a freshly created volume does not record its filesystem"
+fi
+python - "$MAP" <<'PYEOF'
+import sys
+f = open(sys.argv[1], 'r+b')
+f.seek(1080)
+f.write(bytes(2))
+f.close()
+PYEOF
+reset_boot
+before=$(cksum "$MAP")
+run_setup
+show
+check "disk: dm-crypt unlocked, no ext4 magic, but its header records that a"
+check "disk: filesystem was created in it once - refusing to format it"
+check_not "no filesystem inside"
+same "$MAP" "$before" "the volume was not reformatted"
+
+# ---------------------------------------------------------------- 24
+echo
+echo "== 24. sealed key, second boot on the volume it created =="
+DISK=$DEV/sealednew               # created in 19 with the sealed key
+KEY=$SIM/no-plaintext.key
+reset_boot
+typed "$PASSPHRASE"
+ext4_inside                       # the volume still holds its ext4
+run_setup
+show
+check "disk: dm-crypt unlocked, formatted ext4 mounted on /root"
+check "mounted: $MAP"
+check_not "created dm-crypt volume"
+KEY=$SIM/luks.key
+fi   # SEAL exists
+
+# ---------------------------------------------------------------- 25
+echo
+echo "== 25. no mkfs.ext4 in the image, blank disk = "
+DISK=$DEV/nomkfs
+new_disk "$DISK" 8192
+reset_boot
+MKFS_BIN=$SIM/no-mkfs
+run_setup
+show
+check "disk: no mkfs.ext4 in the image"
+check "disk: mkfs.ext4 failed inside the mapping - nothing is mounted"
+MKFS_BIN=$BIN/mkfs.ext4
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ] || exit 1
 exit 0
 MYSTIC_SIM_EOF
     say "boot-path simulation: stage/init + host helper + fake /dev"
-    ROOT=$(pwd) SIM="$SIM" SIM_DMCRYPT="$HOST" sh "$SIM/run.sh" \
+    ROOT=$(pwd) SIM="$SIM" SIM_DMCRYPT="$HOST" SIM_PASSWD="$WORK/sim.passwd" \
+        SIM_PASS="$SIM_PASS" sh "$SIM/run.sh" \
         || die "the boot-path simulation failed"
 }
 
@@ -1879,6 +3015,8 @@ case "${1:-stage}" in
     test)       cmd_test ;;
     key)        cmd_key ;;
     new-key)    cmd_new_key ;;
+    seal)       shift; cmd_seal "$@" ;;
+    unseal)     cmd_unseal ;;
     reset-disk) cmd_reset_disk ;;
     elf)        shift; elf_report "${1:?usage: mkenc.sh elf <file>}" ;;
     -h|--help|help)

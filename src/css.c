@@ -372,6 +372,10 @@ static int parse_percent(const char *s, int *out)
     return 1;
 }
 
+/* Defined with the declaration values below; the box and font-size
+ * shorthands need it before then. */
+static int next_word(const char **pp, char *out, int cap);
+
 /* A unitless number: "1.5". line-height is the only property that takes
  * one, and there it means a multiple of the element's font size. */
 static int parse_multiplier(const char *s, int *pct)
@@ -394,6 +398,206 @@ static int parse_multiplier(const char *s, int *pct)
     if (v > 1000.0f) v = 1000.0f;
     *pct = (int)(v + 0.5f);
     return 1;
+}
+
+/* "1.2rem" -> 120, i.e. the percentage parse_percent() gives for
+ * "120%", but measured against the root element instead of the parent.
+ * Returns 0 when the suffix is not rem. */
+/* A bare number in hundredths: "1.25" -> 125, "60" -> 6000. Unlike
+ * parse_multiplier() this is for lengths, not line-height percentages, so
+ * 60em (a 960 px column) must survive: the ceiling is 1000em. */
+static int parse_number_100(const char *s, int *out)
+{
+    const char *p = s;
+    float v = 0.0f;
+    int digits = 0;
+    while (*p == ' ' || *p == '	') p++;
+    while (is_digit((unsigned char)*p)) { v = v * 10.0f + (float)(*p - '0'); p++; digits++; }
+    if (*p == '.') {
+        float f = 0.1f;
+        p++;
+        while (is_digit((unsigned char)*p)) { v += (float)(*p - '0') * f; f *= 0.1f; p++; digits++; }
+    }
+    while (*p == ' ' || *p == '	') p++;
+    if (!digits || *p) return 0;
+    v *= 100.0f;
+    if (v > 100000.0f) v = 100000.0f;
+    if (v < -100000.0f) v = -100000.0f;
+    *out = (int)(v + (v >= 0.0f ? 0.5f : -0.5f));
+    return 1;
+}
+
+/* "1.2rem" -> 120, i.e. the percentage parse_percent() gives for
+ * "120%", but measured against the root element instead of the parent.
+ * Returns 0 when the suffix is not rem. */
+static int parse_rem(const char *s, int *pct)
+{
+    char buf[40];
+    size_t n = 0;
+    const char *p = s;
+    while (*p == ' ' || *p == '	') p++;
+    while (*p && n + 1 < sizeof buf) buf[n++] = *p++;
+    if (n < 4) return 0;
+    if (buf[n - 3] != 'r' || buf[n - 2] != 'e' || buf[n - 1] != 'm') return 0;
+    buf[n - 3] = 0;
+    return parse_number_100(buf, pct);
+}
+
+/* "1.2em" -> 120: em is the parent's own size, which is what the
+ * percentage form means for font-size. Returns 0 when the unit is not em. */
+static int parse_em(const char *s, int *pct)
+{
+    char buf[40];
+    size_t n = 0;
+    const char *p = s;
+    while (*p == ' ' || *p == '	') p++;
+    while (*p && n + 1 < sizeof buf) buf[n++] = *p++;
+    if (n < 3) return 0;
+    if (buf[n - 2] != 'e' || buf[n - 1] != 'm') return 0;
+    buf[n - 2] = 0;
+    return parse_number_100(buf, pct);
+}
+
+/* font-size: an absolute length, em/% of the parent, rem of the root, or
+ * one of the absolute keywords. The relative forms are stored as a
+ * percentage here and resolved by css_for(), which is the only place that
+ * knows the parent's resolved size. */
+static int apply_font_size(CssStyle *st, const char *val)
+{
+    static const struct { const char *name; int pct; } kSizes[] = {
+        { "xx-small", 60 }, { "x-small", 75 }, { "small", 89 },
+        { "medium", 100 }, { "large", 120 }, { "x-large", 150 },
+        { "xx-large", 200 }, { "xxx-large", 250 }
+    };
+    int px = 0, pct = 0;
+
+    for (size_t i = 0; i < sizeof kSizes / sizeof kSizes[0]; i++) {
+        if (!ieq(val, kSizes[i].name)) continue;
+        st->set &= ~(CSS_SET_FONT_SIZE | CSS_SET_FONT_SIZE_REM);
+        st->font_size_pct = kSizes[i].pct;
+        st->set |= CSS_SET_FONT_SIZE_REL;
+        return 1;
+    }
+    if (ieq(val, "smaller") || ieq(val, "larger")) {
+        st->set &= ~(CSS_SET_FONT_SIZE | CSS_SET_FONT_SIZE_REM);
+        st->font_size_pct = ieq(val, "smaller") ? 83 : 120;
+        st->set |= CSS_SET_FONT_SIZE_REL;
+        return 1;
+    }
+    if (parse_rem(val, &pct)) {
+        st->set &= ~(CSS_SET_FONT_SIZE | CSS_SET_FONT_SIZE_REL);
+        st->font_size_pct = pct;
+        st->set |= CSS_SET_FONT_SIZE_REM;
+        return 1;
+    }
+    if (parse_em(val, &pct) || parse_percent(val, &pct)) {
+        st->set &= ~(CSS_SET_FONT_SIZE | CSS_SET_FONT_SIZE_REM);
+        st->font_size_pct = pct;
+        st->set |= CSS_SET_FONT_SIZE_REL;
+        return 1;
+    }
+    if (parse_length(val, &px) && px > 0) {
+        st->set &= ~(CSS_SET_FONT_SIZE_REL | CSS_SET_FONT_SIZE_REM);
+        st->font_size = px;
+        st->set |= CSS_SET_FONT_SIZE;
+        return 1;
+    }
+    return 0;
+}
+
+/* display. Only none / block / list-item change a text renderer's
+ * output; the rest are recognised so that a real stylesheet's
+ * `display:table` is not a parse error, and are treated as inline. */
+static int parse_display(const char *val, int *out)
+{
+    if (ieq(val, "none")) *out = CSS_DISPLAY_NONE;
+    else if (ieq(val, "block")) *out = CSS_DISPLAY_BLOCK;
+    else if (ieq(val, "list-item")) *out = CSS_DISPLAY_LIST_ITEM;
+    else if (ieq(val, "inline")) *out = CSS_DISPLAY_INLINE;
+    else if (ieq(val, "inline-block")) *out = CSS_DISPLAY_INLINE_BLOCK;
+    else if (ieq(val, "table")) *out = CSS_DISPLAY_TABLE;
+    else if (ieq(val, "table-row")) *out = CSS_DISPLAY_TABLE_ROW;
+    else if (ieq(val, "table-cell")) *out = CSS_DISPLAY_TABLE_CELL;
+    /* A flow container is a block with one axis: flex and grid lay their
+     * children out as a block box in this renderer, which is what a
+     * single column actually is. Saying so is better than dropping the
+     * container entirely. */
+    else if (ieq(val, "flex") || ieq(val, "grid") ||
+             ieq(val, "flow-root") || ieq(val, "table-caption"))
+        *out = CSS_DISPLAY_BLOCK;
+    else if (ieq(val, "inline-flex") || ieq(val, "inline-grid") ||
+             ieq(val, "contents"))
+        *out = CSS_DISPLAY_INLINE;
+    else return 0;
+    return 1;
+}
+
+/* A box length: px, pt, or em. Returns 1 with *out set and *rel saying
+ * which unit it is: 0 for an absolute px value, 1 when *out is in
+ * hundredths of an em and needs the element's font size. `rem` is left
+ * to font-size alone, where the root size is reachable. */
+static int parse_len(const char *s, int *out, int *rel)
+{
+    *rel = 0;
+    if (parse_length(s, out)) return 1;
+    if (parse_em(s, out)) { *rel = 1; return 1; }
+    return 0;
+}
+
+/* One to four values, in CSS's expansion:
+ *   1 value  -> all four sides
+ *   2 values -> top+bottom, left+right
+ *   3 values -> top, left+right, bottom
+ *   4 values -> top, right, bottom, left
+ * `auto` is 0: a text column has nothing to distribute a free-space
+ * margin into, and centring is what width/max-width already do. */
+static int apply_box_shorthand(CssStyle *st, const char *val,
+                               int *top, unsigned btop, unsigned rtop,
+                               int *right, unsigned bright, unsigned rright,
+                               int *bottom, unsigned bbottom, unsigned rbottom,
+                               int *left, unsigned bleft, unsigned rleft,
+                               int allow_negative)
+{
+    int v[4], rel[4];
+    int n = 0;
+    const char *p = val;
+    char tok[32];
+    while (next_word(&p, tok, sizeof tok)) {
+        int px = 0, r = 0;
+        if (!ieq(tok, "auto") && !parse_len(tok, &px, &r)) return 0;
+        if (!allow_negative && px < 0) px = 0;
+        if (n >= 4) return 0;                 /* CSS takes at most four */
+        rel[n] = r;
+        v[n++] = px;
+    }
+    if (n == 0) return 0;
+    int t, r, b, l, rt = 0, rr = 0, rb = 0, rl = 0;
+    if (n == 1)      { t = r = b = l = v[0]; rt = rr = rb = rl = rel[0]; }
+    else if (n == 2) { t = b = v[0]; r = l = v[1];
+                       rt = rb = rel[0]; rr = rl = rel[1]; }
+    else if (n == 3) { t = v[0]; r = l = v[1]; b = v[2];
+                       rt = rel[0]; rr = rl = rel[1]; rb = rel[2]; }
+    else             { t = v[0]; r = v[1]; b = v[2]; l = v[3];
+                       rt = rel[0]; rr = rel[1]; rb = rel[2]; rl = rel[3]; }
+    *top = t; *right = r; *bottom = b; *left = l;
+    st->set |= btop | bright | bbottom | bleft;
+    st->rel = (st->rel & ~(rtop | rright | rbottom | rleft)) |
+              (rt ? rtop : 0) | (rr ? rright : 0) |
+              (rb ? rbottom : 0) | (rl ? rleft : 0);
+    return 1;
+}
+
+/* The first token of a value that is a colour, or 0. `background`
+ * carries an image, a position and a repeat mode as well as a colour, so
+ * the whole-value parser is the wrong tool for it. */
+static int first_color(const char *val, u32 *out)
+{
+    const char *p = val;
+    char tok[64];
+    while (next_word(&p, tok, sizeof tok)) {
+        if (css_color(tok, strlen(tok), out)) return 1;
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------
@@ -470,18 +674,9 @@ static void skip_balanced(Cur *c)
     }
 }
 
-/* The '@' has already been consumed. */
-static void skip_at_rule(Cur *c)
-{
-    while (c->i < c->n) {
-        int ch = cpeek(c);
-        if (ch == ';') { cadv(c); return; }
-        if (ch == '{') { cadv(c); skip_balanced(c); return; }
-        if (ch == '"' || ch == '\'') { skip_string(c, ch); continue; }
-        if (ch == '/' && c->i + 1 < c->n && c->s[c->i + 1] == '*') { cskip_ws(c); continue; }
-        cadv(c);
-    }
-}
+/* How deep @media blocks may nest before the rest is skipped. Real sheets
+ * never go past two; a hostile one must not recurse without end. */
+#define CSS_MEDIA_DEPTH 3
 
 /* ------------------------------------------------------------
  *  Statistics. One line, the first problem, with its real line.
@@ -795,7 +990,7 @@ static int decl_apply(CssStyle *st, const char *name, const char *val,
         st->set |= CSS_SET_COLOR;
         return 1;
     }
-    if (ieq(name, "background-color") || ieq(name, "background")) {
+    if (ieq(name, "background-color")) {
         if (!css_color(val, strlen(val), &c)) {
             if (sh) sh->stats.bad_values++;
             note(sh, line, "bad value for", name);
@@ -803,6 +998,38 @@ static int decl_apply(CssStyle *st, const char *name, const char *val,
         }
         st->background = c;
         st->set |= CSS_SET_BACKGROUND;
+        return 1;
+    }
+    if (ieq(name, "background")) {
+        /* `background: #fff url(x.png) no-repeat center` - the colour is
+         * one token of many, and a page that writes it this way is
+         * asking for the same fill as background-color. The first token
+         * that parses as a colour is that colour. */
+        if (!first_color(val, &c)) {
+            if (sh) sh->stats.bad_values++;
+            note(sh, line, "bad value for", name);
+            return 0;
+        }
+        st->background = c;
+        st->set |= CSS_SET_BACKGROUND;
+        return 1;
+    }
+    if (ieq(name, "display")) {
+        if (!parse_display(val, &n)) {
+            if (sh) sh->stats.bad_values++;
+            note(sh, line, "bad value for", name);
+            return 0;
+        }
+        st->display = n;
+        st->set |= CSS_SET_DISPLAY;
+        return 1;
+    }
+    if (ieq(name, "font-size")) {
+        if (!apply_font_size(st, val)) {
+            if (sh) sh->stats.bad_values++;
+            note(sh, line, "bad value for", name);
+            return 0;
+        }
         return 1;
     }
     if (ieq(name, "font-weight")) {
@@ -872,23 +1099,98 @@ static int decl_apply(CssStyle *st, const char *name, const char *val,
         return 1;
     }
     if (ieq(name, "margin-top") || ieq(name, "margin-bottom")) {
-        if (!parse_length(val, &n)) {
+        int rel = 0;
+        if (!parse_len(val, &n, &rel)) {
             if (sh) sh->stats.bad_values++;
             note(sh, line, "bad value for", name);
             return 0;
         }
-        if (ieq(name, "margin-top")) { st->margin_top = n; st->set |= CSS_SET_MARGIN_TOP; }
+        int top = ieq(name, "margin-top");
+        st->rel = (st->rel & ~(top ? CSS_RL_MARGIN_TOP : CSS_RL_MARGIN_BOTTOM)) |
+                  (rel ? (top ? CSS_RL_MARGIN_TOP : CSS_RL_MARGIN_BOTTOM) : 0);
+        if (top) { st->margin_top = n; st->set |= CSS_SET_MARGIN_TOP; }
         else { st->margin_bottom = n; st->set |= CSS_SET_MARGIN_BOTTOM; }
         return 1;
     }
-    if (ieq(name, "padding-top") || ieq(name, "padding-bottom")) {
-        if (!parse_length(val, &n) || n < 0) {
+    if (ieq(name, "margin-left") || ieq(name, "margin-right")) {
+        int rel = 0;
+        if (ieq(val, "auto")) {
+            n = 0;                     /* one column: no free space to take */
+        } else if (!parse_len(val, &n, &rel)) {
             if (sh) sh->stats.bad_values++;
             note(sh, line, "bad value for", name);
             return 0;
         }
-        if (ieq(name, "padding-top")) { st->pad_top = n; st->set |= CSS_SET_PAD_TOP; }
+        int left = ieq(name, "margin-left");
+        st->rel = (st->rel & ~(left ? CSS_RL_MARGIN_LEFT : CSS_RL_MARGIN_RIGHT)) |
+                  (rel ? (left ? CSS_RL_MARGIN_LEFT : CSS_RL_MARGIN_RIGHT) : 0);
+        if (left) { st->margin_left = n; st->set |= CSS_SET_MARGIN_LEFT; }
+        else { st->margin_right = n; st->set |= CSS_SET_MARGIN_RIGHT; }
+        return 1;
+    }
+    if (ieq(name, "margin")) {
+        if (!apply_box_shorthand(st, val,
+                                 &st->margin_top, CSS_SET_MARGIN_TOP, CSS_RL_MARGIN_TOP,
+                                 &st->margin_right, CSS_SET_MARGIN_RIGHT, CSS_RL_MARGIN_RIGHT,
+                                 &st->margin_bottom, CSS_SET_MARGIN_BOTTOM, CSS_RL_MARGIN_BOTTOM,
+                                 &st->margin_left, CSS_SET_MARGIN_LEFT, CSS_RL_MARGIN_LEFT,
+                                 1)) {
+            if (sh) sh->stats.bad_values++;
+            note(sh, line, "bad value for", name);
+            return 0;
+        }
+        return 1;
+    }
+    if (ieq(name, "padding-top") || ieq(name, "padding-bottom")) {
+        int rel = 0;
+        if (!parse_len(val, &n, &rel) || n < 0) {
+            if (sh) sh->stats.bad_values++;
+            note(sh, line, "bad value for", name);
+            return 0;
+        }
+        int top = ieq(name, "padding-top");
+        st->rel = (st->rel & ~(top ? CSS_RL_PAD_TOP : CSS_RL_PAD_BOTTOM)) |
+                  (rel ? (top ? CSS_RL_PAD_TOP : CSS_RL_PAD_BOTTOM) : 0);
+        if (top) { st->pad_top = n; st->set |= CSS_SET_PAD_TOP; }
         else { st->pad_bottom = n; st->set |= CSS_SET_PAD_BOTTOM; }
+        return 1;
+    }
+    if (ieq(name, "padding-left") || ieq(name, "padding-right")) {
+        int rel = 0;
+        if (!parse_len(val, &n, &rel) || n < 0) {
+            if (sh) sh->stats.bad_values++;
+            note(sh, line, "bad value for", name);
+            return 0;
+        }
+        int left = ieq(name, "padding-left");
+        st->rel = (st->rel & ~(left ? CSS_RL_PAD_LEFT : CSS_RL_PAD_RIGHT)) |
+                  (rel ? (left ? CSS_RL_PAD_LEFT : CSS_RL_PAD_RIGHT) : 0);
+        if (left) { st->pad_left = n; st->set |= CSS_SET_PAD_LEFT; }
+        else { st->pad_right = n; st->set |= CSS_SET_PAD_RIGHT; }
+        return 1;
+    }
+    if (ieq(name, "padding")) {
+        if (!apply_box_shorthand(st, val,
+                                 &st->pad_top, CSS_SET_PAD_TOP, CSS_RL_PAD_TOP,
+                                 &st->pad_right, CSS_SET_PAD_RIGHT, CSS_RL_PAD_RIGHT,
+                                 &st->pad_bottom, CSS_SET_PAD_BOTTOM, CSS_RL_PAD_BOTTOM,
+                                 &st->pad_left, CSS_SET_PAD_LEFT, CSS_RL_PAD_LEFT,
+                                 0)) {
+            if (sh) sh->stats.bad_values++;
+            note(sh, line, "bad value for", name);
+            return 0;
+        }
+        return 1;
+    }
+    if (ieq(name, "border")) {
+        /* This renderer draws a block's top and bottom rule, so a plain
+         * `border: 1px solid x` is those two. */
+        if (!apply_border_shorthand(st, val, 1) ||
+            !apply_border_shorthand(st, val, 0)) {
+            if (sh) sh->stats.bad_values++;
+            note(sh, line, "bad value for", name);
+            return 0;
+        }
         return 1;
     }
     if (ieq(name, "border-top") || ieq(name, "border-bottom")) {
@@ -931,23 +1233,25 @@ static int decl_apply(CssStyle *st, const char *name, const char *val,
         return 1;
     }
     if (ieq(name, "width") || ieq(name, "max-width")) {
-        int px = 0, pct = 0;
+        int px = 0, pct = 0, rel = 0;
         int is_max = (name[0] == 'm');
         if (is_max && ieq(val, "none")) {
             /* none is a real value: no maximum, whatever an ancestor said */
             st->max_width = 0;
             st->max_width_pct = 0;
+            st->rel &= ~CSS_RL_MAX_WIDTH;
             st->set |= CSS_SET_MAX_WIDTH;
             return 1;
         }
         if (!is_max && ieq(val, "auto")) {
             st->width = 0;
             st->width_pct = 0;
+            st->rel &= ~CSS_RL_WIDTH;
             st->set |= CSS_SET_WIDTH;
             return 1;
         }
         if (parse_percent(val, &pct)) { px = 0; }
-        else if (!parse_length(val, &px) || px < 0) {
+        else if (!parse_len(val, &px, &rel) || px < 0) {
             if (sh) sh->stats.bad_values++;
             note(sh, line, "bad value for", name);
             return 0;
@@ -955,10 +1259,12 @@ static int decl_apply(CssStyle *st, const char *name, const char *val,
         if (is_max) {
             st->max_width = px;
             st->max_width_pct = pct;
+            st->rel = (st->rel & ~CSS_RL_MAX_WIDTH) | (rel ? CSS_RL_MAX_WIDTH : 0);
             st->set |= CSS_SET_MAX_WIDTH;
         } else {
             st->width = px;
             st->width_pct = pct;
+            st->rel = (st->rel & ~CSS_RL_WIDTH) | (rel ? CSS_RL_WIDTH : 0);
             st->set |= CSS_SET_WIDTH;
         }
         return 1;
@@ -1162,6 +1468,139 @@ void css_sheet_init(CssSheet *sheet)
     memset(sheet, 0, sizeof *sheet);
 }
 
+/* ------------------------------------------------------------
+ *  @media
+ *
+ *  A text browser can answer one media question - what kind of medium
+ *  is this - and it answers it from the query's TYPE, never by guessing
+ *  at a viewport it does not have. `screen`, `all` and `not print`
+ *  match. `print` does not. A query that narrows on a feature
+ *  (`(max-width: 600px)`, `(prefers-color-scheme: dark)`) cannot be
+ *  evaluated against a column of text, so it does not match and is
+ *  counted: a mobile-first sheet's phone rules must not be applied to
+ *  the desktop page the reader is looking at.
+ * ------------------------------------------------------------ */
+static int media_query_matches(const char *q)
+{
+    if (!q[0]) return 1;                       /* `@media {` = all      */
+    for (const char *p = q; *p; p++)
+        if (*p == '(') return 0;               /* a feature: not ours   */
+
+    const char *p = q;
+    char tok[32];
+    int negated = 0, yes = 0, typed = 0;
+    while (next_word(&p, tok, sizeof tok)) {
+        if (ieq(tok, "not")) { negated = 1; continue; }
+        if (ieq(tok, "only") || ieq(tok, "and")) continue;
+        if (ieq(tok, "screen") || ieq(tok, "all")) { yes = 1; typed = 1; continue; }
+        if (ieq(tok, "print") || ieq(tok, "speech") || ieq(tok, "tv") ||
+            ieq(tok, "braille") || ieq(tok, "handheld") ||
+            ieq(tok, "projection") || ieq(tok, "tty") ||
+            ieq(tok, "embossed")) { typed = 1; continue; }
+        return 0;                              /* a type we do not know */
+    }
+    if (negated) return !yes;
+    return yes || !typed;
+}
+
+/* A whole comma-separated media query list. */
+static int media_matches(const char *list, size_t len)
+{
+    size_t i = 0;
+    while (i <= len) {
+        size_t j = i;
+        while (j < len && list[j] != ',') j++;
+        char q[96];
+        size_t a = i, b = j, n = 0;
+        while (a < b && is_space((unsigned char)list[a])) a++;
+        while (b > a && is_space((unsigned char)list[b - 1])) b--;
+        for (size_t k = a; k < b && n + 1 < sizeof q; k++) q[n++] = list[k];
+        q[n] = 0;
+        if (media_query_matches(q)) return 1;
+        if (j >= len) break;
+        i = j + 1;
+    }
+    return 0;
+}
+
+int css_media_matches(const char *list)
+{
+    if (!list || !list[0]) return 1;
+    return media_matches(list, strlen(list));
+}
+
+static void parse_rule_list(Cur *c, CssSheet *sh, int depth);
+
+/* The '@' has already been consumed. Everything except a screen @media
+ * is skipped as a unit, exactly as before. */
+static void parse_at_rule(Cur *c, CssSheet *sh, int depth)
+{
+    char name[20];
+    if (!read_name(c, name, (int)sizeof name, 1)) name[0] = 0;
+
+    char pre[96];
+    int pl = 0, have_block = 0;
+    for (;;) {
+        int ch = cpeek(c);
+        if (ch < 0) break;
+        if (ch == ';') { cadv(c); break; }
+        if (ch == '{') { cadv(c); have_block = 1; break; }
+        if (ch == '"' || ch == '\'') { skip_string(c, ch); continue; }
+        if (ch == '/' && c->i + 1 < c->n && c->s[c->i + 1] == '*') { cskip_ws(c); continue; }
+        if (is_space(ch)) {
+            if (pl > 0 && pre[pl - 1] != ' ' && pl < (int)sizeof pre - 1)
+                pre[pl++] = ' ';
+        } else if (pl < (int)sizeof pre - 1) {
+            pre[pl++] = (char)ch;
+        }
+        cadv(c);
+    }
+    pre[pl] = 0;
+    while (pl > 0 && pre[pl - 1] == ' ') pre[--pl] = 0;
+
+    sh->stats.at_rules++;
+    if (!have_block) return;                   /* @import, @charset: done */
+
+    if (ieq(name, "media") && depth < CSS_MEDIA_DEPTH) {
+        if (!media_matches(pre, (size_t)pl)) {
+            sh->stats.media_skipped++;
+            skip_balanced(c);
+            return;
+        }
+        sh->stats.media_applied++;
+        parse_rule_list(c, sh, depth + 1);
+        return;
+    }
+    skip_balanced(c);
+}
+
+/* Parse rules until the closing '}' of the enclosing block (consumed) or
+ * the end of the sheet. `depth` is how many @media blocks enclose this
+ * one; at depth 0 a stray '}' is an error, inside a block it is the end. */
+static void parse_rule_list(Cur *c, CssSheet *sh, int depth)
+{
+    for (;;) {
+        cskip_ws(c);
+        int ch = cpeek(c);
+        if (ch < 0) return;
+        if (ch == '}') {
+            cadv(c);
+            if (depth == 0) {
+                sh->stats.bad_rules++;
+                note(sh, c->line, "unexpected", "}");
+                continue;
+            }
+            return;
+        }
+        if (ch == '@') {
+            cadv(c);
+            parse_at_rule(c, sh, depth);
+            continue;
+        }
+        parse_rule(c, sh);
+    }
+}
+
 int css_parse(const char *text, size_t len, CssSheet *sheet)
 {
     if (!text || !sheet) return -1;
@@ -1180,24 +1619,7 @@ int css_parse(const char *text, size_t len, CssSheet *sheet)
     c.i = 0;
     c.line = 1;
 
-    for (;;) {
-        cskip_ws(&c);
-        int ch = cpeek(&c);
-        if (ch < 0) break;
-        if (ch == '@') {
-            cadv(&c);
-            sheet->stats.at_rules++;
-            skip_at_rule(&c);
-            continue;
-        }
-        if (ch == '}') {
-            cadv(&c);
-            sheet->stats.bad_rules++;
-            note(sheet, c.line, "unexpected", "}");
-            continue;
-        }
-        parse_rule(&c, sheet);
-    }
+    parse_rule_list(&c, sheet, 0);
     return sheet->nrules - before;
 }
 
@@ -1221,6 +1643,10 @@ int css_parse(const char *text, size_t len, CssSheet *sheet)
  * ------------------------------------------------------------ */
 static const char kDefaultCss[] =
 "body { margin-top: 0; margin-bottom: 0; }\n"
+/* HTML's own hidden elements. This is real UA CSS, and it matters for
+ * real pages: <head> carries <meta>, <link> and <style> children whose
+ * text would otherwise be laid out as a paragraph. */
+"head, script, style, title, base, meta, link, param { display: none; }\n"
 "p { margin-top: 12px; margin-bottom: 12px; }\n"
 "h1, h2, h3, h4, h5, h6 { font-weight: bold; margin-top: 16px; margin-bottom: 16px; }\n"
 "ul, ol, menu, dir { margin-top: 12px; margin-bottom: 12px; }\n"
@@ -1253,7 +1679,10 @@ typedef struct {
 } CssTagDefault;
 
 static const CssTagDefault kTagDefaults[] = {
-    { "body",       CSS_BASE_FONT_SIZE, 0,  0 },
+    /* `body` is deliberately absent: its size is the initial one, so it
+     * inherits whatever <html> resolved to (html { font-size: 16px } on a
+     * real page must reach the text, not be overwritten by a 12 px UA
+     * fact). css_style_init() already starts at CSS_BASE_FONT_SIZE. */
     { "h1",         24,                 0,  0 },
     { "h2",         20,                 0,  0 },
     { "h3",         17,                 0,  0 },
@@ -1366,9 +1795,9 @@ static int sel_match(const CssSelector *sel, const char *tag,
  * is nothing to cascade. */
 enum {
     P_COLOR, P_BG, P_WEIGHT, P_ITALIC, P_DECOR, P_ALIGN,
-    P_MT, P_MB, P_PT, P_PB,
+    P_MT, P_MB, P_ML, P_MR, P_PT, P_PB, P_PL, P_PR,
     P_BTW, P_BTS, P_BTC, P_BBW, P_BBS, P_BBC,
-    P_LIST, P_WS, P_WIDTH, P_MAXW, P_LH, P_COUNT
+    P_LIST, P_WS, P_WIDTH, P_MAXW, P_LH, P_DISPLAY, P_FS, P_COUNT
 };
 
 #define CSS_SPEC_UA   (-1000000)
@@ -1402,17 +1831,59 @@ static void cascade(CssStyle *dst, const CssStyle *src, int spec, int *best)
     if (TAKE(CSS_SET_ALIGN, P_ALIGN)) {
         dst->align = src->align; best[P_ALIGN] = spec; dst->set |= CSS_SET_ALIGN;
     }
+    /* A relative length keeps its CSS_RL_* bit with the value it belongs
+     * to: taking a declaration must take its unit as well, or an em value
+     * from a lower-priority rule would be read as px. */
     if (TAKE(CSS_SET_MARGIN_TOP, P_MT)) {
         dst->margin_top = src->margin_top; best[P_MT] = spec; dst->set |= CSS_SET_MARGIN_TOP;
+        dst->rel = (dst->rel & ~CSS_RL_MARGIN_TOP) | (src->rel & CSS_RL_MARGIN_TOP);
     }
     if (TAKE(CSS_SET_MARGIN_BOTTOM, P_MB)) {
         dst->margin_bottom = src->margin_bottom; best[P_MB] = spec; dst->set |= CSS_SET_MARGIN_BOTTOM;
+        dst->rel = (dst->rel & ~CSS_RL_MARGIN_BOTTOM) | (src->rel & CSS_RL_MARGIN_BOTTOM);
+    }
+    if (TAKE(CSS_SET_MARGIN_LEFT, P_ML)) {
+        dst->margin_left = src->margin_left; best[P_ML] = spec; dst->set |= CSS_SET_MARGIN_LEFT;
+        dst->rel = (dst->rel & ~CSS_RL_MARGIN_LEFT) | (src->rel & CSS_RL_MARGIN_LEFT);
+    }
+    if (TAKE(CSS_SET_MARGIN_RIGHT, P_MR)) {
+        dst->margin_right = src->margin_right; best[P_MR] = spec; dst->set |= CSS_SET_MARGIN_RIGHT;
+        dst->rel = (dst->rel & ~CSS_RL_MARGIN_RIGHT) | (src->rel & CSS_RL_MARGIN_RIGHT);
     }
     if (TAKE(CSS_SET_PAD_TOP, P_PT)) {
         dst->pad_top = src->pad_top; best[P_PT] = spec; dst->set |= CSS_SET_PAD_TOP;
+        dst->rel = (dst->rel & ~CSS_RL_PAD_TOP) | (src->rel & CSS_RL_PAD_TOP);
     }
     if (TAKE(CSS_SET_PAD_BOTTOM, P_PB)) {
         dst->pad_bottom = src->pad_bottom; best[P_PB] = spec; dst->set |= CSS_SET_PAD_BOTTOM;
+        dst->rel = (dst->rel & ~CSS_RL_PAD_BOTTOM) | (src->rel & CSS_RL_PAD_BOTTOM);
+    }
+    if (TAKE(CSS_SET_PAD_LEFT, P_PL)) {
+        dst->pad_left = src->pad_left; best[P_PL] = spec; dst->set |= CSS_SET_PAD_LEFT;
+        dst->rel = (dst->rel & ~CSS_RL_PAD_LEFT) | (src->rel & CSS_RL_PAD_LEFT);
+    }
+    if (TAKE(CSS_SET_PAD_RIGHT, P_PR)) {
+        dst->pad_right = src->pad_right; best[P_PR] = spec; dst->set |= CSS_SET_PAD_RIGHT;
+        dst->rel = (dst->rel & ~CSS_RL_PAD_RIGHT) | (src->rel & CSS_RL_PAD_RIGHT);
+    }
+
+    if (TAKE(CSS_SET_DISPLAY, P_DISPLAY)) {
+        dst->display = src->display; best[P_DISPLAY] = spec; dst->set |= CSS_SET_DISPLAY;
+    }
+    /* font-size is one property with three sources; the winner clears the
+     * other two so css_for() resolves the one that was written last. */
+    if ((src->set & (CSS_SET_FONT_SIZE | CSS_SET_FONT_SIZE_REL | CSS_SET_FONT_SIZE_REM)) &&
+        spec >= best[P_FS]) {
+        dst->set &= ~(CSS_SET_FONT_SIZE | CSS_SET_FONT_SIZE_REL | CSS_SET_FONT_SIZE_REM);
+        if (src->set & CSS_SET_FONT_SIZE) {
+            dst->font_size = src->font_size;
+            dst->set |= CSS_SET_FONT_SIZE;
+        } else {
+            dst->font_size_pct = src->font_size_pct;
+            dst->set |= (src->set & CSS_SET_FONT_SIZE_REM) ? CSS_SET_FONT_SIZE_REM
+                                                          : CSS_SET_FONT_SIZE_REL;
+        }
+        best[P_FS] = spec;
     }
     if (TAKE(CSS_SET_BORDER_TOP_W, P_BTW)) {
         dst->border_top_w = src->border_top_w; best[P_BTW] = spec; dst->set |= CSS_SET_BORDER_TOP_W;
@@ -1441,10 +1912,12 @@ static void cascade(CssStyle *dst, const CssStyle *src, int spec, int *best)
     if (TAKE(CSS_SET_WIDTH, P_WIDTH)) {
         dst->width = src->width; dst->width_pct = src->width_pct;
         best[P_WIDTH] = spec; dst->set |= CSS_SET_WIDTH;
+        dst->rel = (dst->rel & ~CSS_RL_WIDTH) | (src->rel & CSS_RL_WIDTH);
     }
     if (TAKE(CSS_SET_MAX_WIDTH, P_MAXW)) {
         dst->max_width = src->max_width; dst->max_width_pct = src->max_width_pct;
         best[P_MAXW] = spec; dst->set |= CSS_SET_MAX_WIDTH;
+        dst->rel = (dst->rel & ~CSS_RL_MAX_WIDTH) | (src->rel & CSS_RL_MAX_WIDTH);
     }
     if (TAKE(CSS_SET_LINE_HEIGHT, P_LH)) {
         dst->line_height = src->line_height; dst->line_height_pct = src->line_height_pct;
@@ -1605,9 +2078,51 @@ CssStyle css_for(const CssSheet *sheet, const char *tag, const char *class_attr,
     if (!(out.set & CSS_SET_BORDER_BOTTOM_C)) out.border_bottom_color = out.color;
     if (out.pad_top < 0) out.pad_top = 0;
     if (out.pad_bottom < 0) out.pad_bottom = 0;
+    if (out.pad_left < 0) out.pad_left = 0;
+    if (out.pad_right < 0) out.pad_right = 0;
     if (out.border_top_w < 0) out.border_top_w = 0;
     if (out.border_bottom_w < 0) out.border_bottom_w = 0;
     if (out.font_size <= 0) out.font_size = CSS_BASE_FONT_SIZE;
+
+    /* em / % are relative to the parent's resolved size, rem to the root
+     * element's. This is the one place that can see both. */
+    if (out.set & (CSS_SET_FONT_SIZE_REL | CSS_SET_FONT_SIZE_REM)) {
+        int base = CSS_BASE_FONT_SIZE;
+        if (out.set & CSS_SET_FONT_SIZE_REL) {
+            if (parent && parent->font_size > 0) base = parent->font_size;
+        } else {
+            const CssNode *r = st;
+            while (r && r->up) r = r->up;
+            if (r && r->style.font_size > 0) base = r->style.font_size;
+        }
+        out.font_size = (base * out.font_size_pct + 50) / 100;
+        out.set &= ~(CSS_SET_FONT_SIZE_REL | CSS_SET_FONT_SIZE_REM);
+        out.set |= CSS_SET_FONT_SIZE;
+    }
+    if (out.font_size < 4) out.font_size = 4;
+    if (out.font_size > 400) out.font_size = 400;
+
+    /* em lengths: multiplied by this element's own resolved font size,
+     * which is exactly what CSS says `margin: 1em` means. Done here, after
+     * the font size is final, so a rule that sets both is not read in the
+     * wrong order. */
+    if (out.rel) {
+        int fs = out.font_size;
+#define RESOLVE_EM(field, bit)                                                          if (out.rel & (bit)) {                                                              int v = out.field;                                                              out.field = (v * fs + (v < 0 ? -50 : 50)) / 100;                            }
+        RESOLVE_EM(margin_top,    CSS_RL_MARGIN_TOP)
+        RESOLVE_EM(margin_right,  CSS_RL_MARGIN_RIGHT)
+        RESOLVE_EM(margin_bottom, CSS_RL_MARGIN_BOTTOM)
+        RESOLVE_EM(margin_left,   CSS_RL_MARGIN_LEFT)
+        RESOLVE_EM(pad_top,       CSS_RL_PAD_TOP)
+        RESOLVE_EM(pad_right,     CSS_RL_PAD_RIGHT)
+        RESOLVE_EM(pad_bottom,    CSS_RL_PAD_BOTTOM)
+        RESOLVE_EM(pad_left,      CSS_RL_PAD_LEFT)
+        RESOLVE_EM(width,         CSS_RL_WIDTH)
+        RESOLVE_EM(max_width,     CSS_RL_MAX_WIDTH)
+#undef RESOLVE_EM
+        out.rel = 0;
+    }
+
     if (out.weight < 100) out.weight = 100;
     if (out.weight > 900) out.weight = 900;
     if (out.line_height_pct > 0)
@@ -1651,4 +2166,38 @@ int css_inline(CssStyle *style, const char *decls, size_t len)
     if (style->line_height_pct > 0)
         style->line_height = (style->font_size * style->line_height_pct + 50) / 100;
     return applied;
+}
+
+void css_resolve_relative(CssStyle *style, int parent_font_size,
+                          int root_font_size)
+{
+    if (!style) return;
+    if (style->set & (CSS_SET_FONT_SIZE_REL | CSS_SET_FONT_SIZE_REM)) {
+        int base = (style->set & CSS_SET_FONT_SIZE_REM) ? root_font_size
+                                                        : parent_font_size;
+        if (base <= 0) base = CSS_BASE_FONT_SIZE;
+        style->font_size = (base * style->font_size_pct + 50) / 100;
+        style->set |= CSS_SET_FONT_SIZE;
+        style->set &= ~(CSS_SET_FONT_SIZE_REL | CSS_SET_FONT_SIZE_REM);
+    }
+    if (style->font_size < 4) style->font_size = 4;
+    if (style->font_size > 400) style->font_size = 400;
+    if (style->line_height_pct > 0)
+        style->line_height = (style->font_size * style->line_height_pct + 50) / 100;
+    if (style->line_height < 0) style->line_height = 0;
+}
+
+int css_inline_for(CssStyle *style, const char *decls, size_t len,
+                   const CssStyle *parent)
+{
+    if (!style) return -1;
+    int n = css_inline(style, decls, len);
+    if (n < 0) return n;
+    int root = CSS_BASE_FONT_SIZE;
+    if (parent && (parent->set & CSS_SET_FONT_SIZE) && parent->font_size > 0)
+        root = parent->font_size;
+    css_resolve_relative(style, parent && parent->font_size > 0 ? parent->font_size
+                                                               : CSS_BASE_FONT_SIZE,
+                         root);
+    return n;
 }

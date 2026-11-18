@@ -8,11 +8,23 @@
 #
 #      pkg list                  what the repository offers
 #      pkg installed             what is on the disk
-#      pkg install <name>        download, verify, unpack
+#      pkg install <name>        download (resuming a .part), verify, unpack
 #      pkg remove <name>         delete it
 #      pkg update                refresh the cached index
 #      pkg repo                  which repository is in use
 #      pkg key                   which public key this image trusts
+#
+#  What an install produces: one bundle under $APPS, i.e.
+#      $APPS/<bundle>/manifest      name, desc, version, exec
+#      $APPS/<bundle>/<exec>        the program the launcher runs
+#      $APPS/<bundle>/.pkg-name     the package that put it there
+#      $APPS/<bundle>/.pkg-version  the version the signed index published
+#  <bundle> is the package name unless the package's manifest names one, and
+#  <exec> is checked against the tree pkg just unpacked - a manifest whose
+#  exec= names a file the package does not contain is repaired, not shipped as
+#  a tile that cannot start. After the move pkg writes $RUN/rescan.request: the
+#  launcher polls it, rescans and removes it, so a new bundle can be launched
+#  in the same session it was installed in.
 #
 #  Repository layout - identical for a static host, a directory
 #  listing and GitHub release assets. The index is signed; an index
@@ -22,6 +34,8 @@
 #      <base>/index.pub       32 raw bytes, the publisher's public key
 #      <base>/<file>
 #      name<TAB>version<TAB>size<TAB>sha256<TAB>file<TAB>description
+#  size is the transfer size. An optional seventh column is the unpacked size;
+#  when a publisher provides it, the space check before the download is exact.
 #
 #  The trusted key is NOT downloaded. It ships in the image at
 #  /etc/mystic/repo.pub, because a key fetched from the same server as
@@ -33,8 +47,26 @@
 #                              non-comment, non-blank line holds the URL
 #      the built-in public repository (the latest GitHub release assets)
 #
-#  A failed transfer never leaves a .part file behind and always
-#  reports the HTTP status it saw.
+#  A transfer is RESUMED, never silently restarted: a .part left behind by an
+#  interrupted attempt is continued with `wget -c` (Range), reported once a
+#  second as bytes-so-far against the size the signed index publishes, and
+#  verified - size first, then sha256 - BEFORE a single byte is unpacked. A
+#  mismatch deletes the .part and prints both numbers. A failed transfer keeps
+#  the .part and says so, because the next run continues it.
+#
+#  Free space is checked twice: before the first byte is requested (the index
+#  size must fit in the cache and in $APPS) and again, with the exact size of
+#  the unpacked tree taken from the archive's own member list, before anything
+#  is written to $APPS. A package that cannot fit says so with the real
+#  numbers - need X, have Y - instead of dying halfway through a write.
+#
+#  A tarball may contain symlinks and a lib/ tree (the vlc package does). tar
+#  cannot create a symlink on every filesystem, and busybox tar stops at the
+#  first member it cannot create, so the exit status of tar is not the test:
+#  every member of the archive is looked for in the unpacked tree, the ones
+#  tar skipped are extracted by name, and every symlink member is created with
+#  ln -s (or, where the filesystem forbids links entirely, copied from its
+#  target). What was repaired is counted and printed.
 # ============================================================
 
 # The public default: the GitHub release that publishes the package assets
@@ -49,9 +81,17 @@ CONF="${MYSTIC_REPO_CONF:-/etc/mystic/repo.conf}"
 # medium choose another root); the image always uses the defaults.
 APPS="${MYSTIC_APPS:-/root/apps}"
 CACHE="${MYSTIC_CACHE:-/tmp/pkg}"
+# The desktop's run dir: the cached index the Store reads, and the two request
+# files below. MYSTIC_RUN is the same kind of host-test hook.
+RUN="${MYSTIC_RUN:-/run/mystic}"
 INDEX="$CACHE/index.tsv"
 DL_LOG="$CACHE/download.log"
-RUN_INDEX=/run/mystic/repo.index
+RUN_INDEX="$RUN/repo.index"
+# Written after every install/remove and removed by the desktop when it has
+# rescanned. Without it the launcher's list is frozen at whatever it found when
+# it started: a bundle installed from the Store stayed invisible until reboot,
+# and the tile that was there pointed at a payload pkg had just replaced.
+RESCAN="$RUN/rescan.request"
 
 # The trust anchor. The public key is part of the OS image and is never
 # fetched: a key that arrives from the same server as the signature proves
@@ -66,10 +106,32 @@ say()  { echo "$*"; }
 warn() { echo "pkg: $*" >&2; }
 die()  { echo "pkg: $*" >&2; exit 1; }
 
-# A transfer interrupted by a signal must not leave a .part behind either.
+# A transfer interrupted by a signal keeps its .part and kills its wget: that is
+# the whole point of resuming. Only an explicit failure path deletes it.
 PART=
-cleanup() { [ -n "$PART" ] && rm -f "$PART"; }
-trap cleanup EXIT INT TERM HUP
+XFER_ACTIVE=0
+XFER_PID=
+CLEANED=0
+cleanup() {
+    [ "$CLEANED" = 1 ] && return 0
+    CLEANED=1
+    if [ "$XFER_ACTIVE" = 1 ]; then
+        # The child does not die with this shell: wget would keep writing the
+        # .part after the message that says the transfer stopped.
+        [ -n "$XFER_PID" ] && kill "$XFER_PID" 2>/dev/null
+        if [ -n "$PART" ] && [ -f "$PART" ]; then
+            _c_bytes=$(file_bytes "$PART" 2>/dev/null) || _c_bytes=0
+            echo "" >&2
+            warn "interrupted with $(human "$_c_bytes") in $PART"
+            warn "  the partial file is kept - run the same command again to resume it"
+            return 0
+        fi
+    fi
+    [ -n "$PART" ] && rm -f "$PART"
+    return 0
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM HUP
 
 trim() {
     printf '%s' "$1" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
@@ -130,18 +192,148 @@ http_code_of() {
     sed -n 's/.*HTTP\/[0-9][0-9.]*[[:space:]]*\([0-9][0-9][0-9]\).*/\1/p' "$1" | tail -n 1
 }
 
-download_once() {
-    PART=$2
-    rm -f "$2" "$DL_LOG"
-    wget -q -S -T "$3" -O "$2" "$1" 2>"$DL_LOG"
+# ------------------------------------------------------------- transfers
+# One transfer, shared by a 1 KB index and a 38.8 MB tarball. Over plain
+# `wget -O` it adds four things the large packages need:
+#
+#  RESUME    a .part left by an interrupted attempt is continued with
+#            `wget -c`, which sends "Range: bytes=<have>-" and appends the
+#            rest. A .part already at the published size is not resumed: it is
+#            either complete-and-unverified or junk, so it starts over.
+#  PROGRESS  bytes so far against the total the signed index publishes, once a
+#            second: one rewritten line on a terminal, one line every 10% in a
+#            log. No total in the index means no percentage - never a guess.
+#  WATCHDOG  a transfer that delivers nothing for XFER_STALL seconds is killed.
+#            The timeout lives here rather than in wget's -T because busybox
+#            builds without FEATURE_WGET_TIMEOUT do not have -T at all.
+#  NO TRUST  wget's exit status proves nothing; the caller checks the final
+#            size and the sha256 against the index before anything is unpacked.
+XFER_POLL=1
+XFER_STALL=60
+
+# xfer URL DEST TOTAL WHAT - TOTAL 0 means "the index does not say".
+# Returns 0 when wget reports success; the caller verifies the bytes.
+xfer() {
+    _x_url=$1
+    _x_dest=$2
+    _x_total=$3
+    _x_what=$4
+
+    _x_have=$(file_bytes "$_x_dest" 2>/dev/null) || _x_have=0
+    [ -n "$_x_have" ] || _x_have=0
+    _x_resume=0
+    if num_ge "$_x_have" 1; then
+        if num_ge "$_x_total" 1 && num_ge "$_x_have" "$_x_total"; then
+            say "  $_x_what: discarding a $(human "$_x_have") partial file (the index says $(human "$_x_total"))"
+            rm -f "$_x_dest"
+            _x_have=0
+        else
+            _x_resume=1
+            if num_ge "$_x_total" 1; then
+                say "  $_x_what: resuming at $(human "$_x_have") of $(human "$_x_total") ($(awk -v a="$_x_have" -v b="$_x_total" 'BEGIN { printf "%d", int(a * 100 / b) }')%)"
+            else
+                say "  $_x_what: resuming at $(human "$_x_have")"
+            fi
+        fi
+    fi
+
+    : > "$DL_LOG"
+    _x_tty=0
+    [ -t 1 ] && _x_tty=1
+    if [ "$_x_resume" = 1 ]; then
+        wget -q -S -c -O "$_x_dest" "$_x_url" 2>"$DL_LOG" &
+    else
+        wget -q -S -O "$_x_dest" "$_x_url" 2>"$DL_LOG" &
+    fi
+    _x_pid=$!
+    XFER_PID=$_x_pid
+    PART=$_x_dest
+    XFER_ACTIVE=1
+    _x_t0=$(date +%s)
+    _x_seen=$_x_have
+    _x_grow_at=$(date +%s)
+    _x_stall=0
+    _x_shown=-1
+    while kill -0 "$_x_pid" 2>/dev/null; do
+        sleep "$XFER_POLL"
+        _x_now=$(file_bytes "$_x_dest" 2>/dev/null) || _x_now=0
+        [ -n "$_x_now" ] || _x_now=0
+        if [ "$_x_now" = "$_x_seen" ]; then
+            # Wall clock, not the number of polls: sleep drifts, and this number
+            # is what decides that a transfer is dead.
+            _x_stall=$(( $(date +%s) - _x_grow_at ))
+        else
+            _x_seen=$_x_now
+            _x_grow_at=$(date +%s)
+            _x_stall=0
+        fi
+        _x_el=$(( $(date +%s) - _x_t0 ))
+        [ "$_x_el" -ge 1 ] || _x_el=1
+        _x_rate=$(awk -v n="$_x_now" -v h="$_x_have" -v t="$_x_el" 'BEGIN {
+            r = (n - h) / t;
+            if (r >= 1048576) printf "%.1f MB/s", r / 1048576;
+            else if (r >= 1024) printf "%.0f KB/s", r / 1024;
+            else printf "%.0f B/s", r;
+        }')
+        if num_ge "$_x_total" 1; then
+            _x_pct=$(awk -v a="$_x_now" -v b="$_x_total" 'BEGIN {
+                p = int(a * 100 / b); if (p > 99) p = 99; if (p < 0) p = 0; print p }')
+            _x_line="  $_x_what: $(human "$_x_now") / $(human "$_x_total") ($_x_pct%) $_x_rate ${_x_el}s"
+            _x_bucket=$((_x_pct / 10))
+        else
+            _x_line="  $_x_what: $(human "$_x_now") downloaded $_x_rate ${_x_el}s"
+            _x_bucket=$((_x_el / 10))
+        fi
+        if [ "$_x_tty" = 1 ]; then
+            printf '\r%s\033[K' "$_x_line"
+        elif [ "$_x_bucket" != "$_x_shown" ]; then
+            say "$_x_line"
+            _x_shown=$_x_bucket
+        fi
+        if [ "$_x_stall" -ge "$XFER_STALL" ]; then
+            [ "$_x_tty" = 1 ] && printf '\n'
+            warn "$_x_what: no data for ${_x_stall}s - giving up on this transfer"
+            kill "$_x_pid" 2>/dev/null
+            break
+        fi
+    done
+    wait "$_x_pid"
+    _x_rc=$?
+    XFER_ACTIVE=0
+    XFER_PID=
+    [ "$_x_tty" = 1 ] && printf '\n'
+    _x_now=$(file_bytes "$_x_dest" 2>/dev/null) || _x_now=0
+    [ -n "$_x_now" ] || _x_now=0
+    # wget's status can be lost if it exited between two samples (the shell
+    # reaped it before wait). The size is the evidence the caller re-checks.
+    if [ "$_x_rc" -ne 0 ] && num_ge "$_x_total" 1 && [ "$_x_now" = "$_x_total" ]; then
+        _x_rc=0
+    fi
+    if [ "$_x_rc" -ne 0 ]; then
+        return 1
+    fi
+    PART=
+    _x_secs=$(( $(date +%s) - _x_t0 ))
+    if num_ge "$_x_total" 1; then
+        say "  $_x_what: $(human "$_x_now") of $(human "$_x_total") in ${_x_secs}s"
+    else
+        say "  $_x_what: $(human "$_x_now") in ${_x_secs}s"
+    fi
+    return 0
 }
 
-# download URL DEST TIMEOUT WHAT
+# download URL DEST TIMEOUT WHAT - the index-sized files. TIMEOUT is a stall
+# limit in seconds (it used to be wget's -T, which not every busybox has).
 download() {
     _what=$4
+    _x_saved=$XFER_STALL
+    case "$3" in
+        ''|*[!0-9]*) : ;;
+        *) [ "$3" -ge 1 ] && XFER_STALL=$3 ;;
+    esac
     DL_CODE=
-    if download_once "$1" "$2" "$3"; then
-        PART=
+    if xfer "$1" "$2" 0 "$_what"; then
+        XFER_STALL=$_x_saved
         return 0
     fi
     _code=$(http_code_of "$DL_LOG")
@@ -152,13 +344,14 @@ download() {
         ''|5??|429)
             say "  $_what: retrying once..."
             sleep 1
-            if download_once "$1" "$2" "$3"; then
-                PART=
+            if xfer "$1" "$2" 0 "$_what"; then
+                XFER_STALL=$_x_saved
                 return 0
             fi
             _code=$(http_code_of "$DL_LOG")
             ;;
     esac
+    XFER_STALL=$_x_saved
     rm -f "$2"
     PART=
     DL_CODE=$_code
@@ -171,7 +364,6 @@ download() {
     [ -n "$_why" ] && warn "  wget: $_why"
     return 1
 }
-
 # The cached index and the tarballs live in $CACHE. If an unprivileged
 # user pre-created that directory they could swap the index between the
 # signature check and the read, so the cache must be ours and not writable
@@ -235,25 +427,266 @@ verify_index() {
     return 1
 }
 
-# A package is unpacked as root. tar would happily write "../../etc/shadow"
-# or an absolute path out of the install directory, so every member is
-# checked before a single byte is extracted.
-tar_members_ok() {
-    _list="$CACHE/.members.$$"
-    if ! tar -tzf "$1" >"$_list" 2>/dev/null; then
-        rm -f "$_list"
-        warn "$2 is not a readable gzip tar archive"
+# ---------------------------------------------------------------- archives
+# Everything that follows reads one archive three times (names, modes+sizes,
+# members) and keeps the results in $CACHE/.scan, so the safety check, the
+# space arithmetic, the symlink repair and the post-unpack verification all
+# work from the same evidence instead of trusting tar's exit status.
+TAR_DIR=
+TAR_NAMES=
+TAR_LINKS=
+TAR_LIST=
+
+# Resolve a symlink target the way the kernel would, but lexically: a member's
+# directory plus its target, '.' dropped and '..' folded. Prints "" when the
+# result leaves the archive root, which is what makes a link a write primitive
+# outside the bundle.
+TAR_LINK_AWK='
+function norm(p,   n, i, k, parts, out, s) {
+    n = split(p, parts, "/")
+    k = 0
+    for (i = 1; i <= n; i++) {
+        if (parts[i] == "" || parts[i] == ".") continue
+        if (parts[i] == "..") { if (k == 0) return ""; k--; continue }
+        out[++k] = parts[i]
+    }
+    s = ""
+    for (i = 1; i <= k; i++) s = (i == 1) ? out[i] : (s "/" out[i])
+    return s
+}
+BEGIN { FS = "\t" }
+{
+    name = $1
+    target = $2
+    if (substr(target, 1, 1) == "/") { bad = name " -> " target; exit }
+    dir = name
+    if (sub(/\/[^\/]*$/, "", dir) == 0) dir = ""
+    if (dir == ".") dir = ""
+    if (norm(dir "/" target) == "") { bad = name " -> " target; exit }
+}
+END { if (bad != "") { print bad; exit 1 } exit 0 }
+'
+
+# tar_scan ARCHIVE LABEL -> 0 when the archive is safe to unpack. Fills
+# TAR_NAMES (one member per line, exactly as stored), TAR_LINKS
+# (member<TAB>target for every symlink) and TAR_LIST (the -tv listing).
+tar_scan() {
+    _tk_arc=$1
+    _tk_label=$2
+    TAR_DIR="$CACHE/.scan"
+    TAR_NAMES="$TAR_DIR/names"
+    TAR_LINKS="$TAR_DIR/links"
+    TAR_LIST="$TAR_DIR/list"
+    rm -rf "$TAR_DIR"
+    mkdir -p "$TAR_DIR" || die "cannot create $TAR_DIR"
+
+    if ! tar -tzf "$_tk_arc" >"$TAR_NAMES" 2>/dev/null; then
+        warn "$_tk_label is not a readable gzip tar archive"
         return 1
     fi
-    _bad=$(grep -E '(^/|(^|/)\.\.($|/))' "$_list" | head -n 1)
-    _n=$(wc -l < "$_list" | tr -d ' ')
-    rm -f "$_list"
-    if [ -n "$_bad" ]; then
-        warn "$2 contains a path that would escape the install directory: $_bad"
+    _tk_n=$(wc -l <"$TAR_NAMES" | tr -d ' ')
+    if [ "$_tk_n" -eq 0 ]; then
+        warn "$_tk_label is an empty archive"
         return 1
     fi
-    if [ "$_n" -eq 0 ]; then
-        warn "$2 is an empty archive"
+    # The package is unpacked as root: a member named /etc/shadow or
+    # ../../etc/shadow would be written outside the bundle.
+    _tk_bad=$(grep -E '(^/|(^|/)\.\.($|/))' "$TAR_NAMES" | head -n 1)
+    if [ -n "$_tk_bad" ]; then
+        warn "$_tk_label contains a path that would escape the install directory: $_tk_bad"
+        return 1
+    fi
+    if ! tar -tvzf "$_tk_arc" >"$TAR_LIST" 2>/dev/null; then
+        warn "$_tk_label: cannot read the member list with modes and sizes"
+        return 1
+    fi
+    # "lrwxrwxrwx 0/0 0 1970-01-01 05:30:00 ./lib/libz.so.1 -> libz.so.1.4"
+    # is five fields and then the name, so the name starts after the fifth and
+    # the target after the " -> " separator.
+    awk '
+        $1 ~ /^l/ {
+            line = $0
+            i = index(line, " -> ")
+            if (i == 0) next
+            name = substr(line, 1, i - 1)
+            target = substr(line, i + 4)
+            sub(/^([^ \t]+[ \t]+){5}/, "", name)
+            sub(/[ \t]+$/, "", name)
+            printf "%s\t%s\n", name, target
+        }
+    ' "$TAR_LIST" >"$TAR_LINKS"
+    awk '
+        substr($1, 1, 1) == "-" {
+            name = $0
+            sub(/^([^ \t]+[ \t]+){5}/, "", name)
+            sub(/[ \t]+$/, "", name)
+            if (substr(name, 1, 2) == "./") name = substr(name, 3)
+            printf "%s\t%s\n", name, $3
+        }
+    ' "$TAR_LIST" >"$TAR_DIR/sizes"
+    _tk_badl=$(awk "$TAR_LINK_AWK" "$TAR_LINKS" | head -n 1)
+    if [ -n "$_tk_badl" ]; then
+        warn "$_tk_label contains a symlink that points outside the bundle: $_tk_badl"
+        return 1
+    fi
+    return 0
+}
+
+# Bytes the unpacked tree will occupy: every file rounded up to whole 4 KiB
+# blocks plus one block for its metadata, one block per directory and per
+# link. It is an estimate of the write, and it is the only honest one
+# available before the write happens, so it is named as such in the message.
+tar_footprint() {
+    awk '
+        {
+            t = substr($1, 1, 1)
+            if (t == "d") { dirs++; blk += 4096 }
+            else if (t == "l" || t == "h") { links++; blk += 4096 }
+            else { files++; blk += int(($3 + 4095) / 4096) * 4096 + 4096 }
+            n++
+        }
+        END { printf "%.0f %d %d %d %d\n", blk, n, files, dirs, links }
+    ' "$TAR_LIST"
+}
+
+# Bytes the copy fallback adds: on a filesystem that cannot store a symlink,
+# every link member becomes a full copy of its target, so that much more disk is
+# needed. Printed as "<bytes> <links> <links with a known target>".
+tar_link_cost() {
+    awk -F'\t' -v szf="$TAR_DIR/sizes" '
+    function norm(p,   n, i, k, parts, out, s) {
+        n = split(p, parts, "/")
+        k = 0
+        for (i = 1; i <= n; i++) {
+            if (parts[i] == "" || parts[i] == ".") continue
+            if (parts[i] == "..") { if (k == 0) return ""; k--; continue }
+            out[++k] = parts[i]
+        }
+        s = ""
+        for (i = 1; i <= k; i++) s = (i == 1) ? out[i] : (s "/" out[i])
+        return s
+    }
+    BEGIN {
+        while ((getline line < szf) > 0) {
+            i = index(line, "\t")
+            if (i > 0) size[substr(line, 1, i - 1)] = substr(line, i + 1) + 0
+        }
+        close(szf)
+    }
+    {
+        name = $1
+        target = $2
+        dir = name
+        if (sub(/\/[^\/]*$/, "", dir) == 0) dir = ""
+        if (dir == ".") dir = ""
+        r = norm(dir "/" target)
+        links++
+        if (r != "" && (r in size)) { total += size[r]; known++ }
+    }
+    END { printf "%.0f %d %d\n", total, links, known }
+    ' "$TAR_LINKS"
+}
+
+# Can this filesystem store a symlink at all? Probed where the bundle will live.
+link_works() {
+    _lw_probe="$1/.pkg-link-probe.$$"
+    rm -f "$_lw_probe"
+    if ln -s . "$_lw_probe" 2>/dev/null; then
+        rm -f "$_lw_probe"
+        return 0
+    fi
+    rm -rf "$_lw_probe"
+    return 1
+}
+
+# unpack_archive ARCHIVE STAGE LABEL -> 0 only when every member of the
+# archive is in STAGE. busybox tar stops at the first member it cannot create -
+# a symlink on a filesystem that forbids them - and leaves every later member
+# unwritten, so its exit status cannot be the test. What tar skipped is
+# extracted by name, then every symlink member is created with ln -s, or copied
+# from its target where the filesystem cannot make links at all. Both repairs
+# are counted and printed: an install that needed one is not a plain install.
+unpack_archive() {
+    _up_arc=$1
+    _up_dir=$2
+    _up_label=$3
+    _up_err="$TAR_DIR/tar.err"
+    _up_missing="$TAR_DIR/missing"
+    _up_batch="$TAR_DIR/batch"
+    _up_lmiss="$TAR_DIR/link-missing"
+    _up_told=0
+
+    : >"$_up_err"
+    tar -xzf "$_up_arc" -C "$_up_dir" 2>"$_up_err"
+    _up_rc=$?
+
+    : >"$_up_missing"
+    while IFS= read -r _up_m; do
+        case "$_up_m" in ''|./) continue ;; esac
+        if [ ! -e "$_up_dir/$_up_m" ] && [ ! -L "$_up_dir/$_up_m" ]; then
+            printf '%s\n' "$_up_m" >>"$_up_missing"
+        fi
+    done <"$TAR_NAMES"
+    _up_miss_n=$(wc -l <"$_up_missing" | tr -d ' ')
+
+    if [ "$_up_rc" -ne 0 ] && [ "$_up_miss_n" -eq 0 ]; then
+        say "  tar exited $_up_rc but every member is present"
+    fi
+
+    _up_files=0
+    _up_links=0
+    _up_copies=0
+    if [ "$_up_miss_n" -gt 0 ]; then
+        # Split what is missing into link members (repaired below) and content
+        # members (re-extracted from the archive by name).
+        : >"$_up_batch"
+        : >"$_up_lmiss"
+        awk -F'\t' -v lb="$_up_lmiss" -v cb="$_up_batch" '
+            NR == FNR { link[$1] = 1; next }
+            { if ($0 in link) print > lb; else print > cb }
+        ' "$TAR_LINKS" "$_up_missing"
+        _up_files=$(wc -l <"$_up_batch" | tr -d ' ')
+        _up_links=$(wc -l <"$_up_lmiss" | tr -d ' ')
+        if [ "$_up_files" -gt 0 ]; then
+            tr '\n' '\000' <"$_up_batch" | xargs -0 tar -xzf "$_up_arc" -C "$_up_dir" 2>>"$_up_err"
+        fi
+        if [ "$_up_links" -gt 0 ]; then
+            while IFS= read -r _up_m; do
+                _up_t=$(awk -F'\t' -v m="$_up_m" '$1 == m { print $2; exit }' "$TAR_LINKS")
+                _up_p="$_up_dir/$_up_m"
+                _up_d=$(dirname "$_up_p")
+                mkdir -p "$_up_d" 2>/dev/null
+                rm -rf "$_up_p"
+                if (cd "$_up_d" 2>/dev/null && ln -s "$_up_t" "${_up_p##*/}") 2>/dev/null; then
+                    _up_told=$((_up_told + 1))
+                elif [ -f "$_up_d/$_up_t" ] && cp -f "$_up_d/$_up_t" "$_up_p" 2>/dev/null; then
+                    _up_copies=$((_up_copies + 1))
+                else
+                    warn "cannot recreate $_up_m -> $_up_t (ln -s and copy both failed)"
+                fi
+            done <"$_up_lmiss"
+        fi
+        say "  tar skipped $_up_miss_n member(s): $_up_files re-extracted, $_up_told re-linked, $_up_copies copied"
+    elif [ -s "$TAR_LINKS" ]; then
+        _up_nl=$(wc -l <"$TAR_LINKS" | tr -d ' ')
+        say "  tar created all $_up_nl symlink member(s)"
+    fi
+
+    # The final word is not tar's: every member the archive names must exist.
+    _up_still="$TAR_DIR/still-missing"
+    : >"$_up_still"
+    while IFS= read -r _up_m; do
+        case "$_up_m" in ''|./) continue ;; esac
+        if [ ! -e "$_up_dir/$_up_m" ] && [ ! -L "$_up_dir/$_up_m" ]; then
+            printf '%s\n' "$_up_m" >>"$_up_still"
+        fi
+    done <"$TAR_NAMES"
+    if [ -s "$_up_still" ]; then
+        _up_left=$(wc -l <"$_up_still" | tr -d ' ')
+        warn "$_up_label did not unpack: $_up_left of the archive's members are missing"
+        warn "  first: $(head -n 1 "$_up_still")"
+        _up_why=$(grep -v '^$' "$_up_err" 2>/dev/null | head -n 3 | tr '\n' ' ')
+        [ -n "$_up_why" ] && warn "  tar said: $_up_why"
         return 1
     fi
     return 0
@@ -316,7 +749,7 @@ fetch_index() {
     say "$_n packages (signature ok, key sha256 $(key_fingerprint "$PUBKEY"))"
     # The Store app lists "Available" from this file, so keep its copy in step
     # whenever pkg refreshes the index.
-    if [ -d /run/mystic ]; then
+    if [ -d "$RUN" ]; then
         cp "$INDEX" "$RUN_INDEX.tmp" 2>/dev/null && mv "$RUN_INDEX.tmp" "$RUN_INDEX" 2>/dev/null
     fi
     return 0
@@ -343,10 +776,75 @@ row_for() {
 
 human() {
     awk -v b="${1:-0}" 'BEGIN {
-        if (b >= 1048576) printf "%.1f MB", b / 1048576;
+        if (b >= 1073741824) printf "%.1f GB", b / 1073741824;
+        else if (b >= 1048576) printf "%.1f MB", b / 1048576;
         else if (b >= 1024) printf "%.0f KB", b / 1024;
         else printf "%d B", b;
     }'
+}
+
+# ------------------------------------------------------------ quantities
+# Byte counts are compared by awk, never by $(( )): the arithmetic of a 32-bit
+# ash build wraps at 2 GB, and a disk image, a download or a free-space figure
+# can be larger than that. awk's doubles are exact to 2^53 (9 PB).
+num_ge() { awk -v a="$1" -v b="$2" 'BEGIN { exit !((a + 0) >= (b + 0)) }'; }
+num_lt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !((a + 0) < (b + 0)) }'; }
+num_sub() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.0f\n", (a + 0) - (b + 0) }'; }
+
+# Bytes in a file, nothing if it is absent.
+file_bytes() {
+    [ -f "$1" ] || return 1
+    _fby=$(stat -c %s "$1" 2>/dev/null | tr -cd '0-9')
+    [ -n "$_fby" ] || return 1
+    printf '%s\n' "$_fby"
+}
+
+# "<available bytes> <total bytes> <mount point>" for the filesystem a path
+# lives on. df -Pk is POSIX and busybox has it; stat -f is the fallback for a
+# system whose df cannot name the mount. Nothing is invented: if neither
+# tool can answer, this prints nothing and the caller says so.
+fs_space() {
+    _fs_p=$1
+    while [ ! -e "$_fs_p" ] && [ "$_fs_p" != "/" ] && [ -n "$_fs_p" ]; do
+        _fs_p=$(dirname "$_fs_p")
+    done
+    [ -e "$_fs_p" ] || return 1
+    _fs_line=$(df -Pk "$_fs_p" 2>/dev/null | awk 'NR == 2 {
+        mount = $6; for (i = 7; i <= NF; i++) mount = mount " " $i;
+        printf "%.0f %.0f %s\n", $4 * 1024, $2 * 1024, mount }')
+    if [ -n "$_fs_line" ]; then printf '%s\n' "$_fs_line"; return 0; fi
+    set -- $(stat -f -c '%a %S %b' "$_fs_p" 2>/dev/null)
+    if [ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ]; then
+        awk -v a="$1" -v s="$2" -v t="$3" 'BEGIN { printf "%.0f %.0f %s\n", a * s, t * s, "(stat -f)" }'
+        return 0
+    fi
+    return 1
+}
+
+# space_need PATH BYTES WHAT -> 0 when PATH's filesystem has BYTES free. The
+# failure is printed with both real numbers, because "no space left on device"
+# after 38 MB of transfer is exactly what this exists to prevent.
+space_need() {
+    _sn_need=$2
+    _sn_what=$3
+    _sn=$(fs_space "$1") || _sn=
+    if [ -z "$_sn" ]; then
+        warn "cannot read the free space of $1 (df and stat -f both failed)"
+        warn "  $_sn_what needs $(human "$_sn_need"); continuing without the check"
+        return 0
+    fi
+    _sn_avail=$(printf '%s\n' "$_sn" | awk '{ print $1 }')
+    _sn_total=$(printf '%s\n' "$_sn" | awk '{ print $2 }')
+    _sn_mount=$(printf '%s\n' "$_sn" | cut -d' ' -f3-)
+    if num_ge "$_sn_avail" "$_sn_need"; then
+        say "  space ok: $_sn_what needs $(human "$_sn_need"), $(human "$_sn_avail") free on $_sn_mount"
+        return 0
+    fi
+    warn "not enough space for $_sn_what"
+    warn "  need: $(human "$_sn_need") ($_sn_need bytes)"
+    warn "  have: $(human "$_sn_avail") free of $(human "$_sn_total") on $_sn_mount ($1)"
+    warn "  short by: $(human "$(num_sub "$_sn_need" "$_sn_avail")")"
+    return 1
 }
 
 cmd_list() {
@@ -380,11 +878,29 @@ cmd_installed() {
         for d in "$APPS"/*; do
             [ -d "$d" ] || continue
             name=$(basename "$d")
+            # a bundle installed under a different id than its package name says
+            # so, so nobody has to guess which of the two to remove
+            origin=
+            if [ -f "$d/.pkg-name" ]; then
+                _pn=$(cat "$d/.pkg-name" 2>/dev/null | tr -d '\r\n')
+                [ -n "$_pn" ] && [ "$_pn" != "$name" ] && origin=" (package $_pn)"
+            fi
+            # The manifest is what the launcher reads; .pkg-version is what pkg
+            # recorded at install time from the signed index. Either one is a
+            # fact; neither is printed if neither exists.
+            _ver=
+            if [ -f "$d/manifest" ]; then
+                _ver=$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$d/manifest" | head -n 1 | tr -d '\r')
+            fi
+            if [ -z "$_ver" ] && [ -f "$d/.pkg-version" ]; then
+                _ver=$(cat "$d/.pkg-version" 2>/dev/null | tr -d '\r\n')
+            fi
+            [ -n "$_ver" ] || _ver=-
             if [ -f "$d/manifest" ]; then
                 desc=$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*//p' "$d/manifest" | head -n 1 | tr -d '\r')
-                say "  $name  $desc"
+                say "  $name$origin  $_ver  $desc"
             else
-                say "  $name"
+                say "  $name$origin  $_ver"
             fi
             n=$((n + 1))
         done
@@ -401,6 +917,124 @@ valid_name() {
         -*|.*) return 1 ;;
     esac
     [ "${#1}" -le 32 ] || return 1
+    return 0
+}
+
+# ------------------------------------------------------------ bundle identity
+# A package is installed as a BUNDLE: $APPS/<id>/{manifest,payload}, and the
+# launcher draws one tile per bundle id. The bundle id is the package name
+# unless the package says otherwise:
+#
+#   * a 'bundle = <id>' line in the unpacked manifest wins. That is how a
+#     package whose repository name differs from the app it ships states so;
+#   * otherwise the one package that predates that line is mapped here. Its
+#     payload IS the player the image already ships as vlcplayer, so installing
+#     it under 'vlc' put a second, duplicate tile next to the stub - two ids for
+#     one program, one of them dead.
+#
+# Both forms are checked with valid_name() by the caller: the id is a path
+# component and the launcher will refuse anything with a slash or a '..'.
+bundle_for() {
+    _bf_name=$1
+    _bf_manifest=$2
+    if [ -n "$_bf_manifest" ] && [ -f "$_bf_manifest" ]; then
+        _bf_id=$(sed -n 's/^[[:space:]]*bundle[[:space:]]*=[[:space:]]*//p' "$_bf_manifest" | head -n 1 | tr -d '\r')
+        if [ -n "$_bf_id" ]; then
+            printf '%s\n' "$_bf_id"
+            return 0
+        fi
+    fi
+    case "$_bf_name" in
+        vlc) printf 'vlcplayer\n' ;;
+        *)   printf '%s\n' "$_bf_name" ;;
+    esac
+}
+
+# Which bundle directory holds this package. The package name is the usual
+# answer, but a bundle may have been installed under another id (the manifest
+# 'bundle =' line, or the vlc -> vlcplayer mapping), so the installed bundle
+# records the package that put it there in .pkg-name and that is what removal
+# looks for. Prints the directory name, or nothing with exit 1.
+find_bundle() {
+    [ -n "$1" ] || return 1
+    if [ -d "$APPS/$1" ]; then
+        printf '%s\n' "$1"
+        return 0
+    fi
+    for _fb_d in "$APPS"/*; do
+        [ -d "$_fb_d" ] || continue
+        [ -f "$_fb_d/.pkg-name" ] || continue
+        if [ "$(cat "$_fb_d/.pkg-name" 2>/dev/null)" = "$1" ]; then
+            printf '%s\n' "${_fb_d##*/}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Does this filesystem store an execute bit at all? A FAT image, a Windows
+# share, or a host harness on NTFS cannot: chmod succeeds, the mode comes back
+# without an x and test -x stays false forever. Probed in the directory the
+# bundle will live in, because that is the filesystem that has to store it.
+exec_bit_works() {
+    _eb_probe="$1/.pkg-exec-probe.$$"
+    : >"$_eb_probe" 2>/dev/null || return 1
+    chmod 0755 "$_eb_probe" 2>/dev/null
+    if [ -x "$_eb_probe" ]; then
+        rm -f "$_eb_probe"
+        return 0
+    fi
+    rm -f "$_eb_probe"
+    return 1
+}
+
+# The file the launcher will exec, relative to the bundle root. The manifest
+# decides; when it names a file the package does not contain, the payload that
+# IS there is used, and the caller rewrites the installed manifest to match.
+# Only a BARE name in the bundle root is accepted: wmsrv refuses an exec value
+# containing a slash, so a manifest that says "libexec/player" is a tile that
+# cannot start, and it is repaired here rather than installed.
+# Ambiguity is an error, not a guess: two candidates means a human decides.
+# Prints the name, or nothing with exit 1.
+resolve_exec() {
+    _re_dir=$1
+    _re_want=$2
+    if [ -n "$_re_want" ]; then
+        case "$_re_want" in
+            /*|*/|*/*|*..*) : ;;   # not a bare name this launcher can exec
+            *) [ -f "$_re_dir/$_re_want" ] && { printf '%s\n' "$_re_want"; return 0; } ;;
+        esac
+    fi
+    _re_found=
+    _re_n=0
+    for _re_f in "$_re_dir"/*; do
+        [ -f "$_re_f" ] || continue
+        _re_base=${_re_f##*/}
+        case "$_re_base" in
+            manifest|.*) continue ;;
+        esac
+        # a shared library is not a program
+        case "$_re_base" in
+            *.so|*.so.*) continue ;;
+        esac
+        _re_n=$((_re_n + 1))
+        _re_found=$_re_base
+    done
+    [ "$_re_n" -eq 1 ] || return 1
+    printf '%s\n' "$_re_found"
+    return 0
+}
+
+# Ask the desktop to look at $APPS again. One empty file: the desktop polls it,
+# rescans, and removes it. A failure here is not fatal (the package IS
+# installed) but it must be said out loud, because the symptom is "nothing
+# happened" and the cause would otherwise be invisible.
+request_rescan() {
+    if mkdir -p "$RUN" 2>/dev/null && : > "$RESCAN" 2>/dev/null; then
+        say "asked the launcher to rescan ($RESCAN)"
+    else
+        warn "cannot write $RESCAN - the new bundle stays invisible until the desktop restarts"
+    fi
     return 0
 }
 
@@ -432,43 +1066,150 @@ cmd_install() {
 
     size=$(printf '%s\n' "$row" | cut -f3 | tr -cd '0-9')
     [ -n "$size" ] || size=0
-    say "installing $name ($file, $(human "$size")) from $REPO"
+    version=$(printf '%s\n' "$row" | cut -f2 | tr -d '\r')
+    if [ -n "$version" ]; then
+        say "installing $name $version ($file, $(human "$size")) from $REPO"
+    else
+        say "installing $name ($file, $(human "$size")) from $REPO"
+    fi
 
     prepare_cache
     mkdir -p "$APPS" || die "cannot create $APPS"
     tar_path="$CACHE/$file"
+    part_path="$tar_path.part"
+
+    # ---- space, before the first byte is requested ------------------------
+    # The index publishes the transfer size. Its optional seventh column (the
+    # unpacked size) is used when the publisher provides one; without it the
+    # transfer size is the floor, and the exact figure comes after the transfer
+    # from the archive's own member list, before anything is written to $APPS.
+    unpacked=$(printf '%s\n' "$row" | cut -f7 | tr -cd '0-9')
+    apps_need=$size
+    if num_ge "$unpacked" 1; then
+        apps_need=$unpacked
+        say "  the index publishes the unpacked size: $(human "$unpacked")"
+    fi
+    space_need "$CACHE" "$size" "the $file download in $CACHE" \
+        || die "no room to download $file - nothing was downloaded"
+    space_need "$APPS" "$apps_need" "at least the $file download, unpacked" \
+        || die "no room in $APPS for $name - nothing was downloaded"
+
+    # ---- an already verified tarball is not transferred twice -------------
     if [ -f "$tar_path" ]; then
-        got=$(sha256sum "$tar_path" | cut -d' ' -f1)
-        if [ "$got" != "$want" ]; then
-            warn "cached $file does not match the signed index - downloading it again"
+        cached_size=$(file_bytes "$tar_path" 2>/dev/null) || cached_size=0
+        cached_sum=$(sha256sum "$tar_path" | cut -d' ' -f1)
+        size_bad=0
+        if num_ge "$size" 1 && [ "$cached_size" != "$size" ]; then size_bad=1; fi
+        if [ "$cached_sum" != "$want" ] || [ "$size_bad" = 1 ]; then
+            warn "the cached $file does not match the signed index - downloading it again"
+            warn "  index: $want, $size bytes"
+            warn "  cache: $cached_sum, $cached_size bytes"
             rm -f "$tar_path"
+        else
+            say "using the cached $file ($(human "$cached_size"), sha256 matches the index)"
         fi
     fi
+
+    # ---- transfer ---------------------------------------------------------
     if [ ! -f "$tar_path" ]; then
-        download "$REPO/$file" "$tar_path.part" 300 "download of $file" || {
-            if [ "$DL_CODE" = 404 ]; then
+        if ! xfer "$REPO/$file" "$part_path" "$size" "downloading $file"; then
+            code=$(http_code_of "$DL_LOG")
+            if [ "$code" = 404 ]; then
+                rm -f "$part_path"
+                PART=
                 warn "the index advertises $file, but the repository does not serve it"
                 warn "the publisher has to upload that asset (or drop the row from index.tsv)"
+            else
+                why=$(grep -v 'HTTP/' "$DL_LOG" 2>/dev/null | sed '/^[[:space:]]*$/d' | tail -n 2 | tr '\n' ' ')
+                [ -n "$why" ] && warn "  wget: $why"
+                kept=$(file_bytes "$part_path" 2>/dev/null) || kept=0
+                if num_ge "$kept" 1; then
+                    warn "kept $(human "$kept") in $part_path"
+                    warn "  run the same command again to resume the download where it stopped"
+                fi
             fi
+            # PART is what the EXIT trap deletes. On this path the partial file
+            # is either already gone (404) or is the resume point just promised
+            # to the user, so the trap must not touch it either way.
+            PART=
             die "download failed - nothing was installed"
-        }
-        mv "$tar_path.part" "$tar_path" || { rm -f "$tar_path.part"; die "cannot store $tar_path"; }
-        got=$(sha256sum "$tar_path" | cut -d' ' -f1)
-        if [ "$got" != "$want" ]; then
-            rm -f "$tar_path"
-            die "checksum mismatch for $file (signed index says $want, download is $got) - refusing to unpack"
         fi
+
+        # ---- size, then sha256, then - and only then - the rename ---------
+        # Both checks run on the .part: the verified object and the resumable
+        # object are the same file, and neither is promoted before it passes.
+        got_size=$(file_bytes "$part_path" 2>/dev/null) || got_size=0
+        if num_ge "$size" 1 && [ "$got_size" != "$size" ]; then
+            rm -f "$part_path"
+            PART=
+            warn "size mismatch for $file"
+            warn "  signed index says: $size bytes ($(human "$size"))"
+            warn "  the transfer is:   $got_size bytes ($(human "$got_size"))"
+            die "the download is not the file the index describes - deleted, nothing was installed"
+        fi
+        got=$(sha256sum "$part_path" | cut -d' ' -f1)
+        if [ "$got" != "$want" ]; then
+            rm -f "$part_path"
+            PART=
+            warn "sha256 mismatch for $file"
+            warn "  signed index says: $want"
+            warn "  the download is:   $got"
+            die "the file does not match the signed index - deleted, nothing was installed"
+        fi
+        mv "$part_path" "$tar_path" || { rm -f "$part_path"; die "cannot store $tar_path"; }
     fi
-    say "checksum ok ($want)"
-    if ! tar_members_ok "$tar_path" "$file"; then
+    got_size=$(file_bytes "$tar_path" 2>/dev/null) || got_size=0
+    if num_ge "$size" 1; then
+        say "size ok: $got_size bytes, the signed index says $size"
+    else
+        say "size: $got_size bytes (the index row carries no size to check against)"
+    fi
+    got=$(sha256sum "$tar_path" | cut -d' ' -f1)
+    if [ "$got" != "$want" ]; then
+        rm -f "$tar_path"
+        warn "sha256 mismatch for $file"
+        warn "  signed index says: $want"
+        warn "  the file is:       $got"
+        die "the file does not match the signed index - nothing was installed"
+    fi
+    say "checksum ok: sha256 $got"
+
+    # ---- what the unpacked tree needs, before anything is written --------
+    if ! tar_scan "$tar_path" "$file"; then
         rm -f "$tar_path"
         die "$file is not safe to unpack - nothing was installed"
     fi
+    foot_line=$(tar_footprint)
+    foot=$(printf '%s\n' "$foot_line" | awk '{ print $1 }')
+    members=$(printf '%s\n' "$foot_line" | awk '{ print $2 }')
+    nfiles=$(printf '%s\n' "$foot_line" | awk '{ print $3 }')
+    ndirs=$(printf '%s\n' "$foot_line" | awk '{ print $4 }')
+    nlinks=$(printf '%s\n' "$foot_line" | awk '{ print $5 }')
+    say "  $members members: $nfiles files, $ndirs directories, $nlinks symlinks"
+    # A filesystem without symlinks turns every link member into a copy of its
+    # target, which is what the 113 links in the vlc package cost on such a
+    # filesystem. The probe decides the number; nothing is assumed.
+    need=$foot
+    if [ "$nlinks" -gt 0 ]; then
+        if link_works "$APPS"; then
+            say "  $APPS stores symlinks: the $nlinks link member(s) need no extra space"
+        else
+            lc_line=$(tar_link_cost)
+            lc_bytes=$(printf '%s\n' "$lc_line" | awk '{ print $1 }')
+            lc_n=$(printf '%s\n' "$lc_line" | awk '{ print $2 }')
+            say "  $APPS cannot store symlinks: the $lc_n link member(s) will be copied from their targets, +$(human "$lc_bytes")"
+            need=$(awk -v a="$foot" -v b="$lc_bytes" 'BEGIN { printf "%.0f", a + b }')
+        fi
+    fi
+    if ! space_need "$APPS" "$need" "the unpacked $name tree (whole 4 KiB blocks plus one per member)"; then
+        die "the verified download is kept in $tar_path - make that space and run the same command again; it will not be transferred twice"
+    fi
 
+    # ---- unpack -----------------------------------------------------------
     stage="$APPS/.$name.new.$$"
     rm -rf "$stage"
     mkdir -p "$stage" || die "cannot create $stage"
-    if ! tar -xzf "$tar_path" -C "$stage"; then
+    if ! unpack_archive "$tar_path" "$stage" "$file"; then
         rm -rf "$stage"
         die "unpack failed - nothing was installed"
     fi
@@ -476,43 +1217,139 @@ cmd_install() {
         warn "package has no manifest - writing a minimal one"
         printf 'name = %s\ndesc = installed by pkg\nexec = bin\n' "$name" > "$stage/manifest"
     fi
+
+    # The version this bundle IS comes from the signed index, the publisher's
+    # number. A manifest with no version line leaves the Store unable to tell
+    # an old copy from a current one (it offers an update forever), so the
+    # index value is recorded when the package forgot to carry one.
+    man_ver=$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$stage/manifest" | head -n 1 | tr -d '\r')
+    if [ -z "$man_ver" ] && [ -n "$version" ]; then
+        [ -n "$(tail -c 1 "$stage/manifest" 2>/dev/null)" ] && printf '\n' >>"$stage/manifest"
+        printf 'version = %s\n' "$version" >>"$stage/manifest" \
+            && say "manifest carried no version line - recorded $version from the signed index" \
+            || warn "cannot record the version in $stage/manifest"
+        man_ver=$version
+    fi
+
+    # Which bundle this package becomes: the launcher keys its tiles, its
+    # dedupe against the image and its exec path on the DIRECTORY name, so a
+    # package that lands under a different id than the app it ships is a tile
+    # that cannot start or, worse, a duplicate of one that can.
+    bundle=$(bundle_for "$name" "$stage/manifest" | tr -d '\r\n')
+    valid_name "$bundle" || {
+        rm -rf "$stage"
+        die "package $name asks for an unusable bundle id '$bundle' - nothing was installed"
+    }
+
+    # The exec= line names the file the launcher runs. Keeping it valid is not
+    # cosmetic: a manifest that says 'bin' over a package that ships
+    # 'vlcplayer' installs a tile whose payload does not exist, so the click
+    # does nothing at all. vlc ships exactly that today.
     exec_name=$(sed -n 's/^[[:space:]]*exec[[:space:]]*=[[:space:]]*//p' "$stage/manifest" | head -n 1 | tr -d '\r')
     [ -n "$exec_name" ] || exec_name=bin
-    case "$exec_name" in
-        /*|*..*) exec_name=bin ;;
-    esac
-    if [ -f "$stage/$exec_name" ]; then
-        chmod +x "$stage/$exec_name" || warn "cannot mark $exec_name executable"
+    real_exec=$(resolve_exec "$stage" "$exec_name") || {
+        rm -rf "$stage"
+        die "$name has no single payload to run (manifest says exec = $exec_name) - nothing was installed"
+    }
+    if [ "$real_exec" != "$exec_name" ]; then
+        case "$exec_name" in
+            */*) say "$name's manifest says exec = $exec_name, which this launcher cannot run (it execs a bare name in the bundle root)" ;;
+            *)   say "$name ships '$real_exec' but its manifest says exec = $exec_name" ;;
+        esac
+        if sed "s|^[[:space:]]*exec[[:space:]]*=.*|exec = $real_exec|" "$stage/manifest" > "$stage/.manifest.$$" \
+           && mv "$stage/.manifest.$$" "$stage/manifest"; then
+            say "installed with exec = $real_exec"
+        else
+            rm -f "$stage/.manifest.$$"
+            rm -rf "$stage"
+            die "cannot fix exec in $stage/manifest - nothing was installed"
+        fi
+        exec_name=$real_exec
+    fi
+    # The launcher execs this file. A payload without the execute bit is a tile
+    # that does nothing when it is clicked, so the mode is set to 0755 and then
+    # read back. A chmod that did not take is a failed install - unless the
+    # filesystem itself cannot store the bit, which is checked and said out loud
+    # rather than passed over.
+    if [ ! -x "$stage/$exec_name" ]; then
+        say "  $exec_name came without the execute bit - setting mode 0755"
+        chmod 0755 "$stage/$exec_name" 2>/dev/null
+    fi
+    if [ ! -x "$stage/$exec_name" ]; then
+        _ex_mode=$(stat -c %a "$stage/$exec_name" 2>/dev/null | tr -cd '0-7')
+        if exec_bit_works "$stage"; then
+            rm -rf "$stage"
+            die "cannot make $exec_name executable (mode ${_ex_mode:-unknown}) - nothing was installed"
+        fi
+        warn "this filesystem cannot store an execute bit: chmod 0755 leaves mode ${_ex_mode:-unknown} and test -x stays false"
+        warn "  $exec_name exists and is readable, and the launcher will exec it; the mode"
+        warn "  will be 0755 on the image's ext4 root, where execute bits exist"
+    fi    # remember which package this bundle is, so `pkg remove <name>` finds it
+    # even when the bundle id is not the package name
+    printf '%s\n' "$name" > "$stage/.pkg-name" || warn "cannot record the package name in $stage"
+    if [ -n "$man_ver" ]; then
+        printf '%s\n' "$man_ver" > "$stage/.pkg-version" || warn "cannot record the version in $stage"
     fi
 
     # Swap the unpacked tree in only after it is complete, so a failed
     # upgrade leaves the working installation untouched.
-    if [ -d "$APPS/$name" ]; then
-        old="$APPS/.$name.old.$$"
+    if [ -d "$APPS/$bundle" ]; then
+        old="$APPS/.$bundle.old.$$"
         rm -rf "$old"
-        mv "$APPS/$name" "$old" || { rm -rf "$stage"; die "cannot replace $APPS/$name"; }
-        if mv "$stage" "$APPS/$name"; then
+        mv "$APPS/$bundle" "$old" || { rm -rf "$stage"; die "cannot replace $APPS/$bundle"; }
+        if mv "$stage" "$APPS/$bundle"; then
             rm -rf "$old"
         else
-            mv "$old" "$APPS/$name"
+            mv "$old" "$APPS/$bundle"
             rm -rf "$stage"
-            die "cannot install $name"
+            die "cannot install $bundle"
         fi
     else
-        mv "$stage" "$APPS/$name" || { rm -rf "$stage"; die "cannot install $name"; }
+        mv "$stage" "$APPS/$bundle" || { rm -rf "$stage"; die "cannot install $bundle"; }
     fi
 
-    say "installed $name to $APPS/$name"
-    say "open the launcher (eye or Super) - it rescans the disk"
+    on_disk=
+    du_kb=$(du -sk "$APPS/$bundle" 2>/dev/null | awk '{ print $1 }')
+    case "$du_kb" in
+        ''|*[!0-9]*) : ;;
+        *) on_disk=$(awk -v k="$du_kb" 'BEGIN { printf "%.0f", k * 1024 }') ;;
+    esac
+    what="$name"
+    [ -n "$man_ver" ] && what="$name $man_ver"
+    if [ -n "$on_disk" ]; then
+        note=", $(human "$on_disk") on disk"
+    else
+        note=
+    fi
+    if [ "$bundle" = "$name" ]; then
+        say "installed $what to $APPS/$bundle (exec: $exec_name$note)"
+    else
+        say "installed $what as bundle $bundle in $APPS/$bundle (exec: $exec_name$note)"
+    fi
+    rm -rf "$TAR_DIR"
+    request_rescan
 }
 
 cmd_remove() {
     name=$1
     [ -n "$name" ] || die "usage: pkg remove <name>"
     valid_name "$name" || die "invalid package name: $name"
-    [ -d "$APPS/$name" ] || die "not installed: $name"
-    rm -rf "$APPS/$name" || die "cannot remove $APPS/$name"
-    say "removed $name"
+    # The bundle, not the package name: removing 'vlc' has to remove the
+    # vlcplayer bundle it created, or the tile stays and can only be deleted by
+    # hand.
+    bundle=$(find_bundle "$name")
+    if [ -z "$bundle" ]; then
+        bundle=$(bundle_for "$name" "" | tr -d '\r\n')
+    fi
+    valid_name "$bundle" || die "package $name maps to an unusable bundle id '$bundle'"
+    [ -d "$APPS/$bundle" ] || die "not installed: $name (no $APPS/$bundle)"
+    rm -rf "$APPS/$bundle" || die "cannot remove $APPS/$bundle"
+    if [ "$bundle" = "$name" ]; then
+        say "removed $name"
+    else
+        say "removed $name (bundle $bundle)"
+    fi
+    request_rescan
 }
 
 cmd_repo() {

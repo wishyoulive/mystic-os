@@ -23,10 +23,44 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static int listen_fd = -1;
 static int shm_seq = 0;
+
+/* The reason the last launch failed, kept for the launcher to pick up with
+ * wms_take_launch_error(). Empty when the last launch worked. */
+static char last_launch_error[192];
+
+/* ---------------------------------------------------------- paths
+ * The run dir and the two bundle roots are constants in the shipped system.
+ * MYSTIC_RUN_DIR and MYSTIC_APP_ROOTS ("<image>:<installed>") let the host
+ * harness point the real scanner at a fixture tree - the same test hook pkg has
+ * with MYSTIC_APPS. Only the owner of this process can set its environment, so
+ * neither is a way in; a desktop with them unset behaves exactly as before.
+ */
+static const char *run_dir(void) {
+    const char *e = getenv("MYSTIC_RUN_DIR");
+    return (e && e[0]) ? e : WM_RUN_DIR;
+}
+
+static void run_file(char *out, size_t cap, const char *leaf) {
+    snprintf(out, cap, "%s/%s", run_dir(), leaf);
+}
+
+static void app_roots(char *image, size_t ni, char *installed, size_t nw) {
+    snprintf(image, ni, "%s", WM_APP_DIR);
+    snprintf(installed, nw, "%s", WM_APP_DIR_RW);
+    const char *e = getenv("MYSTIC_APP_ROOTS");
+    if (!e || !e[0]) return;
+    const char *colon = strchr(e, ':');
+    if (!colon) return;
+    size_t l = (size_t)(colon - e);
+    if (l > 0 && l < ni) { memcpy(image, e, l); image[l] = 0; }
+    if (colon[1] && strlen(colon + 1) < nw)
+        snprintf(installed, nw, "%s", colon + 1);
+}
 
 /* ---------------------------------------------------------- helpers */
 static void sendf(WmClient *c, const char *fmt, ...) {
@@ -300,18 +334,24 @@ static int cmp_app(const void *a, const void *b) {
     return strcmp(((const WmApp *)a)->id, ((const WmApp *)b)->id);
 }
 
-/* Two roots, on purpose: WM_APP_DIR is the image's own bundles, and
- * /root/apps is where pkg unpacks what the user installed - and /root is the
- * only place that survives a reboot. Scanning just the first meant a package
- * installed from the Store could never be launched. */
-static const char *const APP_ROOTS[] = { WM_APP_DIR, "/root/apps" };
-
+/* Two roots, on purpose: the image's own bundles, and /root/apps where pkg
+ * unpacks what the user installed - /root is the only place that survives a
+ * reboot. Scanning just the first meant a package installed from the Store
+ * could never be launched; and because the launcher then exec'd everything from
+ * WM_APP_DIR, the tiles it did draw for installed bundles were dead. Each
+ * WmApp now remembers its root and wms_launch() uses it. */
 static int scan_root(WmApp *out, int n, int max, const char *root, int from_image) {
+    if (strlen(root) >= sizeof(out[0].root)) {
+        fprintf(stderr, "wms: app root %.80s is too long to remember; skipped\n", root);
+        return n;
+    }
     DIR *d = opendir(root);
     if (!d) return n;
     struct dirent *e;
     while ((e = readdir(d)) && n < max) {
         if (e->d_name[0] == '.') continue;
+        /* the id becomes a path component twice (manifest, payload) */
+        if (strchr(e->d_name, '/')) continue;
         char path[512];
         snprintf(path, sizeof(path), "%s/%s/manifest", root, e->d_name);
         FILE *f = fopen(path, "r");
@@ -321,6 +361,7 @@ static int scan_root(WmApp *out, int n, int max, const char *root, int from_imag
         memset(a, 0, sizeof(*a));
         a->from_image = from_image;
         snprintf(a->id, sizeof(a->id), "%s", e->d_name);
+        snprintf(a->root, sizeof(a->root), "%s", root);
 
         char line[256];
         while (fgets(line, sizeof(line), f)) {
@@ -349,40 +390,201 @@ static int scan_root(WmApp *out, int n, int max, const char *root, int from_imag
     return n;
 }
 
-int wms_scan_apps(WmApp *out, int max) {
-    int n = 0;
-    for (unsigned i = 0; i < sizeof(APP_ROOTS) / sizeof(APP_ROOTS[0]); i++)
-        n = scan_root(out, n, max, APP_ROOTS[i], i == 0);
-    /* readdir order is arbitrary; sort so the launcher is stable. */
-    qsort(out, (size_t)n, sizeof(WmApp), cmp_app);
-    /* Two roots can hold the same id - the image's bundle and a copy that pkg
-     * unpacked into /root/apps. The image must win, deterministically: the
-     * previous version kept "the first one" after qsort, which is not stable,
-     * so a stale /root/apps copy could shadow a freshly built bundle and the
-     * desktop would run last month's binary with no way to tell. */
+int wms_bundle_payload(const WmApp *app, char *out, size_t cap,
+                       char *why, size_t whyn) {
+    if (why && whyn) why[0] = 0;
+    if (!out || cap == 0) return -1;
+    out[0] = 0;
+    if (!app) return -1;
+
+    /* exec= and the directory name both come off the disk, so both are
+     * untrusted: a bare file name and a bare directory name, or nothing. A
+     * '..' or a slash here would point the launcher at a file of the bundle's
+     * choosing instead of its own payload. */
+    if (!app->id[0] || strchr(app->id, '/') || strstr(app->id, "..")) {
+        if (why && whyn) snprintf(why, whyn, "unusable bundle id '%.31s'", app->id);
+        return -1;
+    }
+    if (!app->exe[0] || strchr(app->exe, '/') || strstr(app->exe, "..")) {
+        if (why && whyn) snprintf(why, whyn, "unsafe exec '%.31s'", app->exe);
+        return -1;
+    }
+
+    const char *root = app->root[0] ? app->root : WM_APP_DIR;
+    int k = snprintf(out, cap, "%s/%s/%s", root, app->id, app->exe);
+    if (k < 0 || (size_t)k >= cap) {
+        if (why && whyn) snprintf(why, whyn, "path longer than %d bytes", (int)cap - 1);
+        out[0] = 0;
+        return -1;
+    }
+
+    /* The three ways a bundle is dead: nothing there, not a file, not
+     * executable. Each one is reported with the kernel's own words, because
+     * "it did not start" is not a diagnosis. */
+    struct stat st;
+    if (stat(out, &st) != 0) {
+        if (why && whyn) snprintf(why, whyn, "%s", strerror(errno));
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        if (why && whyn) snprintf(why, whyn, "not a regular file");
+        return -1;
+    }
+    if (access(out, X_OK) != 0) {
+        if (why && whyn) snprintf(why, whyn, "%s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/* 1 when the payload is there and executable. Used to decide which of two
+ * bundles with the same id is worth a tile. */
+static int payload_ok(const WmApp *a) {
+    char path[512], why[96];
+    return wms_bundle_payload(a, path, sizeof(path), why, sizeof(why)) == 0;
+}
+
+/* Two roots can hold the same id, and exactly one of them gets the tile. Two
+ * rules, both of which shipping needs:
+ *
+ *   - a bundle whose payload is missing or not executable cannot start, so it
+ *     must not shadow one that can. A half-finished install then leaves the
+ *     shipped app working instead of turning a good tile into a dead one.
+ *
+ *   - when both can start, the installed copy wins. /usr/share is the image: it
+ *     cannot be upgraded without reflashing, while /root/apps is only there
+ *     because the user installed it on purpose. This is what makes the 'vlc'
+ *     package replace the shipped vlcplayer stub instead of leaving a second
+ *     tile for one program.
+ *
+ * A tie (neither works) keeps the image's copy, so the error names the bundle
+ * that shipped with the OS. The decision is symmetric in the argument order
+ * because qsort is not stable: whichever copy comes first, the same one wins. */
+static int merge_dups(WmApp *out, int n) {
     int keep = 0;
     for (int i = 0; i < n; i++) {
-        int dup = 0;
+        int at = -1;
         for (int j = 0; j < keep; j++)
-            if (!strcmp(out[j].id, out[i].id)) { dup = 1; break; }
-        if (dup) {
-            if (out[i].from_image) {          /* image copy replaces the other */
-                for (int j = 0; j < keep; j++)
-                    if (!strcmp(out[j].id, out[i].id)) { out[j] = out[i]; break; }
-            }
+            if (!strcmp(out[j].id, out[i].id)) { at = j; break; }
+        if (at < 0) {
+            if (keep != i) out[keep] = out[i];
+            keep++;
             continue;
         }
-        if (keep != i) out[keep] = out[i];
-        keep++;
+        int cand_ok = payload_ok(&out[i]);
+        int kept_ok = payload_ok(&out[at]);
+        int take;
+        const char *why;
+        if (cand_ok != kept_ok) {
+            /* exactly one can start: it gets the tile, whatever order it came in */
+            take = cand_ok;
+            why = take ? "the other copy has no runnable payload"
+                       : "this copy has no runnable payload";
+        } else if (cand_ok) {
+            /* both run: the installed copy wins, so a package can replace a
+             * stub the image shipped */
+            take = !out[i].from_image && out[at].from_image;
+            why = "both run, and the installed copy wins";
+        } else {
+            /* neither runs: keep the shipped bundle, so the error names it */
+            take = out[i].from_image && !out[at].from_image;
+            why = "neither copy runs; keeping the shipped one";
+        }
+        if (take) {
+            fprintf(stderr, "wms: bundle %s: launching %.120s, not %.120s (%s)\n",
+                    out[i].id, out[i].root, out[at].root, why);
+            out[at] = out[i];
+        } else {
+            fprintf(stderr, "wms: bundle %s: launching %.120s, not %.120s (%s)\n",
+                    out[at].id, out[at].root, out[i].root, why);
+        }
     }
     return keep;
 }
 
+int wms_scan_apps(WmApp *out, int max) {
+    if (!out || max <= 0) return 0;
+    char image[256], installed[256];
+    app_roots(image, sizeof(image), installed, sizeof(installed));
+    int n = scan_root(out, 0, max, image, 1);
+    n = scan_root(out, n, max, installed, 0);
+    if (n == max)
+        fprintf(stderr, "wms: app list is full (%d); a bundle may be missing\n", max);
+
+    /* readdir order is arbitrary; sort so the launcher is stable. */
+    qsort(out, (size_t)n, sizeof(WmApp), cmp_app);
+    return merge_dups(out, n);
+}
+
+int wms_apps_poll_rescan(WmApp *out, int *count, int max) {
+    if (!out || max <= 0) return 0;
+
+    char req[256];
+    run_file(req, sizeof(req), WM_RESCAN_LEAF);
+    struct stat st;
+    if (stat(req, &st) != 0) return 0;
+
+    /* Take the request before scanning: pkg writes it after the bundle is in
+     * place, and a request we cannot remove must not turn into a rescan (and a
+     * few hundred stat() calls) on every frame. Remember which one we could not
+     * delete instead. */
+    static long long stubborn_ino = -1, stubborn_mtime = -1;
+    if (unlink(req) != 0 && errno != ENOENT) {
+        if ((long long)st.st_ino == stubborn_ino && (long long)st.st_mtime == stubborn_mtime)
+            return 0;
+        stubborn_ino = (long long)st.st_ino;
+        stubborn_mtime = (long long)st.st_mtime;
+        fprintf(stderr, "wms: cannot remove %s (%s); scanning anyway\n", req, strerror(errno));
+    } else {
+        stubborn_ino = -1;
+        stubborn_mtime = -1;
+    }
+
+    int n = wms_scan_apps(out, max);
+    if (count) *count = n;
+    fprintf(stderr, "wms: rescan: %d bundle(s)\n", n);
+    return 1;
+}
+
+/* ---------------------------------------------------------- launch errors
+ * A tile that does not start used to fail three syscalls deep in a forked
+ * child and leave nothing behind but a pid. Every failure now becomes one line
+ * that says which bundle, which path and what the kernel said - logged, handed
+ * to the launcher through wms_take_launch_error(), and written to
+ * WM_LAUNCH_ERR so it survives even a launcher that never asks.
+ */
+static void launch_failed(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(last_launch_error, sizeof(last_launch_error), fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "wms: launch failed: %s\n", last_launch_error);
+
+    char path[256];
+    run_file(path, sizeof(path), WM_LAUNCH_LEAF);
+    mkdir(run_dir(), 0755);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "wms: cannot write %s: %s\n", path, strerror(errno));
+        return;
+    }
+    fprintf(f, "%s\n", last_launch_error);
+    fclose(f);
+}
+
+int wms_take_launch_error(char *out, int cap) {
+    if (!out || cap <= 0) return 0;
+    if (!last_launch_error[0]) { out[0] = 0; return 0; }
+    snprintf(out, (size_t)cap, "%s", last_launch_error);
+    last_launch_error[0] = 0;
+    return 1;
+}
+
 /* ---------------------------------------------------------- sandbox
  * Every app runs in its own mount/network/IPC namespace, chrooted into a jail
- * that contains only its own binary, a private /tmp, /dev/null and the window
- * socket. It runs as uid 1000, so even if it escaped the chroot it could not
- * read /root (root-owned, mode 0700).
+ * that contains its own payload, its own bundle (read-only, at /app), a private
+ * /tmp, /dev/null and the window socket. It runs as uid 1000, so even if it
+ * escaped the chroot it could not read /root (root-owned, mode 0700).
  *
  * This is what stops a malicious app from being ransomware: it never sees the
  * user's files to encrypt. The kernel enforces it (namespaces + DAC), not us.
@@ -403,7 +605,25 @@ static void mkdirp_for(const char *jail, const char *sub) {
     mkdir(buf, 0755);
 }
 
-static void sandbox_child(const char *exe, const char *id, int net, int audio, const char *arg) {
+/* One line from the child, before it becomes the app: what failed, on what
+ * path, and what the kernel said. The write end is close-on-exec, so the parent
+ * treats "the pipe closed without a word" as proof that exec worked. */
+#define LAUNCH_MSG_MAX 256
+
+static void child_report(int fd, const char *what, const char *path) {
+    if (fd < 0) return;
+    int err = errno;                  /* before anything else can clobber it */
+    char buf[LAUNCH_MSG_MAX];
+    int n = snprintf(buf, sizeof(buf), "%s %.160s: %s", what, path ? path : "",
+                     strerror(err));
+    if (n <= 0) return;
+    if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
+    ssize_t w = write(fd, buf, (size_t)n);
+    (void)w;
+}
+
+static void sandbox_child(const char *exe, const char *id, int net, int audio,
+                          const char *arg, int errfd) {
     char jail[192], path[256];
     snprintf(jail, sizeof(jail), "/run/mystic/jail/%s", id);
 
@@ -411,8 +631,9 @@ static void sandbox_child(const char *exe, const char *id, int net, int audio, c
      * root-opened /dev/fb0 (read AND write the whole screen, forge a lock
      * screen) and the evdev keyboard (the unlock PIN in cleartext), plus the
      * listener and every other client's socket and shm buffer. Namespaces hide
-     * paths; they do not take away file descriptors. */
-    for (int fd = 3; fd < 1024; fd++) close(fd);
+     * paths; they do not take away file descriptors. errfd is the one exception:
+     * it is how this child tells the desktop why it never became an app. */
+    for (int fd = 3; fd < 1024; fd++) if (fd != errfd) close(fd);
 
     /* An app that declares 'network = host' keeps the real namespace: a
      * browser in an empty netns can only reach loopback, which is exactly the
@@ -442,8 +663,37 @@ static void sandbox_child(const char *exe, const char *id, int net, int audio, c
         snprintf(path, sizeof(path), "%s/bin/app", jail);
         int fd = open(path, O_CREAT | O_RDWR, 0755);
         if (fd >= 0) close(fd);
-        if (mount(exe, path, NULL, MS_BIND, NULL) < 0)
-            fprintf(stderr, "wms: sandbox bind exe failed: %s\n", strerror(errno));
+        if (mount(exe, path, NULL, MS_BIND, NULL) < 0) {
+            /* This is the failure that used to be invisible: the tile was there,
+             * the click did nothing, and 127 scrolled past on a console nobody
+             * reads. Report it and stop - exec'ing an unmounted /bin/app would
+             * only add a second, less useful error. The report goes first so it
+             * carries the errno the syscall actually set, not the one fprintf
+             * left behind. */
+            child_report(errfd, "cannot mount the payload", exe);
+            fprintf(stderr, "wms: sandbox bind %.160s -> %s failed: %s\n",
+                    exe, path, strerror(errno));
+            _exit(123);
+        }
+
+        /* A payload is not always the whole app: pkg installs a tree, and a
+         * package can ship a runtime beside its executable (libVLC's shared
+         * objects, a browser's engine, data files). Binding only the executable
+         * left such an app unable to see its own files, so the bundle directory
+         * is mounted read-only at /app and MYSTIC_BUNDLE says where. Only that
+         * one directory is added - not /root, not the rest of
+         * /usr/share/mystic/apps. */
+        {
+            char bundle_dir[512];
+            snprintf(bundle_dir, sizeof(bundle_dir), "%s", exe);
+            char *last = strrchr(bundle_dir, '/');
+            if (last) *last = 0;                       /* <root>/<id> */
+            snprintf(path, sizeof(path), "%s/app", jail);
+            mkdir(path, 0755);
+            if (mount(bundle_dir, path, NULL, MS_BIND | MS_RDONLY, NULL) < 0)
+                fprintf(stderr, "wms: sandbox bundle bind %.200s failed: %s\n",
+                        bundle_dir, strerror(errno));
+        }
 
         snprintf(path, sizeof(path), "%s/run/mystic/wm.sock", jail);
         fd = open(path, O_CREAT | O_RDWR, 0666);
@@ -567,17 +817,20 @@ static void sandbox_child(const char *exe, const char *id, int net, int audio, c
             chdir("/");
             setgroups(0, NULL);
             if (setgid(SANDBOX_GID) != 0 || setuid(SANDBOX_UID) != 0) {
+                child_report(errfd, "cannot drop to uid 1000 in", jail);
                 fprintf(stderr, "wms: sandbox uid drop failed: %s; refusing to run\n",
                         strerror(errno));
                 _exit(126);
             }
         } else {
+            child_report(errfd, "cannot chroot into", jail);
             fprintf(stderr, "wms: chroot failed: %s; refusing to run\n", strerror(errno));
             _exit(124);
         }
     } else {
         /* fail closed: an app that cannot be isolated must not run at all,
          * rather than quietly running as root with the whole filesystem */
+        child_report(errfd, "cannot unshare namespaces for", id);
         fprintf(stderr, "wms: unshare failed (%s); refusing to run %s\n",
                 strerror(errno), id);
         _exit(125);
@@ -594,26 +847,47 @@ static void sandbox_child(const char *exe, const char *id, int net, int audio, c
     }
     setenv("HOME", "/tmp", 1);
     setenv("TMPDIR", "/tmp", 1);
+    /* the bundle's own tree, if the app needs more than its payload */
+    setenv("MYSTIC_BUNDLE", "/app", 1);
+    setenv("LD_LIBRARY_PATH", "/app/usr/lib:/app/lib", 1);
 }
 
 static int wms_launch_arg(const WmApp *app, WmClient *cl, int slot, const char *arg) {
     if (!app || slot < 0) return -1;
-    char exe[512];
-    snprintf(exe, sizeof(exe), "%s/%s/%s", WM_APP_DIR, app->id, app->exe);
 
-    /* exec= comes from a manifest, which is untrusted input: a bare filename
-     * only. ".." or a slash would let a bundle point at /bin/sh, and the old
-     * unconditional host fallback would then run it as root. */
-    if (!app->exe[0] || strchr(app->exe, '/') || strstr(app->exe, "..")) {
-        fprintf(stderr, "wms: refusing bundle %s: unsafe exec=%.40s\n", app->id, app->exe);
+    /* The payload comes from the root the manifest was found under, never from
+     * a hardcoded one: a pkg-installed bundle lives in /root/apps and exec'ing
+     * <WM_APP_DIR>/<id> for it hit a path that does not exist, which is why
+     * every installed tile was clickable and dead. The path is also proven to
+     * be a regular executable before a fork is spent on it, so the failure is
+     * one honest line instead of a pid that never opens a window. */
+    char exe[512], why[128];
+    if (wms_bundle_payload(app, exe, sizeof(exe), why, sizeof(why)) != 0) {
+        if (exe[0]) launch_failed("%s: %s (%s)", app->id[0] ? app->id : "?", why, exe);
+        else        launch_failed("%s: %s", app->id[0] ? app->id : "?", why);
         return -1;
     }
 
+    int ep[2];
+    if (pipe(ep) != 0) {
+        launch_failed("%s: pipe: %s", app->id, strerror(errno));
+        return -1;
+    }
+    /* The write end dies with the exec, so the parent can tell "running" from
+     * "never ran" without polling /proc or waiting for a window. */
+    fcntl(ep[1], F_SETFD, FD_CLOEXEC);
+    fcntl(ep[0], F_SETFL, fcntl(ep[0], F_GETFL, 0) | O_NONBLOCK);
+
     pid_t pid = fork();
-    if (pid < 0) return -1;
+    if (pid < 0) {
+        launch_failed("%s: fork: %s", app->id, strerror(errno));
+        close(ep[0]);
+        close(ep[1]);
+        return -1;
+    }
     if (pid == 0) {
-        sandbox_child(exe, app->id, app->net, app->audio, arg);
-        (void)arg;
+        close(ep[0]);
+        sandbox_child(exe, app->id, app->net, app->audio, arg, ep[1]);
         if (arg && arg[0]) {
             /* an app that was asked to open a document gets the path as
              * argv[1]; the path was validated by the desktop, and the app
@@ -622,9 +896,41 @@ static int wms_launch_arg(const WmApp *app, WmClient *cl, int slot, const char *
         } else {
             execl("/bin/app", "app", (char *)NULL);   /* inside the jail, or not at all */
         }
-        fprintf(stderr, "wms: cannot exec the jailed %s\n", app->id);
+        /* exec failed: /bin/app is not an executable (a 0-byte placeholder, a
+         * library, a wrong architecture). The kernel says which. */
+        child_report(ep[1], "cannot exec", exe);
+        fprintf(stderr, "wms: cannot exec the jailed %s: %s\n", app->id, strerror(errno));
         _exit(127);
     }
+
+    close(ep[1]);
+    /* Wait for one of two answers: the pipe closes (exec happened, the app is
+     * running) or it carries a sentence (it did not). Bounded, because a mount
+     * that hangs must not freeze the desktop's frame loop. */
+    char msg[LAUNCH_MSG_MAX + 1];
+    int got = 0, timed_out = 0;
+    for (int i = 0; i < 2000 && got < (int)sizeof(msg) - 1; i++) {
+        ssize_t r = read(ep[0], msg + got, sizeof(msg) - 1 - (size_t)got);
+        if (r > 0) { got += (int)r; continue; }
+        if (r == 0) break;                       /* closed: nothing went wrong */
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+        if (i == 1999) { timed_out = 1; break; }
+        struct timespec ts = { 0, 1000000 };     /* 1 ms */
+        nanosleep(&ts, NULL);
+    }
+    close(ep[0]);
+    msg[got] = 0;
+
+    if (got > 0) {
+        for (int i = 0; i < got; i++) if (msg[i] == 10 || msg[i] == 13) msg[i] = ' ';
+        launch_failed("%s: %s", app->id, msg);
+        int status = 0;
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) { }
+        return -1;
+    }
+    if (timed_out)
+        fprintf(stderr, "wms: %s has not exec'd after 2 s; leaving it alone\n", app->id);
     (void)cl;
     return (int)pid;
 }

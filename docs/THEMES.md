@@ -11,31 +11,35 @@ directory, and see it in Settings without recompiling anything.
 |---|---|
 | `stage/etc/mystic/themes/*.theme` | the sources, baked into the image at `/etc/mystic/themes` |
 | `src/theme.c` | the parser (`theme_load`, `theme_load_all`) and the built-in defaults |
-| `src/mystic.h:127-142` | the `Theme` struct every other file draws from |
-| `src/main.c:32` | `THEME_DIR`, the directory the desktop reads |
+| `src/mystic.h` (`Theme`) | the struct every other file draws from |
+| `src/main.c` (`THEME_DIR`) | the directory the desktop reads |
 | `src/apps/settings.c` | the Settings → Theme list |
 | `tools/mkimage.py:94-103` | overlays all of `stage/` onto the rootfs, so a new `.theme` file needs no build-list edit |
 
 The desktop loads the directory once at boot, in **filename order**
 (`theme_load_all` sorts with `strcmp`), so the leading number in `1-obsidian.theme`
-is what puts it first. `Ctrl+1` … `Ctrl+9` select the 1st … 9th theme in that
-order (`src/main.c:1453`). Settings writes the chosen theme's `name` to
+is what puts it first. `Ctrl+1` … `Ctrl+9` (defined in `src/shortcuts.c`)
+select the 1st … 9th theme in that order. Settings writes the chosen theme's `name` to
 `/etc/mystic/current-theme`, which the desktop re-reads once a second; the match
 is on the **`name =` field inside the file, not the filename**.
 
 ## The key set
 
-Fifteen keys, one per line, `key = value`. All of them are optional: a file that
-omits one keeps the built-in default from `defaults()` (`src/theme.c:68-86`), and
+Twenty-three keys, one per line, `key = value`. All of them are optional: a file
+that omits one keeps the built-in default from `defaults()` in `src/theme.c`, and
 the parser says so on stderr.
 
 | Key | Type | Range / form | Default | What it paints |
 |---|---|---|---|---|
 | `name` | text | ≤ 63 bytes, unique | `Default` | shown in Settings, written to `/etc/mystic/current-theme`; the only identity the desktop persists |
-| `dark` | flag | `0` or `1` | `1` | tells the wallpaper which palette to use — shadows deepen at `1`, lift at `0` (`src/wallpaper.c:210-212`); it does **not** change text colours |
+| `dark` | flag | `0` or `1` | `1` | tells the wallpaper which palette to use — shadows deepen at `1`, lift at `0` (`src/wallpaper.c` reads it); it does **not** change text colours |
 | `bg_top` | colour | opaque | `#0B0F1A` | top of the desktop gradient (the wallpaper is blended onto it) |
 | `bg_bottom` | colour | opaque | `#141A2B` | bottom of that gradient |
 | `accent` | colour | opaque | `#7AA2F7` | focus rings, selected rows, links, warnings; drawn on both `window_bg` and `panel` |
+| `icon_accent` | colour | alpha allowed | same as `accent` | the second colour **inside every icon**: the terminal chevron, folder tab, gear hub, clock hands, pencil nib, tallest bar, inner Mandel ring, waveform peak, globe meridian, picture, play triangle and document rules. A focused or hovered icon is drawn in the theme's two icon colours with measured luminance choosing the roles: the **dimmer is the body and the brighter is the highlight**, never a third colour and never one colour |
+| `icon_style` | text | `solid`, `outline`, `duotone`, `rounded`, `sharp`, `pixel` | `duotone` | **geometry only**: filled marks, a 1.5 px stroke, ~35 % corners, 0-1 px corners or a 3 px grid. A theme that omits `icon_accent` (it defaults to `accent`) is legitimately one colour. Every style still draws a highlight: `icon_accent` for an ordinary icon, the brighter of `accent`/`icon_accent` when the icon is active (Neon: body `#FF2BD6`, highlight `#22F0FF`) |
+| `anim` | text | `none`, `pulse`, `glow`, `drift`, `orbit`, `wave`, `spin` | `pulse` | the theme's motion. Every value except `none` includes the breathe; `glow` adds a halo, `orbit` a dot circling the active item's icon, `wave` moving bars, `spin` rotating gear teeth, `drift` a slow background light, advanced on the same hover frames |
+| `anim_amp` | number | `0 … 1` | `0.6` | amplitude of that motion. `0` means **no animation**, exactly like `anim_speed = 0` |
 | `glow` | colour | opaque | `#3D59A0` | the secondary light in the wallpaper and the bloom behind the launcher |
 | `glow_strength` | number | `0 … 1` | `0.55` | how much `glow` is mixed in |
 | `panel` | colour | alpha allowed | `#8C1A2033` | top bar, launcher, lock panel, and in-window toolbars/footers; the alpha is the glass |
@@ -46,11 +50,15 @@ the parser says so on stderr.
 | `window_border` | colour | alpha allowed | `#22FFFFFF` | the 1 px edge of a window |
 | `corner` | number | `0 … 48` px | `14` | corner radius of windows and panels |
 | `blur` | number | `0 … 1` | `1.0` | backdrop blur strength; `0` skips the blur entirely (crisper, and the cheapest theme to compose) |
+| `font_ui` | text | an installed family, ≤ 47 bytes | empty (keep the current face) | UI family role. The user's `/etc/mystic/fonts.conf` wins over the theme (`docs/FONTS.md`) |
+| `font_mono` | text | an installed family, ≤ 47 bytes | empty (keep the current face) | monospace role, same precedence |
+| `font_scale` | number | `0.8 … 1.6` | `1.0` | per-theme text scale, multiplied by the user's global UI scale |
+| `anim_speed` | number | `0 … 3` | `1.0` | icon pulse multiplier. `0` means **no animation at all**: nothing moves and no frame is requested for it. `1` is a 0.8 Hz breathe, `1.6` is 1.28 Hz. Values outside the range are reported and clamped |
 
 ### `window_bg` is always opaque
 
 Every value is taken as written except one: `theme_load()` forces the alpha of
-`window_bg` to `FF` (`src/theme.c:321`). A window body sits *over* a blurred copy
+`window_bg` to `FF` (`theme_load()`). A window body sits *over* a blurred copy
 of the wallpaper, so a translucent body lets wallpaper detail bleed through the
 text and turns into haze. The colour is still the theme's; only the alpha is
 ignored. Write `#RRGGBB` and there is nothing to know.
@@ -77,7 +85,10 @@ ignored. Write `#RRGGBB` and there is nothing to know.
 ### Numbers
 
 Plain decimal. `glow_strength` and `blur` are clamped to `0 … 1`, `corner` to
-`0 … 48`. Out-of-range values are reported and clamped rather than rejected.
+`0 … 48`, `anim_speed` to `0 … 3`, `anim_amp` to `0 … 1` and `font_scale` to
+`0.8 … 1.6`. For the two animation keys, `0` is a valid value and means *off*,
+so it is not treated as a missing key. Out-of-range values are reported and
+clamped rather than rejected.
 
 ## Contrast
 
@@ -142,7 +153,7 @@ How the four differ is a design decision, not a hue rotation:
   `#0E0E0E`, `#121212`, `#DEDEDE`, `#A0A0A0`, accent pure white. `blur = 0.0` and
   `glow_strength = 0.25`, because flat surfaces and crisp glyph edges are what
   maximum legibility means; it is also the cheapest theme to compose. The only
-  colour left on the screen is the three window buttons, which `src/main.c:793-797`
+  colour left on the screen is the three window buttons, which `src/main.c`
   paints at fixed RGB instead of taking them from the theme.
 
 ### The two space themes, measured
@@ -181,6 +192,147 @@ Same formula, same method, for the record:
 | Sandstone | 15.35 : 1 | 4.57 : 1 | just over the line (4.55 on a panel) |
 | Carbon | 19.60 : 1 | 12.46 : 1 | |
 
+## Icons and animation
+
+### Two-tone icons
+
+Every icon is drawn from two theme colours. An ordinary icon keeps `text` as the
+body and draws one deliberate part in `icon_accent`: the terminal's prompt
+chevron, the folder's tab, the gear's hub, the clock's hands, the pencil's nib,
+the tallest bar, the inner Mandel ring, the waveform's peak, the globe's
+meridian, the picture frame's inner square, the play triangle and the document's
+rule lines. The other icons carry the second colour in their most characteristic
+part (the calculator display, the live cell, one grid/2048 tile, the System "i").
+
+A focused dock icon and a selected or hovered launcher tile are drawn in the
+theme's two icon colours with the roles assigned by measured WCAG luminance:
+**the dimmer colour is the body, the brighter one is the highlight**. That is
+what keeps the two roles distinct in the active state. The earlier rule - body
+= `accent`, highlight = "the brighter of the two" - made both roles the same
+colour on the eight themes whose `accent` is the brighter of the pair
+(Porcelain, Aurora, Sandstone, Carbon, Eclipse, Mono, Neon and Rose), so their
+active icons collapsed back to a one-colour silhouette. The focused Neon icon is
+body `#FF2BD6` with a `#22F0FF` highlight; on Mono it is `#B4B4B4` with a
+`#FFFFFF` highlight. Both are visible, pixel for pixel, in
+`.work/ti2/focused-neon.png` and `.work/ti2/focused-mono.png`.
+
+A theme that wants a monochrome icon sets `accent` and `icon_accent` to the same
+colour; no shipped theme does that, and no `icon_style` drops the highlight by
+itself.
+
+`icon_accent` is resolved **after** the file is read, so a theme may set it
+before or after `accent`; when it is absent it becomes that theme's `accent`. It
+is a UI colour, not text, but it is held to a readable floor anyway: **≥ 4.5 : 1**
+against `window_bg` and against `panel` over both the desktop and the window
+body. Measured for the shipped files (WCAG formula above):
+
+| Theme | `icon_accent` | on `window_bg` | on `panel` (bar / in window) |
+|---|---|---|---|
+| Obsidian | `#C4A7FF` | 8.60 : 1 | 8.87 / 8.44 |
+| Porcelain | `#2F5D62` | 7.34 : 1 | 7.16 / 7.34 |
+| Aurora | `#E879C8` | 6.52 : 1 | 6.77 / 6.45 |
+| Basalt | `#E8D8C0` | 12.62 : 1 | 12.59 / 12.25 |
+| Sandstone | `#2F5D62` | 7.22 : 1 | 6.99 / 7.11 |
+| Carbon | `#FF6B35` | 6.91 : 1 | 6.77 / 6.73 |
+| Neon | `#FF2BD6` | 6.30 : 1 | 6.26 / 6.22 |
+| Forest | `#A8D5A2` | 11.01 : 1 | 10.56 / 10.34 |
+| Rose | `#7A3F55` | 7.54 : 1 | 7.39 / 7.39 |
+| Mono | `#B4B4B4` | 9.04 : 1 | 8.39 / 8.31 |
+| Nebula | `#7FE7E0` | 13.08 : 1 | 13.40 / 13.22 |
+| Eclipse | `#8FB8FF` | 9.94 : 1 | 10.00 / 9.88 |
+
+Mono stays grayscale by construction: both icon colours are greys, and its
+focused pair is a `#B4B4B4` body with a `#FFFFFF` highlight - a lighter grey,
+never a hue. On the active dock tile (`accent` at 28 % over `window_bg`, which
+is what the dock paints) the measured worst case across the shipped files is
+3.2 : 1 for the body (Neon) and 3.1 : 1 for the highlight (Porcelain), both
+above the 3 : 1 non-text floor in WCAG 2.1 SC 1.4.11.
+
+### Icon geometry
+
+`icon_style` selects geometry, not colour. `solid` is the filled mark,
+`outline` draws the same silhouette as a 1.5 px stroke, `rounded` opens the
+corners to ~35 % of the mark, `sharp` closes them to 0-1 px, and `pixel` snaps
+every edge to a visible 3 px grid with square ends. In **all six** an ordinary
+icon's body is `text`; a focused or hovered one swaps to the theme's two icon
+colours as described above (dimmer body, brighter highlight), and the highlight
+part listed above is always the second colour. A truly monochrome icon is a
+theme whose two colours are equal, not a style that drops the highlight. `anim`
+adds a second motion on top of the breathe: `glow` a halo, `orbit` a dot circling
+the active item's icon, `wave` bars stepping in sequence, `spin` gear teeth
+rotating, and `drift` a slow light behind the desktop (it advances only while an
+item is active, so it cannot keep a still desktop awake). `none` turns every
+icon motion off.
+
+### The pulse
+
+A hovered dock icon and the selected (or hovered) launcher tile breathe. The
+multiplier is computed, not faked:
+
+```
+phase   = fmod(now_sec * anim_speed * 2*pi*0.8, 2*pi)
+pulse   = 0.5 + 0.5 * sin(phase)                 # 0 .. 1
+scale   = 1 - 0.035 * anim_amp * (1 - pulse)     # 0.965 .. 1.0 at amp 1
+```
+
+It is implemented once in `theme_icon_pulse_scale()` in `src/theme.c`, which
+the desktop and the host harness both call, so there is no second formula to
+drift.
+
+* **Shrink only.** The scale never exceeds 1.0, so an icon can only get smaller
+  than the room it was already given: it cannot leave its tile or the dock hit
+  box. The eye is not animated when the pointer is away from every dock and
+  calm themes (`anim_amp` 0.50: Porcelain, Eclipse, Forest, Rose), 0.80 px on
+  Obsidian, Sandstone and Nebula (0.60), 0.93 px on Aurora and Basalt (0.70),
+  1.13 px on Neon (0.85) and 1.20 px on Carbon (0.90). Those are the minimum
+  scale over one period taken from `theme_icon_pulse_scale()` itself, so
+  `(1 - min) * 38`; the old "0.8-1.2 px" was too large at the calm end and did
+  not name the fastest theme.
+* **Rate comes from the theme.** `anim_speed` multiplies the phase: 0.45 in
+  Forest (a 0.36 Hz breathe) up to 1.6 in Neon (1.28 Hz). Amplitude is
+  `anim_amp`, not the rate - two themes with the same `anim_amp` shrink by the
+  same number of pixels however fast they breathe.
+* **`anim_speed = 0` is a still desktop.** `theme_icon_pulse_scale()` returns
+  exactly 1.0 and the frame request is skipped, so no repaint happens for the
+  pulse - not a slow one, none.
+* **Idle costs nothing.** A frame is requested only while an item is active -
+  a hovered dock icon, a hovered launcher tile or the launcher's keyboard
+  selection - and at most 30 times a second. The gate is `anim_gate()` and it
+  has no other input: the pointer over empty desktop, over the start button, or
+  a window being dragged requests zero frames for icon animation. Measured over
+  10 s of idle (303 frame slots) on every shipped theme: 0 frames idle, 303 with
+  a dock icon hovered.
+* **The eye does not animate.** The start button's eye blinks on a press with
+  its own 90 ms + 170 ms schedule and is not governed by `anim_speed`. It has no
+  orbit and it is not an animation item, so hovering it asks for no frame. The
+  `orbit` motion belongs to the active item's icon, which is already gated by
+  its hover/selection.
+
+  MEASURED, against the real dock icon (ui_px(40) x ui_scale_get() = 56 px
+  at the shipped scale 1.0; 45 px before the legacy ui.conf is migrated):
+  the breathe is 3.5% x anim_amp of the tile, i.e. 0.98 px at amp 0.50
+  (Forest, Porcelain, Rose), 1.18 px at 0.60 (Obsidian), 1.37 at 0.70
+  (Sandstone), 1.67 at 0.85 (Neon) and 1.76 at 0.90 (Carbon); Mono is 0.
+  An earlier revision quoted 0.66-1.20 px because it measured a 38 px
+  reference tile, not the shipped 56 px one.
+
+### Shipped values
+
+| Theme | `icon_accent` | `anim_speed` | Why |
+|---|---|---|---|
+| Obsidian | `#C4A7FF` | `1.0` | the reference rate; a lavender second light against the blue accent |
+| Porcelain | `#2F5D62` | `0.6` | calm: deep sage that holds up on paper white |
+| Aurora | `#E879C8` | `0.9` | a slow magenta shimmer, the second aurora colour |
+| Basalt | `#E8D8C0` | `0.8` | bone against amber, unhurried |
+| Sandstone | `#2F5D62` | `0.7` | terracotta + deep teal, relaxed |
+| Carbon | `#FF6B35` | `1.2` | crisp industrial warning colour, a little quicker |
+| Neon | `#FF2BD6` | `1.6` | fast and loud; the magenta glow doubles as the icon highlight |
+| Forest | `#A8D5A2` | `0.45` | the calmest moving theme; sage on moss |
+| Rose | `#7A3F55` | `0.6` | calm; a plum highlight that measures 7.5 : 1 on the warm paper |
+| Mono | `#B4B4B4` | `0` | no hue, no motion: a still desktop |
+| Nebula | `#7FE7E0` | `0.7` | a slow mint orbit against the lavender accent |
+| Eclipse | `#8FB8FF` | `0.5` | the cool starlight in the corona's shadow, very slow |
+
 ## Adding a theme
 
 1. Copy a file you like, e.g. `cp 1-obsidian.theme 7-mine.theme`. The leading
@@ -189,11 +341,12 @@ Same formula, same method, for the record:
    identify a theme by this string, and two themes with the same name cannot be
    told apart.
 3. Fill in all nine that matter: `name`, `dark`, `bg_top`, `bg_bottom`, `accent`,
-   `panel`, `text`, `text_dim`, `window_bg`. The other six have defaults that work
-   on any background.
+   `panel`, `text`, `text_dim`, `window_bg`. The other fourteen have defaults that
+   work on any background. `icon_accent` defaults to `accent` and `anim_speed` to
+   `1.0`; set them if the second icon colour or the motion is part of the idea.
 4. Measure. The two rules that catch people out: composited alpha, and `panel`
    over both `bg_top` and `window_bg`. `text` must be ≥ 7 : 1 and `text_dim`
-   ≥ 4.5 : 1 on both.
+   ≥ 4.5 : 1 on both. If you set `icon_accent`, hold it to ≥ 4.5 : 1 on both too.
 5. Put the file in `stage/etc/mystic/themes/` (that directory *is*
    `/etc/mystic/themes` in the image; `tools/mkimage.py` overlays all of `stage/`,
    so there is no build list to add it to), rebuild the image, boot, and look at
@@ -212,6 +365,8 @@ harness, not just documented:
 |---|---|---|
 | `bg_top = #12345` | default kept | `theme: FILE:3: key 'bg_top': malformed colour '#12345' (want #RRGGBB or #AARRGGBB), keeping #FF0B0F1A` |
 | `glow_strength = 2.5` | clamped to `1` | `theme: FILE:6: key 'glow_strength': 2.5 is outside 0..1, using 1` |
+| `anim_speed = 9` | clamped to `3` | `theme: FILE:7: key 'anim_speed': 9 is outside 0..3, using 3` |
+| `icon_accent = nothex` | resolved to the file's `accent`, whatever the key order | `theme: FILE:6: key 'icon_accent': malformed colour 'nothex' (want #RRGGBB or #AARRGGBB), using the theme's accent` |
 | `blur = nan` | default kept | `theme: FILE:8: key 'blur': not a number, keeping 1` |
 | `accent` missing entirely | default kept | `theme: FILE: key 'accent': missing, keeping the built-in default` |
 | `acccent = #123456` | line ignored | `theme: FILE:12: unknown key 'acccent', ignored (see docs/THEMES.md)` |
@@ -230,24 +385,15 @@ the boot log.
 
 `src/theme.c` will scan 256 directory entries, load at most `THEME_MAX` (32) into
 a caller's array, and warn when the caller asks for more than 32
-(`src/theme.c:36-39`). It also warns when the directory holds more `.theme` files
-than the caller has slots, and names the ones it had to drop.
+(`src/theme.c` defines `THEME_SCAN_MAX` / `THEME_MAX`). It also warns
+when the directory holds more `.theme` files than the caller has slots, and
+names the ones it had to drop.
 
-**That limit is currently 8, and it is a real bug.** With ten themes shipped:
-
-* `src/main.c:99` — `static Theme themes[8];`
-* `src/main.c:1367` — `theme_count = theme_load_all(themes, 8, THEME_DIR);`
-* `src/apps/settings.c` — `#define MAX_THEMES 8`, deliberately matched to
-  `main.c` so Settings never offers a row the desktop cannot apply.
-
-So `neon.theme` and `rose.theme` sort after the eighth name and are **not loaded**;
-the boot log now says exactly that:
-
-```
-theme: /etc/mystic/themes: 2 of 10 theme file(s) not loaded - the caller only has 8 slots (raise the Theme array, see docs/THEMES.md): neon.theme rose.theme
-```
-
-The fix is three numbers in files this document does not own — raise `themes[8]`
-to `themes[16]`, pass `16`, and set `MAX_THEMES` to `16`. `theme.c` is already
-sized for it (`THEME_MAX 32`), and so is the rest of the desktop: `Ctrl+1..9`
-addresses nine themes, and Settings scrolls.
+The desktop used to hold only 8, which silently dropped the last two files. That
+is fixed: `src/main.c` declares `static Theme themes[16]`, calls
+`theme_load_all(themes, 16, THEME_DIR)`, and `src/apps/settings.c` uses
+`#define MAX_THEMES 16` so Settings never offers a row the desktop cannot apply.
+Twelve themes are shipped, so there are four spare slots; a thirteenth file would
+still be loaded, and a seventeenth would produce the warning above naming it.
+`Ctrl+1` … `Ctrl+9` addresses the first nine in filename order; Settings
+scrolls to the rest.

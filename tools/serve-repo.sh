@@ -37,9 +37,19 @@ pack_one() {
 for d in stage/usr/share/mystic/apps/*/; do
     [ -d "$d" ] || continue
     name=$(basename "$d")
+    # vlc is not a plain stage bundle. Its package carries the libVLC
+    # closure (103 MB installed) and is produced by tools/fetch-vlc.py;
+    # packing the stage directory here would overwrite the real
+    # build/repo/vlc.tar.gz with the 169 KB image placeholder and install a
+    # player whose libvlc does not exist.
+    if [ "$name" = vlc ]; then continue; fi
     desc=$(sed -n 's/^desc *= *//p' "$d/manifest" 2>/dev/null | head -1)
     pack_one "$name" "$d" "${desc:-Mystic application}"
 done
+# keep the vlc row tools/fetch-vlc.py wrote, if the package is there
+if [ -f "$REPO/vlc.tar.gz" ] && [ -f "$REPO/vlc.row" ]; then
+    cat "$REPO/vlc.row" >> "$REPO/index.tsv.new"
+fi
 # the browser engine, if it has been fetched by tools/fetch-browser.py
 pack_one "browser" "build/browser-root" "Chromium headless engine (installs to /root/apps)"
 

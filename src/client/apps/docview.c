@@ -311,6 +311,20 @@ static int dv_wrap_count(const char *text, Font *f, int maxw, int *clipped) {
 }
 
 /* Greedy fit for a single-line label. */
+static size_t dv_utf8_trim(const char *buf, size_t len) {
+    if (len == 0) return 0;
+    size_t i = len;
+    while (i > 0 && ((unsigned char)buf[i - 1] & 0xC0) == 0x80) i--;
+    if (i == 0) return len;
+    unsigned char c = (unsigned char)buf[i - 1];
+    int need = 1;
+    if (c >= 0xC2 && c <= 0xDF) need = 2;
+    else if (c >= 0xE0 && c <= 0xEF) need = 3;
+    else if (c >= 0xF0 && c <= 0xF4) need = 4;
+    if (len - (i - 1) >= (size_t)need) return len;
+    return i - 1;
+}
+
 static void dv_draw_fit(Surface *s, Font *f, float x, float y, float maxw,
                         const char *text, u32 color) {
     if (!f || !text || !text[0] || maxw < 4) return;
@@ -323,8 +337,10 @@ static void dv_draw_fit(Surface *s, Font *f, float x, float y, float maxw,
     float dots = font_width(f, "..");
     size_t n = strlen(buf);
     while (n > 0) {
+        n = dv_utf8_trim(buf, n);
         buf[n] = 0;
         if (font_width(f, buf) + dots <= maxw) break;
+        if (n == 0) break;
         n--;
     }
     if (n == 0) return;
@@ -682,7 +698,12 @@ static void dv_draw_raw_line(Viewer *v, Surface *s, const DvLine *l, int y) {
     if (!f) f = font_get(FONT_REGULAR, 11.0f);
     char saved = base[l->off + l->len];
     base[l->off + l->len] = 0;
-    font_draw(s, f, (float)l->x, (float)y, base + l->off, C_TEXT);
+    /* A raw source line has no wrap width of its own; fit it to the body
+     * band instead of letting it run under the scrollbar and out of the
+     * window. */
+    float maxw = (float)(v->w - l->x - ui_px(16));
+    if (maxw < 4.0f) maxw = (float)v->w - (float)l->x;
+    dv_draw_fit(s, f, (float)l->x, (float)y, maxw, base + l->off, C_TEXT);
     base[l->off + l->len] = saved;
 }
 

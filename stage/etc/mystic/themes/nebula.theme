@@ -21,3 +21,18 @@ window_bg     = #120B26
 window_border = #3A8F7AE0
 corner        = 16
 blur          = 1.0
+
+# Icon animation: anim_speed is a pulse multiplier (0 = a still desktop,
+# sensible range 0..3); icon_accent is the highlight colour inside every icon.
+icon_accent   = #7FE7E0
+anim_speed    = 0.7
+
+# Icon geometry, motion and type. anim is one of none/pulse/glow/drift/orbit/
+# wave/spin; icon_style one of solid/outline/duotone/rounded/sharp/pixel;
+# font_scale (0.8..1.6) multiplies the user text scale.
+anim          = orbit
+anim_amp      = 0.6
+icon_style    = duotone
+font_ui       = Lato
+font_mono     = JetBrains Mono
+font_scale    = 1.0

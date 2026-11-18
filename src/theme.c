@@ -25,6 +25,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,6 +72,10 @@ static void defaults(Theme *t) {
     t->bg_top = RGB(0x0B, 0x0F, 0x1A);
     t->bg_bottom = RGB(0x14, 0x1A, 0x2B);
     t->accent = RGB(0x7A, 0xA2, 0xF7);
+    t->icon_accent = t->accent;          /* a theme with no second colour still
+                                          * gets a highlight of its own */
+    t->icon_style = ICON_STYLE_DUOTONE;
+    t->anim = ANIM_PULSE;
     t->glow = RGB(0x3D, 0x59, 0xA0);
     t->glow_strength = 0.55f;
     t->panel = WITH_A(RGB(0x1A, 0x20, 0x33), 0x8C);
@@ -81,6 +86,11 @@ static void defaults(Theme *t) {
     t->window_border = WITH_A(RGB(0xFF, 0xFF, 0xFF), 0x22);
     t->corner = 14.0f;
     t->blur = 1.0f;
+    t->anim_speed = 1.0f;                /* icons pulse gently by default */
+    t->anim_amp = 0.6f;
+    t->font_scale = 1.0f;
+    t->font_ui[0] = 0;                   /* 0 = keep whatever font.c chose  */
+    t->font_mono[0] = 0;
     t->dark = 1;
 }
 
@@ -162,24 +172,60 @@ static void set_flag(Src *s, const char *key, const char *v, int *dst) {
     twarn_at(s, key, "malformed flag '%s' (want 0 or 1), keeping %d", v, *dst);
 }
 
+/* ------------------------------------------------------ named values ---- */
+static const char *const anim_names[] = {
+    "none", "pulse", "glow", "drift", "orbit", "wave", "spin"
+};
+static const char *const style_names[] = {
+    "solid", "outline", "duotone", "rounded", "sharp", "pixel"
+};
+
+static void set_anim(Src *s, const char *key, const char *v, AnimKind *dst) {
+    for (int i = 0; i < ANIM_COUNT; i++)
+        if (!strcmp(v, anim_names[i])) { *dst = (AnimKind)i; return; }
+    twarn_at(s, key, "unknown animation '%s' (want %s), keeping '%s'", v,
+             "none|pulse|glow|drift|orbit|wave|spin", anim_names[*dst]);
+}
+
+static void set_style(Src *s, const char *key, const char *v, IconStyle *dst) {
+    for (int i = 0; i < ICON_STYLE_COUNT; i++)
+        if (!strcmp(v, style_names[i])) { *dst = (IconStyle)i; return; }
+    twarn_at(s, key, "unknown icon style '%s' (want %s), keeping '%s'", v,
+             "solid|outline|duotone|rounded|sharp|pixel", style_names[*dst]);
+}
+
+static void set_text(Src *s, const char *key, const char *v, char *dst, size_t cap) {
+    if (!v[0]) {
+        twarn_at(s, key, "empty value, keeping '%s'", dst[0] ? dst : "the default");
+        return;
+    }
+    if (strlen(v) >= cap)
+        twarn_at(s, key, "longer than %d bytes, truncated", (int)cap - 1);
+    snprintf(dst, cap, "%s", v);
+}
+
 /* ------------------------------------------------------------ keys ---- */
 
 enum {
-    K_NAME, K_DARK, K_BG_TOP, K_BG_BOTTOM, K_ACCENT, K_GLOW,
-    K_GLOW_STRENGTH, K_PANEL, K_PANEL_BORDER, K_TEXT, K_TEXT_DIM,
-    K_WINDOW_BG, K_WINDOW_BORDER, K_CORNER, K_BLUR, K_COUNT
+    K_NAME, K_DARK, K_BG_TOP, K_BG_BOTTOM, K_ACCENT, K_ICON_ACCENT,
+    K_ICON_STYLE, K_ANIM, K_GLOW, K_GLOW_STRENGTH, K_PANEL, K_PANEL_BORDER,
+    K_TEXT, K_TEXT_DIM, K_WINDOW_BG, K_WINDOW_BORDER, K_CORNER, K_BLUR,
+    K_ANIM_SPEED, K_ANIM_AMP, K_FONT_UI, K_FONT_MONO, K_FONT_SCALE, K_COUNT
 };
 
 static const char *const key_name[K_COUNT] = {
     "name",         "dark",        "bg_top",       "bg_bottom",
-    "accent",       "glow",        "glow_strength","panel",
-    "panel_border", "text",        "text_dim",     "window_bg",
-    "window_border","corner",      "blur"
+    "accent",       "icon_accent", "icon_style",   "anim",
+    "glow",         "glow_strength", "panel",      "panel_border",
+    "text",         "text_dim",    "window_bg",    "window_border",
+    "corner",       "blur",        "anim_speed",   "anim_amp",
+    "font_ui",      "font_mono",   "font_scale"
 };
 
 /* The keys a theme is expected to set. The rest have defaults that are safe
- * on any background (the glow, the two border alphas, the corner radius and
- * the blur strength). These nine decide whether the theme is readable, so a
+ * on any background (the glow, the two border alphas, the corner radius, the
+ * blur strength, and the icon pair - icon_accent falls back to accent and the
+ * icon pulse to 1.0). These nine decide whether the theme is readable, so a
  * missing one is worth a warning even though the default still works. */
 static const unsigned REQUIRED =
     (1u << K_NAME) | (1u << K_DARK) | (1u << K_BG_TOP) | (1u << K_BG_BOTTOM) |
@@ -277,7 +323,19 @@ int theme_load(Theme *t, const char *path) {
         case K_DARK:          set_flag(&src, key, val, &t->dark);          break;
         case K_BG_TOP:        set_color(&src, key, val, &t->bg_top);       break;
         case K_BG_BOTTOM:     set_color(&src, key, val, &t->bg_bottom);    break;
-        case K_ACCENT:        set_color(&src, key, val, &t->accent);       break;
+        case K_ACCENT:        set_color(&src, key, val, &t->accent);        break;
+        case K_ICON_STYLE:    set_style(&src, key, val, &t->icon_style);     break;
+        case K_ANIM:          set_anim(&src, key, val, &t->anim);            break;
+        case K_ICON_ACCENT:
+            /* A malformed highlight is not "no highlight": drop the seen bit
+             * so the after-the-loop rule resolves it to this file's accent,
+             * whatever order the two keys are written in. */
+            if (!parse_color(val, &t->icon_accent)) {
+                twarn_at(&src, key, "malformed colour '%s' (want #RRGGBB or "
+                         "#AARRGGBB), using the theme's accent", val);
+                seen &= ~(1u << K_ICON_ACCENT);
+            }
+            break;
         case K_GLOW:          set_color(&src, key, val, &t->glow);         break;
         case K_GLOW_STRENGTH:
             set_num(&src, key, val, &t->glow_strength, 0.0f, 1.0f);
@@ -290,6 +348,13 @@ int theme_load(Theme *t, const char *path) {
         case K_WINDOW_BORDER: set_color(&src, key, val, &t->window_border);break;
         case K_CORNER:        set_num(&src, key, val, &t->corner, 0.0f, 48.0f); break;
         case K_BLUR:          set_num(&src, key, val, &t->blur, 0.0f, 1.0f);    break;
+        /* 0 means a still desktop; the upper end is a multiplier, not a
+         * frame rate, and 3 is as fast as the small sine is pleasant. */
+        case K_ANIM_SPEED:    set_num(&src, key, val, &t->anim_speed, 0.0f, 3.0f); break;
+        case K_ANIM_AMP:      set_num(&src, key, val, &t->anim_amp, 0.0f, 1.0f);   break;
+        case K_FONT_UI:       set_text(&src, key, val, t->font_ui, sizeof t->font_ui); break;
+        case K_FONT_MONO:     set_text(&src, key, val, t->font_mono, sizeof t->font_mono); break;
+        case K_FONT_SCALE:    set_num(&src, key, val, &t->font_scale, 0.8f, 1.6f);   break;
         default: break;
         }
     }
@@ -303,6 +368,15 @@ int theme_load(Theme *t, const char *path) {
         if (!(REQUIRED & (1u << i)) || (seen & (1u << i))) continue;
         twarn_at(&src, key_name[i], "missing, keeping the built-in default");
     }
+
+    /* icon_accent defaults to the theme's own accent rather than to a fixed
+     * colour, and it is resolved *after* the loop so the order of the two keys
+     * in the file cannot change the result. */
+    if (!(seen & (1u << K_ICON_ACCENT))) t->icon_accent = t->accent;
+
+    /* Two independent ways to say "nothing moves": speed 0 and amplitude 0.
+     * Normalise both to ANIM_NONE so the frame-request path has one test. */
+    if (t->anim_speed <= 0.0f || t->anim_amp <= 0.0f) t->anim = ANIM_NONE;
 
     /* ----------------------------------------------------------------
      * A window body is the surface an app's pixels and text are drawn on,
@@ -320,6 +394,84 @@ int theme_load(Theme *t, const char *path) {
      * ---------------------------------------------------------------- */
     t->window_bg = WITH_A(t->window_bg, 0xFF);
     return 0;
+}
+
+/* -------------------------------------------------- icons and motion --
+ * Both of these are theme policy, so they live next to the values they read
+ * rather than in the desktop: the host test links this file and measures the
+ * same numbers the compositor draws.
+ */
+static float srgb_lin(u32 v) {
+    float c = (float)v / 255.0f;
+    return (c <= 0.04045f) ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+}
+
+/* WCAG relative luminance: "the brighter of the two colours" is a measured
+ * statement, not whichever channel happens to be largest. */
+static float rel_luma(u32 c) {
+    return 0.2126f * srgb_lin(GET_R(c)) + 0.7152f * srgb_lin(GET_G(c)) +
+           0.0722f * srgb_lin(GET_B(c));
+}
+
+/* The two colours an icon is drawn in. An ordinary icon keeps the caller's
+ * base colour for the body and the theme's icon_accent for the highlight. A
+ * focused or hovered icon is drawn in the theme's two icon colours with the
+ * roles assigned by measured luminance: the dimmer colour is the body and the
+ * brighter one the highlight. That is the whole fix for the active state -
+ * the old pair (body = accent, highlight = "the brighter of the two") made both
+ * roles the same colour on every theme whose accent is the brighter one, so a
+ * focused icon came out as a one-colour silhouette on eight of the twelve
+ * shipped themes. When a theme sets accent == icon_accent the icon stays
+ * monochrome on purpose; that is the theme's choice, not a lost highlight. */
+IconPair theme_icon_pair(const Theme *t, u32 base, int active) {
+    IconPair p;
+    p.body = base;
+    p.hi = base;
+    if (!t) return p;
+    if (!active) {
+        p.hi = t->icon_accent;
+        return p;
+    }
+    if (rel_luma(t->accent) >= rel_luma(t->icon_accent)) {
+        p.body = t->icon_accent;    /* the dimmer half */
+        p.hi = t->accent;           /* the brighter half */
+    } else {
+        p.body = t->accent;
+        p.hi = t->icon_accent;
+    }
+    return p;
+}
+
+u32 theme_icon_highlight(const Theme *t, int active) {
+    if (!t) return 0u;              /* no theme, no colour */
+    return theme_icon_pair(t, 0u, active).hi;
+}
+
+float theme_icon_pulse_scale(const Theme *t, double now_sec) {
+    if (!t || t->anim == ANIM_NONE ||
+        t->anim_speed <= 0.0f || t->anim_amp <= 0.0f) return 1.0f;
+    double phase = now_sec * (double)t->anim_speed *
+                   (6.283185307179586 * (double)THEME_PULSE_HZ);
+    /* Fold before the float cast: the monotonic clock can be days old, and a
+     * phase of 10^6 radians held in a float carries quantisation a 3.5 %
+     * amplitude would turn into a visible stutter. */
+    phase = fmod(phase, 6.283185307179586);
+    if (phase < 0.0) phase += 6.283185307179586;
+    float p = 0.5f + 0.5f * sinf((float)phase);        /* 0 .. 1 */
+    return 1.0f - THEME_PULSE_DEPTH * t->anim_amp * (1.0f - p);
+}
+
+/* Font roles: a theme may choose them, but the user's fonts.conf wins. */
+int theme_apply_fonts(const Theme *t, int conf_ui_set, int conf_mono_set) {
+    if (!t) return 0;
+    int applied = 0;
+    if (!conf_ui_set && t->font_ui[0]) {
+        if (font_set_ui_family(t->font_ui) == 0) applied |= 1;
+    }
+    if (!conf_mono_set && t->font_mono[0]) {
+        if (font_set_mono_family(t->font_mono) == 0) applied |= 2;
+    }
+    return applied;
 }
 
 static int cmp_str(const void *a, const void *b) {

@@ -8,18 +8,34 @@
  *  window allows, and it is built from the same card, the same columns
  *  and the same keys as the table in sysmon.c.
  *
- *  Everything is re-read from /proc:
+ *  Everything is read from /proc:
  *
  *    /proc/<pid>/stat     field 2 (comm), field 3 (state),
  *                         fields 14/15 (utime, stime)
  *    /proc/<pid>/statm    resident set size
+ *
+ *  The table is resampled at most four times a second (MON_TTL_S):
+ *  the whole /proc scan runs only when the last real sample is older
+ *  than 250 ms. Four hertz is live for a process table (a human cannot
+ *  read a row changing faster, and a 250 ms window is 25 jiffies at
+ *  HZ=100, enough to measure CPU% honestly), while a scan is one
+ *  opendir plus two file reads per pid - at 120 pids that cost belongs
+ *  to the sample, not to every frame the compositor asks for. Between
+ *  samples the rows are the values from that last real read, never a
+ *  guess: a number on screen is at most 250 ms old. A sort, a filter
+ *  change or a kill marks the sample stale so the next frame rescans;
+ *  a resize does not, because the window size cannot change /proc and
+ *  the desktop calls resize() on every mouse move while a window edge
+ *  is being dragged - invalidating there would put the scan back on a
+ *  per-frame path.
  *
  *  CPU% is a DELTA and the card says so on its title line: the jiffies
  *  a process burned between two samples divided by the wall time
  *  between those samples, measured with CLOCK_MONOTONIC. It is a
  *  percentage of one core, so a threaded process can legitimately read
  *  above 100%. A process that appears after a sample has no previous
- *  ticks yet and reads 0.0%; the displayed sample interval is the real
+ *  ticks yet and reads "-" (unknown), never a 0.0% that looks like a
+ *  measurement; the displayed sample interval is the real
  *  measured gap, not the requested one.
  *
  *  Columns, left to right: PID, NAME, STATE, CPU%, MEM. Every number is
@@ -62,7 +78,10 @@
 #include <unistd.h>
 
 #define MAX_PROC     256
-#define SAMPLE_S     0.35     /* shortest gap between two CPU samples */
+#define MON_TTL_S    0.25     /* process-table sample lifetime, 4 Hz    */
+#define MON_MIN_DT_S 0.05     /* a forced rescan sooner than this keeps
+                               * the previous CPU%, so a jiffy-quantised
+                               * 0% or 400% is never published           */
 #define KILL_GRACE_S 2.0      /* SIGTERM -> SIGKILL */
 
 #ifndef MON_PROC
@@ -129,14 +148,17 @@ static void crd_fit(Font *f, const char *text, char *out, size_t cap, float maxw
     size_t n = strlen(tmp);
     while (n > 0) {
         n--;
-        snprintf(out, cap, "%.*s..", (int)n, tmp);
+        /* never split a UTF-8 sequence: back up to its first byte, then cut
+         * with a real ellipsis (U+2026), which Lato carries */
+        while (n > 0 && ((unsigned char)tmp[n] & 0xC0) == 0x80) n--;
+        snprintf(out, cap, "%.*s…", (int)n, tmp);
         if (font_width(f, out) <= maxw) return;
     }
     out[0] = 0;
 }
 
 static void crd_begin(Surface *s, const CrdRect *c, const CrdMetrics *m,
-                      const CrdStyle *st, Font *ft,
+                      const CrdStyle *st, Font *ft, Font *fs,
                       const char *title, const char *meta, int meta_warn) {
     float r = st->corner;
     float lim = (c->w < c->h ? c->w : c->h) * 0.5f;
@@ -147,11 +169,16 @@ static void crd_begin(Surface *s, const CrdRect *c, const CrdMetrics *m,
     font_draw(s, ft, c->x + m->pad, crd_top(ft, base), title,
               color_alpha(st->accent, 0.92f));
     if (meta && meta[0]) {
-        float mw = font_width(ft, meta);
-        if (mw + m->pad * 2.0f + font_width(ft, title) <= c->w)
-            font_draw(s, ft, c->x + c->w - m->pad - mw, crd_top(ft, base), meta,
+        /* The note beside the title is the SMALL face, one step down the type
+         * scale, so a 320 px card still holds both "PROCESSES" and the delta
+         * interval. It is dropped rather than overlapped if even that fails. */
+        float mw = font_width(fs, meta);
+        if (mw + m->pad * 2.0f + font_width(ft, title) <= c->w) {
+            float mb = crd_base(fs, c->y + m->pad, m->title_h);
+            font_draw(s, fs, c->x + c->w - m->pad - mw, crd_top(fs, mb), meta,
                       meta_warn ? color_alpha(st->warn, 0.95f)
                                 : color_alpha(st->text, 0.45f));
+        }
     }
     float ry = c->y + m->pad + m->title_h;
     surf_blend(s, (int)(c->x + m->pad), (int)ry,
@@ -212,27 +239,38 @@ static ProcCard proc_card_layout(const CrdRect *card, const CrdMetrics *m,
     float gap = m->gap;
     float min_name = (float)ui_px(24);
 
-    float mem_w = font_width(fr, "9999.9 MB") + gap;
+    float mem_w = font_width(fr, "9999.9 GB") + gap;
     float cpu_w = font_width(fr, "999.9%") + gap;
     float st_w  = font_width(fs, "STATE") + gap;
-    float pid_w = font_width(fr, "999999");
+    float pid_w = font_width(fr, "9999999");   /* pid_max is 7 digits */
 
     p.pid_r = inner_l + pid_w;
     p.name_x = p.pid_r + gap;
     p.mem_r = inner_r;
-    p.cpu_r = p.mem_r - mem_w;
-    p.state_r = p.cpu_r - cpu_w;
+    p.mem_l = p.mem_r - mem_w;
+    p.cpu_r = p.mem_l;
+    p.cpu_l = p.cpu_r - cpu_w;
+    p.state_r = p.cpu_l;
+    p.state_l = p.state_r - st_w;
 
-    p.have_mem = (p.cpu_r - p.name_x) >= min_name;
-    if (!p.have_mem) { p.mem_r = inner_r; p.cpu_r = inner_r; p.state_r = inner_r; }
-    p.have_cpu = p.have_mem && (p.state_r - p.name_x) >= min_name;
-    if (!p.have_cpu) { p.state_r = p.cpu_r; }
-    p.have_state = p.have_cpu && (p.state_r - st_w - p.name_x) >= min_name;
-    if (!p.have_state) { p.state_r = p.cpu_r; }
+    /* Drop columns from the right until the name has min_name pixels of its
+     * own. Every *_l above is the LEFT EDGE OF THE VALUES, not of the heading:
+     * a heading is narrower than its values, and the name must never run
+     * under a value. */
+    p.have_mem = (p.mem_l - p.name_x) >= min_name;
+    if (!p.have_mem) {
+        p.mem_l = p.mem_r = inner_r;
+        p.cpu_l = p.cpu_r = inner_r;
+        p.state_l = p.state_r = inner_r;
+    }
+    p.have_cpu = p.have_mem && (p.cpu_l - p.name_x) >= min_name;
+    if (!p.have_cpu) {
+        p.cpu_l = p.cpu_r = p.mem_l;
+        p.state_l = p.state_r = p.mem_l;
+    }
+    p.have_state = p.have_cpu && (p.state_l - p.name_x) >= min_name;
+    if (!p.have_state) p.state_l = p.state_r = p.cpu_l;
 
-    p.mem_l = p.mem_r - font_width(fs, "MEM");
-    p.cpu_l = p.cpu_r - font_width(fs, "CPU%");
-    p.state_l = p.state_r - font_width(fs, "STATE");
     p.name_end = p.have_state ? p.state_l
                : p.have_cpu   ? p.cpu_l
                : p.have_mem   ? p.mem_l
@@ -408,10 +446,20 @@ static void proc_sort_mark(Surface *s, float x, float y, int dir, u32 col) {
     gfx_polygon(s, pts, 3, col);
 }
 
+/* RSS for the table: one formatter in both tables, so the same process reads
+ * the same string in either window. MB below a gigabyte, GB above it; the MEM
+ * column is measured from "9999.9 GB", so even a huge process still fits. */
+static void proc_fmt_mem(long kb, char *out, size_t n) {
+    if (kb < 0) snprintf(out, n, "-");
+    else if (kb < 1024) snprintf(out, n, "%ld kB", kb);
+    else if (kb < 1024L * 1024L) snprintf(out, n, "%.1f MB", (double)kb / 1024.0);
+    else snprintf(out, n, "%.1f GB", (double)kb / (1024.0 * 1024.0));
+}
+
 static void proc_draw(Surface *s, const ProcCard *p, const CrdMetrics *m,
                       const CrdStyle *st, Font *ft, Font *fr, Font *fs,
                       const ProcView *v, const char *title, const char *meta) {
-    crd_begin(s, &p->card, m, st, ft, title, meta, 0);
+    crd_begin(s, &p->card, m, st, ft, fs, title, meta, 0);
 
     u32 label = color_alpha(st->text, 0.45f);
     u32 dim = color_alpha(st->text, 0.62f);
@@ -422,13 +470,16 @@ static void proc_draw(Surface *s, const ProcCard *p, const CrdMetrics *m,
         char line[96], out[128];
         if (v->filter[0]) snprintf(line, sizeof(line), "/ %s", v->filter);
         else              snprintf(line, sizeof(line), "/ filter   (f)");
-        float rightw = 0.0f;
-        char rtxt[128];
+        /* Both ends of this line are measured and fitted, so a long kill
+         * message cannot push the count past the card edge or over the
+         * filter text. */
+        char rtxt[128], rout[128];
         rtxt[0] = 0;
         if (v->note && v->note[0]) snprintf(rtxt, sizeof(rtxt), "%s", v->note);
         else snprintf(rtxt, sizeof(rtxt), "%d of %d", v->nview, v->ntotal);
-        rightw = font_width(fs, rtxt);
-        crd_fit(fs, line, out, sizeof(out), p->filter.w - rightw - m->gap);
+        crd_fit(fs, rtxt, rout, sizeof(rout), p->filter.w * 0.62f);
+        float rightw = rout[0] ? font_width(fs, rout) + m->gap : 0.0f;
+        crd_fit(fs, line, out, sizeof(out), p->filter.w - rightw);
         font_draw(s, fs, p->filter.x, crd_top(fs, base), out,
                   v->filter_edit ? color_alpha(st->accent, 0.95f)
                                  : color_alpha(st->text, 0.55f));
@@ -439,7 +490,7 @@ static void proc_draw(Surface *s, const ProcCard *p, const CrdMetrics *m,
         }
         if (rightw > 0.0f)
             font_draw(s, fs, p->filter.x + p->filter.w - rightw, crd_top(fs, base),
-                      rtxt, v->note && v->note[0]
+                      rout, v->note && v->note[0]
                                 ? (v->note_warn ? color_alpha(st->warn, 0.95f)
                                                 : color_alpha(st->accent, 0.85f))
                                 : dim);
@@ -449,8 +500,9 @@ static void proc_draw(Surface *s, const ProcCard *p, const CrdMetrics *m,
     if (p->show_head) {
         float base = crd_base(fs, p->head.y, p->head.h);
         float ty = crd_top(fs, base);
-        const char *nm = "NAME";
-        font_draw(s, fs, p->name_x, ty, nm, label);
+        char nmb[8];
+        crd_fit(fs, "NAME", nmb, sizeof(nmb), p->name_max);
+        font_draw(s, fs, p->name_x, ty, nmb, label);
         if (p->have_state) {
             const char *t = "STATE";
             font_draw(s, fs, p->state_r - font_width(fs, t), ty, t, label);
@@ -487,10 +539,14 @@ static void proc_draw(Surface *s, const ProcCard *p, const CrdMetrics *m,
     /* rows */
     if (v->nview == 0) {
         if (p->rows > 0) {
+            /* the empty state is one line, and it is measured like every other
+             * string: at a narrow window it is cut with the same ellipsis */
+            char eb[64];
+            crd_fit(fr, v->filter[0] ? "no process matches the filter"
+                                     : "no process in /proc",
+                    eb, sizeof(eb), p->card.w - 2.0f * m->pad);
             float base = crd_base(fr, p->body_y, p->row_h);
-            font_draw(s, fr, p->card.x + m->pad, crd_top(fr, base),
-                      v->filter[0] ? "no process matches the filter"
-                                   : "no process in /proc",
+            font_draw(s, fr, p->card.x + m->pad, crd_top(fr, base), eb,
                       color_alpha(st->text, 0.40f));
         }
     } else {
@@ -536,9 +592,14 @@ static void proc_draw(Surface *s, const ProcCard *p, const CrdMetrics *m,
                 }
             }
             if (p->have_mem) {
-                snprintf(buf, sizeof(buf), "%.1f MB", (double)pr->mem_kb / 1024.0);
-                font_draw(s, fr, p->mem_r - font_width(fr, buf), ty, buf,
-                          color_alpha(st->text, 0.85f));
+                if (pr->mem_kb < 0) {
+                    font_draw(s, fr, p->mem_r - font_width(fr, "-"), ty, "-",
+                              color_alpha(st->text, 0.40f));
+                } else {
+                    proc_fmt_mem(pr->mem_kb, buf, sizeof(buf));
+                    font_draw(s, fr, p->mem_r - font_width(fr, buf), ty, buf,
+                              color_alpha(st->text, 0.85f));
+                }
             }
         }
     }
@@ -610,15 +671,17 @@ static int stat_sample(int pid, char *name, int namesz, char *state,
     return parse_stat(buf, name, namesz, state, ticks);
 }
 
+/* -1 means the file could not be read, which the table draws as "-": a
+ * process whose statm is unreadable must not claim to use 0.0 MB. */
 static long statm_kb(int pid, long page_kb) {
     char path[64];
     snprintf(path, sizeof(path), MON_PROC "/%d/statm", pid);
     FILE *f = fopen(path, "r");
-    if (!f) return 0;
+    if (!f) return -1;
     long size_pages = 0, rss_pages = 0;
     int got = fscanf(f, "%ld %ld", &size_pages, &rss_pages);
     fclose(f);
-    if (got != 2) return 0;
+    if (got != 2) return -1;
     return rss_pages > 0 ? rss_pages * page_kb : 0;
 }
 
@@ -648,6 +711,7 @@ typedef struct {
     int    scroll;
     int    rows;                   /* visible rows from the last layout */
     int    w, h;
+    int    stale;                  /* a user action asked for a fresh scan */
     char   msg[96];
     double msg_at;
     int    msg_ok;
@@ -660,25 +724,46 @@ static int find_sample(const Sample *arr, int n, int pid) {
     return -1;
 }
 
-static void scan(Monitor *m) {
+/* One /proc walk. The TTL is checked here, before the first syscall, so a
+ * draw inside the sample window performs ZERO file-system calls and the
+ * table keeps showing the values read by the last walk. `force` comes from
+ * a user action that can change the data (sort, filter, kill); it may run
+ * the walk early but never fabricates a value - every field still comes
+ * from the /proc files read in this call. */
+static void scan(Monitor *m, int force) {
     double t = mono_now();
+
+    /* A monotonic timestamp of 0 means clock_gettime failed, and t < snap_t
+     * means the clock moved backwards: in both cases refresh rather than
+     * trust the age of the last sample. */
+    if (!force && m->snap_t > 0.0 && t >= m->snap_t &&
+        t - m->snap_t < MON_TTL_S)
+        return;
+
     long hz = sysconf(_SC_CLK_TCK);
     if (hz <= 0) hz = 100;
     long page_kb = sysconf(_SC_PAGESIZE) / 1024;
     if (page_kb <= 0) page_kb = 4;
 
-    /* Resample when enough wall time has passed, otherwise republish the value
-     * from the last sample - a burst of redraws must not produce a
-     * jiffy-quantised 0% or 400%. */
-    int resample = (m->snap_t <= 0.0) || (t - m->snap_t >= SAMPLE_S);
-    double dt = t - m->snap_t;
+    /* With no previous sample there is no interval to divide by; using the
+     * raw monotonic reading would print "delta over 12345.60 s" on the first
+     * frame. dt = 0 makes the card say it needs a second sample instead. */
+    double dt = (m->snap_t > 0.0 && t > m->snap_t) ? t - m->snap_t : 0.0;
 
     m->nproc = 0;
     m->seen = 0;
     int nn = 0;
 
     DIR *d = opendir(MON_PROC);
-    if (!d) return;
+    if (!d) {
+        /* /proc is unreachable. Drop the baseline (no CPU% may be computed
+         * across the gap) and move the timestamp so the retry happens at the
+         * TTL instead of once per frame. */
+        m->snap_count = 0;
+        m->snap_t = t;
+        m->sample_dt = 0.0;
+        return;
+    }
 
     static Sample next[MAX_PROC];
     struct dirent *e;
@@ -699,15 +784,18 @@ static void scan(Monitor *m) {
 
         double cpu = -1.0;             /* no previous sample yet */
         int old = find_sample(m->snap, m->snap_count, pid);
-        if (resample) {
-            if (old >= 0 && dt > 0.001 && ticks >= m->snap[old].ticks) {
-                double dtick = (double)(ticks - m->snap[old].ticks);
-                cpu = 100.0 * (dtick / (double)hz) / dt;
-            }
+        if (old >= 0 && dt >= MON_MIN_DT_S && ticks >= m->snap[old].ticks) {
+            double dtick = (double)(ticks - m->snap[old].ticks);
+            cpu = 100.0 * (dtick / (double)hz) / dt;
         } else if (old >= 0) {
+            /* Too soon after the previous sample to divide: republish the %
+             * that was measured over a real interval instead of a jiffy-
+             * quantised one. */
             cpu = m->snap[old].cpu;
         }
-        if (cpu < 0.0) cpu = 0.0;
+        /* cpu stays -1 when there is no previous sample or the counters
+         * went backwards; the table draws "-" for that, never a 0.0%
+         * that looks like a measurement. */
         if (cpu > 999.0) cpu = 999.0;  /* keep the column readable */
 
         Proc *p = &m->procs[m->nproc++];
@@ -726,12 +814,21 @@ static void scan(Monitor *m) {
     }
     closedir(d);
 
-    if (resample) {
-        for (int i = 0; i < nn; i++) m->snap[i] = next[i];
-        m->snap_count = nn;
-        m->snap_t = t;
-        m->sample_dt = dt;
-    }
+    for (int i = 0; i < nn; i++) m->snap[i] = next[i];
+    m->snap_count = nn;
+    m->snap_t = t;
+    /* When a forced scan comes too soon to divide, the CPU% on screen is the
+     * one measured over the previous real interval, so keep saying THAT
+     * interval on the title line: printing the too-short dt would attach the
+     * old number to a window it was not measured over. */
+    if (dt == 0.0 || dt >= MON_MIN_DT_S) m->sample_dt = dt;
+}
+
+/* The events that can change what the table should show. Navigation alone is
+ * not one of them: moving the cursor cannot change a process, and the sample
+ * is never more than 250 ms old. */
+static void scan_invalidate(Monitor *m) {
+    m->stale = 1;
 }
 
 /* ------------------------------------------------------------
@@ -766,6 +863,7 @@ static void kill_selected(Monitor *m) {
     } else if (kill(pid, SIGTERM) == 0) {
         snprintf(buf, sizeof(buf), "SIGTERM -> %d %s", pid, name);
         set_msg(m, buf, 1);
+        scan_invalidate(m);        /* the target may be gone next frame */
         m->pending_pid = pid;
         m->pending_at = mono_now() + KILL_GRACE_S;
     } else {
@@ -780,6 +878,7 @@ static void check_pending(Monitor *m) {
     if (mono_now() < m->pending_at) return;
     int pid = m->pending_pid;
     m->pending_pid = 0;
+    scan_invalidate(m);            /* the target may die from this signal */
     char buf[96];
     if (!proc_alive(pid)) {
         snprintf(buf, sizeof(buf), "pid %d exited after SIGTERM", pid);
@@ -854,13 +953,14 @@ static void monitor_draw(App *a, Surface *s, int x, int y, int w, int h, const T
     m->w = w;
     m->h = h;
 
-    Font *ft = font_get(FONT_MEDIUM, 12);
+    Font *ft = font_get(FONT_SEMIBOLD, 12);
     Font *fr = font_get(FONT_REGULAR, 11);
     Font *fs = font_get(FONT_REGULAR, 10);
     if (!ft || !fr || !fs) return;
 
     check_pending(m);
-    scan(m);
+    scan(m, m->stale);
+    m->stale = 0;
     m->nview = proc_view_build(m->procs, m->nproc, m->sort_key, m->sort_dir,
                                m->filter, m->view);
     int sel = proc_view_index(m->procs, m->view, m->nview, m->sel_pid);
@@ -898,11 +998,14 @@ static void monitor_draw(App *a, Surface *s, int x, int y, int w, int h, const T
     snprintf(pv.filter, sizeof(pv.filter), "%s", m->filter);
     pv.filter_edit = m->filter_edit;
 
+    /* The card's title line carries the interval the CPU% delta was measured
+     * over. "delta" is the word that matters: every CPU% here is a change
+     * between two samples, not a total. Short enough for 320 px at 160%. */
     char meta[64];
     if (m->sample_dt > 0.0)
-        snprintf(meta, sizeof(meta), "cpu%% = delta over %.2f s", m->sample_dt);
+        snprintf(meta, sizeof(meta), "delta %.2f s", m->sample_dt);
     else
-        snprintf(meta, sizeof(meta), "cpu%% needs a second sample");
+        snprintf(meta, sizeof(meta), "no delta yet");
     char note[96];
     note[0] = 0;
     if (m->msg[0] && mono_now() - m->msg_at < 5.0) {
@@ -945,6 +1048,7 @@ static void move_sel(Monitor *m, int delta) {
 
 static void resort(Monitor *m) {
     int keep = m->sel_pid;
+    scan_invalidate(m);            /* order the freshest real sample */
     m->nview = proc_view_build(m->procs, m->nproc, m->sort_key, m->sort_dir,
                                m->filter, m->view);
     int sel = proc_view_index(m->procs, m->view, m->nview, keep);
@@ -964,6 +1068,7 @@ static void set_sort(Monitor *m, int key) {
 }
 
 static void filter_changed(Monitor *m) {
+    scan_invalidate(m);            /* the surviving rows should be current */
     m->nview = proc_view_build(m->procs, m->nproc, m->sort_key, m->sort_dir,
                                m->filter, m->view);
     int sel = proc_view_index(m->procs, m->view, m->nview, m->sel_pid);
@@ -990,7 +1095,9 @@ static void monitor_key(App *a, const char *bytes, int n) {
         }
 
         if (m->filter_edit) {
-            if (c == '\b' || c == 0x7F) {
+            if (c == 0x1B) {
+                m->filter_edit = 0;
+            } else if (c == '\b' || c == 0x7F) {
                 size_t len = strlen(m->filter);
                 if (len) m->filter[len - 1] = 0;
                 filter_changed(m);
@@ -1024,7 +1131,7 @@ static void monitor_click(App *a, int x, int y, int buttons) {
     Monitor *m = a->state;
     if (!m || !(buttons & 1)) return;
 
-    Font *ft = font_get(FONT_MEDIUM, 12);
+    Font *ft = font_get(FONT_SEMIBOLD, 12);
     Font *fr = font_get(FONT_REGULAR, 11);
     Font *fs = font_get(FONT_REGULAR, 10);
     if (!ft || !fr || !fs) return;
@@ -1053,7 +1160,13 @@ static void monitor_click(App *a, int x, int y, int buttons) {
 
 static void monitor_resize(App *a, int w, int h) {
     Monitor *m = a->state;
-    if (m) { m->w = w; m->h = h; }
+    if (m) {
+        /* Deliberately NOT scan_invalidate(): the window size cannot change
+         * /proc, and the desktop calls resize() on every mouse move while an
+         * edge is dragged. The 250 ms TTL still bounds the age of the sample. */
+        m->w = w;
+        m->h = h;
+    }
 }
 
 static void monitor_wheel(App *a, int notches) {

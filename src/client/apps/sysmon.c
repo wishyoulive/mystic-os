@@ -23,17 +23,20 @@
  *    CPU%    the jiffies between two samples divided by the measured wall
  *            time between those samples (CLOCK_MONOTONIC), as a percentage
  *            of one core, so a threaded process can read above 100%. The
- *            process card's title says "cpu% = delta over 0.98 s" with the
- *            interval that was actually measured.
+ *            process card's title says "delta 0.98 s" with the interval
+ *            that was actually measured; before the second sample it
+ *            says "no delta yet" instead of inventing a zero.
  *    NET     the byte counters are cumulative; the rates beside them are
  *            (now - previous) / measured seconds, and the network card's
- *            title says "rates since last sample".
+ *            title says "rates delta 1.00 s".
  *
  *  Memory is statm field 2 (resident pages) times the real page size.
  *
- *  Kill sends SIGTERM to the selected pid; if it is still alive after the
- *  grace period it sends SIGKILL. It refuses pid 1 and this process, and
- *  reports kill(2) errors with strerror.
+ *  Kill is the same key and the same path as Monitor: K sends SIGTERM to
+ *  the selected pid immediately (no confirmation step, so the two
+ *  windows cannot diverge), SIGKILL follows after the grace period if it
+ *  is still alive, pids 1 and this process are refused, and kill(2)
+ *  errors are reported with strerror.
  *
  *  The graphs are ring buffers inside this process: one point per one
  *  second sample, RING_N slots (three minutes). A ring is only advanced
@@ -90,7 +93,10 @@ static const u32 C_BORDER = WITH_A(RGB(0xFF, 0xFF, 0xFF), 0x1A);
  * parsers at a fixture tree it wrote itself, so nothing in the shipped
  * object changes. */
 #ifdef SYSMON_HOST_TEST
-#  define PROC_ROOT ".work/systemui/fake/proc"
+#  ifndef SYSMON_PROC_ROOT
+#    define SYSMON_PROC_ROOT ".work/sysui/fake/proc"
+#  endif
+#  define PROC_ROOT SYSMON_PROC_ROOT
 #else
 #  define PROC_ROOT "/proc"
 #endif
@@ -145,9 +151,6 @@ typedef struct {
     int    scroll, rows;
 
     /* actions */
-    int    dlg;
-    int    kill_pid;
-    char   kill_comm[32];
     int    pending_pid;
     double pending_at;
     char   msg[160];
@@ -506,7 +509,10 @@ static void crd_fit(Font *f, const char *text, char *out, size_t cap, float maxw
     size_t n = strlen(tmp);
     while (n > 0) {
         n--;
-        snprintf(out, cap, "%.*s..", (int)n, tmp);
+        /* never split a UTF-8 sequence: back up to its first byte, then cut
+         * with a real ellipsis (U+2026), which Lato carries */
+        while (n > 0 && ((unsigned char)tmp[n] & 0xC0) == 0x80) n--;
+        snprintf(out, cap, "%.*s…", (int)n, tmp);
         if (font_width(f, out) <= maxw) return;
     }
     out[0] = 0;
@@ -515,7 +521,12 @@ static void crd_fit(Font *f, const char *text, char *out, size_t cap, float maxw
 static void crd_row_text(Font *fr, float inner_w, float gap,
                          const char *label, const char *value,
                          char *lb, size_t lcap, char *vb, size_t vcap) {
-    float maxv = inner_w * 0.58f;
+    /* The value gets what the label does not need, with a floor at 40% so a
+     * long label can never squeeze a number down to nothing. Then the label
+     * is fitted into the remainder, which is what keeps the two apart. */
+    float lw = font_width(fr, label ? label : "");
+    float maxv = inner_w - lw - gap;
+    if (maxv < inner_w * 0.40f) maxv = inner_w * 0.40f;
     if (maxv < 0.0f) maxv = 0.0f;
     crd_fit(fr, value, vb, vcap, maxv);
     float vw = vb[0] ? font_width(fr, vb) + gap : 0.0f;
@@ -527,7 +538,7 @@ static float crd_row_y(const CrdRect *c, const CrdMetrics *m, int i) {
 }
 
 static void crd_begin(Surface *s, const CrdRect *c, const CrdMetrics *m,
-                      const CrdStyle *st, Font *ft,
+                      const CrdStyle *st, Font *ft, Font *fs,
                       const char *title, const char *meta, int meta_warn) {
     float r = st->corner;
     float lim = (c->w < c->h ? c->w : c->h) * 0.5f;
@@ -538,11 +549,16 @@ static void crd_begin(Surface *s, const CrdRect *c, const CrdMetrics *m,
     font_draw(s, ft, c->x + m->pad, crd_top(ft, base), title,
               color_alpha(st->accent, 0.92f));
     if (meta && meta[0]) {
-        float mw = font_width(ft, meta);
-        if (mw + m->pad * 2.0f + font_width(ft, title) <= c->w)
-            font_draw(s, ft, c->x + c->w - m->pad - mw, crd_top(ft, base), meta,
+        /* The note beside the title is the SMALL face, one step down the type
+         * scale, so a 320 px card still holds both "PROCESSES" and the delta
+         * interval. It is dropped rather than overlapped if even that fails. */
+        float mw = font_width(fs, meta);
+        if (mw + m->pad * 2.0f + font_width(ft, title) <= c->w) {
+            float mb = crd_base(fs, c->y + m->pad, m->title_h);
+            font_draw(s, fs, c->x + c->w - m->pad - mw, crd_top(fs, mb), meta,
                       meta_warn ? color_alpha(st->warn, 0.95f)
                                 : color_alpha(st->text, 0.45f));
+        }
     }
     float ry = c->y + m->pad + m->title_h;
     surf_blend(s, (int)(c->x + m->pad), (int)ry,
@@ -594,7 +610,11 @@ static void crd_spark(Surface *s, const CrdRect *c, const CrdMetrics *m,
     float x1 = c->x + c->w - m->pad;
     float gy0 = top + font_height(fs) + (float)ui_px(2);
     float gy1 = c->y + c->h - m->pad;
-    if (legend && legend[0]) font_draw(s, fs, x0, top, legend, legend_col);
+    if (legend && legend[0]) {
+        char cap[64];
+        crd_fit(fs, legend, cap, sizeof(cap), x1 - x0);
+        font_draw(s, fs, x0, top, cap, legend_col);
+    }
     if (x1 - x0 < 8.0f || gy1 - gy0 < 4.0f) return;
     surf_blend(s, (int)x0, (int)gy1, (int)(x1 - x0), 1, color_alpha(col, 0.38f));
     surf_blend(s, (int)x0, (int)gy0, (int)(x1 - x0), 1, color_alpha(col, 0.12f));
@@ -643,7 +663,7 @@ static CrdStyle crd_style(void) {
     st.dim    = C_DIM;
     st.accent = C_ACCENT;
     st.warn   = C_WARN;
-    st.corner = 7.0f;
+    st.corner = 7.7f;   /* 14 x 0.55, the Obsidian theme's card radius */
     return st;
 }
 
@@ -675,27 +695,38 @@ static ProcCard proc_card_layout(const CrdRect *card, const CrdMetrics *m,
     float gap = m->gap;
     float min_name = (float)ui_px(24);
 
-    float mem_w = font_width(fr, "9999.9 MB") + gap;
+    float mem_w = font_width(fr, "9999.9 GB") + gap;
     float cpu_w = font_width(fr, "999.9%") + gap;
     float st_w  = font_width(fs, "STATE") + gap;
-    float pid_w = font_width(fr, "999999");
+    float pid_w = font_width(fr, "9999999");   /* pid_max is 7 digits */
 
     p.pid_r = inner_l + pid_w;
     p.name_x = p.pid_r + gap;
     p.mem_r = inner_r;
-    p.cpu_r = p.mem_r - mem_w;
-    p.state_r = p.cpu_r - cpu_w;
+    p.mem_l = p.mem_r - mem_w;
+    p.cpu_r = p.mem_l;
+    p.cpu_l = p.cpu_r - cpu_w;
+    p.state_r = p.cpu_l;
+    p.state_l = p.state_r - st_w;
 
-    p.have_mem = (p.cpu_r - p.name_x) >= min_name;
-    if (!p.have_mem) { p.mem_r = inner_r; p.cpu_r = inner_r; p.state_r = inner_r; }
-    p.have_cpu = p.have_mem && (p.state_r - p.name_x) >= min_name;
-    if (!p.have_cpu) { p.state_r = p.cpu_r; }
-    p.have_state = p.have_cpu && (p.state_r - st_w - p.name_x) >= min_name;
-    if (!p.have_state) { p.state_r = p.cpu_r; }
+    /* Drop columns from the right until the name has min_name pixels of its
+     * own. Every *_l above is the LEFT EDGE OF THE VALUES, not of the heading:
+     * a heading is narrower than its values, and the name must never run
+     * under a value. */
+    p.have_mem = (p.mem_l - p.name_x) >= min_name;
+    if (!p.have_mem) {
+        p.mem_l = p.mem_r = inner_r;
+        p.cpu_l = p.cpu_r = inner_r;
+        p.state_l = p.state_r = inner_r;
+    }
+    p.have_cpu = p.have_mem && (p.cpu_l - p.name_x) >= min_name;
+    if (!p.have_cpu) {
+        p.cpu_l = p.cpu_r = p.mem_l;
+        p.state_l = p.state_r = p.mem_l;
+    }
+    p.have_state = p.have_cpu && (p.state_l - p.name_x) >= min_name;
+    if (!p.have_state) p.state_l = p.state_r = p.cpu_l;
 
-    p.mem_l = p.mem_r - font_width(fs, "MEM");
-    p.cpu_l = p.cpu_r - font_width(fs, "CPU%");
-    p.state_l = p.state_r - font_width(fs, "STATE");
     p.name_end = p.have_state ? p.state_l
                : p.have_cpu   ? p.cpu_l
                : p.have_mem   ? p.mem_l
@@ -848,10 +879,20 @@ static void proc_sort_mark(Surface *s, float x, float y, int dir, u32 col) {
     gfx_polygon(s, pts, 3, col);
 }
 
+/* RSS for the table: one formatter in both tables, so the same process reads
+ * the same string in either window. MB below a gigabyte, GB above it; the MEM
+ * column is measured from "9999.9 GB", so even a huge process still fits. */
+static void proc_fmt_mem(long kb, char *out, size_t n) {
+    if (kb < 0) snprintf(out, n, "-");
+    else if (kb < 1024) snprintf(out, n, "%ld kB", kb);
+    else if (kb < 1024L * 1024L) snprintf(out, n, "%.1f MB", (double)kb / 1024.0);
+    else snprintf(out, n, "%.1f GB", (double)kb / (1024.0 * 1024.0));
+}
+
 static void proc_draw(Surface *s, const ProcCard *p, const CrdMetrics *m,
                       const CrdStyle *st, Font *ft, Font *fr, Font *fs,
                       const ProcView *v, const char *title, const char *meta) {
-    crd_begin(s, &p->card, m, st, ft, title, meta, 0);
+    crd_begin(s, &p->card, m, st, ft, fs, title, meta, 0);
 
     u32 label = color_alpha(st->text, 0.45f);
     u32 dim = color_alpha(st->text, 0.62f);
@@ -861,12 +902,16 @@ static void proc_draw(Surface *s, const ProcCard *p, const CrdMetrics *m,
         char line[96], out[128];
         if (v->filter[0]) snprintf(line, sizeof(line), "/ %s", v->filter);
         else              snprintf(line, sizeof(line), "/ filter   (f)");
-        char rtxt[128];
+        /* Both ends of this line are measured and fitted, so a long kill
+         * message cannot push the count past the card edge or over the
+         * filter text. */
+        char rtxt[128], rout[128];
         rtxt[0] = 0;
         if (v->note && v->note[0]) snprintf(rtxt, sizeof(rtxt), "%s", v->note);
         else snprintf(rtxt, sizeof(rtxt), "%d of %d", v->nview, v->ntotal);
-        float rightw = font_width(fs, rtxt);
-        crd_fit(fs, line, out, sizeof(out), p->filter.w - rightw - m->gap);
+        crd_fit(fs, rtxt, rout, sizeof(rout), p->filter.w * 0.62f);
+        float rightw = rout[0] ? font_width(fs, rout) + m->gap : 0.0f;
+        crd_fit(fs, line, out, sizeof(out), p->filter.w - rightw);
         font_draw(s, fs, p->filter.x, crd_top(fs, base), out,
                   v->filter_edit ? color_alpha(st->accent, 0.95f)
                                  : color_alpha(st->text, 0.55f));
@@ -877,7 +922,7 @@ static void proc_draw(Surface *s, const ProcCard *p, const CrdMetrics *m,
         }
         if (rightw > 0.0f)
             font_draw(s, fs, p->filter.x + p->filter.w - rightw, crd_top(fs, base),
-                      rtxt, v->note && v->note[0]
+                      rout, v->note && v->note[0]
                                 ? (v->note_warn ? color_alpha(st->warn, 0.95f)
                                                 : color_alpha(st->accent, 0.85f))
                                 : dim);
@@ -886,8 +931,9 @@ static void proc_draw(Surface *s, const ProcCard *p, const CrdMetrics *m,
     if (p->show_head) {
         float base = crd_base(fs, p->head.y, p->head.h);
         float ty = crd_top(fs, base);
-        const char *nm = "NAME";
-        font_draw(s, fs, p->name_x, ty, nm, label);
+        char nmb[8];
+        crd_fit(fs, "NAME", nmb, sizeof(nmb), p->name_max);
+        font_draw(s, fs, p->name_x, ty, nmb, label);
         if (p->have_state) {
             const char *t = "STATE";
             font_draw(s, fs, p->state_r - font_width(fs, t), ty, t, label);
@@ -922,10 +968,14 @@ static void proc_draw(Surface *s, const ProcCard *p, const CrdMetrics *m,
 
     if (v->nview == 0) {
         if (p->rows > 0) {
+            /* the empty state is one line, and it is measured like every other
+             * string: at a narrow window it is cut with the same ellipsis */
+            char eb[64];
+            crd_fit(fr, v->filter[0] ? "no process matches the filter"
+                                     : "no process in /proc",
+                    eb, sizeof(eb), p->card.w - 2.0f * m->pad);
             float base = crd_base(fr, p->body_y, p->row_h);
-            font_draw(s, fr, p->card.x + m->pad, crd_top(fr, base),
-                      v->filter[0] ? "no process matches the filter"
-                                   : "no process in /proc",
+            font_draw(s, fr, p->card.x + m->pad, crd_top(fr, base), eb,
                       color_alpha(st->text, 0.40f));
         }
     } else {
@@ -975,7 +1025,7 @@ static void proc_draw(Surface *s, const ProcCard *p, const CrdMetrics *m,
                     font_draw(s, fr, p->mem_r - font_width(fr, "-"), ty, "-",
                               color_alpha(st->text, 0.40f));
                 } else {
-                    snprintf(buf, sizeof(buf), "%.1f MB", (double)pr->mem_kb / 1024.0);
+                    proc_fmt_mem(pr->mem_kb, buf, sizeof(buf));
                     font_draw(s, fr, p->mem_r - font_width(fr, buf), ty, buf,
                               color_alpha(st->text, 0.85f));
                 }
@@ -990,7 +1040,7 @@ static void fmt_bytes(double v, char *out, size_t n) {
     if (v < 1024.0) snprintf(out, n, "%.0f B", v);
     else if (v < 1024.0 * 1024.0) snprintf(out, n, "%.1f kB", v / 1024.0);
     else if (v < 1024.0 * 1024.0 * 1024.0) snprintf(out, n, "%.1f MB", v / (1024.0 * 1024.0));
-    else snprintf(out, n, "%.2f GB", v / (1024.0 * 1024.0 * 1024.0));
+    else snprintf(out, n, "%.1f GB", v / (1024.0 * 1024.0 * 1024.0));
 }
 
 static void fmt_uptime(double secs, char *out, size_t n) {
@@ -1007,7 +1057,7 @@ static void fmt_uptime(double secs, char *out, size_t n) {
 /* ------------------------------------------------------------ layout */
 
 typedef struct {
-    Font *head, *body, *small, *mono;
+    Font *head, *body, *small;
 } Fonts;
 
 typedef struct {
@@ -1018,7 +1068,6 @@ typedef struct {
     float margin, gap, legend_h;
     int   legend;
     int   split;
-    CrdRect dlg, dlg_ok, dlg_no;
 } SysLayout;
 
 /* Cards down the left column, the table on the right. The split only happens
@@ -1044,17 +1093,24 @@ static SysLayout sysmon_layout(int w, int h, const SysMon *m,
     if (L.legend) avail -= L.legend_h;
     if (avail < 1.0f) avail = 1.0f;
 
+    /* The card stack and the table share the width only when BOTH can be
+     * read: the cards need their longest label/value pair, and the table
+     * needs enough room to keep all five columns above the minimum name
+     * width. ui_px() now follows the absolute shipped scale, so the default
+     * 760 px window still gets its dashboard (one column would hide the
+     * tables' own reason for being separate from Monitor). */
     float left_w = 0.0f;
     L.split = 0;
-    if (w >= ui_px(560)) {
-        left_w = (float)ui_px(320);
+    if (w >= ui_px(420)) {
+        left_w = (float)ui_px(230);
         float cap = ((float)w - 2.0f * L.margin) * 0.42f;
         if (left_w > cap) left_w = cap;
-        if (left_w >= (float)ui_px(220)) {
-            float inner = left_w - 2.0f * cm->pad;
-            float need = font_width(fr, "0000.0 MB") + font_width(fr, "Load 1/5/15");
-            if (inner >= need) L.split = 1;
-        }
+        float inner = left_w - 2.0f * cm->pad;
+        float need = font_width(fr, "0000.0 MB") + font_width(fr, "Load 1/5/15");
+        float table_w = (float)w - 2.0f * L.margin - L.gap - left_w;
+        if (left_w >= (float)ui_px(200) && inner >= need &&
+            table_w >= (float)ui_px(250))
+            L.split = 1;
     }
 
     if (L.split) {
@@ -1085,24 +1141,6 @@ static SysLayout sysmon_layout(int w, int h, const SysMon *m,
     if (card.h < 1.0f) card.h = 1.0f;
     L.pc = proc_card_layout(&card, cm, fr, fs);
 
-    if (m->dlg) {
-        float dw = (float)ui_px(420);
-        float maxw = (float)w - 2.0f * (float)ui_px(20);
-        if (dw > maxw) dw = maxw;
-        if (dw < 1.0f) dw = 1.0f;
-        float btn_h = font_height(fr) + (float)ui_px(10);
-        float dh = cm->pad * 2.0f + cm->title_h + cm->row_h * 2.0f +
-                   cm->gap + btn_h;
-        if (dh > (float)h - 2.0f * (float)ui_px(10))
-            dh = (float)h - 2.0f * (float)ui_px(10);
-        if (dh < 1.0f) dh = 1.0f;
-        L.dlg = (CrdRect){ ((float)w - dw) * 0.5f, ((float)h - dh) * 0.5f, dw, dh };
-        float ok_w = font_width(fr, "Send SIGTERM") + (float)ui_px(24);
-        float no_w = font_width(fr, "Cancel") + (float)ui_px(24);
-        float by = L.dlg.y + L.dlg.h - cm->pad - btn_h;
-        L.dlg_no = (CrdRect){ L.dlg.x + L.dlg.w - cm->pad - no_w, by, no_w, btn_h };
-        L.dlg_ok = (CrdRect){ L.dlg_no.x - cm->gap - ok_w, by, ok_w, btn_h };
-    }
     return L;
 }
 
@@ -1136,7 +1174,7 @@ static SysLayout sysmon_layout_for(const SysMon *m, int w, int h,
 static void draw_sys_card(Surface *s, const CrdRect *c, const CrdMetrics *cm,
                           const CrdStyle *st, Font *ft, Font *fr, Font *fs,
                           const SysMon *m) {
-    crd_begin(s, c, cm, st, ft, "SYSTEM", NULL, 0);
+    crd_begin(s, c, cm, st, ft, fs, "SYSTEM", NULL, 0);
     char v[96];
     if (m->load_ok)
         snprintf(v, sizeof(v), "%.2f %.2f %.2f", m->load[0], m->load[1], m->load[2]);
@@ -1160,7 +1198,7 @@ static void draw_sys_card(Surface *s, const CrdRect *c, const CrdMetrics *cm,
 static void draw_mem_card(Surface *s, const CrdRect *c, const CrdMetrics *cm,
                           const CrdStyle *st, Font *ft, Font *fr, Font *fs,
                           const SysMon *m) {
-    crd_begin(s, c, cm, st, ft, "MEMORY", NULL, 0);
+    crd_begin(s, c, cm, st, ft, fs, "MEMORY", NULL, 0);
     char used[32], total[32], v[96];
     if (m->mem_ok) {
         long u = m->total_kb - m->avail_kb;
@@ -1185,11 +1223,14 @@ static void draw_mem_card(Surface *s, const CrdRect *c, const CrdMetrics *cm,
 }
 
 static void draw_net_card(Surface *s, const CrdRect *c, const CrdMetrics *cm,
-                          const CrdStyle *st, Font *ft, Font *fr,
+                          const CrdStyle *st, Font *ft, Font *fr, Font *fs,
                           const SysMon *m) {
     char meta[64];
-    snprintf(meta, sizeof(meta), "rates = delta over %.2f s", m->dt_ms / 1000.0);
-    crd_begin(s, c, cm, st, ft, "NETWORK", meta, 0);
+    if (m->dt_ms > 0.5)
+        snprintf(meta, sizeof(meta), "rates delta %.2f s", m->dt_ms / 1000.0);
+    else
+        snprintf(meta, sizeof(meta), "no delta yet");
+    crd_begin(s, c, cm, st, ft, fs, "NETWORK", meta, 0);
     int shown = m->nif < 2 ? m->nif : 2;
     int row = 0;
     char label[32], v[96], tot[24], rate[24];
@@ -1225,22 +1266,31 @@ static void draw_frame(SysMon *m, Surface *s, const SysLayout *L,
         switch (L->kind[i]) {
         case K_SYS: draw_sys_card(s, &L->sum[i], &cm, &sty, F->head, F->body, F->small, m); break;
         case K_MEM: draw_mem_card(s, &L->sum[i], &cm, &sty, F->head, F->body, F->small, m); break;
-        case K_NET: draw_net_card(s, &L->sum[i], &cm, &sty, F->head, F->body, m); break;
+        case K_NET: draw_net_card(s, &L->sum[i], &cm, &sty, F->head, F->body, F->small, m); break;
         default: break;
         }
     }
 
+    /* The card's title line carries the interval the CPU% delta was measured
+     * over. "delta" is the word that matters: every CPU% here is a change
+     * between two samples, not a total. Short enough for 320 px at 160%. */
     char meta[64];
     if (m->dt_ms > 0.5)
-        snprintf(meta, sizeof(meta), "cpu%% = delta over %.2f s", m->dt_ms / 1000.0);
+        snprintf(meta, sizeof(meta), "delta %.2f s", m->dt_ms / 1000.0);
     else
-        snprintf(meta, sizeof(meta), "cpu%% needs a second sample");
+        snprintf(meta, sizeof(meta), "no delta yet");
     proc_draw(s, &L->pc, &cm, &sty, F->head, F->body, F->small, pv, "PROCESSES", meta);
 
     if (L->legend) {
         char legend[192], out[192];
         snprintf(legend, sizeof(legend),
-                 "1-5 or click: sort    S: reverse    f: filter    j/k: move    K: kill    q: quit");
+                 "1-5 or click: sort    S: reverse    f: filter    j/k: move    K: kill");
+        /* q only exists in this process, and only gets a hint when the line
+         * has room for it; the shared keys read exactly like Monitor's. */
+        if (font_width(F->small, legend) + font_width(F->small, "    q: quit") <=
+            (float)w - 2.0f * L->margin)
+            snprintf(legend + strlen(legend), sizeof(legend) - strlen(legend),
+                     "    q: quit");
         crd_fit(F->small, legend, out, sizeof(out), (float)w - 2.0f * L->margin);
         float ly = (float)h - L->legend_h;
         font_draw(s, F->small, L->margin,
@@ -1248,38 +1298,6 @@ static void draw_frame(SysMon *m, Surface *s, const SysLayout *L,
                   color_alpha(C_TEXT, 0.40f));
     }
 
-    if (m->dlg) {
-        surf_blend(s, 0, 0, w, h, color_alpha(RGB(0, 0, 0), 0.55f));
-        gfx_rrect_aa(s, L->dlg.x, L->dlg.y, L->dlg.w, L->dlg.h, 8.0f,
-                     C_PANEL, C_WARN, 1.5f);
-        char line[160];
-        font_draw(s, F->head, L->dlg.x + cm.pad, L->dlg.y + cm.pad,
-                  "Kill this process?", C_TEXT);
-        snprintf(line, sizeof(line), "pid %d   %s", m->kill_pid, m->kill_comm);
-        font_draw(s, F->mono, L->dlg.x + cm.pad,
-                  L->dlg.y + cm.pad + font_height(F->head) + cm.gap, line, C_TEXT);
-        snprintf(line, sizeof(line),
-                 "SIGTERM now; SIGKILL after %.1f s if it is still alive.",
-                 KILL_GRACE_MS / 1000.0);
-        crd_fit(F->small, line, line, sizeof(line), L->dlg.w - 2.0f * cm.pad);
-        font_draw(s, F->small, L->dlg.x + cm.pad,
-                  L->dlg.y + cm.pad + font_height(F->head) + cm.gap +
-                      font_height(F->body) + cm.gap,
-                  line, C_DIM);
-
-        gfx_rrect_aa(s, L->dlg_ok.x, L->dlg_ok.y, L->dlg_ok.w, L->dlg_ok.h, 4.0f,
-                     color_alpha(C_WARN, 0.22f), C_WARN, 1.0f);
-        font_draw(s, F->body,
-                  L->dlg_ok.x + (L->dlg_ok.w - font_width(F->body, "Send SIGTERM")) * 0.5f,
-                  crd_top(F->body, crd_base(F->body, L->dlg_ok.y, L->dlg_ok.h)),
-                  "Send SIGTERM", C_TEXT);
-        gfx_rrect_aa(s, L->dlg_no.x, L->dlg_no.y, L->dlg_no.w, L->dlg_no.h, 4.0f,
-                     C_PANEL, C_BORDER, 1.0f);
-        font_draw(s, F->body,
-                  L->dlg_no.x + (L->dlg_no.w - font_width(F->body, "Cancel")) * 0.5f,
-                  crd_top(F->body, crd_base(F->body, L->dlg_no.y, L->dlg_no.h)),
-                  "Cancel", C_DIM);
-    }
 }
 
 /* ------------------------------------------------------------ actions */
@@ -1295,21 +1313,30 @@ static int proc_alive(int pid) {
 }
 
 static void do_kill(SysMon *m) {
-    int pid = m->kill_pid;
-    m->dlg = 0;
+    if (m->sel_pid <= 0) { set_msg(m, "select a process first"); return; }
+    int pid = m->sel_pid;
+    const Proc *p = NULL;
+    for (int i = 0; i < m->nproc; i++)
+        if (m->procs[i].pid == pid) { p = &m->procs[i]; break; }
+    char name[32] = "?";
+    if (p) snprintf(name, sizeof(name), "%s", p->comm);
     char buf[160];
-    if (pid <= 0) { set_msg(m, "no process selected"); return; }
-    if (pid == 1) { set_msg(m, "refusing to kill pid 1 (init)"); return; }
-    if (pid == (int)getpid()) { set_msg(m, "refusing to kill this monitor"); return; }
-    if (kill(pid, SIGTERM) != 0) {
+
+    if (pid <= 1) {
+        snprintf(buf, sizeof(buf), "refused: pid %d is init", pid);
+        set_msg(m, buf);
+    } else if (pid == (int)getpid()) {
+        snprintf(buf, sizeof(buf), "refused: pid %d is me", pid);
+        set_msg(m, buf);
+    } else if (kill(pid, SIGTERM) == 0) {
+        snprintf(buf, sizeof(buf), "SIGTERM -> %d %s", pid, name);
+        set_msg(m, buf);
+        m->pending_pid = pid;
+        m->pending_at = mono_ms() + KILL_GRACE_MS;
+    } else {
         snprintf(buf, sizeof(buf), "SIGTERM to %d failed: %s", pid, strerror(errno));
         set_msg(m, buf);
-        return;
     }
-    m->pending_pid = pid;
-    m->pending_at = mono_ms() + KILL_GRACE_MS;
-    snprintf(buf, sizeof(buf), "SIGTERM sent to %d (%s)", pid, m->kill_comm);
-    set_msg(m, buf);
 }
 
 static void check_pending(SysMon *m) {
@@ -1326,17 +1353,6 @@ static void check_pending(SysMon *m) {
         snprintf(buf, sizeof(buf), "SIGKILL to %d failed: %s", pid, strerror(errno));
     }
     set_msg(m, buf);
-}
-
-static void open_kill_dialog(SysMon *m) {
-    int i = proc_view_index(m->procs, m->view, m->nview, m->sel_pid);
-    if (i < 0) { set_msg(m, "select a process first"); return; }
-    const Proc *p = &m->procs[m->view[i]];
-    if (p->pid == 1) { set_msg(m, "refusing to kill pid 1 (init)"); return; }
-    if (p->pid == (int)getpid()) { set_msg(m, "refusing to kill this monitor"); return; }
-    m->kill_pid = p->pid;
-    snprintf(m->kill_comm, sizeof(m->kill_comm), "%s", p->comm);
-    m->dlg = 1;
 }
 
 /* ------------------------------------------------------------ view helpers */
@@ -1402,8 +1418,7 @@ int main(void) {
     F.head  = font_get(FONT_SEMIBOLD, 12);
     F.body  = font_get(FONT_REGULAR, 11);
     F.small = font_get(FONT_REGULAR, 10);
-    F.mono  = font_get(FONT_MONO, 10);
-    if (!F.head || !F.body || !F.small || !F.mono) {
+    if (!F.head || !F.body || !F.small) {
         fprintf(stderr, "sysmon: no fonts in /usr/share/fonts\n");
         mc_close(&c);
         return 1;
@@ -1441,7 +1456,7 @@ int main(void) {
             next_sample = now + 1000.0;
             dirty = 1;
         }
-        if (m.msg[0] && m.msg_at > 0.0 && now - m.msg_at > 8000.0) {
+        if (m.msg[0] && m.msg_at > 0.0 && now - m.msg_at > 5000.0) {
             m.msg[0] = 0;
             dirty = 1;
         }
@@ -1468,7 +1483,7 @@ int main(void) {
             pv.filter_edit = m.filter_edit;
             char note[160];
             note[0] = 0;
-            if (m.msg[0] && mono_ms() - m.msg_at < 8000.0)
+            if (m.msg[0] && mono_ms() - m.msg_at < 5000.0)
                 snprintf(note, sizeof(note), "%s", m.msg);
             else if (m.truncated)
                 snprintf(note, sizeof(note), "list full: %d in /proc", m.nproc);
@@ -1501,12 +1516,7 @@ int main(void) {
                 break;
 
             case MC_TEXT: {
-                if (m.dlg) {
-                    if (strchr(ev.text, 'y') || strchr(ev.text, 'Y')) do_kill(&m);
-                    else if (strchr(ev.text, 'n') || strchr(ev.text, 'N')) m.dlg = 0;
-                    dirty = 1;
-                    break;
-                }
+                int filter_dirty = 0;
                 for (const char *p = ev.text; *p; p++) {
                     char ch = *p;
                     if (m.filter_edit) {
@@ -1515,6 +1525,7 @@ int main(void) {
                             (unsigned char)ch >= 32 && ch != 127) {
                             m.filter[n] = ch;
                             m.filter[n + 1] = 0;
+                            filter_dirty = 1;
                         }
                     } else if (ch == '/') {
                         m.filter_edit = 1;
@@ -1522,10 +1533,11 @@ int main(void) {
                         m.filter_edit = 1;
                     } else if (ch == 'c') {
                         m.filter[0] = 0;
+                        filter_dirty = 1;
                     } else if (ch == 'q' || ch == 'Q') {
                         quit = 1;
                     } else if (ch == 'K') {
-                        open_kill_dialog(&m);
+                        do_kill(&m);
                     } else if (ch == 's') {
                         set_sort(&m, (m.sort_key + 1) % S_N);
                     } else if (ch == 'S') {
@@ -1533,14 +1545,11 @@ int main(void) {
                         m.scroll = 0;
                     } else if (ch >= '1' && ch < '1' + S_N) {
                         set_sort(&m, ch - '1');
-                    } else if ((unsigned char)ch >= 32 && ch != 127) {
-                        /* typing a letter that is not a command starts the
-                         * filter with that letter */
-                        m.filter_edit = 1;
-                        m.filter[0] = ch;
-                        m.filter[1] = 0;
                     }
                 }
+                /* a changed filter starts the list at its first match, the
+                 * same rule monitor.c's filter_changed() uses */
+                if (filter_dirty) m.scroll = 0;
                 refresh_view(&m);
                 reveal_selection(&m);
                 dirty = 1;
@@ -1549,11 +1558,6 @@ int main(void) {
 
             case MC_KEY: {
                 if (!ev.press) break;
-                if (m.dlg) {
-                    if (ev.key == 1) { m.dlg = 0; dirty = 1; }
-                    else if (ev.key == 28) { do_kill(&m); dirty = 1; }
-                    break;
-                }
                 if (m.filter_edit) {
                     if (ev.key == 1) {
                         m.filter_edit = 0;
@@ -1572,28 +1576,18 @@ int main(void) {
                     break;
                 }
                 switch (ev.key) {
-                case 1:
-                    if (m.filter[0]) {
-                        m.filter[0] = 0;
-                        refresh_view(&m);
-                        m.scroll = 0;
-                        dirty = 1;
-                    }
-                    break;
                 case 103: move_sel(&m, -1); dirty = 1; break;
                 case 108: move_sel(&m,  1); dirty = 1; break;
                 case 104: move_sel(&m, -L.pc.rows); dirty = 1; break;
                 case 109: move_sel(&m,  L.pc.rows); dirty = 1; break;
                 case 102: move_sel(&m, -m.nview); dirty = 1; break;
                 case 107: move_sel(&m,  m.nview); dirty = 1; break;
-                case 28:  open_kill_dialog(&m); dirty = 1; break;
                 default: break;
                 }
                 break;
             }
 
             case MC_WHEEL: {
-                if (m.dlg) break;
                 m.scroll -= ev.wheel * 3;
                 if (m.scroll > m.nview - L.pc.rows) m.scroll = m.nview - L.pc.rows;
                 if (m.scroll < 0) m.scroll = 0;
@@ -1605,11 +1599,7 @@ int main(void) {
                 int x = ev.x, y = ev.y;
                 int down = ev.buttons & 1;
                 if (down && !was_down) {
-                    if (m.dlg) {
-                        if (crd_hit(&L.dlg_ok, x, y)) do_kill(&m);
-                        else if (crd_hit(&L.dlg_no, x, y)) m.dlg = 0;
-                        dirty = 1;
-                    } else if (L.pc.show_filter && crd_hit(&L.pc.filter, x, y)) {
+                    if (L.pc.show_filter && crd_hit(&L.pc.filter, x, y)) {
                         m.filter_edit = 1;
                         dirty = 1;
                     } else if (L.pc.show_head && crd_hit(&L.pc.head, x, y)) {

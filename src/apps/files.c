@@ -311,6 +311,19 @@ static void ui_text_right(Surface *s, Font *f, int right, int y, const char *t, 
     font_draw(s, f, (float)right - font_width(f, t), (float)y, t, c);
 }
 
+static void text_fit(char *buf, size_t cap, Font *f, const char *text, float maxw);
+
+/* Same edge, but fitted to the column it owns: a size from a file (or a
+ * GB-scale number) can be wider than the stand-in the column was sized
+ * from, and it must be cut rather than painted over the stamp/name cell. */
+static void ui_text_right_fit(Surface *s, Font *f, int right, int y, float maxw,
+                              const char *t, u32 c) {
+    char buf[64];
+    text_fit(buf, sizeof(buf), f, t, maxw);
+    if (!buf[0]) return;
+    font_draw(s, f, (float)right - font_width(f, buf), (float)y, buf, c);
+}
+
 /* One button: the header action and the dialog buttons share it, so a
  * button looks the same wherever it appears. */
 static void ui_button(Surface *s, int x, int y, int w, int h, float r,
@@ -625,21 +638,28 @@ static void fmt_mtime(long long mtime, char *out, size_t n) {
  * (x0 + width) - x0, which in floating point can come out a few
  * thousandths of a pixel smaller than the width it started from - enough
  * to chop the last letter off a label that fits perfectly. */
-static void draw_clipped(Surface *s, Font *f, float x, float y, float maxw,
-                         const char *text, u32 color) {
+static void text_fit(char *buf, size_t cap, Font *f, const char *text, float maxw) {
+    if (cap == 0) return;
+    buf[0] = 0;
     if (!f || !text || !text[0] || maxw < 4.0f) return;
-    char buf[PATH_LEN + 8];
     size_t len = strlen(text);
-    if (len >= sizeof(buf) - 3) len = sizeof(buf) - 3;
+    if (len >= cap - 3) len = cap - 3;
     memcpy(buf, text, len);
     buf[len] = 0;
-    if (font_width(f, buf) <= maxw + 0.5f) { font_draw(s, f, x, y, buf, color); return; }
+    if (font_width(f, buf) <= maxw + 0.5f) return;
     float budget = maxw - font_width(f, "..");
     size_t cut = len;
     while (cut > 0 && font_width(f, buf) > budget) buf[--cut] = 0;
-    if (cut == 0) return;
+    if (cut == 0) { buf[0] = 0; return; }
     memcpy(buf + cut, "..", 3);
-    font_draw(s, f, x, y, buf, color);
+    buf[cut + 2] = 0;
+}
+
+static void draw_clipped(Surface *s, Font *f, float x, float y, float maxw,
+                         const char *text, u32 color) {
+    char buf[PATH_LEN + 8];
+    text_fit(buf, sizeof(buf), f, text, maxw);
+    if (buf[0]) font_draw(s, f, x, y, buf, color);
 }
 
 /* ------------------------------------------------------------
@@ -729,6 +749,7 @@ static int layout_build(Layout *L, int w, int h) {
     {
         int right = w - L->m;
         L->size_col = ui_ceilf(font_width(L->f.small, "999.9 MB"));
+        if (L->size_col > SP(12)) L->size_col = SP(12);
         /* the stamp is drawn as "YYYY-MM-DD HH:MM" (fmt_mtime), so the
          * column is measured from that real string, not a short stand-in */
         L->time_col = ui_ceilf(font_width(L->f.small, "0000-00-00 00:00"));
@@ -3056,11 +3077,11 @@ static void draw_list(Files *f, Surface *s, int x, int y, int w,
         }
 
         if (L->show_size && !e->is_dir) {
-            char sz[24];
+            char sz[32];
             human_size(e->size, sz, sizeof(sz));
-            ui_text_right(s, L->f.small, x + L->size_right,
-                          (int)ry + L->small_dy, sz,
-                          color_alpha(th->text, sel ? 0.85f : 0.52f));
+            ui_text_right_fit(s, L->f.small, x + L->size_right,
+                              (int)ry + L->small_dy, (float)L->size_col, sz,
+                              color_alpha(th->text, sel ? 0.85f : 0.52f));
         }
         if (L->show_time) {
             char ts[32];

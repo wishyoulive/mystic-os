@@ -31,10 +31,29 @@
 #define PATH_LEN    512
 #define ERR_LEN     200
 
-/* bands, in window-local pixels */
-#define HEAD_H 30
-#define FOOT_H 20
-#define ROW_H  16
+/* The three bands are not constants: a text row is the body line box plus
+ * one spacing unit, so the pitch follows font_height() at every text scale
+ * instead of a 16 px constant that overlapped its own glyphs from 1.0 up. */
+static int ui_row_h(void) {
+    Font *f = font_get(FONT_REGULAR, 11);
+    if (!f) return 16;
+    return (int)(font_height(f) + 0.5f) + ui_px(4);
+}
+
+static int ui_head_h(void) {
+    Font *f = font_get(FONT_MEDIUM, 12);
+    if (!f) return 30;
+    return (int)(font_height(f) + 0.5f) + ui_px(10);
+}
+
+static int ui_foot_h(void) {
+    Font *f = font_get(FONT_REGULAR, 11);
+    if (!f) return 20;
+    return (int)(font_height(f) + 0.5f) + ui_px(4);
+}
+
+/* One left inset for every band, and the same inset on the right. */
+static int ui_inset(void) { return ui_px(8); }
 
 /* Palette. A client app gets no Theme: it owns its pixels, so it
  * carries its own colours, chosen to sit next to the desktop. */
@@ -66,7 +85,26 @@ typedef struct {
 
 /* ------------------------------------------------------------ text */
 
-/* Draw text, truncating with ".." when it cannot fit in maxw pixels. */
+/* Length of the longest prefix of buf[0..len) that does not end in the
+ * middle of a UTF-8 codepoint. A file name is arbitrary bytes, so the cut
+ * must never leave half a character for font_draw() to misread. */
+static size_t utf8_trim(const char *buf, size_t len) {
+    if (len == 0) return 0;
+    size_t i = len;
+    while (i > 0 && ((unsigned char)buf[i - 1] & 0xC0) == 0x80) i--;
+    if (i == 0) return len;                    /* malformed: keep as-is */
+    unsigned char c = (unsigned char)buf[i - 1];
+    int need = 1;
+    if (c >= 0xC2 && c <= 0xDF) need = 2;
+    else if (c >= 0xE0 && c <= 0xEF) need = 3;
+    else if (c >= 0xF0 && c <= 0xF4) need = 4;
+    if (len - (i - 1) >= (size_t)need) return len;
+    return i - 1;                              /* drop the partial lead */
+}
+
+/* Draw text, truncating with an ellipsis when it cannot fit in maxw px.
+ * This is the only text entry point in the app: nothing is drawn without
+ * being measured against the box it is given. */
 static void draw_fit(Surface *s, Font *f, float x, float y, float maxw,
                      const char *text, u32 color) {
     if (!f || !text || !text[0] || maxw < 4.0f) return;
@@ -78,17 +116,20 @@ static void draw_fit(Surface *s, Font *f, float x, float y, float maxw,
         return;
     }
 
-    float dots = font_width(f, "..");
+    const char *ell = "\xE2\x80\xA6";         /* U+2026 HORIZONTAL ELLIPSIS */
+    float dots = font_width(f, ell);
     size_t len = strlen(buf);
+    if (len > sizeof(buf) - 4) len = sizeof(buf) - 4;
     while (len > 0) {
+        len = utf8_trim(buf, len);
         buf[len] = 0;
         if (font_width(f, buf) + dots <= maxw) break;
+        if (len == 0) break;
         len--;
     }
     if (len == 0) return;
-    buf[len] = '.';
-    buf[len + 1] = '.';
-    buf[len + 2] = 0;
+    memcpy(buf + len, ell, 3);
+    buf[len + 3] = 0;
     font_draw(s, f, x, y, buf, color);
 }
 
@@ -190,9 +231,10 @@ static void load(Browser *b, const char *keep) {
 /* --------------------------------------------------------- movement */
 
 static int rows_for(int h) {
-    int avail = h - HEAD_H - FOOT_H;
-    if (avail < ROW_H) return 0;
-    return avail / ROW_H;
+    int avail = h - ui_head_h() - ui_foot_h();
+    int rh = ui_row_h();
+    if (avail < rh || rh < 1) return 0;
+    return avail / rh;
 }
 
 /* Rows that can be drawn, and rows currently rendered. */
@@ -302,9 +344,10 @@ static void handle_mouse(Browser *b, int x, int y, int buttons) {
     if (!(buttons & 1)) return;
     if (prev & 1) return;
     if (x < 0 || x >= b->w) return;
-    if (y < HEAD_H || y >= b->h - FOOT_H) return;
+    int head = ui_head_h(), foot = ui_foot_h(), rh = ui_row_h();
+    if (y < head || y >= b->h - foot || rh < 1) return;
 
-    int row = (y - HEAD_H) / ROW_H;
+    int row = (y - head) / rh;
     if (row < 0 || row >= rows_for(b->h)) return;
     int idx = b->top + row;
     if (idx < 0 || idx >= b->count) return;
@@ -316,18 +359,22 @@ static void handle_mouse(Browser *b, int x, int y, int buttons) {
 /* ----------------------------------------------------------- drawing */
 
 static void render(MClient *c, Browser *b) {
-    if (b->w < 40 || b->h < HEAD_H + FOOT_H) return;
+    const int head = ui_head_h(), foot = ui_foot_h(), rh = ui_row_h();
+    const int inset = ui_inset();
+    if (b->w < 40 || b->h < head + foot) return;
 
-    Surface s = { c->px, b->w, b->h, c->stride };
+    Surface s = { c->px, b->w, b->h, c->stride, 0, 0, 0, 0 };
     gfx_gradient(&s, 0, 0, b->w, b->h, BG_TOP, BG_BOT);
 
     Font *fp = font_get(FONT_MEDIUM, 12);     /* path / header */
     Font *fr = font_get(FONT_REGULAR, 11);    /* rows / footer */
     if (!fp || !fr) return;
+    const float ph = font_height(fp), rh_line = font_height(fr);
 
-    /* header: where we are */
-    draw_fit(&s, fp, 10.0f, 7.0f, (float)b->w - 20.0f, b->path, C_TEXT);
-    surf_blend(&s, 10, HEAD_H - 3, b->w - 20, 1, color_alpha(C_TEXT, 0.10f));
+    /* header: where we are, centred in its band by its own line box */
+    draw_fit(&s, fp, (float)inset, (float)(head - ph) * 0.5f,
+             (float)b->w - 2.0f * (float)inset, b->path, C_TEXT);
+    surf_blend(&s, inset, head - 1, b->w - 2 * inset, 1, color_alpha(C_TEXT, 0.10f));
 
     int rows = rows_for(b->h);
     if (rows > 0) {
@@ -336,15 +383,20 @@ static void render(MClient *c, Browser *b) {
         /* The list gets its own Surface view, so every row - and every
          * glyph in it - is clipped to the band between header and
          * footer instead of spilling over them. */
-        Surface list = { c->px + (size_t)HEAD_H * (size_t)c->stride,
-                         b->w, rows * ROW_H, c->stride };
+        Surface list = { c->px + (size_t)head * (size_t)c->stride,
+                         b->w, rows * rh, c->stride, 0, 0, 0, 0 };
+
+        /* one text baseline per row, vertically centred in the pitch */
+        float ty = (float)(rh - rh_line) * 0.5f;
 
         if (b->error) {
-            draw_fit(&list, fr, 10.0f, 3.0f, (float)b->w - 20.0f, b->error_text, C_ERROR);
-            draw_fit(&list, fr, 10.0f, 3.0f + ROW_H, (float)b->w - 20.0f,
+            draw_fit(&list, fr, (float)inset, ty, (float)b->w - 2.0f * (float)inset,
+                     b->error_text, C_ERROR);
+            draw_fit(&list, fr, (float)inset, ty + (float)rh,
+                     (float)b->w - 2.0f * (float)inset,
                      "Backspace goes up", color_alpha(C_TEXT, 0.40f));
         } else if (b->count == 0) {
-            draw_fit(&list, fr, 10.0f, 3.0f, (float)b->w - 20.0f,
+            draw_fit(&list, fr, (float)inset, ty, (float)b->w - 2.0f * (float)inset,
                      "empty directory", color_alpha(C_TEXT, 0.40f));
         }
 
@@ -353,23 +405,24 @@ static void render(MClient *c, Browser *b) {
             if (idx >= b->count) break;
             const Entry *e = &b->ent[idx];
             int selected = (idx == b->sel);
-            float ry = (float)(i * ROW_H);
-            float ty = ry + 2.0f;
+            float ry = (float)(i * rh);
 
             if (selected)
                 gfx_rrect_aa(&list, 6.0f, ry + 1.0f, (float)b->w - 12.0f,
-                             (float)ROW_H - 2.0f, 4.0f,
+                             (float)rh - 2.0f, 4.0f,
                              color_alpha(C_ACCENT, 0.20f), 0, 0);
 
-            /* size, right-aligned - a real st_size, in B/K/M */
+            /* size, right-aligned on the shared right edge - a real st_size.
+             * The value is measured, then the name gets what is actually
+             * left, so a wide value can never paint over the name cell. */
             char size[24];
             human_size(e->size, size, sizeof(size));
             float sw = font_width(fr, size);
-            float right = (float)b->w - 10.0f;
+            float right = (float)b->w - (float)inset;
             u32 size_col = selected ? color_alpha(C_TEXT, 0.80f)
                                     : color_alpha(C_TEXT, e->is_dir ? 0.28f : 0.45f);
             font_draw(&list, fr, right - sw, ty, size, size_col);
-            right -= sw + 12.0f;
+            float name_right = right - sw - (float)ui_px(6);
 
             /* name, '/' appended for directories */
             char name[NAME_LEN + 4];
@@ -378,38 +431,38 @@ static void render(MClient *c, Browser *b) {
             if (selected)    name_col = C_TEXT;
             else if (e->is_dir) name_col = C_DIR;
             else             name_col = color_alpha(C_TEXT, 0.72f);
-            draw_fit(&list, fr, 10.0f, ty, right - 10.0f, name, name_col);
+            draw_fit(&list, fr, (float)inset, ty,
+                     name_right - (float)inset, name, name_col);
         }
     }
 
     /* footer: how many entries, and how many of them are not on screen */
-    if (b->h >= HEAD_H + FOOT_H) {
-        surf_blend(&s, 10, b->h - FOOT_H, b->w - 20, 1, color_alpha(C_TEXT, 0.10f));
-        float fy = (float)(b->h - FOOT_H) + 3.0f;
+    surf_blend(&s, inset, b->h - foot, b->w - 2 * inset, 1, color_alpha(C_TEXT, 0.10f));
+    float fy = (float)(b->h - foot) + (float)(foot - rh_line) * 0.5f;
 
-        int shown = visible_rows(b);
-        int hidden = b->count - shown;
-        if (hidden < 0) hidden = 0;
+    int shown = visible_rows(b);
+    int hidden = b->count - shown;
+    if (hidden < 0) hidden = 0;
 
-        char left[64], right[48];
-        snprintf(left, sizeof(left), "%d entr%s%s", b->count,
-                 b->count == 1 ? "y" : "ies",
-                 b->count >= MAX_ENTRIES ? " (limit)" : "");
-        snprintf(right, sizeof(right), "%d off-screen", hidden);
+    char left[64], right_txt[48];
+    snprintf(left, sizeof(left), "%d entr%s%s", b->count,
+             b->count == 1 ? "y" : "ies",
+             b->count >= MAX_ENTRIES ? " (limit)" : "");
+    snprintf(right_txt, sizeof(right_txt), "%d off-screen", hidden);
 
-        float rw = font_width(fr, right);
-        draw_fit(&s, fr, 10.0f, fy, (float)b->w - rw - 26.0f, left,
-                 color_alpha(C_TEXT, 0.50f));
-        font_draw(&s, fr, (float)b->w - 10.0f - rw, fy, right,
-                  color_alpha(C_TEXT, 0.50f));
-    }
+    float rw = font_width(fr, right_txt);
+    draw_fit(&s, fr, (float)inset, fy,
+             (float)b->w - rw - 2.0f * (float)inset - (float)ui_px(6), left,
+             color_alpha(C_TEXT, 0.50f));
+    font_draw(&s, fr, (float)b->w - (float)inset - rw, fy, right_txt,
+              color_alpha(C_TEXT, 0.50f));
 }
 
 /* Last resort: if we cannot even allocate the browser, say so on the
  * screen with the real errno text instead of dying silently. */
 static void render_fatal(MClient *c, const char *what, const char *why) {
     if (!c->px) return;
-    Surface s = { c->px, c->w, c->h, c->stride };
+    Surface s = { c->px, c->w, c->h, c->stride, 0, 0, 0, 0 };
     gfx_gradient(&s, 0, 0, c->w, c->h, RGB(0x1D, 0x10, 0x14), RGB(0x2B, 0x16, 0x1B));
     Font *fr = font_get(FONT_REGULAR, 12);
     if (!fr) return;
