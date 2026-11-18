@@ -37,8 +37,19 @@ mount_pseudo() {
     /bin/hostname mystic
     export PATH=/sbin:/usr/sbin:/bin:/usr/bin
     mkdir -p /root /run/mystic /tmp /var/log /dev/shm 2>/dev/null
-    # shared memory for the display protocol
-    /bin/mount -t tmpfs none /dev/shm 2>/dev/null
+    # Shared memory for the display protocol. Only the window server writes
+    # here now: each jailed app gets its own tmpfs for /dev/shm (src/wmsrv.c,
+    # "the sandbox plan"), so this mount holds one buffer per connected client
+    # and nothing else. The cap is arithmetic, not a guess: eight clients x
+    # one 1920x1080 buffer (1920*1080*4 = 8,294,400 B) = 66,355,200 B = 63.3
+    # MiB, so 128 MiB is twice the worst case. mode 1777 is the tmpfs default
+    # made explicit; nosuid,nodev because nothing here is ever executable.
+    /bin/mount -t tmpfs -o size=128M,mode=1777,nosuid,nodev none /dev/shm 2>/dev/null
+    # The sandbox's anchor directory. The window server makes it too (it must
+    # work without this line), but doing it here means the very first launch
+    # does not race the first mkdir. Owner root, 0755: an app never writes it.
+    mkdir -p /run/mystic/jail 2>/dev/null
+    chmod 0755 /run/mystic/jail 2>/dev/null
 }
 
 # ------------------------------------------------------------
@@ -818,7 +829,9 @@ probe() {
         echo "disk     : mounted, boot counter now $n"
         touch /root/permtest
         chmod 600 /root/permtest
-        chown 1000:1000 /root/permtest 2>/dev/null
+        # 2000 is the first sandbox uid (src/wmsrv.c: SBX_UID_BASE); the disk
+        # supports arbitrary owners when this line reports 2000:2000.
+        chown 2000:2000 /root/permtest 2>/dev/null
         echo "perms    : $(ls -l /root/permtest | tr -s ' ' | cut -d' ' -f1,3,4)"
         echo "          files: $(ls /root | tr '
 ' ' ')"
@@ -856,6 +869,17 @@ fi
 
 # If there is a screen, start the desktop. Otherwise drop to a shell
 # (this is what a headless probe boot does).
+#
+# The desktop is also the sandbox's parent: everything a jailed app gets is
+# built by src/wmsrv.c before it execs, from a plan it can print
+# (MYSTIC_SANDBOX_PRINT=1). Init owes that code exactly four things, all of
+# them done above:
+#   - a writable /dev/shm (the server's per-client buffers live there),
+#   - /run/mystic and /run/mystic/jail, root-owned,
+#   - devtmpfs, so /dev/null, /dev/urandom and /dev/snd exist to be bound,
+#   - procfs on /proc, so "procs = yes" apps have the host view to bind.
+# The uids 2000..2007 that apps run as need no /etc/passwd entry: setuid(2)
+# takes a number, and the jail has no /etc/passwd to read anyway.
 if [ -x /usr/bin/mystic-desktop ] && [ -e /dev/fb0 ]; then
     # Clipboard: the daemon owns /root/clipboard and the socket every copy
     # and paste goes through. Start it BEFORE the desktop so the first

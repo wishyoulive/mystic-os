@@ -1,3 +1,14 @@
 name = Sysmon
 desc = Live system dashboard reading /proc, as its own process.
 exec = bin
+# Sysmon is the one app whose whole job is to read OTHER processes' /proc
+# entries, so it is the one app allowed to skip its private pid namespace.
+#
+# procs = yes means: no CLONE_NEWPID, and the host /proc is bound read-only
+# into the jail. The cost is real and is written down in docs/SECURITY.md:
+# this app can see every process name and command line, where a normal
+# sandboxed app sees only itself. It still runs as its own uid with its own
+# mount namespace, its own size-limited /tmp and /dev/shm, no /root and no
+# network, and it cannot signal another app's processes (DAC: different uid).
+# Every other bundle must NOT set this.
+procs = yes

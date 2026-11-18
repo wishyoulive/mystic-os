@@ -1,6 +1,6 @@
 # A real browser engine on Mystic OS
 
-The owner asked for full HTML/CSS/JS. `src/client/apps/web.c` is our own
+The user asked for full HTML/CSS/JS. `src/client/apps/web.c` is our own
 renderer: it parses HTML, applies a CSS subset and draws text, and it will
 never run a framework. This document is the honest answer to "put a real
 engine in it":
@@ -333,7 +333,7 @@ which one is missing instead of a dead rectangle:
 | JavaScript | V8. The binary contains `v8_context_snapshot` [apk]. WebAssembly is V8's. |
 | Canvas / WebGL | Canvas yes (software). WebGL is refused: the app passes `--disable-gpu` because there is no GPU; Chromium would otherwise try DRI drivers that need `llvm22-libs` and a DRM node. |
 | H.264 / VP9 / AV1 video without DRM | The engine links `libavcodec.so.62`, `libopenh264.so.8`, `libdav1d.so.7`, and the closure carries `x265-libs`, `aom-libs`, `libSvtAv1Enc` [apk, DT_NEEDED + idx]. Decoding is therefore present. **Not measured**: no video was played. |
-| Audio from a page | The app passes `--mute-audio` when `/dev/snd/pcmC0D0p` does not exist and says so once on stderr. With a PCM node it does not pass the flag and the page's audio goes to the engine's own output. Whether that output exists in the guest is the audio worker's question, not this document's. |
+| Audio from a page | The app passes `--mute-audio` when `/dev/snd/pcmC0D0p` does not exist and says so once on stderr. With a PCM node it does not pass the flag and the page's audio goes to the engine's own output. Whether that output exists in the guest is the audio contributor's question, not this document's. |
 | **DRM (Netflix, Spotify, Prime)** | **No.** The engine knows the API (`requestMediaKeySystemAccess`, `widevine` strings are present) but the CDM library `libwidevinecdm.so` is not in the binary's directory and there is **no widevine package in the whole Alpine v3.24 index** [idx]. Without a CDM, EME playback fails by design. |
 | PDF viewer | Chromium's PDF viewer needs its plugin resources; the headless shell package does not carry them. Use `docview`/`pdf.c`. |
 | Downloads | Not wired: `Page.setDownloadBehavior` is not called and there is no file picker in the jail. |
@@ -508,7 +508,7 @@ What it is not: **NetSurf 3.11 has no JavaScript engine.** Its CSS support is a
 2.1 subset with some CSS3. A page that is a React app, or that needs
 `fetch()`, shows nothing but its `<noscript>` or an empty body. For reading
 documentation, Wikipedia's early-2000s surface and plain HTML sites it is
-genuinely good; for "full HTML/CSS/JS" it is not the thing the owner asked for.
+genuinely good; for "full HTML/CSS/JS" it is not the thing the design calls for.
 
 It also has no compositor integration: it wants the framebuffer device, which
 the jail does not bind, so it would need the same kind of packaging work this
@@ -530,8 +530,8 @@ It also does not solve JavaScript. A JS engine would be a second dependency:
 are in the index [idx], but neither is a browser DOM/Web API implementation, so
 a page calling `document.querySelector` still fails.
 
-**Recommendation:** if the owner wants a real browser, install `engine`
-(§7). If the owner wants a small, honest HTML reader, NetSurf is the option and
+**Recommendation:** if the design wants a real browser, install `engine`
+(§7). If the design wants a small, honest HTML reader, NetSurf is the option and
 its cost is 23 packages. There is no 10 MB full browser engine, in this index
 or anywhere else.
 

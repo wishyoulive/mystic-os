@@ -79,7 +79,7 @@ line_body    = (int)(font_height(fb) + 0.5f)          fb = FONT_REGULAR  12
 
 height = low          -> pad*2 + line_summary
        = body shown   -> pad*2 + line_summary + line_body + ui_px(2)
-       = critical     -> pad*2 + line_summary + line_body + ui_px(12)   (+ hint line)
+       = revieweral     -> pad*2 + line_summary + line_body + ui_px(12)   (+ hint line)
 ```
 
 Note `font_get()` already multiplies by `ui_scale_get()` internally: ask for
@@ -100,7 +100,7 @@ let new ones appear below it, so the bubble a person is reading never moves.
 | `NOTIFY_CRITICAL` (2) | `WITH_A(th->accent, 0xFF)` | `WITH_A(th->panel, 0xE6)` | `WITH_A(th->accent, 0xC0)` | `th->text` | `th->text_dim` + a hint line |
 
 So urgency is told by *structure* (stripe alpha, louder border, an extra line),
-not by a red that would fight the theme. A critical bubble is also the only one
+not by a red that would fight the theme. A revieweral bubble is also the only one
 that never arrives pre-suppressed by do-not-disturb.
 
 **Time left.** If `item.ttl_ms > 0`, draw a 2 px hairline along the bottom edge
@@ -349,7 +349,7 @@ printf 'LIST\n' | nc -U /run/mystic/notify.sock
 printf 'DND\t1\n' | nc -U /run/mystic/notify.sock   # -> OK 1
 ```
 
-Urgency is `0` normal, `1` low, `2` critical. `timeout_ms` is `0` for "until
+Urgency is `0` normal, `1` low, `2` revieweral. `timeout_ms` is `0` for "until
 dismissed". A tag is optional; an empty tag never replaces anything. A client
 that connects, sends half a line and disappears costs the service one `read()`
 that returns 0 - it has no effect on the list or on the next client.

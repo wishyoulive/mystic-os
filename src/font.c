@@ -8,7 +8,7 @@
  *  Fonts are DISCOVERED, not hard-coded. At startup the loader
  *  scans for *.ttf / *.otf, in this order:
  *
- *      /root/fonts          the owner's own fonts (highest priority)
+ *      /root/fonts          the user's own fonts (highest priority)
  *      <font_init() dir>    normally /usr/share/fonts
  *      /usr/share/fonts     the faces the image ships
  *
@@ -1475,7 +1475,7 @@ static unsigned next_use(Font *f) {
  *
  *  The old lookup asked the role's face only: stbtt_FindGlyphIndex()
  *  returning 0 meant the index of glyph 0, .notdef, which is the box
- *  the owner saw where a Cyrillic or Japanese letter should be - even
+ *  the user saw where a Cyrillic or Japanese letter should be - even
  *  with a face installed that had the letter.  So a miss now walks the
  *  whole face list (the same list the roles were chosen from) and the
  *  first face with real ink in the glyph wins; a face that maps the

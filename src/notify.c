@@ -367,8 +367,8 @@ int notify_insert(NotifyServer *s, const char *app, const char *tag,
     }
 
     if (s->count >= NOTIFY_MAX) {
-        /* Full ring: the oldest notification that is not critical goes;
-         * if every single one is critical, the oldest goes anyway. The
+        /* Full ring: the oldest notification that is not revieweral goes;
+         * if every single one is revieweral, the oldest goes anyway. The
          * ring cannot grow, so this is the only choice there is. */
         int victim = 0;
         for (int i = 0; i < s->count; i++) {

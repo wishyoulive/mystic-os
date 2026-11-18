@@ -8,11 +8,22 @@
  * ============================================================ */
 #include "ipc.h"
 
+#ifdef MYSTIC_SANDBOX_PLAN
+/* The host harness build: the plan is portable C, so it needs nothing but
+ * stdio, strings and the S_IF* bits. No kernel calls, nothing Linux-only. */
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#else
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <grp.h>
+#include <linux/magic.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,10 +32,503 @@
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/un.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#endif
+
+
+/* The plan below is the sandbox, as data: it is built from the bundle, the
+ * credential and the screen size, printed by the host harness, and executed
+ * step by step. It is included before the Linux-only server body so that a
+ * harness can build and print a plan without a kernel (docs/SECURITY.md). */
+/* ============================================================
+ *  The sandbox plan
+ *
+ *  What a jailed app gets is DATA before it is syscalls: one SbxPlan is
+ *  built from the bundle, the credential and the screen size, printed by
+ *  the host harness, and then executed - by sandbox_prepare() in the
+ *  desktop's own namespaces before the fork, and by sandbox_child() in the
+ *  app's namespaces afterwards. The printer and both executors walk the
+ *  same array, so a printed plan cannot describe something different from
+ *  what runs.
+ *
+ *  Why the split:
+ *
+ *   - the jail skeleton and the two per-app tmpfs mounts happen in the
+ *     PARENT, before fork. They have to: the desktop writes the app's file
+ *     picker request to <jail>/tmp/filepick.request (main.c) and creates the
+ *     app's pixel buffer inside <jail>/dev/shm after HELLO. Both paths only
+ *     reach the app if that tmpfs instance is inherited by it instead of
+ *     being mounted on the child's side of the fork.
+ *
+ *   - every read-only bind, the procfs, the chroot, the credential drop and
+ *     the post-drop writability check happen in the CHILD, after unshare(),
+ *     so nothing the app can influence exists before its namespaces do.
+ *
+ *  This part of the file compiles on any host (see docs/SECURITY.md,
+ *  "proving it"): it is only arrays, snprintf and mode bits, no kernel
+ *  calls, so the harness can run it on the build machine and print the
+ *  exact plan. The executor below is Linux.
+ * ============================================================ */
+
+/* ---------------------------------------------------------- credentials
+ * One uid per BUNDLE, from a small indexed pool: uid = 2000 + slot.
+ *
+ * Why per bundle and not per connection: an app's own /root (its appdata) can
+ * only have one owner, and two windows of the same program must not fight over
+ * it. Two DIFFERENT apps never share a uid, which is the hole the audit proved:
+ * with one SANDBOX_UID for everything, any app could open, forge and ftruncate
+ * any other app's pixel buffer and SIGBUS the compositor.
+ *
+ * The range is capped at the number of windows the server can serve
+ * (WM_MAX_CLIENTS), and a uid is only handed to a bundle that has no live
+ * process, so a uid is never reused while an app is still running under it.
+ */
+#define SBX_UID_BASE   2000
+#define SBX_UID_SLOTS  WM_MAX_CLIENTS        /* 8 -> uid 2000..2007 */
+#define SBX_UID_TOP    (SBX_UID_BASE + SBX_UID_SLOTS)
+#define SBX_GID_BASE   SBX_UID_BASE          /* gid == uid; groups stay empty */
+
+typedef struct {
+    char id[32];                  /* bundle that owns this uid, "" = slot free */
+    int  nanchor;                 /* launches whose process is still alive */
+    int  npid;                    /* connections the kernel attributes here */
+    long anchor[SBX_UID_SLOTS];
+    long pid[SBX_UID_SLOTS];
+} SbxCred;
+
+static SbxCred sbx_creds[SBX_UID_SLOTS];
+
+static int sbx_uid_of_slot(int i) { return SBX_UID_BASE + i; }
+
+static int sbx_uid_valid(int uid) {
+    return uid >= SBX_UID_BASE && uid < SBX_UID_TOP;
+}
+
+/* The harness has no children to watch, so a recorded process counts as
+ * alive: its output then shows the pool doing its job instead of every slot
+ * being collected the moment it is handed out. */
+#ifdef MYSTIC_SANDBOX_PLAN
+static int sbx_pid_alive(long pid) { return pid > 0; }
+static void sbx_jail_forget(const char *id) { (void)id; }
+#else
+static int sbx_pid_alive(long pid) {
+    return pid > 0 && kill((pid_t)pid, 0) == 0;
+}
+static void sbx_jail_forget(const char *id);   /* defined in the executor */
+#endif
+
+/* Drop entries whose process is gone. A bundle whose processes have all
+ * exited loses its uid (and with it the per-app tmpfs - sbx_jail_forget()
+ * unmounts it in the server). */
+static void sbx_cred_gc(void) {
+    for (int i = 0; i < SBX_UID_SLOTS; i++) {
+        SbxCred *c = &sbx_creds[i];
+        if (!c->id[0]) continue;
+        int k = 0;
+        for (int j = 0; j < c->nanchor; j++)
+            if (sbx_pid_alive(c->anchor[j])) c->anchor[k++] = c->anchor[j];
+        c->nanchor = k;
+        k = 0;
+        for (int j = 0; j < c->npid; j++)
+            if (sbx_pid_alive(c->pid[j])) c->pid[k++] = c->pid[j];
+        c->npid = k;
+        if (c->nanchor == 0 && c->npid == 0) {
+            sbx_jail_forget(c->id);
+            c->id[0] = 0;
+        }
+    }
+}
+
+static SbxCred *sbx_cred_by_uid(int uid) {
+    if (!sbx_uid_valid(uid)) return NULL;
+    SbxCred *c = &sbx_creds[uid - SBX_UID_BASE];
+    return c->id[0] ? c : NULL;
+}
+
+/* Reserve the uid for a bundle. Returns the uid, or -1 when every slot is
+ * held by a live app (which is also when the client table is full).
+ *
+ * `reuse` comes back 1 when this bundle already holds a uid, i.e. a second
+ * window of a program that is already running: the tmpfs the first window
+ * mounted is kept instead of being replaced underneath it. */
+static int sbx_cred_acquire(const char *id, int *reuse) {
+    if (reuse) *reuse = 0;
+    if (!id || !id[0]) return -1;
+    sbx_cred_gc();
+    int slot = -1;
+    for (int i = 0; i < SBX_UID_SLOTS; i++) {
+        if (sbx_creds[i].id[0] && !strcmp(sbx_creds[i].id, id)) {
+            if (reuse) *reuse = 1;
+            return sbx_uid_of_slot(i);
+        }
+        if (!sbx_creds[i].id[0] && slot < 0) slot = i;
+    }
+    if (slot < 0) return -1;
+    SbxCred *c = &sbx_creds[slot];
+    memset(c, 0, sizeof(*c));
+    snprintf(c->id, sizeof(c->id), "%s", id);
+    return sbx_uid_of_slot(slot);
+}
+
+static void sbx_cred_add_anchor(int uid, long pid) {
+    SbxCred *c = sbx_cred_by_uid(uid);
+    if (!c || pid <= 0) return;
+    for (int i = 0; i < c->nanchor; i++) if (c->anchor[i] == pid) return;
+    if (c->nanchor < SBX_UID_SLOTS) c->anchor[c->nanchor++] = pid;
+}
+
+static void sbx_cred_add_pid(int uid, long pid) {
+    SbxCred *c = sbx_cred_by_uid(uid);
+    if (!c || pid <= 0) return;
+    for (int i = 0; i < c->npid; i++) if (c->pid[i] == pid) return;
+    if (c->npid < SBX_UID_SLOTS) c->pid[c->npid++] = pid;
+}
+
+/* A window closed: forget that connection. The uid goes back to the pool when
+ * the last process of that bundle is gone - which may be now, or a moment
+ * later when the app finishes exiting (the next gc sees it). */
+static void sbx_cred_del_pid(int uid, long pid) {
+    SbxCred *c = sbx_cred_by_uid(uid);
+    if (c) {
+        for (int i = 0; i < c->npid; i++) {
+            if (c->pid[i] != pid) continue;
+            for (int j = i + 1; j < c->npid; j++) c->pid[j - 1] = c->pid[j];
+            c->npid--;
+            break;
+        }
+    }
+    sbx_cred_gc();
+}
+
+/* ---------------------------------------------------------- the plan */
+#define SBX_STEPS 24
+#define SBX_PATH  320
+
+/* where a step runs */
+enum { SBX_PARENT = 0, SBX_CHILD = 1 };
+
+/* what a step does */
+enum {
+    SBX_MKDIR = 1,     /* mkdir -p, no symlink in the way */
+    SBX_TMPFS,         /* mount -t tmpfs with size= and mode= */
+    SBX_CHOWN,         /* give the app its appdata, recursively if needed */
+    SBX_BIND,          /* mount --bind, optionally read-only */
+    SBX_PROC,          /* mount -t proc proc (the app's own pid namespace) */
+    SBX_PROC_RO,       /* mount --bind /proc, read-only (procs = yes) */
+    SBX_CHROOT,
+    SBX_DROP,          /* setgroups(0), setgid, setuid */
+    SBX_VERIFY         /* prove the jail is not writable and /tmp+/root are */
+};
+
+/* mount flags, in our own bits so the plan prints on a host without MS_* */
+enum { SBX_F_NOSUID = 1u << 0, SBX_F_NODEV = 1u << 1, SBX_F_NOEXEC = 1u << 2 };
+
+typedef struct {
+    unsigned char where;             /* SBX_PARENT or SBX_CHILD */
+    unsigned char op;
+    unsigned char ro;
+    unsigned mode;
+    unsigned flags;                  /* SBX_F_* */
+    int uid;
+    unsigned long long size;
+    char src[SBX_PATH];
+    char dst[SBX_PATH];              /* absolute for the parent, jail-relative
+                                      * for the child */
+    char opts[112];
+} SbxStep;
+
+typedef struct {
+    char id[32];
+    char jail[SBX_PATH];
+    int  uid, gid;
+    unsigned ns;                     /* SBX_NS_* */
+    int  procs, net, audio;
+    int  reuse;                      /* a window of this app is already up */
+    int  stride, maxh;
+    unsigned long long buf_bytes, shm_size, tmp_size;
+    int  nstep;
+    SbxStep step[SBX_STEPS];
+} SbxPlan;
+
+/* The namespace set is described with our own bits and translated to CLONE_*
+ * at the one place that calls unshare(), so the plan prints and compares on a
+ * host that has no clone(2). */
+enum { SBX_NS_MNT = 1u << 0, SBX_NS_IPC = 1u << 1, SBX_NS_UTS = 1u << 2,
+       SBX_NS_NET = 1u << 3, SBX_NS_PID = 1u << 4 };
+
+/* Every per-app tmpfs is two buffers plus a megabyte: the buffer is at most
+ * stride * maxh * 4 bytes (the server clamps a HELLO to the screen, so that is
+ * the whole window), and 2x gives an app room for exactly one more buffer's
+ * worth of its own shared memory on top, + 1 MiB for the rest (a player's
+ * cache, a lock file, a score). That is the whole point: an app can fill its
+ * own tmpfs and get ENOSPC, not fill the machine. */
+#define SBX_MIB 1048576ull
+static unsigned long long sbx_buf_bytes(int stride, int maxh) {
+    if (stride < 1) stride = 1;
+    if (maxh < 1) maxh = 1;
+    return (unsigned long long)stride * (unsigned long long)maxh * 4ull;
+}
+static unsigned long long sbx_tmpfs_size(unsigned long long buf) {
+    return 2ull * buf + SBX_MIB;
+}
+
+static void sbx_ns_names(unsigned ns, char *buf, size_t cap) {
+    static const struct { unsigned bit; const char *name; } tab[] = {
+        { SBX_NS_MNT, "NEWNS" },  { SBX_NS_IPC, "NEWIPC" },
+        { SBX_NS_UTS, "NEWUTS" }, { SBX_NS_NET, "NEWNET" },
+        { SBX_NS_PID, "NEWPID" },
+    };
+    size_t o = 0;
+    buf[0] = 0;
+    for (size_t i = 0; i < sizeof(tab) / sizeof(tab[0]); i++) {
+        if (!(ns & tab[i].bit)) continue;
+        int n = snprintf(buf + o, cap - o, "%s%s", o ? "|" : "", tab[i].name);
+        if (n < 0) break;
+        if ((size_t)n >= cap - o) { buf[cap - 1] = 0; return; }
+        o += (size_t)n;
+    }
+}
+
+static SbxStep *sbx_add(SbxPlan *p, int where, int op,
+                        const char *src, const char *dst) {
+    static SbxStep overflow;       /* a build bug, never a valid plan */
+    if (p->nstep >= SBX_STEPS) {
+        fprintf(stderr, "wms: sandbox plan for %s is full (%d steps); "
+                        "the extra step is not added\n", p->id, SBX_STEPS);
+        memset(&overflow, 0, sizeof(overflow));
+        return &overflow;
+    }
+    SbxStep *s = &p->step[p->nstep++];
+    memset(s, 0, sizeof(*s));
+    s->where = (unsigned char)where;
+    s->op = (unsigned char)op;
+    s->uid = p->uid;
+    if (src) snprintf(s->src, sizeof(s->src), "%s", src);
+    if (dst) snprintf(s->dst, sizeof(s->dst), "%s", dst);
+    return s;
+}
+
+static void sbx_plan_init(SbxPlan *p, const char *run, const char *id,
+                          const char *exe, const char *appdata,
+                          int uid, int procs, int net, int audio,
+                          int stride, int maxh, const char *arg) {
+    memset(p, 0, sizeof(*p));
+    snprintf(p->id, sizeof(p->id), "%s", id ? id : "");
+    snprintf(p->jail, sizeof(p->jail), "%s/jail/%s", run, p->id);
+    p->uid = uid;
+    p->gid = uid;
+    p->procs = procs ? 1 : 0;
+    p->net = net ? 1 : 0;
+    p->audio = audio ? 1 : 0;
+    p->stride = stride;
+    p->maxh = maxh;
+    p->buf_bytes = sbx_buf_bytes(stride, maxh);
+    p->shm_size = sbx_tmpfs_size(p->buf_bytes);
+    p->tmp_size = p->shm_size;
+
+    /* A private pid namespace is the default: the app sees itself and
+     * nothing else, and cannot signal any process outside its own
+     * namespace - not even the desktop. procs = yes is the single, named
+     * exception (sysmon reads every process); it skips CLONE_NEWPID and
+     * gets the host /proc read-only instead. That trade is made once, in
+     * the manifest, and documented in docs/SECURITY.md. */
+    p->ns = SBX_NS_MNT | SBX_NS_IPC | SBX_NS_UTS;
+    if (!p->net) p->ns |= SBX_NS_NET;
+    if (!p->procs) p->ns |= SBX_NS_PID;
+
+    char dir[SBX_PATH];
+
+    /* ---- parent: skeleton + the two per-app tmpfs mounts */
+    sbx_add(p, SBX_PARENT, SBX_MKDIR, NULL, p->jail)->mode = 0755;
+    snprintf(dir, sizeof(dir), "%s/tmp", p->jail);
+    sbx_add(p, SBX_PARENT, SBX_MKDIR, NULL, dir)->mode = 0755;
+    {
+        SbxStep *s = sbx_add(p, SBX_PARENT, SBX_TMPFS, "tmpfs", dir);
+        s->mode = 0700; s->size = p->tmp_size;
+        s->flags = SBX_F_NOSUID | SBX_F_NODEV;
+        snprintf(s->opts, sizeof(s->opts),
+                 "size=%llu,mode=0700,uid=%d,gid=%d", p->tmp_size, uid, uid);
+    }
+    snprintf(dir, sizeof(dir), "%s/dev/shm", p->jail);
+    sbx_add(p, SBX_PARENT, SBX_MKDIR, NULL, dir)->mode = 0755;
+    {
+        SbxStep *s = sbx_add(p, SBX_PARENT, SBX_TMPFS, "tmpfs", dir);
+        s->mode = 0700; s->size = p->shm_size;
+        s->flags = SBX_F_NOSUID | SBX_F_NODEV | SBX_F_NOEXEC;
+        snprintf(s->opts, sizeof(s->opts),
+                 "size=%llu,mode=0700,uid=%d,gid=%d", p->shm_size, uid, uid);
+    }
+
+    /* ---- parent: the app's own /root, owned by the app */
+    sbx_add(p, SBX_PARENT, SBX_CHOWN, appdata, appdata)->mode = 0700;
+
+    /* ---- child: the payload and its own bundle, read-only */
+    {
+        SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, exe, "/bin/app");
+        s->ro = 1; s->mode = 0755;
+    }
+    {
+        /* the bundle directory: a package may ship a runtime beside the
+         * executable (libVLC and its plugins), and only that one directory is
+         * added - never /root, never the rest of the apps tree */
+        char bundle[SBX_PATH];
+        snprintf(bundle, sizeof(bundle), "%s", exe);
+        char *slash = strrchr(bundle, '/');
+        if (slash) *slash = 0;
+        SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, bundle, "/app");
+        s->ro = 1; s->mode = 0755;
+    }
+
+    /* ---- child: the window socket */
+    {
+        SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, WM_SOCKET, "/run/mystic/wm.sock");
+        s->mode = 0666;
+    }
+
+    /* ---- child: name resolution, only for an app that asked for the netns */
+    if (p->net) {
+        static const char *const netfiles[] = {
+            "/etc/resolv.conf", "/etc/hosts", "/etc/ssl/certs/ca-bundle.crt"
+        };
+        for (size_t i = 0; i < sizeof(netfiles) / sizeof(netfiles[0]); i++) {
+            SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, netfiles[i], netfiles[i]);
+            s->ro = 1; s->mode = 0644;
+        }
+    }
+
+    /* ---- child: its own /root (the appdata directory, bound) */
+    {
+        SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, appdata, "/root");
+        s->mode = 0700;
+    }
+
+    /* ---- child: the four devices a GUI app cannot do without */
+    {
+        SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, "/dev/null", "/dev/null");
+        s->mode = 0666;
+    }
+    {
+        SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, "/usr/share/fonts", "/usr/share/fonts");
+        s->ro = 1; s->mode = 0755;
+    }
+    {
+        SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, "/dev/urandom", "/dev/urandom");
+        s->ro = 1; s->mode = 0666;
+    }
+
+    /* ---- child: the one document the requirement was to open, read-only */
+    if (arg && arg[0] == '/' && !strstr(arg, ".."))
+        sbx_add(p, SBX_CHILD, SBX_BIND, arg, arg)->ro = 1;
+
+    /* ---- child: audio, only when the manifest says 'audio = yes' */
+    if (p->audio) {
+        SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, "/dev/snd", "/dev/snd");
+        s->mode = 0755;
+    }
+
+    /* ---- child: processes. Private procfs, or the host's read-only. */
+    if (p->procs) sbx_add(p, SBX_CHILD, SBX_PROC_RO, "/proc", "/proc");
+    else          sbx_add(p, SBX_CHILD, SBX_PROC, "proc", "/proc");
+
+    /* ---- child: switch root, drop the credential, prove the result */
+    sbx_add(p, SBX_CHILD, SBX_CHROOT, NULL, NULL);
+    sbx_add(p, SBX_CHILD, SBX_DROP, NULL, NULL);
+    sbx_add(p, SBX_CHILD, SBX_VERIFY, NULL, NULL);
+}
+
+/* Print the plan. Every number below is the number the executor uses: the
+ * sizes come from the same struct, and the step list is the list it walks. */
+static void sbx_plan_print(const SbxPlan *p, FILE *f) {
+    char ns[96];
+    sbx_ns_names(p->ns, ns, sizeof(ns));
+    fprintf(f, "sandbox plan: %s\n", p->id);
+    fprintf(f, "  uid/gid    : %d/%d, groups empty (setgroups(0))\n", p->uid, p->gid);
+    fprintf(f, "  procs      : %s\n", p->procs
+            ? "yes -> NO pid namespace, host /proc bound read-only"
+            : "no  -> its own pid namespace, a fresh procfs");
+    fprintf(f, "  unshare    : %s\n", ns);
+    fprintf(f, "  buffer     : stride %d * maxh %d * 4 = %llu B\n",
+            p->stride, p->maxh, p->buf_bytes);
+    fprintf(f, "  /dev/shm   : 2 * %llu + %llu = %llu B (%.2f MiB)  [2x buffer + 1 MiB]\n",
+            p->buf_bytes, SBX_MIB, p->shm_size, (double)p->shm_size / (double)SBX_MIB);
+    fprintf(f, "  /tmp       : 2 * %llu + %llu = %llu B (%.2f MiB)  [2x buffer + 1 MiB]\n",
+            p->buf_bytes, SBX_MIB, p->tmp_size, (double)p->tmp_size / (double)SBX_MIB);
+    fprintf(f, "  jail       : %s\n", p->jail);
+    if (p->reuse)
+        fprintf(f, "  note       : another window of this app is up -> its tmpfs is reused\n");
+    for (int i = 0; i < p->nstep; i++) {
+        const SbxStep *s = &p->step[i];
+        const char *who = s->where == SBX_PARENT ? "parent" : "child ";
+        switch (s->op) {
+        case SBX_MKDIR:
+            fprintf(f, "  %2d %s mkdir -p %s (mode %04o, root:root)\n",
+                    i + 1, who, s->dst, s->mode);
+            break;
+        case SBX_TMPFS: {
+            char fl[32] = "";
+            if (s->flags & SBX_F_NOSUID) snprintf(fl + strlen(fl), 8, ",nosuid");
+            if (s->flags & SBX_F_NODEV)  snprintf(fl + strlen(fl), 7, ",nodev");
+            if (s->flags & SBX_F_NOEXEC) snprintf(fl + strlen(fl), 8, ",noexec");
+            fprintf(f, "  %2d %s mount -t tmpfs -o %s%s %s %s\n",
+                    i + 1, who, s->opts, fl, s->src, s->dst);
+            break;
+        }
+        case SBX_CHOWN:
+            fprintf(f, "  %2d %s chown -R %s %d:%d (only if the user differs), mode %04o\n",
+                    i + 1, who, s->dst, s->uid, s->uid, s->mode);
+            break;
+        case SBX_BIND:
+            fprintf(f, "  %2d %s mount --bind%s %s %s%s (mode %04o)\n",
+                    i + 1, who, s->ro ? ",ro" : "", s->src, p->jail, s->dst, s->mode);
+            break;
+        case SBX_PROC:
+            fprintf(f, "  %2d %s mount -t proc proc %s/proc (the app's own pid namespace)\n",
+                    i + 1, who, p->jail);
+            break;
+        case SBX_PROC_RO:
+            fprintf(f, "  %2d %s mount --bind,ro /proc %s/proc (procs = yes)\n",
+                    i + 1, who, p->jail);
+            break;
+        case SBX_CHROOT:
+            fprintf(f, "  %2d %s chroot %s + chdir /\n", i + 1, who, p->jail);
+            break;
+        case SBX_DROP:
+            fprintf(f, "  %2d %s setgroups(0, NULL); setgid(%d); setuid(%d)\n",
+                    i + 1, who, p->gid, p->uid);
+            break;
+        case SBX_VERIFY:
+            fprintf(f, "  %2d %s verify uid==%d, / and /bin NOT writable, /tmp and /root writable\n",
+                    i + 1, who, p->uid);
+            break;
+        default:
+            fprintf(f, "  %2d %s ?\n", i + 1, who);
+            break;
+        }
+    }
+}
+
+/* What to do with the path a mount will land on. The runtime lstat()s, turns
+ * the mode into one of the four types below and hands the result here; keeping
+ * the decision in one pure function is what makes "a symlink target is
+ * refused" provable on a host that has no mount(2). */
+enum { SBX_TYPE_DIR = 1, SBX_TYPE_FILE = 2, SBX_TYPE_LINK = 3, SBX_TYPE_OTHER = 4 };
+enum { SBX_T_MAKE = 0, SBX_T_DIR = 1, SBX_T_FILE = 2,
+       SBX_T_NO_SYMLINK = 3, SBX_T_NO_TYPE = 4 };
+
+static int sbx_target_verdict(int lstat_err, int type, int want_dir) {
+    if (lstat_err) return lstat_err == ENOENT ? SBX_T_MAKE : SBX_T_NO_TYPE;
+    if (type == SBX_TYPE_LINK) return SBX_T_NO_SYMLINK;
+    if (want_dir) return type == SBX_TYPE_DIR ? SBX_T_DIR : SBX_T_NO_TYPE;
+    return type == SBX_TYPE_FILE ? SBX_T_FILE : SBX_T_NO_TYPE;
+}
+
+/* Everything below this line is the server: Linux only. */
+#ifndef MYSTIC_SANDBOX_PLAN
 
 static int listen_fd = -1;
 static int shm_seq = 0;
@@ -37,7 +541,7 @@ static char last_launch_error[192];
  * The run dir and the two bundle roots are constants in the shipped system.
  * MYSTIC_RUN_DIR and MYSTIC_APP_ROOTS ("<image>:<installed>") let the host
  * harness point the real scanner at a fixture tree - the same test hook pkg has
- * with MYSTIC_APPS. Only the owner of this process can set its environment, so
+ * with MYSTIC_APPS. Only the user of this process can set its environment, so
  * neither is a way in; a desktop with them unset behaves exactly as before.
  */
 static const char *run_dir(void) {
@@ -84,23 +588,89 @@ void wms_set_screen(int w, int h) {
     if (w > 0 && h > 0) { screen_w = w; screen_h = h; }
 }
 
+/* One buffer per client. The server creates and maps it; the app opens the
+ * path the OK message handed it. Both must resolve to the same inode:
+ *
+ *   jailed : <run>/jail/<id>/dev/shm/<leaf>   ==  /dev/shm/<leaf> in the jail
+ *   host   : /dev/shm/<leaf>                  (a client the desktop did not
+ *                                              launch, e.g. an app started from
+ *                                              a shell; that one is not chrooted)
+ *
+ * The file is 0600 and owned by the uid the KERNEL says the app runs as, and it
+ * lives in that app's own 0700 tmpfs, so no other app can open it - let alone
+ * ftruncate it. That was the audit's "one app can SIGBUS the desktop" hole.
+ *
+ * Why it is still created at HELLO and not before the fork: HELLO carries the
+ * size. Why that works at all: the tmpfs is mounted by the server, in the host
+ * namespace, so a file created here after the app started is the same file the
+ * app sees at /dev/shm/<leaf>.
+ */
 static int make_shm(WmClient *c) {
-    snprintf(c->shm_path, sizeof(c->shm_path), "/dev/shm/mystic-%d-%d", (int)getpid(), ++shm_seq);
-    unlink(c->shm_path);
-    int fd = open(c->shm_path, O_CREAT | O_RDWR | O_EXCL, 0600);
-    if (fd < 0) return -1;
+    char leaf[64];
+    snprintf(leaf, sizeof(leaf), "mystic-%d-%d", (int)getpid(), ++shm_seq);
+    snprintf(c->shm_path, sizeof(c->shm_path), "/dev/shm/%s", leaf);
+    if (c->jailed)
+        snprintf(c->shm_host, sizeof(c->shm_host), "%s/jail/%s/dev/shm/%s",
+                 run_dir(), c->jail_id, leaf);
+    else
+        snprintf(c->shm_host, sizeof(c->shm_host), "/dev/shm/%s", leaf);
+
+    unlink(c->shm_host);
+    int fd = open(c->shm_host, O_CREAT | O_RDWR | O_EXCL, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "wms: cannot create %s: %s\n", c->shm_host, strerror(errno));
+        c->shm_path[0] = 0;
+        return -1;
+    }
 
     size_t bytes = (size_t)c->stride * (size_t)c->maxh * 4;
-    if (ftruncate(fd, (off_t)bytes) < 0) { close(fd); unlink(c->shm_path); return -1; }
+    /* A jailed buffer lives in a tmpfs that is smaller than the machine: read
+     * the free space before touching a page. ftruncate() beyond a tmpfs limit
+     * succeeds and the SIGBUS only arrives on the first write - which would be
+     * this memset, in the desktop. Fail the client instead. The size is
+     * 2 buffers + 1 MiB, so a second window of the same app fits and a third
+     * gets one honest line rather than a dead compositor. */
+    if (c->jailed) {
+        struct statfs sfs;
+        if (statfs(c->shm_host, &sfs) == 0) {
+            unsigned long long free_b = (unsigned long long)sfs.f_bsize *
+                                        (unsigned long long)sfs.f_bfree;
+            if ((unsigned long long)bytes > free_b) {
+                fprintf(stderr, "wms: %s: a %zu B buffer does not fit in the "
+                                "%llu B left in its /dev/shm\n",
+                        c->id[0] ? c->id : "client", bytes, free_b);
+                close(fd);
+                unlink(c->shm_host);
+                c->shm_path[0] = 0;
+                return -1;
+            }
+        }
+    }
+    if (ftruncate(fd, (off_t)bytes) < 0) {
+        fprintf(stderr, "wms: cannot size %s to %zu bytes: %s\n",
+                c->shm_host, bytes, strerror(errno));
+        close(fd);
+        unlink(c->shm_host);
+        c->shm_path[0] = 0;
+        return -1;
+    }
 
     c->px = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (c->px == MAP_FAILED) { close(fd); unlink(c->shm_path); c->px = NULL; return -1; }
+    if (c->px == MAP_FAILED) {
+        fprintf(stderr, "wms: cannot map %s: %s\n", c->shm_host, strerror(errno));
+        close(fd);
+        unlink(c->shm_host);
+        c->px = NULL;
+        c->shm_path[0] = 0;
+        return -1;
+    }
     c->shm_fd = fd;
     /* start black so an app that has not drawn yet is not garbage */
     memset(c->px, 0, bytes);
-    /* the app now runs as uid 1000 inside its jail and still has to draw */
-    if (chown(c->shm_path, 1000, 1000) != 0)
-        fprintf(stderr, "wms: chown shm failed: %s\n", strerror(errno));
+    /* the app runs as its own uid and still has to draw */
+    if (chown(c->shm_host, (uid_t)c->uid, (gid_t)c->uid) != 0)
+        fprintf(stderr, "wms: chown %s to %d failed: %s\n",
+                c->shm_host, c->uid, strerror(errno));
     return 0;
 }
 
@@ -112,7 +682,8 @@ static void free_shm(WmClient *c) {
     c->px = NULL;
     if (c->shm_fd >= 0) close(c->shm_fd);
     c->shm_fd = -1;
-    if (c->shm_path[0]) unlink(c->shm_path);
+    if (c->shm_host[0]) unlink(c->shm_host);
+    c->shm_host[0] = 0;
     c->shm_path[0] = 0;
 }
 
@@ -221,6 +792,15 @@ int wms_start(void) {
     snprintf(dir, sizeof(dir), "%s", WM_SOCKET);
     char *slash = strrchr(dir, '/');
     if (slash) { *slash = 0; mkdir(dir, 0755); }
+    /* The sandbox's own anchor: one directory per bundle, made by
+     * sandbox_prepare() below it. Created here so the first launch does not
+     * have to invent it. */
+    snprintf(dir, sizeof(dir), "%s/jail", run_dir());
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST)
+        fprintf(stderr, "wms: cannot create %s: %s\n", dir, strerror(errno));
+    fprintf(stderr, "wms: sandbox: uids %d..%d, one per bundle (gid == uid, "
+                    "no supplementary groups), private /dev/shm and /tmp per app\n",
+            SBX_UID_BASE, SBX_UID_TOP - 1);
 
     unlink(WM_SOCKET);
     listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -246,7 +826,7 @@ int wms_start(void) {
     fcntl(listen_fd, F_SETFL, fcntl(listen_fd, F_GETFL, 0) | O_NONBLOCK);
     fprintf(stderr, "wms: listening on %s\n", WM_SOCKET);
 
-    /* the one file the owner can open before installing anything */
+    /* the one file the user can open before installing anything */
     provision_media();
     return 0;
 }
@@ -269,8 +849,45 @@ static void handle_line(WmClient *c, char *line) {
         }
         if (w < 80) w = 80;
         if (h < 60) h = 60;
-        if (w > 1600) w = 1600;
-        if (h > 1200) h = 1200;
+        /* A window cannot be bigger than the screen, and the buffer is exactly
+         * one screen: stride * maxh * 4 is then the largest buffer the plan
+         * reserved a tmpfs for. The old 1600x1200 ceiling let a client ask for
+         * more than the screen and get a buffer the size of neither. */
+        if (w > screen_w) w = screen_w;
+        if (h > screen_h) h = screen_h;
+
+        /* Who is this, really? The kernel answers. SO_PEERCRED carries the
+         * sender's uid and pid as OUR namespace sees them, and an app cannot
+         * forge it. A uid from the sandbox pool means the desktop launched this
+         * process into a jail, so its buffer belongs in that jail's tmpfs and
+         * the bundle id is the one the launch recorded - not the one the app
+         * typed. That keeps a lying HELLO from aiming a buffer at another
+         * app's /dev/shm or at another app's file-picker directory. */
+        c->uid = 0;
+        c->pid = 0;
+        c->jailed = 0;
+        c->jail_id[0] = 0;
+        {
+            struct ucred uc;
+            socklen_t ul = sizeof(uc);
+            if (getsockopt(c->fd, SOL_SOCKET, SO_PEERCRED, &uc, &ul) == 0) {
+                SbxCred *cred = sbx_cred_by_uid((int)uc.uid);
+                c->uid = (int)uc.uid;
+                c->pid = (long)uc.pid;
+                if (cred) {
+                    c->jailed = 1;
+                    snprintf(c->jail_id, sizeof(c->jail_id), "%s", cred->id);
+                    sbx_cred_add_pid(c->uid, c->pid);
+                    if (strcmp(cred->id, id) != 0)
+                        fprintf(stderr, "wms: uid %d calls itself \"%.31s\"; "
+                                        "it was launched as \"%.31s\" and stays that\n",
+                                c->uid, id, cred->id);
+                }
+            } else {
+                fprintf(stderr, "wms: SO_PEERCRED on a new connection failed: %s\n",
+                        strerror(errno));
+            }
+        }
 
         /* A second HELLO on the same connection replaces the window. Release
          * the previous buffer first: make_shm overwrites shm_path/shm_fd/px,
@@ -282,16 +899,21 @@ static void handle_line(WmClient *c, char *line) {
             free_shm(c);
         }
 
-        snprintf(c->id, sizeof(c->id), "%s", id);
+        /* The bundle id is authoritative for a jailed client: the launch
+         * recorded it, the kernel proved which uid is connecting. For a client
+         * the desktop did not launch (no sandbox uid) the id is its own - it is
+         * not jailed, so nothing depends on it. */
+        if (c->jailed) snprintf(c->id, sizeof(c->id), "%s", c->jail_id);
+        else           snprintf(c->id, sizeof(c->id), "%s", id);
         snprintf(c->title, sizeof(c->title), "%s", title);
         c->w = w;
         c->h = h;
-        /* The buffer is allocated for the whole screen, not the size the app
-         * asked to open at: otherwise a client can never grow, and maximising
-         * its window just draws the same small picture in a bigger frame. */
-        c->maxw = w > screen_w ? w : screen_w;
-        c->maxh = h > screen_h ? h : screen_h;
-        c->stride = c->maxw;                 /* keep it simple and explicit */
+        /* The buffer is the whole screen, not the size the app asked to open
+         * at: otherwise a client can never grow, and maximising its window just
+         * draws the same small picture in a bigger frame. */
+        c->maxw = screen_w;
+        c->maxh = screen_h;
+        c->stride = screen_w;                /* keep it simple and explicit */
 
         if (make_shm(c) < 0) {
             sendf(c, "ERR no shm\n");
@@ -303,7 +925,8 @@ static void handle_line(WmClient *c, char *line) {
         }
         sendf(c, "OK %s %d %d %d\n", c->shm_path, c->stride, c->maxw, c->maxh);
         c->want_frame = 1;
-        fprintf(stderr, "wms: %s connected %dx%d\n", c->id, c->w, c->h);
+        fprintf(stderr, "wms: %s connected %dx%d as uid %d (%s)\n",
+                c->id, c->w, c->h, c->uid, c->jailed ? c->shm_host : "not jailed");
         return;
     }
     if (!strncmp(line, "FRAME", 5)) { c->want_frame = 1; return; }
@@ -429,6 +1052,21 @@ void wms_shutdown_client(WmClient *c) {
     c->fd = -1;
     c->used = 0;
     c->win = -1;
+    /* The window is gone: forget the connection against the uid that owned it.
+     * The uid itself goes back to the pool when that bundle has no process
+     * left, and so does its tmpfs (sbx_jail_forget) - an app that keels over
+     * without ever connecting is collected by the same sweep on the next
+     * launch, so a broken bundle cannot eat the pool. */
+    if (c->jailed) {
+        sbx_cred_del_pid(c->uid, c->pid);
+        SbxCred *cred = sbx_cred_by_uid(c->uid);
+        fprintf(stderr, "wms: %s (uid %d) disconnected; %s\n", c->id, c->uid,
+                cred ? "its other window is still up" : "uid released");
+        c->jailed = 0;
+        c->uid = 0;
+        c->pid = 0;
+        c->jail_id[0] = 0;
+    }
 }
 
 /* ---------------------------------------------------------- apps */
@@ -683,28 +1321,320 @@ int wms_take_launch_error(char *out, int cap) {
 }
 
 /* ---------------------------------------------------------- sandbox
- * Every app runs in its own mount/network/IPC namespace, chrooted into a jail
- * that contains its own payload, its own bundle (read-only, at /app), a private
- * /tmp, /dev/null and the window socket. It runs as uid 1000, so even if it
- * escaped the chroot it could not read /root (root-owned, mode 0700).
+ * Every app runs in its own mount/IPC/UTS/PID namespace, chrooted into a jail
+ * that contains its own payload, its own bundle (read-only, at /app), its own
+ * size-limited /tmp and /dev/shm, its own appdata as /root, the window socket
+ * and nothing else. It runs as its own uid from the pool above, so even if it
+ * escaped the chroot it could not read /root (root-owned, mode 0700) or any
+ * other app's buffer.
  *
- * This is what stops a malicious app from being ransomware: it never sees the
- * user's files to encrypt. The kernel enforces it (namespaces + DAC), not us.
+ * The plan built by sbx_plan_init() is what runs: sandbox_prepare() executes
+ * the parent steps and sandbox_child() the child steps, in order. Fail closed
+ * everywhere - an app that cannot be isolated does not run.
  */
-#define SANDBOX_UID 1000
-#define SANDBOX_GID 1000
 
-/* mkdir -p inside the jail, for the bind targets */
-static void mkdirp_for(const char *jail, const char *sub) {
-    char buf[256];
-    snprintf(buf, sizeof(buf), "%s%s", jail, sub);
-    for (char *p = buf + strlen(jail) + 1; *p; p++) {
-        if (*p != '/') continue;
-        *p = 0;
-        mkdir(buf, 0755);
-        *p = '/';
+/* The one place the name spaces become kernel bits. */
+static int sbx_clone_flags(unsigned ns) {
+    int f = 0;
+    if (ns & SBX_NS_MNT) f |= CLONE_NEWNS;
+    if (ns & SBX_NS_IPC) f |= CLONE_NEWIPC;
+    if (ns & SBX_NS_UTS) f |= CLONE_NEWUTS;
+    if (ns & SBX_NS_NET) f |= CLONE_NEWNET;
+    if (ns & SBX_NS_PID) f |= CLONE_NEWPID;
+    return f;
+}
+
+/* A bundle whose processes are all gone gives its tmpfs back. Called from
+ * sbx_cred_gc() (portable part) through the prototype there. */
+static void sbx_jail_forget(const char *id) {
+    if (!id || !id[0] || strchr(id, '/') || strstr(id, "..")) return;
+    char path[SBX_PATH];
+    snprintf(path, sizeof(path), "%s/jail/%s/dev/shm", run_dir(), id);
+    if (umount2(path, MNT_DETACH) == 0) fprintf(stderr, "wms: sandbox: unmounted %s\n", path);
+    snprintf(path, sizeof(path), "%s/jail/%s/tmp", run_dir(), id);
+    if (umount2(path, MNT_DETACH) == 0) fprintf(stderr, "wms: sandbox: unmounted %s\n", path);
+}
+
+/* st_mode -> the four types the verdict understands. */
+static int sbx_type_of(unsigned mode) {
+    if (S_ISLNK(mode)) return SBX_TYPE_LINK;
+    if (S_ISDIR(mode)) return SBX_TYPE_DIR;
+    if (S_ISREG(mode)) return SBX_TYPE_FILE;
+    return SBX_TYPE_OTHER;
+}
+
+/* Pull apart <base><sub> one component at a time, creating what is missing and
+ * refusing to follow a symlink anywhere on the way.
+ *
+ * This is the hole the audit called out: mount(2) follows a symlink in the
+ * target path, and an app can plant symlinks in the one directory it owns -
+ * its appdata, which is bound at /root. Without this check a bundle could put
+ * "-> /etc" in its appdata, ask the desktop to open /root/x, and have the next
+ * mount land on a host path of its choosing - as root. Nothing is mounted on a
+ * path that is, or goes through, a symlink. */
+static int sbx_walk(const char *base, const char *sub, int want_dir, unsigned mode,
+                    char *out, size_t cap, char *err, size_t errn) {
+    int n = snprintf(out, cap, "%s%s", base, sub ? sub : "");
+    if (n < 0 || (size_t)n >= cap) {
+        snprintf(err, errn, "path longer than %d bytes", (int)cap - 1);
+        return -1;
     }
-    mkdir(buf, 0755);
+    char *p = out + strlen(base);
+    while (*p == '/') p++;
+    if (!*p) {
+        /* the base itself */
+        struct stat st;
+        if (lstat(out, &st) == 0) {
+            if (S_ISLNK(st.st_mode)) { snprintf(err, errn, "refusing to use %s: it is a symlink", out); return -1; }
+            if (!S_ISDIR(st.st_mode)) { snprintf(err, errn, "refusing to use %s: not a directory", out); return -1; }
+            return 0;
+        }
+        if (errno != ENOENT || mkdir(out, mode ? (mode_t)mode : 0755) != 0) {
+            snprintf(err, errn, "mkdir %s: %s", out, strerror(errno));
+            return -1;
+        }
+        return 0;
+    }
+    for (;;) {
+        char *slash = strchr(p, '/');
+        if (slash) *slash = 0;
+        int last = slash == NULL;
+        struct stat st;
+        int r = lstat(out, &st);
+        int verdict = sbx_target_verdict(r ? errno : 0,
+                                         r ? SBX_TYPE_OTHER : sbx_type_of(st.st_mode),
+                                         last ? want_dir : 1);
+        if (verdict == SBX_T_MAKE) {
+            if (last && !want_dir) {
+                int fd = open(out, O_CREAT | O_EXCL | O_RDWR | O_NOFOLLOW,
+                              mode ? (mode_t)mode : 0644);
+                if (fd < 0) { snprintf(err, errn, "create %s: %s", out, strerror(errno)); return -1; }
+                close(fd);
+            } else if (mkdir(out, last ? (mode ? (mode_t)mode : 0755) : 0755) != 0) {
+                snprintf(err, errn, "mkdir %s: %s", out, strerror(errno));
+                return -1;
+            }
+        } else if (verdict == SBX_T_NO_SYMLINK) {
+            snprintf(err, errn, "refusing to mount on %s: it is a symlink", out);
+            return -1;
+        } else if (verdict == SBX_T_NO_TYPE) {
+            snprintf(err, errn, "refusing to mount on %s: wrong file type%s", out,
+                     r ? " (or it cannot be inspected)" : "");
+            return -1;
+        }
+        if (last) break;
+        *slash = '/';
+        p = slash + 1;
+        while (*p == '/') p++;
+        if (!*p) break;
+    }
+    return 0;
+}
+
+/* Recursive lchown with FTW_PHYS: never follows a symlink inside the app's own
+ * tree, so a link the app planted cannot make root chown a host file. */
+static uid_t sbx_owner_uid;
+static gid_t sbx_owner_gid;
+static int   sbx_owner_err;
+
+static int sbx_chown_cb(const char *path, const struct stat *st, int flag, struct FTW *f) {
+    (void)st; (void)f;
+    if (flag == FTW_NS || flag == FTW_DNR) {
+        if (!sbx_owner_err) sbx_owner_err = errno ? errno : EACCES;
+        return 0;
+    }
+    if (lchown(path, sbx_owner_uid, sbx_owner_gid) != 0 && errno != ENOENT && !sbx_owner_err)
+        sbx_owner_err = errno;
+    return 0;                     /* keep going; report the first failure */
+}
+
+/* The app's own /root. One owner per bundle, so when the uid assigned to a
+ * bundle changes (another app took its slot after a reboot) the tree is
+ * re-owned once; the fast path is a single stat().
+ *
+ * A failed re-own is logged and the launch continues: the app starts and says
+ * which file it cannot write, which is better than a tile that does nothing. */
+static int sbx_adopt_appdata(const char *path, int uid, int gid,
+                             char *err, size_t errn) {
+    char abs[SBX_PATH * 2];
+    if (sbx_walk("", path, 1, 0700, abs, sizeof(abs), err, errn) != 0) return -1;
+    struct stat st;
+    if (stat(abs, &st) != 0) {
+        snprintf(err, errn, "stat %s: %s", abs, strerror(errno));
+        return -1;
+    }
+    if (st.st_uid != (uid_t)uid || st.st_gid != (gid_t)gid) {
+        sbx_owner_uid = (uid_t)uid;
+        sbx_owner_gid = (gid_t)gid;
+        sbx_owner_err = 0;
+        if (nftw(abs, sbx_chown_cb, 16, FTW_PHYS) != 0 && !sbx_owner_err) sbx_owner_err = errno;
+        if (sbx_owner_err)
+            fprintf(stderr, "wms: appdata %s: could not re-own everything (%s); "
+                            "the app will report what it cannot write\n",
+                    abs, strerror(sbx_owner_err));
+        else
+            fprintf(stderr, "wms: appdata %s: re-owned %d:%d (was %d:%d)\n", abs, uid, gid,
+                    (int)st.st_uid, (int)st.st_gid);
+    }
+    if ((st.st_mode & 0777) != 0700 && chmod(abs, 0700) != 0)
+        fprintf(stderr, "wms: appdata %s: chmod 0700 failed: %s\n", abs, strerror(errno));
+    return 0;
+}
+
+/* Parent side: the skeleton and the two per-app tmpfs mounts, in the desktop's
+ * own namespaces, before the fork. Returns 0, or -1 with a sentence in err. */
+static int sandbox_prepare(const SbxPlan *p, char *err, size_t errn) {
+    char path[SBX_PATH * 2], anchor[SBX_PATH];
+    if (mkdir(run_dir(), 0755) != 0 && errno != EEXIST) {
+        snprintf(err, errn, "mkdir %s: %s", run_dir(), strerror(errno));
+        return -1;
+    }
+    snprintf(anchor, sizeof(anchor), "%s/jail", run_dir());
+    if (mkdir(anchor, 0755) != 0 && errno != EEXIST) {
+        snprintf(err, errn, "mkdir %s: %s", anchor, strerror(errno));
+        return -1;
+    }
+    size_t al = strlen(anchor);
+    for (int i = 0; i < p->nstep; i++) {
+        const SbxStep *s = &p->step[i];
+        if (s->where != SBX_PARENT) continue;
+        if (strncmp(s->dst, anchor, al) != 0 ||
+            (s->dst[al] != 0 && s->dst[al] != '/')) {
+            snprintf(err, errn, "sandbox step %d points outside %s", i + 1, anchor);
+            return -1;
+        }
+        switch (s->op) {
+        case SBX_MKDIR:
+            if (sbx_walk(anchor, s->dst + al, 1, s->mode, path, sizeof(path), err, errn) != 0)
+                return -1;
+            break;
+        case SBX_TMPFS: {
+            if (sbx_walk(anchor, s->dst + al, 1, 0755, path, sizeof(path), err, errn) != 0)
+                return -1;
+            struct statfs sfs;
+            int already = p->reuse && statfs(path, &sfs) == 0 &&
+                          (unsigned long)sfs.f_type == (unsigned long)TMPFS_MAGIC;
+            if (already) {
+                /* a second window of the same app shares the tmpfs the first
+                 * one mounted - same uid, same trust domain, and detaching it
+                 * would break the first window's /tmp bridge underneath it */
+                fprintf(stderr, "wms: sandbox %s: reusing the tmpfs at %s\n", p->id, path);
+            } else {
+                if (umount2(path, MNT_DETACH) == 0)
+                    fprintf(stderr, "wms: sandbox %s: unmounted a stale %s\n", p->id, path);
+                unsigned long fl = MS_NOSUID | MS_NODEV;
+                if (s->flags & SBX_F_NOEXEC) fl |= MS_NOEXEC;
+                if (mount("tmpfs", path, "tmpfs", fl, s->opts) != 0) {
+                    snprintf(err, errn, "mount -t tmpfs -o %s %s: %s",
+                             s->opts, path, strerror(errno));
+                    return -1;
+                }
+            }
+            struct stat st;
+            if (stat(path, &st) != 0) {
+                snprintf(err, errn, "stat %s: %s", path, strerror(errno));
+                return -1;
+            }
+            if (st.st_uid != (uid_t)p->uid || (st.st_mode & 0777) != 0700) {
+                snprintf(err, errn, "%s is owned by %d:%d mode %04o; wanted %d:%d mode 0700",
+                         path, (int)st.st_uid, (int)st.st_gid, (unsigned)(st.st_mode & 0777),
+                         p->uid, p->uid);
+                return -1;
+            }
+            break;
+        }
+        case SBX_CHOWN:
+            if (sbx_adopt_appdata(s->dst, p->uid, p->gid, err, errn) != 0) return -1;
+            break;
+        default:
+            snprintf(err, errn, "sandbox step %d is not a parent step", i + 1);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Child side: one step of the plan, inside the app's own namespaces. */
+static int sbx_step_child(const SbxPlan *p, const SbxStep *s, char *err, size_t errn) {
+    char tgt[SBX_PATH * 2];
+    struct stat st;
+    switch (s->op) {
+    case SBX_BIND: {
+        int want_dir = stat(s->src, &st) == 0 && S_ISDIR(st.st_mode);
+        if (sbx_walk(p->jail, s->dst, want_dir, s->mode, tgt, sizeof(tgt), err, errn) != 0)
+            return -1;
+        unsigned long flags = MS_BIND | (s->ro ? MS_RDONLY : 0);
+        if (mount(s->src, tgt, NULL, flags, NULL) != 0) {
+            snprintf(err, errn, "mount %s%s on %s: %s", s->ro ? "--bind,ro " : "--bind ",
+                     s->src, tgt, strerror(errno));
+            return -1;
+        }
+        return 0;
+    }
+    case SBX_PROC:
+        if (sbx_walk(p->jail, s->dst, 1, 0755, tgt, sizeof(tgt), err, errn) != 0) return -1;
+        if (mount("proc", tgt, "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) != 0) {
+            snprintf(err, errn, "mount -t proc %s: %s", tgt, strerror(errno));
+            return -1;
+        }
+        return 0;
+    case SBX_PROC_RO:
+        if (sbx_walk(p->jail, s->dst, 1, 0755, tgt, sizeof(tgt), err, errn) != 0) return -1;
+        if (mount("/proc", tgt, NULL, MS_BIND | MS_RDONLY, NULL) != 0) {
+            snprintf(err, errn, "mount --bind,ro /proc %s: %s", tgt, strerror(errno));
+            return -1;
+        }
+        return 0;
+    case SBX_CHROOT:
+        if (chroot(p->jail) != 0) {
+            snprintf(err, errn, "chroot %s: %s", p->jail, strerror(errno));
+            return -1;
+        }
+        if (chdir("/") != 0) {
+            snprintf(err, errn, "chdir /: %s", strerror(errno));
+            return -1;
+        }
+        return 0;
+    case SBX_DROP:
+        if (setgroups(0, NULL) != 0) {
+            snprintf(err, errn, "setgroups(0): %s", strerror(errno));
+            return -1;
+        }
+        if (setgid((gid_t)p->gid) != 0 || setuid((uid_t)p->uid) != 0) {
+            snprintf(err, errn, "setgid/setuid %d:%d: %s", p->uid, p->gid, strerror(errno));
+            return -1;
+        }
+        return 0;
+    case SBX_VERIFY:
+        /* The checks that would have caught the bugs this file has already
+         * had: an app that cannot write its own /root (so it silently saves
+         * nothing) and a jail root that the app can write (so the "sandbox"
+         * is a directory). Both fail the launch instead of the user. */
+        if (getuid() != (uid_t)p->uid || getgid() != (gid_t)p->gid) {
+            snprintf(err, errn, "credential is %d:%d, wanted %d:%d",
+                     (int)getuid(), (int)getgid(), p->uid, p->gid);
+            return -1;
+        }
+        if (access("/", W_OK) == 0) {
+            snprintf(err, errn, "the jail root is writable by uid %d", p->uid);
+            return -1;
+        }
+        if (access("/bin", W_OK) == 0) {
+            snprintf(err, errn, "/bin is writable by uid %d", p->uid);
+            return -1;
+        }
+        if (access("/tmp", W_OK) != 0) {
+            snprintf(err, errn, "the app cannot write /tmp: %s", strerror(errno));
+            return -1;
+        }
+        if (access("/root", W_OK) != 0) {
+            snprintf(err, errn, "the app cannot write its own /root: %s", strerror(errno));
+            return -1;
+        }
+        return 0;
+    }
+    snprintf(err, errn, "unknown sandbox step %d", (int)s->op);
+    return -1;
 }
 
 /* One line from the child, before it becomes the app: what failed, on what
@@ -724,222 +1654,90 @@ static void child_report(int fd, const char *what, const char *path) {
     (void)w;
 }
 
-static void sandbox_child(const char *exe, const char *id, int net, int audio,
+/* The keeper's job: stay outside the app's pid namespace, hold the pid that
+ * wms_launch() returned, forward the four signals a desktop sends, and reap the
+ * app. It never touches the app's mounts and never runs app code. */
+static volatile pid_t sbx_keeper_app;
+
+static void sbx_keeper_signal(int sig) {
+    if (sbx_keeper_app > 0) kill(sbx_keeper_app, sig);
+}
+
+static void sbx_keeper_wait(pid_t app, int errfd) {
+    close(errfd);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sbx_keeper_signal;
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+    sigaction(SIGQUIT, &sa, NULL);
+    sbx_keeper_app = app;
+    int st = 0;
+    while (waitpid(app, &st, 0) < 0 && errno == EINTR) { }
+    _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 0);
+}
+
+static void sandbox_child(const SbxPlan *plan, const char *exe,
                           const char *arg, int errfd) {
-    char jail[192], path[256];
-    snprintf(jail, sizeof(jail), "/run/mystic/jail/%s", id);
+    char err[SBX_PATH * 2];
 
     /* Nothing above stderr belongs to the app. Without this it inherits our
      * root-opened /dev/fb0 (read AND write the whole screen, forge a lock
      * screen) and the evdev keyboard (the unlock PIN in cleartext), plus the
-     * listener and every other client's socket and shm buffer. Namespaces hide
-     * paths; they do not take away file descriptors. errfd is the one exception:
-     * it is how this child tells the desktop why it never became an app. */
+     * listener and every other client's socket and buffer. Namespaces hide
+     * paths; they do not take away file descriptors. errfd is the one
+     * exception: it is how this child tells the desktop why it never became an
+     * app. */
     for (int fd = 3; fd < 1024; fd++) if (fd != errfd) close(fd);
 
-    /* An app that declares 'network = host' keeps the real namespace: a
-     * browser in an empty netns can only reach loopback, which is exactly the
-     * 'name lookup timed out' it used to report. Everything else stays blind. */
-    int ns = CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | (net ? 0 : CLONE_NEWNET);
-    if (unshare(ns) == 0) {
-        mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
-
-        /* mkdir(2) does not create parents: /run/mystic/jail must exist
-         * before /run/mystic/jail/<id>, or every bind below fails ENOENT. */
-        mkdir("/run/mystic/jail", 0755);
-        if (mkdir(jail, 0755) != 0 && errno != EEXIST) {
-            fprintf(stderr, "wms: sandbox jail mkdir %s failed: %s", jail, strerror(errno));
-            fputc(10, stderr);
+    /* CLONE_NEWPID is the one flag that cannot be unshared by the process that
+     * wants it: unshare() gives the new pid namespace to CHILDREN, so the app
+     * is a fork of this one and this one becomes its keeper. Every other
+     * namespace is unshared by the app itself, which keeps the keeper in the
+     * desktop's own mount and network namespaces. */
+    if (plan->ns & SBX_NS_PID) {
+        if (unshare(CLONE_NEWPID) != 0) {
+            child_report(errfd, "cannot create a pid namespace for", plan->id);
+            _exit(125);
         }
-        struct stat jst;
-        if (stat(jail, &jst) != 0) {
-            fprintf(stderr, "wms: sandbox jail %s does not exist after mkdir: %s", jail, strerror(errno));
-            fputc(10, stderr);
+        pid_t app = fork();
+        if (app < 0) {
+            child_report(errfd, "cannot fork the jailed app", plan->id);
+            _exit(122);
         }
-        snprintf(path, sizeof(path), "%s/bin", jail);        mkdir(path, 0755);
-        snprintf(path, sizeof(path), "%s/dev", jail);        mkdir(path, 0755);
-        snprintf(path, sizeof(path), "%s/tmp", jail);        mkdir(path, 0777);
-        snprintf(path, sizeof(path), "%s/run", jail);        mkdir(path, 0755);
-        snprintf(path, sizeof(path), "%s/run/mystic", jail); mkdir(path, 0755);
+        if (app > 0) sbx_keeper_wait(app, errfd);   /* never returns */
+    }
+    unsigned rest = plan->ns & ~(unsigned)SBX_NS_PID;
+    if (rest && unshare(sbx_clone_flags(rest)) != 0) {
+        child_report(errfd, "cannot unshare namespaces for", plan->id);
+        fprintf(stderr, "wms: unshare failed (%s); refusing to run %s\n",
+                strerror(errno), plan->id);
+        _exit(125);
+    }
+    /* Changes to the mount tree from here on stay in this namespace. */
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
+        fprintf(stderr, "wms: sandbox %s: mount --make-rprivate /: %s\n",
+                plan->id, strerror(errno));
 
-        snprintf(path, sizeof(path), "%s/bin/app", jail);
-        int fd = open(path, O_CREAT | O_RDWR, 0755);
-        if (fd >= 0) close(fd);
-        if (mount(exe, path, NULL, MS_BIND, NULL) < 0) {
-            /* This is the failure that used to be invisible: the tile was there,
-             * the click did nothing, and 127 scrolled past on a console nobody
-             * reads. Report it and stop - exec'ing an unmounted /bin/app would
-             * only add a second, less useful error. The report goes first so it
-             * carries the errno the syscall actually set, not the one fprintf
-             * left behind. */
-            child_report(errfd, "cannot mount the payload", exe);
-            fprintf(stderr, "wms: sandbox bind %.160s -> %s failed: %s\n",
-                    exe, path, strerror(errno));
+    for (int i = 0; i < plan->nstep; i++) {
+        const SbxStep *s = &plan->step[i];
+        if (s->where != SBX_CHILD) continue;
+        if (sbx_step_child(plan, s, err, sizeof(err)) != 0) {
+            int n = snprintf(NULL, 0, "%s", err);
+            if (errfd >= 0 && n > 0) {
+                ssize_t w = write(errfd, err, (size_t)n < LAUNCH_MSG_MAX
+                                        ? (size_t)n : LAUNCH_MSG_MAX);
+                (void)w;
+            }
+            fprintf(stderr, "wms: sandbox %s: %s\n", plan->id, err);
             _exit(123);
         }
-
-        /* A payload is not always the whole app: pkg installs a tree, and a
-         * package can ship a runtime beside its executable (libVLC's shared
-         * objects, a browser's engine, data files). Binding only the executable
-         * left such an app unable to see its own files, so the bundle directory
-         * is mounted read-only at /app and MYSTIC_BUNDLE says where. Only that
-         * one directory is added - not /root, not the rest of
-         * /usr/share/mystic/apps. */
-        {
-            char bundle_dir[512];
-            snprintf(bundle_dir, sizeof(bundle_dir), "%s", exe);
-            char *last = strrchr(bundle_dir, '/');
-            if (last) *last = 0;                       /* <root>/<id> */
-            snprintf(path, sizeof(path), "%s/app", jail);
-            mkdir(path, 0755);
-            if (mount(bundle_dir, path, NULL, MS_BIND | MS_RDONLY, NULL) < 0)
-                fprintf(stderr, "wms: sandbox bundle bind %.200s failed: %s\n",
-                        bundle_dir, strerror(errno));
-        }
-
-        snprintf(path, sizeof(path), "%s/run/mystic/wm.sock", jail);
-        fd = open(path, O_CREAT | O_RDWR, 0666);
-        if (fd >= 0) close(fd);
-        mount(WM_SOCKET, path, NULL, MS_BIND, NULL);
-
-        if (net) {
-            /* getaddrinfo needs these two; ro, and only when asked for */
-            snprintf(path, sizeof(path), "%s/etc", jail);   mkdir(path, 0755);
-            /* the CA bundle lives two levels down; mkdir(2) makes one level */
-            snprintf(path, sizeof(path), "%s/etc/ssl", jail);       mkdir(path, 0755);
-            snprintf(path, sizeof(path), "%s/etc/ssl/certs", jail); mkdir(path, 0755);
-            const char *cf[] = { "/etc/resolv.conf", "/etc/hosts",
-                                 "/etc/ssl/certs/ca-bundle.crt" };
-            for (int ci = 0; ci < (int)(sizeof(cf) / sizeof(cf[0])); ci++) {
-                snprintf(path, sizeof(path), "%s%s", jail, cf[ci]);
-                fd = open(path, O_CREAT | O_RDWR, 0644);
-                if (fd >= 0) close(fd);
-                if (mount(cf[ci], path, NULL, MS_BIND | MS_RDONLY, NULL) < 0)
-                    fprintf(stderr, "wms: sandbox bind %s failed: %s\n", cf[ci], strerror(errno));
-            }
-        }
-
-        /* Each app gets its OWN writable /root. Without this a jailed app
-         * cannot save anything: /root is not in the jail and the jail root is
-         * root-owned, so Paint could not write /root/Pictures and 2048 could
-         * not keep its best score. Mounted as the app's /root, it is still
-         * isolated from every other app and from the real one. */
-        {
-            char home[256];
-            mkdir("/root/appdata", 0755);
-            snprintf(home, sizeof(home), "/root/appdata/%s", id);
-            mkdir(home, 0755);
-            if (chown(home, 1000, 1000) != 0)
-                fprintf(stderr, "wms: appdata chown %s failed: %s\n", home, strerror(errno));
-            snprintf(path, sizeof(path), "%s/root", jail); mkdir(path, 0755);
-            if (mount(home, path, NULL, MS_BIND, NULL) < 0)
-                fprintf(stderr, "wms: appdata bind %s failed: %s\n", home, strerror(errno));
-        }
-
-        snprintf(path, sizeof(path), "%s/dev/null", jail);
-        fd = open(path, O_CREAT | O_RDWR, 0666);
-        if (fd >= 0) close(fd);
-        mount("/dev/null", path, NULL, MS_BIND, NULL);
-
-        /* An app needs exactly four more things to be useful:
-         *   /usr/share/fonts  text (read-only)
-         *   /dev/shm          its own pixel buffer, owned by SANDBOX_UID
-         *   /proc             sysmon/monitor read it; the rest ignore it
-         * Nothing else is visible, so there is no path to /root from in here. */
-        snprintf(path, sizeof(path), "%s/usr/share/fonts", jail);
-        mkdirp_for(jail, "/usr/share/fonts");
-        if (mount("/usr/share/fonts", path, NULL, MS_BIND | MS_RDONLY, NULL) < 0)
-            fprintf(stderr, "wms: sandbox fonts bind failed: %s\n", strerror(errno));
-        {
-            /* an app with no fonts is a blank window: say what the jail sees */
-            DIR *fd2 = opendir(path);
-            int nf = 0;
-            if (fd2) {
-                struct dirent *de2;
-                while ((de2 = readdir(fd2))) if (de2->d_name[0] != '.') nf++;
-                closedir(fd2);
-            } else {
-                fprintf(stderr, "wms: jail fonts opendir failed: %s\n", strerror(errno));
-            }
-            fprintf(stderr, "wms: jail fonts for %s: %d entries\n", id, nf);
-        }
-
-        snprintf(path, sizeof(path), "%s/dev/shm", jail);
-        mkdirp_for(jail, "/dev/shm");
-        mount("/dev/shm", path, NULL, MS_BIND, NULL);
-
-        /* seeding RNG is a legitimate need (2048, paint's palette); this is
-         * read-only randomness, not a channel to anything */
-        snprintf(path, sizeof(path), "%s/dev/urandom", jail);
-        mkdirp_for(jail, "/dev");
-        int ufd = open(path, O_CREAT | O_RDWR, 0666);
-        if (ufd >= 0) close(ufd);
-        mount("/dev/urandom", path, NULL, MS_BIND | MS_RDONLY, NULL);
-
-        /* The document the user asked to open. The desktop validated the
-         * path; here it is bound READ-ONLY, on its own, into the jail at the
-         * same path. So the app can read exactly the file it was asked to
-         * show - not the directory it lives in, not anything beside it, and
-         * it cannot write to it. */
-        if (arg && arg[0] == '/' && !strstr(arg, "..")) {
-            char dirpart[512];
-            snprintf(dirpart, sizeof(dirpart), "%s", arg);
-            char *slash2 = strrchr(dirpart, '/');
-            if (slash2) {
-                *slash2 = 0;                       /* parent path, no name */
-                char jaildir[768];
-                snprintf(jaildir, sizeof(jaildir), "%s%s", jail, dirpart);
-                mkdirp_for(jail, dirpart);
-                int dfd = open(jaildir, O_RDONLY | O_DIRECTORY);
-                if (dfd >= 0) close(dfd);
-                char filepath[768];
-                snprintf(filepath, sizeof(filepath), "%s%s", jail, arg);
-                int ffd = open(filepath, O_CREAT | O_RDONLY, 0444);
-                if (ffd >= 0) close(ffd);
-                if (mount(arg, filepath, NULL, MS_BIND | MS_RDONLY, NULL) < 0)
-                    fprintf(stderr, "wms: cannot bind %.120s into the jail: %s\n",
-                            arg, strerror(errno));
-            }
-        }
-
-        /* Audio: libVLC's ALSA output opens /dev/snd/pcmC0D0p. Without this
-         * bind a video plays silently and the player has to say so. */
-        if (audio) {
-            snprintf(path, sizeof(path), "%s/dev/snd", jail);
-            mkdirp_for(jail, "/dev/snd");
-            if (mount("/dev/snd", path, NULL, MS_BIND, NULL) < 0)
-                fprintf(stderr, "wms: sandbox /dev/snd bind failed: %s\n", strerror(errno));
-        }
-
-        snprintf(path, sizeof(path), "%s/proc", jail);
-        mkdirp_for(jail, "/proc");
-        mount("/proc", path, NULL, MS_BIND, NULL);
-
-        if (chroot(jail) == 0) {
-            chdir("/");
-            setgroups(0, NULL);
-            if (setgid(SANDBOX_GID) != 0 || setuid(SANDBOX_UID) != 0) {
-                child_report(errfd, "cannot drop to uid 1000 in", jail);
-                fprintf(stderr, "wms: sandbox uid drop failed: %s; refusing to run\n",
-                        strerror(errno));
-                _exit(126);
-            }
-        } else {
-            child_report(errfd, "cannot chroot into", jail);
-            fprintf(stderr, "wms: chroot failed: %s; refusing to run\n", strerror(errno));
-            _exit(124);
-        }
-    } else {
-        /* fail closed: an app that cannot be isolated must not run at all,
-         * rather than quietly running as root with the whole filesystem */
-        child_report(errfd, "cannot unshare namespaces for", id);
-        fprintf(stderr, "wms: unshare failed (%s); refusing to run %s\n",
-                strerror(errno), id);
-        _exit(125);
     }
 
     setenv("MYSTIC_SOCKET", "/run/mystic/wm.sock", 1);
-    setenv("MYSTIC_APP_ID", id, 1);
+    setenv("MYSTIC_APP_ID", plan->id, 1);
     {
         /* the text scale is a desktop setting; a client app cannot read
          * /etc/mystic from inside its jail, so it travels in the env */
@@ -961,9 +1759,11 @@ static void sandbox_child(const char *exe, const char *id, int net, int audio,
      * black window with "no suitable interface module". */
     setenv("VLC_PLUGIN_PATH", "/app/lib/vlc/plugins", 1);
     /* VLC and every other library that keeps state writes under these; /tmp
-     * is the jail's own writable tmpfs (mode 0777, created above). */
+     * is the jail's own tmpfs, owned by this app (mode 0700, size in the plan). */
     setenv("XDG_CACHE_HOME", "/tmp/.cache", 1);
     setenv("XDG_CONFIG_HOME", "/tmp/.config", 1);
+    (void)exe;
+    (void)arg;
 }
 
 static int wms_launch_arg(const WmApp *app, WmClient *cl, int slot, const char *arg) {
@@ -982,9 +1782,39 @@ static int wms_launch_arg(const WmApp *app, WmClient *cl, int slot, const char *
         return -1;
     }
 
+    /* The credential is reserved before the fork and before any mount, because
+     * the tmpfs has to be owned by it and the process has to be running as it
+     * by the time it connects. `reuse` says another window of this bundle is
+     * already up: then the tmpfs it mounted is kept. */
+    int reuse = 0;
+    int uid = sbx_cred_acquire(app->id, &reuse);
+    if (uid < 0) {
+        launch_failed("%s: no sandbox uid free (%d apps are already running)",
+                      app->id, SBX_UID_SLOTS);
+        return -1;
+    }
+
+    char appdata[512];
+    snprintf(appdata, sizeof(appdata), "/root/appdata/%s", app->id);
+
+    SbxPlan plan;
+    sbx_plan_init(&plan, run_dir(), app->id, exe, appdata, uid,
+                  app->procs, app->net, app->audio, screen_w, screen_h, arg);
+    plan.reuse = reuse;
+    if (getenv("MYSTIC_SANDBOX_PRINT") && getenv("MYSTIC_SANDBOX_PRINT")[0])
+        sbx_plan_print(&plan, stderr);
+
+    char err[SBX_PATH * 2];
+    if (sandbox_prepare(&plan, err, sizeof(err)) != 0) {
+        launch_failed("%s: %s", app->id, err);
+        sbx_cred_gc();               /* the reservation has no process yet */
+        return -1;
+    }
+
     int ep[2];
     if (pipe(ep) != 0) {
         launch_failed("%s: pipe: %s", app->id, strerror(errno));
+        sbx_cred_gc();
         return -1;
     }
     /* The write end dies with the exec, so the parent can tell "running" from
@@ -997,11 +1827,12 @@ static int wms_launch_arg(const WmApp *app, WmClient *cl, int slot, const char *
         launch_failed("%s: fork: %s", app->id, strerror(errno));
         close(ep[0]);
         close(ep[1]);
+        sbx_cred_gc();
         return -1;
     }
     if (pid == 0) {
         close(ep[0]);
-        sandbox_child(exe, app->id, app->net, app->audio, arg, ep[1]);
+        sandbox_child(&plan, exe, arg, ep[1]);
         if (arg && arg[0]) {
             /* an app that was asked to open a document gets the path as
              * argv[1]; the path was validated by the desktop, and the app
@@ -1016,6 +1847,11 @@ static int wms_launch_arg(const WmApp *app, WmClient *cl, int slot, const char *
         fprintf(stderr, "wms: cannot exec the jailed %s: %s\n", app->id, strerror(errno));
         _exit(127);
     }
+
+    /* The keeper (or the app itself when it has no pid namespace). Either way
+     * this pid lives as long as the app, so the uid cannot be handed to
+     * another bundle while it is still in use. */
+    sbx_cred_add_anchor(uid, (long)pid);
 
     close(ep[1]);
     /* Wait for one of two answers: the pipe closes (exec happened, the app is
@@ -1041,6 +1877,7 @@ static int wms_launch_arg(const WmApp *app, WmClient *cl, int slot, const char *
         launch_failed("%s: %s", app->id, msg);
         int status = 0;
         while (waitpid(pid, &status, 0) < 0 && errno == EINTR) { }
+        sbx_cred_gc();
         return -1;
     }
     if (timed_out)
@@ -1048,6 +1885,7 @@ static int wms_launch_arg(const WmApp *app, WmClient *cl, int slot, const char *
     (void)cl;
     return (int)pid;
 }
+
 /* Two entry points, one implementation: the launcher and the store use the
  * plain one; Files passes a document path so the app can open it. */
 int wms_launch(const WmApp *app, WmClient *c, int slot) {
@@ -1058,3 +1896,4 @@ int wms_launch_path(const WmApp *app, WmClient *c, int slot, const char *path) {
     return wms_launch_arg(app, c, slot, path);
 }
 
+#endif /* !MYSTIC_SANDBOX_PLAN */

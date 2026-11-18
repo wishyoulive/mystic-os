@@ -108,7 +108,7 @@ is visible.
 ## 2. Font fallback (was **not** true before)
 
 `glyph_get()` used to ask the role's own face only. `stbtt_FindGlyphIndex()`
-returning 0 is the index of glyph 0, `.notdef` — the box the owner saw where a
+returning 0 is the index of glyph 0, `.notdef` — the box the user saw where a
 Cyrillic or Japanese letter belonged, even when an installed face had the
 letter.
 

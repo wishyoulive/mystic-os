@@ -474,7 +474,7 @@ typedef struct {
  *  ONE VISUAL LANGUAGE
  *
  *  This block is identical, byte for byte, in files.c, store.c and
- *  settings.c: the owner asked for one desktop, not three
+ *  settings.c: the design calls for one desktop, not three
  *  improvisations. Change it in all three at once.
  *
  *  SPACING. One unit, 8 px, scaled by ui_px() so it follows the global

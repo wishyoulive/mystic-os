@@ -10,8 +10,8 @@
  *
  *  Wire format, one connection per app, line terminated by \n:
  *
- *    app  -> wm :  HELLO <id> <title...> <w> <h>
- *    wm   -> app:  OK <shm-path> <stride>
+ *    app  -> wm :  HELLO <id> <w> <h> <title...>
+ *    wm   -> app:  OK <shm-path> <stride> <maxw> <maxh>
  *    wm   -> app:  ERR <reason>
  *
  *    app  -> wm :  FRAME                     (shared memory is ready)
@@ -27,14 +27,28 @@
  *  mods is a bitmask: 1 shift, 2 ctrl, 4 alt.
  *  buttons is a bitmask: 1 left, 2 right, 4 middle.
  *
- *  The shared memory holds w*h pixels, 32-bit 0xAARRGGBB, stride
- *  pixels per row (stride is given in OK because we round it up).
+ *  The shared memory is maxw * maxh pixels, 32-bit 0xAARRGGBB, stride pixels
+ *  per row. Both numbers come back in OK because the server allocates the
+ *  whole screen (a window can grow, up to that bound) and <w> <h> are only the
+ *  size the app wants to open at: the app must map stride * maxh * 4 bytes and
+ *  never draw outside it. <shm-path> is the path as the APP sees it.
  *
  *  What a launched app finds inside its sandbox: its payload running as
- *  /bin/app, its own bundle mounted read-only at /app (MYSTIC_BUNDLE), a
- *  private empty /root and a writable /tmp, the window socket, read-only
- *  fonts, /dev/shm, /dev/null, /dev/urandom and /proc. MYSTIC_APP_ID and
- *  MYSTIC_UI_SCALE carry the bundle id and the desktop's text scale.
+ *  /bin/app, its own bundle mounted read-only at /app (MYSTIC_BUNDLE), its
+ *  own appdata as /root, its own size-limited tmpfs as /tmp and as /dev/shm,
+ *  the window socket, read-only fonts, /dev/null, /dev/urandom and a procfs.
+ *  MYSTIC_APP_ID and MYSTIC_UI_SCALE carry the bundle id and the desktop's
+ *  text scale.
+ *
+ *  Two things about that sandbox belong to the protocol and so live here:
+ *
+ *   - The app runs as its own uid, allocated per bundle from a small pool
+ *     (2000..2000+WM_MAX_CLIENTS-1). The kernel tells the server which uid a
+ *     connection really belongs to (SO_PEERCRED), which is why the buffer the
+ *     server hands out in OK can be opened only by that app. See
+ *     docs/SECURITY.md.
+ *   - /dev/shm inside the jail is a per-app tmpfs, so the <shm-path> in OK is
+ *     the path as the APP sees it (/dev/shm/...), not a host path.
  * ============================================================ */
 #ifndef MYSTIC_IPC_H
 #define MYSTIC_IPC_H
@@ -72,11 +86,20 @@ typedef struct {
 
     int   w, h, stride;
     int   maxw, maxh;      /* the buffer is this big; w/h is the window */
-    char  shm_path[96];
+    char  shm_path[96];    /* the path the APP opens: /dev/shm/... */
+    char  shm_host[512];   /* the same file as this server reaches it */
     int   shm_fd;
     u32  *px;
 
     char  id[32];
+    char  jail_id[32];     /* the bundle this connection was launched as; for a
+                            * jailed client this comes from the launch, not from
+                            * HELLO, so a lying HELLO cannot aim the buffer at
+                            * another app's /dev/shm */
+    int   uid;             /* SO_PEERCRED: the uid the app really runs as */
+    int   jailed;          /* 1 = uid is one of the sandbox uids (and the app
+                            * really is inside a jail) */
+    long  pid;             /* SO_PEERCRED: the app's pid, for the uid pool */
     char  title[80];
     int   win;               /* index into wins[], or -1 */
     int   want_frame;
@@ -95,6 +118,12 @@ typedef struct {
     int  audio;        /* manifest says 'audio = yes': bind /dev/snd */
     int  net;          /* manifest says 'network = host': keep the host netns,
                         * and give the jail a resolv.conf so lookups work */
+    int  procs;        /* manifest says 'procs = yes': the app reads every
+                        * process, so it gets the host /proc read-only and NO
+                        * pid namespace. Every other app gets its own pid
+                        * namespace and a fresh procfs. The trade is named,
+                        * one manifest line, and documented in
+                        * docs/SECURITY.md; sysmon is the only app that asks. */
 } WmApp;
 
 /* Tell the server how big the screen is, so a client buffer can be allocated

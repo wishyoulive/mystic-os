@@ -25,7 +25,7 @@ Status at the time of writing:
 
 ---
 
-## 1. What the owner does, and what appears
+## 1. What the user does, and what appears
 
 1. **Fresh image, click the Player tile.** The image ships
    `stage/usr/share/mystic/apps/vlc/bin`, a static build of
@@ -325,7 +325,7 @@ The source AVI is 5,069,752 bytes (uncompressed) and stays in `.work/play/`;
 only the encoded MP4 is in the image. It is staged twice on purpose:
 
 - `stage/usr/share/mystic/media/clip.mp4` - the image's canonical copy;
-- `stage/root/media/clip.mp4` - the literal path the owner opens.
+- `stage/root/media/clip.mp4` - the literal path the user opens.
 
 `stage/init` mounts the data disk on `/root` on every normal boot, which hides
 anything the initramfs put in `/root`. So `src/wmsrv.c` also provisions it:
@@ -492,7 +492,7 @@ call).
 | `src/wmsrv.c` | jail environment (`VLC_PLUGIN_PATH`, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME` added to the existing `MYSTIC_BUNDLE`/`LD_LIBRARY_PATH`/`HOME`/`TMPDIR`); `provision_media()` |
 | `src/filetypes.c`, `src/filetypes.h` | `FT_APP_VLC`; mp4/mkv/webm/avi/mov open in the Player |
 | `stage/usr/share/mystic/media/clip.mp4` | new: the canonical sample clip |
-| `stage/root/media/clip.mp4` | new: the same bytes at the path the owner opens |
+| `stage/root/media/clip.mp4` | new: the same bytes at the path the user opens |
 
 Harness sources and transcripts are in `.work/play/` (`host.c`, `mkclip.py`,
 `elfaudit.py`, `tile.c`, `ft.c`, `boot/`, `decode-clip.txt`,

@@ -308,7 +308,7 @@ be distributed with the OS rather than fetched.
 `ensure_index` (`stage/usr/bin/pkg:758-774`) re-verifies a **cached** index
 on every use, so a file in `/tmp` that cannot be authenticated is treated
 as absent and refetched. It also calls `prepare_cache` **before** the
-cached index is read (`:764`), so the ownership check cannot be skipped by
+cached index is read (`:764`), so the usership check cannot be skipped by
 a read-only command such as `pkg list`: a cache directory an unprivileged
 user can write is refused even when a valid signed index is already in it.
 
@@ -383,7 +383,7 @@ refusing one that is not there. So the worst case today is a misleading
 row or a denied install, not code execution - but it is a hole in this
 story and it is listed in section 8.
 
-The fix belongs in `src/main.c`, which this worker does not own. Either:
+The fix belongs in `src/main.c`, which this contributor does not own. Either:
 
 1. replace both `wget` commands (search `src/main.c` for
    `/run/mystic/repo.index`) with

@@ -1174,7 +1174,7 @@ static void draw_ui(MClient *c, Page *p, Engine *e, Font *fs, Font *fb,
 }
 
 /* The card shown when the engine is not installed at all. It states the real
- * cost, because the owner has to raise the guest's memory and disk for the
+ * cost, because the user has to raise the guest's memory and disk for the
  * package to fit. */
 static void draw_missing(MClient *c, Font *fs, Font *fb, const char *why) {
     Surface s;

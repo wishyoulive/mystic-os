@@ -56,7 +56,7 @@
 #  include <unistd.h>
 #endif
 
-/* The type registry belongs to src/filetypes.c (another worker owns it).
+/* The type registry belongs to src/filetypes.c (another contributor owns it).
  * Include it when it exists; the local detector below is only the fallback
  * for a tree where it has not landed yet. viewer_registry_type() is the
  * only place that knows the registry's shape. */
@@ -788,7 +788,7 @@ static int png_decode(const u8 *d, size_t n, VImage *im, char *err, size_t esz) 
             return -1;
         }
 
-        int critical = !(type[0] & 0x20);
+        int revieweral = !(type[0] & 0x20);
         if (!memcmp(type, "IHDR", 4)) {
             if (saw_ihdr) { snprintf(err, esz, "more than one IHDR"); free(idat); return -1; }
             if (clen != 13) { snprintf(err, esz, "IHDR is %u bytes, not 13", (unsigned)clen); free(idat); return -1; }
@@ -855,8 +855,8 @@ static int png_decode(const u8 *d, size_t n, VImage *im, char *err, size_t esz) 
             saw_iend = 1;
             pos += 12u + (size_t)clen;
             break;
-        } else if (critical) {
-            snprintf(err, esz, "unknown critical chunk %.4s", (const char *)type);
+        } else if (revieweral) {
+            snprintf(err, esz, "unknown revieweral chunk %.4s", (const char *)type);
             free(idat);
             return -1;
         }

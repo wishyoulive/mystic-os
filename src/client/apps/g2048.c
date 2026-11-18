@@ -29,7 +29,7 @@
  *    /dev/urandom; the footer says so if that device cannot be read
  *    and the fallback (the monotonic clock) is being used instead.
  *  - The best score is read and written as a real file. /root is
- *    tried first, because that is where the owner asked for it.
+ *    tried first, because that is where the design calls for it.
  *    A jailed app has no /root, so /tmp (its own jail tmp, on the
  *    real disk) is the fallback; if neither can be written the
  *    footer carries the actual strerror(errno) - it never pretends
@@ -391,7 +391,7 @@ static unsigned rng_next(void) {
 
 /* Where the best score can live, in the order it is tried.
  *
- *   /root/g2048.best    what the owner asked for. Reachable when the app runs
+ *   /root/g2048.best    what the design calls for. Reachable when the app runs
  *                       outside the window server's jail, or when the jail
  *                       binds a writable /root (it does not today).
  *   /tmp/g2048.best     on disk, but the jail creates <jail>/tmp as a
@@ -401,7 +401,7 @@ static unsigned rng_next(void) {
  *                       A real file, but RAM-backed: it survives an app
  *                       restart, not a reboot.
  *
- * best_open() records which one answered; the footer prints it, so the owner
+ * best_open() records which one answered; the footer prints it, so the user
  * can see where the score actually went instead of being told it was saved. */
 static const char *const BEST_CANDIDATES[] = {
     "/root/g2048.best",

@@ -107,8 +107,8 @@
  *
  *  VERIFYING
  *  ---------
- *  The plain keypad is the immediate-execution calculator the owner already
- *  uses, so its behaviour is pinned by a matrix at the bottom of this file
+ *  The plain keypad is the immediate-execution calculator users already
+ *  have, so its behaviour is pinned by a matrix at the bottom of this file
  *  (calc_selftest, compiled only under HOST_TEST): backspace, dot, +/-,
  *  1/x, x2, sqrt, repeated operators, the entry ceiling and the
  *  q/s/n/r/k/m/a/d/e keys, every case driven through calc_key() - the same
@@ -1473,7 +1473,7 @@ static void calc_press(Calc *c, int id) {
     if (!c) return;
 
     /* The two mode switches are never destructive and never hit the error
-     * branch: they are how the owner moves between the keypads. */
+     * branch: they are how the user moves between the keypads. */
     if (id == B_SCI) { toggle_sci(c); return; }
     if (id == B_DEG) {
         if (c->error) reset_calc(c);
@@ -2177,7 +2177,7 @@ const AppVT app_vt_calc = {
 /* ============================================================
  *  Host proof harness (not part of the OS build)
  *
- *  The plain keypad is an immediate-execution calculator the owner already
+ *  The plain keypad is an immediate-execution calculator users already
  *  relies on, so its behaviour is pinned here by a matrix instead of by
  *  prose. Each case starts from a fresh calculator, types real key bytes
  *  through calc_key() - the same entry point the desktop's input layer

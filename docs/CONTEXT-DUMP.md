@@ -20,7 +20,7 @@ If you only read three sections, read **1**, **6**, **9**.
 2. Nothing is "done" until built, booted and seen.
 3. No duplicated blocks.
 4. **Nothing >40 MB ships in the image** — it goes in the package repo and is installed at runtime. Enforced by `tools/check-size.sh`.
-5. RSI swarms with 2 critic rounds; I verify everything myself; max 15 agents.
+5. review swarms with 2 reviewer rounds; I verify everything myself; max 15 reviewers.
 6. Keep working continuously.
 
 ---
@@ -142,7 +142,7 @@ Engine already on disk: `build/browser-root/` (1.5 GB, 202 MB `chromium-headless
 **Proof it is real**: 2048 launches inside the jail, draws through the compositor, and reports
 `/dev/urandom: No such file or directory` — i.e. it can only see what was bound.
 
-**Security hunter's CRITICALs, all fixed:**
+**Security reviewer's CRITICALs, all fixed:**
 - **C3** child closes every fd ≥ 3 — it was inheriting a root-opened `/dev/fb0` (read/write the
   entire screen, forge a lock screen) and the evdev keyboard (**the unlock PIN in cleartext**,
   because evdev gives each descriptor its own copy of events). This survived a *perfect* jail.
@@ -160,10 +160,10 @@ can read/forge/`ftruncate` another app's buffer and `SIGBUS` the desktop; `/dev/
 ### 6.2 Store install UI — in flight
 Desktop services `/run/mystic/install.request` → `pkg install <name>` (name whitelisted
 `[a-z0-9-]{1,32}`) and `/run/mystic/repo.refresh` → `wget` the index to `/run/mystic/repo.index`.
-An RSI worker is adding the Store's **Available** section (read index, mark installed, `r`
+An review contributor is adding the Store's **Available** section (read index, mark installed, `r`
 refreshes, Enter writes the install request). Check `progress` for it.
 
-### 6.3 Unresolved worker outcomes (judgement calls already made)
+### 6.3 Unresolved contributor outcomes (judgement calls already made)
 - `research-browser` — UNRESOLVED on **bookkeeping only** (patch count 45 vs 46, w3m closure
   1.5 vs 12 MB, three anchors labelled with the wrong commit, one false CANNOT, Broadway days
   inconsistent). **Keep the file; conclusions unaffected.**
@@ -190,8 +190,8 @@ refreshes, Enter writes the install request). Check `progress` for it.
    password; profile + password change in Settings (`mystic-passwd`).
 6. **Lock screen re-verify** (Ctrl+Alt+L) and add a visible Lock action; the handler exists twice
    in `main.c` (`input.key == 38` ~:1203 and `k == 38` ~:1281) — the first is likely dead.
-7. **Damage rectangles** in the protocol (`FRAME x y w h`) — the hunter measured up to ~117 ms per
-   full recompose with ten windows, which is the stutter the owner feels.
+7. **Damage rectangles** in the protocol (`FRAME x y w h`) — the reviewer measured up to ~117 ms per
+   full recompose with ten windows, which is the stutter the user feels.
 8. `docs/ARCHITECTURE.md` bookkeeping (§6.3).
 
 ---
@@ -211,7 +211,7 @@ refreshes, Enter writes the install request). Check `progress` for it.
 6. **A running QEMU locks `build/initramfs.cpio.gz`** → builds fail "Invalid argument".
 7. **Hunters must not boot QEMU** (they collide on the image and on `pkill -f qemu`).
 8. **Windows Defender flags agent-built harness `.exe`s** in /tmp — delete them, they are not the repo.
-9. **Never dispatch a worker on a file you are editing** (`main.c` collisions have cost two rewrites).
+9. **Never dispatch a contributor on a file you are editing** (`main.c` collisions have cost two rewrites).
 10. **WHPX**: without `-accel whpx`, boot is 8 s instead of 0.9 s.
 11. **`getaddrinfo ENOTFOUND cheapseek.kdns.fr`** — the model provider drops out mid-run. Work
     written before the error is usually fine; always re-check the file rather than re-running.
@@ -224,13 +224,13 @@ refreshes, Enter writes the install request). Check `progress` for it.
 5,773 · headers 407 · tools+init 6,724 · docs 3,549. Plus 5,321 lines of third-party
 `stb_truetype.h` (not counted as ours).
 
-At the measured rate (~2,800 verified lines per 30-minute swarm with a critic on every file),
-500k is ~85 more swarm cycles. The owner forbids padding, so the honest progress metric is
+At the measured rate (~2,800 verified lines per 30-minute swarm with a reviewer on every file),
+500k is ~85 more swarm cycles. The user forbids padding, so the honest progress metric is
 capability; the line count is a by-product.
 
 ---
 
-## 11. Latest hunter round — 20 findings (just landed, mostly unfixed)
+## 11. Latest reviewer round — 20 findings (just landed, mostly unfixed)
 
 Fixed immediately because they were live: **#1** characters were emitted on the
 key-UP edge (nothing echoed until release, and `Shift↓ A↓ Shift↑ A↑` produced
@@ -263,7 +263,7 @@ once per navigation (downgraded), as were the symlink-host-resolution and
 
 ## 12. If I had one more session
 
-1. The 20 findings above (2, 3, 4 are the ones the owner would feel).
+1. The 20 findings above (2, 3, 4 are the ones the user would feel).
 2. Browser fetch (Enter), then publish the repo to a public URL and set `/etc/mystic/repo.conf`.
 3. Sandbox H1/H2/H5 (per-app uid, private `/dev/shm` with `size=`, `CLONE_NEWPID`).
 4. Encryption (dm-crypt modules are in the package), index signing (Ed25519), setup screen.

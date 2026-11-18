@@ -1,6 +1,6 @@
 # VLC on Mystic OS
 
-The owner asked for VLC support. This document answers three questions with
+The user asked for VLC support. This document answers three questions with
 measurements instead of hope:
 
 1. **What does libVLC actually need here?** Alpine ships VLC as one package with
@@ -445,7 +445,7 @@ milestone 1's acceptance test, and it takes ten minutes once the tree exists.
   path is the callbacks in section 3.1 and a `FRAME` line.
 - **As a player for H.264/HEVC/MP4: not inside the initramfs.** 38.19 MB of
   download and **67.5 MB gzipped**, i.e. five copies of the whole OS, to gain
-  one decoder. If the owner wants that, it belongs on the data disk or a
+  one decoder. If the design wants that, it belongs on the data disk or a
   read-only 9p mount the way `docs/BROWSER_PLAN.md` proposes for the browser
   engine - and the 64 MB data disk is too small for it too, so the disk size
   becomes a knob (`MYSTIC_DISK_MB`).
@@ -497,7 +497,7 @@ Either accept a 67.5 MB tree on the data disk (`--profile trim --download`,
 which works today and produces 469 files), or stay with M2. Nothing in the code
 changes; only which libraries are on the filesystem.
 
-**M4 - sound, if the owner wants it.** Section 4, steps 1-3. Acceptance: a small
+**M4 - sound, if the design wants it.** Section 4, steps 1-3. Acceptance: a small
 test program opens `/dev/snd/pcmC0D0p`, writes a 440 Hz sine, and it is audible
 from the host.
 

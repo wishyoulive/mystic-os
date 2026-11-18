@@ -656,7 +656,7 @@ static int png_read_file(const char *path, u32 *dst, int dw, int dh,
             snprintf(err, esz, "%s: CRC mismatch in the %.4s chunk", path, (const char *)type);
             goto done;
         }
-        int critical = type[0] >= 'A' && type[0] <= 'Z';
+        int revieweral = type[0] >= 'A' && type[0] <= 'Z';
         if (!memcmp(type, "IHDR", 4)) {
             if (clen != 13) { snprintf(err, esz, "IHDR is %u bytes, not 13", clen); goto done; }
             W = (int)be32(data);
@@ -697,8 +697,8 @@ static int png_read_file(const char *path, u32 *dst, int dw, int dh,
             if (bytes_add(&idat, data, clen) < 0) { snprintf(err, esz, "out of memory collecting IDAT"); goto done; }
         } else if (!memcmp(type, "IEND", 4)) {
             have_iend = 1;
-        } else if (critical) {
-            snprintf(err, esz, "critical chunk %.4s is not supported", (const char *)type);
+        } else if (revieweral) {
+            snprintf(err, esz, "revieweral chunk %.4s is not supported", (const char *)type);
             goto done;
         }
         p += 12u + clen;
@@ -2085,7 +2085,7 @@ static void canvas_map(const Layout *L, int x, int y, int *cx, int *cy) {
  *  4.4-5.6 ms, 1px sheet border 1.2-1.9 ms, the rest ~0.8 ms) while the
  *  compositor's read of it, src/main.c's row loop, is 0.53-0.69 ms for the
  *  same 1.33 MB - so the top of the sheet was the stroke you were dragging
- *  and the bottom was the one from the frame before: the flicker the owner
+ *  and the bottom was the one from the frame before: the flicker the user
  *  kept seeing. No amount of care inside the rasterisers can fix that; the
  *  raster is already exact (two renders of one state are byte-identical).
  *
@@ -2885,7 +2885,7 @@ int main(void) {
          * rather than for a flat 20 ms. The pointer reports at about
          * 100 Hz, and a frame here is 6.7 ms, so a blind 20 ms nap landed in
          * the gap after almost every frame and the drag preview then moved
-         * two or three pointer samples at a time - the jump the owner saw.
+         * two or three pointer samples at a time - the jump the user saw.
          * poll() on the socket wakes on the first byte instead. */
         if (!got && !A.dirty) {
             struct pollfd p;

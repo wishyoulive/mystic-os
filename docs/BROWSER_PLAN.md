@@ -625,7 +625,7 @@ instead of a decoded JPEG per frame". The arguments against it are therefore
 **not** cost:
 
 1. It puts X11 in an OS whose pitch is that it has no X11. That is a positioning
-   decision for the owner, not a technical one, and it should be made as such.
+   decision for the user, not a technical one, and it should be made as such.
 2. It gives us pixels and synthetic input (XTEST) and nothing else. Every browser
    *function* — URL bar, history, find-in-page, zoom, print, tabs — has to be
    driven by faking keystrokes into a picture. The CDP path in §3 gives all of
@@ -722,7 +722,7 @@ Four things fall out of that table, and they are the whole decision:
    render modern sites.**
 3. **Nothing on this list plays DRM video**, because no Widevine CDM exists for
    musl/Alpine at all. "Multimedia" here means open video (H.264/VP9/AV1 in
-   `<video>`, no EME), and the plan should say so to the owner before the work
+   `<video>`, no EME), and the plan should say so to the user before the work
    starts rather than after.
 4. **Only two designs put pixels in our memory without a codec or a protocol
    translation in between:** CEF off-screen (no musl build exists) and NetSurf's
@@ -748,7 +748,7 @@ separates them:
 So: **#1 if the browser is to be part of the OS** (no X11, and a real API to
 build chrome on); **#2 if frames-per-second is the binding constraint** and X11
 in the image is acceptable. That is an editorial decision about what Mystic OS
-is, not a technical one, and it belongs to the owner. What is *not* a matter of
+is, not a technical one, and it belongs to the user. What is *not* a matter of
 taste is that #2 is far cheaper than this document previously claimed: 7.6 MB of
 X, not 268 MB.
 
@@ -856,7 +856,7 @@ CEF, so the first weeks are a Chromium-class build.
    const u8 *src, int src_stride)` helper plus the `HELLO`/shm handshake, shared
    by every candidate. All five viable options end in the same `memcpy`.
 4. **Then** pick #1 or #2 on that measurement, not on taste, and keep the
-   NetSurf/VNC sketch in a drawer: it is the answer if the owner ever says "it
+   NetSurf/VNC sketch in a drawer: it is the answer if the user ever says "it
    has to run on the 256 MB machine".
 
 ---

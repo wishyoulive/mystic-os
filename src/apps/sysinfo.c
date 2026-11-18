@@ -984,7 +984,7 @@ static void sysinfo_key(App *a, const char *bytes, int n) {
         else if (c == 'g') st->scroll = 0.0f;
         else if (c == 'G') scroll_by(st,  st->content_h);
         else if (c == 'r') {
-            /* Explicit reload: the user asked for the files to be read
+            /* Explicit reload: the requirement was for the files to be read
              * again, so both caches are refilled now. */
             facts_refresh(&st->facts, 1);
             live_refresh(&st->live, 1);

@@ -669,7 +669,7 @@ static int ic_png_decode(const uint8_t *d, size_t n, Img *im,
                           (unsigned long)got_crc);
         }
 
-        int critical = !(type[0] & 0x20);
+        int revieweral = !(type[0] & 0x20);
         if (!memcmp(type, "IHDR", 4)) {
             if (saw_ihdr) { free(idat); return ic_err(err, esz, "PNG has more than one IHDR"); }
             if (clen != 13) { free(idat); return ic_err(err, esz, "PNG IHDR is %lu bytes, not 13", (unsigned long)clen); }
@@ -739,9 +739,9 @@ static int ic_png_decode(const uint8_t *d, size_t n, Img *im,
             idat_len += clen;
         } else if (!memcmp(type, "IEND", 4)) {
             saw_iend = 1;
-        } else if (critical) {
+        } else if (revieweral) {
             free(idat);
-            return ic_err(err, esz, "PNG has unknown critical chunk %.4s", (const char *)type);
+            return ic_err(err, esz, "PNG has unknown revieweral chunk %.4s", (const char *)type);
         }
         pos += 12u + (size_t)clen;
     }

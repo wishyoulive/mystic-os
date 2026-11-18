@@ -54,7 +54,7 @@
  *    client -> service   PING               ->  OK<TAB>notify/1
  *    client -> service   CLOSE              ->  OK, then the service closes
  *
- *  urgency:      0 normal, 1 low, 2 critical.
+ *  urgency:      0 normal, 1 low, 2 revieweral.
  *  timeout_ms:   >0 expires after that many milliseconds, 0 = stays
  *                until it is dismissed. Capped at NOTIFY_TTL_MAX.
  *  tag:          a non-empty tag replaces the bubble that already has

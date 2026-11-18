@@ -1106,7 +1106,7 @@ static Window *win_open(int kind, const char *app_id) {
             snprintf(w->title, sizeof(w->title), "Terminal");
             if (!w->term) { win_reset(w); return NULL; }
         } else {
-            /* The calculator is portrait: the owner asked for it to grow
+            /* The calculator is portrait: the design calls for it to grow
              * downwards rather than sideways, so it opens tall and narrow.
              * Every other app keeps the wide default. The height is clamped to
              * the screen because ui_px(520) is 1165 px at the largest text
@@ -3572,7 +3572,7 @@ static void draw_launcher(Surface *s, const Theme *th) {
     gfx_shadow(s, (float)px, (float)py, (float)pw, (float)ph, 22, 30, 0.55f);
     /* The panel body is opaque, so blurring the wallpaper underneath it was
      * invisible work - and it ran on every pointer move over the grid, which
-     * is exactly the lag the owner reported on the Apps screen. */
+     * is exactly the lag the user reported on the Apps screen. */
     gfx_rrect_aa(s, (float)px, (float)py, (float)pw, (float)ph, 22,
                  color_alpha(th->window_bg, 0.97f), th->window_border, 1.0f);
 
@@ -4045,7 +4045,7 @@ static void win_close_all(void) {
     dirty = 1;
 }
 
-/* Super+1..9 follows the dock, because that is the order the owner sees:
+/* Super+1..9 follows the dock, because that is the order a user sees:
  * the first icon is window 1. `idx` is 0-based. */
 static void focus_window_n(int idx) {
     Window *w = taskbar_at(idx);
@@ -4777,7 +4777,7 @@ static void term_clear(void) {
 }
 
 static void term_copy(void) {
-    /* A real selection wins: that is the thing the owner asked for. With no
+    /* A real selection wins: that is the thing the design calls for. With no
      * selection the old behaviour (the line typed since the last Enter) is
      * still here, so the chord never does nothing. */
     Window *selw = term_sel_window();

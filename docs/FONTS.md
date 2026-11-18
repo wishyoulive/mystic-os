@@ -17,7 +17,7 @@ directories for `*.ttf` and `*.otf` (extension matched case-insensitively):
 
 | order | directory | purpose |
 |---|---|---|
-| 1 | `/root/fonts` | fonts the owner installed; highest priority |
+| 1 | `/root/fonts` | fonts the user installed; highest priority |
 | 2 | the `dir` argument to `font_init()` | `main.c` passes `/usr/share/fonts` |
 | 3 | `/usr/share/fonts` | fonts that ship in the image |
 
@@ -184,7 +184,7 @@ visible in the boot log:
 font: 4 faces: ui=Lato mono=JetBrains Mono
 ```
 
-No font is installed by this loader. `/root/fonts` is the owner's directory;
+No font is installed by this loader. `/root/fonts` is the user's directory;
 the image ships its fonts in `/usr/share/fonts` (`tools/build-desktop.sh`
 copies `assets/fonts/*.ttf` there).
 

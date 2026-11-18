@@ -117,7 +117,7 @@ drivers/md/dm-crypt.ko                               148,999 bytes
 
 **Permanent fix, not applied here:** add `kernel/drivers/md` and
 `kernel/security/keys` to `MODULE_TREES` in `tools/fetch-kernel.sh`. That file
-belongs to another worker in this change; until it is edited, `mkenc.sh` is the
+belongs to another contributor in this change; until it is edited, `mkenc.sh` is the
 step that puts the modules in place, and `fetch-kernel.sh` must not be re-run
 after it without re-running `mkenc.sh`.
 
@@ -347,7 +347,7 @@ desktop window. Two consequences worth knowing before sealing:
 * to get the prompt in the main window, boot with `console=tty0` instead of
   `console=ttyS0` (the VGA text console is still bound at that point — the
   desktop unbinds it later). The exact QEMU command is in `image.sh`; that file
-  belongs to another worker, so the flag is documented here and not changed
+  belongs to another contributor, so the flag is documented here and not changed
   there.
 
 ### 6.3 What the seal is worth
@@ -1090,7 +1090,7 @@ disk: formatted ext4 inside dm-crypt and mounted on /root
 ```
 
 The check therefore still passes, but its *name* is now inaccurate. The honest
-fix is one line in `tools/smoke.sh` (another worker's file):
+fix is one line in `tools/smoke.sh` (another contributor's file):
 
 ```sh
 printf '%s' "$out" | grep -Eq 'mounted /dev/vda \(ext4\)|formatted ext4|mounted /dev/mapper/mystic-root'
