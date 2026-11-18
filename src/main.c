@@ -798,7 +798,37 @@ static void draw_desktop(Surface *s, const Theme *th) {
 
     /* the background is a wallpaper: a pure function of theme + index + time,
      * so the animated ones move and the static ones cost nothing */
-    wallpaper_draw(s, th, wall_index, now_sec() - wall_t0);
+    /* A static wallpaper is evaluated per pixel - the black hole traces
+     * every ray - and it was being recomputed on every frame, even though
+     * nothing about it changes between theme switches. Cache it and blit, so
+     * a frame costs a memcpy instead of a full re-render. Animated
+     * wallpapers keep drawing every frame; that is the point of them. */
+    {
+        static Surface wall;
+        static int wall_key = -1;
+        int key = (th->name[0] ? (int)th->name[0] : 0) * 131 + wall_index * 7 +
+                  s->w * 3 + s->h * 5 + (int)(ui_scale_get() * 100);
+        int animated = wallpaper_animated(wall_index);
+        if (!animated && wall.px && wall_key == key && wall.w == s->w && wall.h == s->h) {
+            surf_copy(s, &wall);
+        } else {
+            wallpaper_draw(s, th, wall_index, now_sec() - wall_t0);
+            if (!animated) {
+                if (!wall.px || wall.w != s->w || wall.h != s->h) {
+                    free(wall.px);
+                    wall.w = s->w;
+                    wall.h = s->h;
+                    wall.stride = s->w;
+                    wall.cx0 = wall.cy0 = wall.cx1 = wall.cy1 = 0;
+                    wall.px = calloc((size_t)wall.w * wall.h, sizeof(u32));
+                }
+                if (wall.px) {
+                    surf_copy(&wall, s);
+                    wall_key = key;
+                }
+            }
+        }
+    }
 
     /* ---------------- top bar ---------------- */
     const int bar = topbar_h();

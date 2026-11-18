@@ -1338,6 +1338,15 @@ float font_draw(Surface *s, Font *f, float x, float y, const char *text, u32 col
                 for (int xx = 0; xx < g->w; xx++) {
                     int dx = gx + xx;
                     if ((unsigned)dx >= (unsigned)s->w) continue;
+                /* Honour the surface clip. Glyphs wrote straight into the
+                 * framebuffer and ignored it, so any text an app drew outside
+                 * its own rect - a label wider than the window, a heading in a
+                 * narrow pane - appeared over the wallpaper or the app beside
+                 * it. Every other primitive respected the clip; this is the
+                 * one that leaked. */
+                if (s->cx1 > s->cx0 &&
+                    (dx < s->cx0 || dx >= s->cx1 || dy < s->cy0 || dy >= s->cy1))
+                    continue;
                     float cov = (src[xx] / 255.0f) * ca;
                     if (cov <= 0.004f) continue;
                     u32 d = row[dx];

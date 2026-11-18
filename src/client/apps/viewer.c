@@ -22,13 +22,21 @@
  *             font with line numbers and real vertical + horizontal
  *             scrolling.
  *    others   never faked. A video, an audio file, a PDF or an
- *             archive shows its real stat() facts, the type that
+ *             archive gets one centred mark, the type that
  *             src/filetypes.c detected from its bytes, and one
- *             honest line saying what would be needed.
+ *             honest sentence saying what would be needed. The
+ *             stat(2) facts sit behind 'i', never in the main view.
  *
- *  Every number on screen comes from stat(2), the file's own
- *  header, or the decoded pixels. The pixel readout under the
- *  pointer is the actual 32-bit pixel from the decoder.
+ *  The window follows the same three-size / 8 px grid as
+ *  src/apps/files.c (see THE VISUAL LANGUAGE below): one header line
+ *  with the name and a type badge, one body, one thin footer. A file
+ *  that cannot be shown, or does not exist, is a centred sentence and
+ *  one hint - never a table of debug fields.
+ *
+ *  Every number on screen comes from stat(2), the file's own header,
+ *  or the decoded pixels. The 'i' sheet repeats those facts, and the
+ *  hover readout in the image footer is the actual 32-bit pixel from
+ *  the decoder.
  * ============================================================ */
 #include "../mystic_client.h"
 #include "../../mystic.h"
@@ -70,17 +78,18 @@
 
 /* ------------------------------------------------------------ colours */
 
-static const u32 C_BG      = RGB(0x10, 0x15, 0x1D);
-static const u32 C_BG2     = RGB(0x16, 0x1D, 0x28);
-static const u32 C_PANEL   = RGB(0x1A, 0x21, 0x2D);
-static const u32 C_LINE    = RGB(0x2A, 0x34, 0x45);
+static const u32 C_BG      = RGB(0x0E, 0x13, 0x1B);   /* the window */
+static const u32 C_BG2     = RGB(0x12, 0x18, 0x22);   /* lower half of it */
+static const u32 C_HEAD    = RGB(0x14, 0x1B, 0x26);   /* header + footer band */
+static const u32 C_PAGE    = RGB(0x0A, 0x0F, 0x16);   /* the reading surface */
+static const u32 C_LINE    = RGB(0x23, 0x2D, 0x3C);   /* hairlines */
 static const u32 C_TEXT    = RGB(0xE8, 0xEC, 0xF6);
-static const u32 C_DIM     = RGB(0x8A, 0x93, 0xA6);
+static const u32 C_DIM     = RGB(0x93, 0xA0, 0xB4);
+static const u32 C_FAINT   = RGB(0x5A, 0x66, 0x78);   /* line numbers */
 static const u32 C_ACCENT  = RGB(0x4F, 0xD1, 0xC5);
-static const u32 C_WARN    = RGB(0xE0, 0x6C, 0x5C);
-static const u32 C_CHK1    = RGB(0x0C, 0x10, 0x17);
+static const u32 C_WARN    = RGB(0xE2, 0x93, 0x7E);
+static const u32 C_CHK1    = RGB(0x0C, 0x10, 0x17);   /* transparency checker */
 static const u32 C_CHK2    = RGB(0x14, 0x1A, 0x23);
-static const u32 C_GUTTER  = RGB(0x0D, 0x12, 0x19);
 
 /* ------------------------------------------------------------ categories
  * One local vocabulary, so the app does not depend on the registry's enum
@@ -89,20 +98,6 @@ enum {
     VCAT_UNKNOWN, VCAT_TEXT, VCAT_IMAGE, VCAT_AUDIO,
     VCAT_VIDEO, VCAT_PDF, VCAT_DOCUMENT, VCAT_ARCHIVE, VCAT_BINARY
 };
-
-static const char *cat_name(int c) {
-    switch (c) {
-    case VCAT_TEXT:    return "text";
-    case VCAT_IMAGE:   return "image";
-    case VCAT_AUDIO:   return "audio";
-    case VCAT_VIDEO:   return "video";
-    case VCAT_PDF:     return "pdf";
-    case VCAT_DOCUMENT:return "document";
-    case VCAT_ARCHIVE: return "archive";
-    case VCAT_BINARY:  return "binary data";
-    default:           return "unknown";
-    }
-}
 
 /* What one honest sentence would be needed for a category this build does
  * not decode. The caller prints this verbatim; it never claims to work. */
@@ -134,7 +129,12 @@ typedef struct {
     char fmt[96];      /* what the file's header actually said */
 } VImage;
 
-typedef enum { DOC_NONE, DOC_IMAGE, DOC_TEXT, DOC_OTHER, DOC_ERROR } DocKind;
+/* What the window is showing. MISSING and EMPTY are their own states so
+ * the body can be a centred sentence instead of an error block. */
+typedef enum { DOC_NONE, DOC_MISSING, DOC_EMPTY, DOC_IMAGE, DOC_TEXT, DOC_OTHER } DocKind;
+
+/* The pictogram a centred state draws. No bitmap, no icon font. */
+enum { MARK_PAGE, MARK_PICTURE, MARK_PLAY, MARK_SOUND, MARK_BOX, MARK_FOLDER, MARK_MISSING };
 
 typedef struct {
     char       path[512];
@@ -143,8 +143,8 @@ typedef struct {
     int        have_st;
     DocKind    kind;
 
-    char       error[256];         /* DOC_ERROR: the real reason */
-    char       other_note[256];    /* DOC_OTHER: one honest line */
+    char       error[256];         /* DOC_MISSING: the real reason */
+    char       other_note[256];    /* DOC_OTHER: one honest sentence */
 
     VImage     img;
 
@@ -169,6 +169,13 @@ typedef struct {
     char       type_name[96];
     char       type_note[160];
     int        type_known;
+
+    char       badge[96];          /* the one pill in the header */
+    int        mark;               /* MARK_* for a centred state */
+    int        info_open;          /* 'i': the stat(2) facts sheet */
+    int        info_scroll;
+    char       encoding[16];       /* scanned from the loaded bytes */
+    char       eol[24];            /* scanned from the loaded bytes */
 } Viewer;
 
 static void viewer_free(Viewer *v) {
@@ -1291,6 +1298,52 @@ static size_t build_display(const u8 *s, size_t len, int col_off, int maxcols,
     return o;
 }
 
+/* Which text is this, really? Both answers are read from the bytes that
+ * were loaded: a strict-enough UTF-8 walk (every sequence well formed) and
+ * a count of the three line-ending forms. Nothing is guessed from the
+ * file's name, and "UTF-8" is never claimed for bytes that are not. */
+static void scan_encoding(Viewer *v) {
+    int ascii = 1;
+    int utf8 = 1;
+    size_t i = 0;
+    size_t lf = 0, crlf = 0, cr = 0;
+
+    while (i < v->text_len) {
+        u8 c = v->text[i];
+        if (c == '\r') {
+            if (i + 1u < v->text_len && v->text[i + 1u] == '\n') { crlf++; i += 2u; }
+            else { cr++; i++; }
+            continue;
+        }
+        if (c == '\n') { lf++; i++; continue; }
+        if (c < 0x80) { i++; continue; }
+
+        ascii = 0;
+        {
+            size_t need = 0;
+            size_t k;
+            u8 b = c;
+            if ((b & 0xE0u) == 0xC0u) need = 1;
+            else if ((b & 0xF0u) == 0xE0u) need = 2;
+            else if ((b & 0xF8u) == 0xF0u) need = 3;
+            else { utf8 = 0; i++; continue; }
+            if (i + need >= v->text_len) { utf8 = 0; i++; continue; }
+            for (k = 1; k <= need; k++)
+                if ((v->text[i + k] & 0xC0u) != 0x80u) { utf8 = 0; break; }
+            i += need + 1u;
+        }
+    }
+
+    snprintf(v->encoding, sizeof(v->encoding), "%s",
+             ascii ? "ASCII" : (utf8 ? "UTF-8" : "8-bit"));
+
+    if (crlf && !lf && !cr) snprintf(v->eol, sizeof(v->eol), "CRLF");
+    else if (lf && !crlf && !cr) snprintf(v->eol, sizeof(v->eol), "LF");
+    else if (cr && !lf && !crlf) snprintf(v->eol, sizeof(v->eol), "CR");
+    else if (!lf && !crlf && !cr) snprintf(v->eol, sizeof(v->eol), "no line breaks");
+    else snprintf(v->eol, sizeof(v->eol), "mixed line endings");
+}
+
 static int load_text_file(Viewer *v, char *err, size_t esz) {
     u8 *buf = NULL;
     size_t len = 0;
@@ -1343,6 +1396,7 @@ static int load_text_file(Viewer *v, char *err, size_t esz) {
     v->line_off = offs;
     v->nlines = nl;
     v->max_cols = max_cols;
+    scan_encoding(v);
     return 0;
 }
 
@@ -1593,20 +1647,24 @@ static void load_document(Viewer *v, const char *path) {
     v->cat = VCAT_UNKNOWN;
     v->zoom = 0.0f;
     v->kind = DOC_NONE;
+    v->mark = MARK_PAGE;
 
     if (!path || !*path) {
-        v->kind = DOC_ERROR;
-        snprintf(v->error, sizeof(v->error),
-                 "no file name was given. Start it as: viewer <path>");
-        snprintf(v->name, sizeof(v->name), "(no file)");
-        snprintf(v->type_name, sizeof(v->type_name), "nothing to open");
+        /* the app was started with no argument: still an app, not an error */
+        v->kind = DOC_NONE;
+        snprintf(v->name, sizeof(v->name), "Viewer");
+        snprintf(v->badge, sizeof(v->badge), "no file");
+        snprintf(v->type_name, sizeof(v->type_name), "no file");
         return;
     }
     snprintf(v->path, sizeof(v->path), "%s", path);
     set_basename(v);
+    snprintf(v->badge, sizeof(v->badge), "%s", "not found");
 
     if (stat(v->path, &v->st) != 0) {
-        v->kind = DOC_ERROR;
+        /* the kernel's own words; the path is the hint under them */
+        v->kind = DOC_MISSING;
+        v->mark = MARK_MISSING;
         snprintf(v->error, sizeof(v->error), "%s", strerror(errno));
         snprintf(v->type_name, sizeof(v->type_name), "unknown");
         return;
@@ -1615,7 +1673,9 @@ static void load_document(Viewer *v, const char *path) {
 
     if (S_ISDIR(v->st.st_mode)) {
         v->kind = DOC_OTHER;
+        v->mark = MARK_FOLDER;
         v->cat = VCAT_UNKNOWN;
+        v->badge[0] = 0;               /* the centred heading is the type */
         snprintf(v->type_name, sizeof(v->type_name), "directory");
         snprintf(v->other_note, sizeof(v->other_note),
                  "a directory has no bytes to display; open a file inside it");
@@ -1623,7 +1683,9 @@ static void load_document(Viewer *v, const char *path) {
     }
     if (!S_ISREG(v->st.st_mode)) {
         v->kind = DOC_OTHER;
+        v->mark = MARK_PAGE;
         v->cat = VCAT_UNKNOWN;
+        v->badge[0] = 0;
         snprintf(v->type_name, sizeof(v->type_name), "special file");
         snprintf(v->other_note, sizeof(v->other_note),
                  "not a regular file; only its facts are shown (nothing is opened)");
@@ -1634,40 +1696,56 @@ static void load_document(Viewer *v, const char *path) {
     size_t got = 0;
     char herr[128];
     if (read_head(v->path, head, sizeof(head), &got, herr, sizeof(herr)) != 0) {
-        v->kind = DOC_ERROR;
+        v->kind = DOC_MISSING;
+        v->mark = MARK_MISSING;
         snprintf(v->error, sizeof(v->error), "%s", herr);
         snprintf(v->type_name, sizeof(v->type_name), "unknown");
         return;
     }
     viewer_detect_type(v, head, got);
+    if (v->cat == VCAT_IMAGE) v->mark = MARK_PICTURE;
+    else if (v->cat == VCAT_VIDEO) v->mark = MARK_PLAY;
+    else if (v->cat == VCAT_AUDIO) v->mark = MARK_SOUND;
+    else if (v->cat == VCAT_ARCHIVE) v->mark = MARK_BOX;
+    else if (v->cat == VCAT_TEXT) v->mark = MARK_PAGE;
 
     if (v->st.st_size == 0) {
-        v->kind = DOC_ERROR;
-        snprintf(v->error, sizeof(v->error), "the file is empty (0 bytes)");
+        v->kind = DOC_EMPTY;
+        v->mark = MARK_PAGE;
+        snprintf(v->badge, sizeof(v->badge), "empty");
         return;
     }
 
     char err[256] = { 0 };
     if (got >= 8 && !memcmp(head, PNG_SIG, 8)) {
         v->kind = DOC_IMAGE;
+        snprintf(v->badge, sizeof(v->badge), "%s",
+                 v->type_name[0] ? v->type_name : "PNG image");
         if (load_image_file(v, png_decode, "the PNG", err, sizeof(err)) != 0) {
-            v->kind = DOC_ERROR;
+            v->kind = DOC_MISSING;
+            v->mark = MARK_PICTURE;
             snprintf(v->error, sizeof(v->error), "PNG: %s", err);
         }
         return;
     }
     if (got >= 2 && head[0] == 'B' && head[1] == 'M') {
         v->kind = DOC_IMAGE;
+        snprintf(v->badge, sizeof(v->badge), "%s",
+                 v->type_name[0] ? v->type_name : "BMP image");
         if (load_image_file(v, bmp_decode, "the BMP", err, sizeof(err)) != 0) {
-            v->kind = DOC_ERROR;
+            v->kind = DOC_MISSING;
+            v->mark = MARK_PICTURE;
             snprintf(v->error, sizeof(v->error), "BMP: %s", err);
         }
         return;
     }
     if (got >= 2 && head[0] == 'P' && head[1] >= '1' && head[1] <= '6') {
         v->kind = DOC_IMAGE;
+        snprintf(v->badge, sizeof(v->badge), "%s",
+                 v->type_name[0] ? v->type_name : "PPM image");
         if (load_image_file(v, pnm_decode, "the PNM", err, sizeof(err)) != 0) {
-            v->kind = DOC_ERROR;
+            v->kind = DOC_MISSING;
+            v->mark = MARK_PICTURE;
             snprintf(v->error, sizeof(v->error), "PNM: %s", err);
         }
         return;
@@ -1675,14 +1753,18 @@ static void load_document(Viewer *v, const char *path) {
 
     if (v->cat == VCAT_TEXT || (v->cat == VCAT_UNKNOWN && looks_text(head, got))) {
         v->kind = DOC_TEXT;
+        snprintf(v->badge, sizeof(v->badge), "%s",
+                 v->type_name[0] ? v->type_name : "plain text");
         if (load_text_file(v, err, sizeof(err)) != 0) {
-            v->kind = DOC_ERROR;
+            v->kind = DOC_MISSING;
+            v->mark = MARK_PAGE;
             snprintf(v->error, sizeof(v->error), "%s", err);
         }
         return;
     }
 
     v->kind = DOC_OTHER;
+    v->badge[0] = 0;                   /* the centred heading is the type */
     if (!v->other_note[0])
         snprintf(v->other_note, sizeof(v->other_note), "%s", cat_needs(v->cat));
 }
@@ -1811,144 +1893,74 @@ static float image_effective_zoom(const Viewer *v, int cw, int ch) {
 #if !defined(VIEWER_HOST_TEST)
 
 /* ============================================================
- *  the window
+ *  THE VISUAL LANGUAGE
+ *
+ *  This window sits on the same grid as src/apps/files.c, so an app
+ *  opening next to it does not look like a different operating system.
+ *
+ *  SPACING. One unit, 8 px, scaled by ui_px(). Every inset, gap,
+ *  radius and bar below is SP(n); there is no second kind of space and
+ *  no literal pixel padding anywhere in this window.
+ *
+ *  TYPE. Exactly three sizes, the same three faces Files uses:
+ *      title  FONT_SEMIBOLD 15   the file's name
+ *      body   FONT_REGULAR  11   a state sentence, an info value
+ *      small  FONT_MEDIUM    9   the type badge, the footer, line numbers
+ *  The document in the text view is the mono face at the BODY size - a
+ *  source listing in a proportional face is a lie - so the reader adds
+ *  no fourth size. These are the only font_get() calls in the file.
+ *
+ *  ROWS. One row height: vceil(font_height(body)) + one unit. The info
+ *  sheet's rows are that height; labels are right-aligned on one column
+ *  and values start on the next, on a shared baseline, so no two rows
+ *  can disagree about where they begin.
+ *
+ *  MEASUREMENT. Nothing is drawn that was not measured: every string is
+ *  fitted to the exact column it was given by tx_fit(), which cuts with
+ *  ".." and measures each cut. In a test build tx_* also counts a string
+ *  that STILL does not fit, and the harness asserts that count is zero at
+ *  every window size and text scale.
+ *
+ *  STATES. One header (name + type badge), one body, one thin footer.
+ *  A file this build cannot show is a centred mark, the type's own name
+ *  and one honest sentence - never a table of stat fields. The real
+ *  stat(2) facts live behind 'i' in an overlay, where they belong.
  * ============================================================ */
 
-#define KEY_ESC      1
-#define KEY_0       11
-#define KEY_MINUS   12
-#define KEY_EQUAL   13
-#define KEY_Q       16
-#define KEY_F       33
-#define KEY_HOME   102
-#define KEY_UP     103
-#define KEY_PAGEUP 104
-#define KEY_LEFT   105
-#define KEY_RIGHT  106
-#define KEY_END    107
-#define KEY_DOWN   108
-#define KEY_PAGEDOWN 109
+#define UI_UNIT 8
+static int SP(int n) { return ui_px(n * UI_UNIT); }
 
-typedef struct {
-    Font *title, *ui, *small, *mono;
-    int   uh, mh, mw;      /* text line heights and mono cell width */
-    int   pad, hh, fh;     /* body padding, header height, footer height */
-} Chrome;
+static int vceil(float v) { int i = (int)v; return (v > (float)i) ? i + 1 : i; }
 
-typedef struct { int x, y, w, h; } VRect;
+typedef struct { Font *title, *body, *small, *mono; } VFonts;
 
-static int rect_hit(VRect r, int x, int y) {
-    return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+static VFonts vfonts(void) {
+    VFonts f;
+    f.title = font_get(FONT_SEMIBOLD, 15);
+    f.body  = font_get(FONT_REGULAR,  11);
+    f.small = font_get(FONT_MEDIUM,    9);
+    f.mono  = font_get(FONT_MONO,     11);
+    return f;
 }
 
-static void chrome_init(Chrome *C) {
-    memset(C, 0, sizeof(*C));
-    C->title = font_get(FONT_SEMIBOLD, 12);
-    C->ui    = font_get(FONT_REGULAR, 10);
-    C->small = font_get(FONT_REGULAR, 8);
-    C->mono  = font_get(FONT_MONO, 10);
-    C->uh = C->ui ? (int)(font_height(C->ui) + 3.0f) : 15;
-    C->mh = C->mono ? (int)(font_height(C->mono) + 2.0f) : 15;
-    C->mw = C->mono ? (int)(font_width(C->mono, "M") + 0.5f) : 7;
-    if (C->uh < 11) C->uh = 11;
-    if (C->mh < 11) C->mh = 11;
-    if (C->mw < 4) C->mw = 4;
-    C->pad = ui_px(8);
-    if (C->pad < 4) C->pad = 4;
-    C->hh = 2 * C->uh + C->pad + 4;
-    C->fh = C->uh + C->pad;
+/* The ink of one line is font_height()/1.4 tall; centring that box, and
+ * not the line box (which carries leading), is what puts caps and
+ * descenders equally inside a band. No guessed baseline. */
+static int vtop(Font *f, int band) {
+    int ink = f ? (int)(font_height(f) / 1.4f + 0.5f) : 0;
+    if (band <= ink) return 0;
+    return (band - ink) / 2;
 }
 
-typedef struct { VRect header, body, footer; } Layout;
-
-static void layout_make(Layout *L, int vw, int vh, const Chrome *C) {
-    L->header.x = 0; L->header.y = 0; L->header.w = vw; L->header.h = C->hh;
-    L->footer.x = 0; L->footer.y = vh - C->fh; L->footer.w = vw; L->footer.h = C->fh;
-    int by = C->hh + 2;
-    int bh = vh - C->hh - C->fh - 4;
-    if (bh < 1) bh = 1;
-    L->body.x = C->pad;
-    L->body.y = by;
-    L->body.w = vw - 2 * C->pad;
-    L->body.h = bh;
-    if (L->body.w < 1) L->body.w = 1;
+/* Two faces on one baseline: the smaller starts lower by exactly the
+ * difference of their ascents. The info sheet's label/value rows use it. */
+static int vbaseline(Font *f, Font *g, int band) {
+    int t = vtop(f, band);
+    int d = (int)(font_ascent(f) - font_ascent(g) + 0.5f);
+    return t + (d > 0 ? d : 0);
 }
 
-static void elide_head(char *out, size_t osz, Font *f, const char *text, int maxw) {
-    out[0] = 0;
-    if (!f || !text || maxw <= 0) return;
-    if (font_width(f, text) <= (float)maxw) {
-        snprintf(out, osz, "%s", text);
-        return;
-    }
-    size_t len = strlen(text);
-    char tmp[1200];
-    while (len > 0) {
-        len--;
-        if (len + 4u >= sizeof(tmp)) continue;
-        memcpy(tmp, text, len);
-        memcpy(tmp + len, "...", 4);
-        if (font_width(f, tmp) <= (float)maxw) {
-            snprintf(out, osz, "%s", tmp);
-            return;
-        }
-    }
-    snprintf(out, osz, "...");
-}
-
-static void elide_tail(char *out, size_t osz, Font *f, const char *text, int maxw) {
-    out[0] = 0;
-    if (!f || !text || maxw <= 0) return;
-    size_t len = strlen(text);
-    for (size_t s = 0; s < len; s++) {
-        if (font_width(f, text + s) <= (float)maxw) {
-            snprintf(out, osz, "%s", text + s);
-            return;
-        }
-    }
-    snprintf(out, osz, "%s", len ? text + len - 1 : "");
-}
-
-static void text_metrics(const Viewer *v, const Chrome *C, VRect body,
-                         int *rows, int *cols, int *gutter) {
-    int digits = 1;
-    int n = v->nlines > 0 ? v->nlines : 1;
-    while (n >= 10) { digits++; n /= 10; }
-    int g = digits * C->mw + 2 * C->pad;
-    if (g > body.w / 2) g = body.w / 2;
-    if (g < C->mw + 2) g = C->mw + 2;
-    int avail = body.w - g - 8;
-    int c = avail / C->mw;
-    if (c < 1) c = 1;
-    int r = (body.h - 8) / C->mh;
-    if (r < 1) r = 1;
-    *rows = r;
-    *cols = c;
-    *gutter = g;
-}
-
-static void text_clamp(Viewer *v, const Chrome *C, VRect body) {
-    int rows, cols, gutter;
-    text_metrics(v, C, body, &rows, &cols, &gutter);
-    int maxfirst = vmax_i(0, v->nlines - rows);
-    if (v->first_line > maxfirst) v->first_line = maxfirst;
-    if (v->first_line < 0) v->first_line = 0;
-    int maxcol = vmax_i(0, v->max_cols - cols);
-    if (v->col_off > maxcol) v->col_off = maxcol;
-    if (v->col_off < 0) v->col_off = 0;
-}
-
-static void image_clamp_pan(Viewer *v, float z, int cw, int ch) {
-    if (v->img.w <= 0 || v->img.h <= 0) return;
-    int sw = iround((float)v->img.w * z);
-    int sh = iround((float)v->img.h * z);
-    float mx = sw > cw ? (float)(sw - cw) * 0.5f : 0.0f;
-    float my = sh > ch ? (float)(sh - ch) * 0.5f : 0.0f;
-    if (v->pan_x > mx) v->pan_x = mx;
-    if (v->pan_x < -mx) v->pan_x = -mx;
-    if (v->pan_y > my) v->pan_y = my;
-    if (v->pan_y < -my) v->pan_y = -my;
-}
+/* ------------------------------------------------------------ numbers */
 
 static void fmt_mode(char *out, size_t n, unsigned mode) {
     char p[11];
@@ -1958,9 +1970,10 @@ static void fmt_mode(char *out, size_t n, unsigned mode) {
            S_ISSOCK(mode) ? 's' :
 #endif
            '-';
-    static const char rwx[] = "rwxrwxrwx";
-    for (int i = 0; i < 9; i++)
+    for (int i = 0; i < 9; i++) {
+        static const char rwx[] = "rwxrwxrwx";
         p[i + 1] = (mode & (1u << (8 - i))) ? rwx[i] : '-';
+    }
     p[10] = 0;
     snprintf(out, n, "%s %04o", p, mode & 07777u);
 }
@@ -1978,355 +1991,1031 @@ static void fmt_time(char *out, size_t n, time_t t) {
         snprintf(out, n, "%lld", (long long)t);
 }
 
-static int draw_wrapped(Surface *s, Font *f, int x, int y, int maxw, int lh,
-                        const char *text, u32 col) {
-    if (!f || !text || maxw <= 0) return y;
-    char line[256];
-    size_t used = 0;
-    line[0] = 0;
-    const char *p = text;
-    while (*p) {
+/* ------------------------------------------------------------ text */
+
+/* Test builds: strings that were still wider than their column after
+ * tx_fit(). The harness reads this and fails if it is not zero. */
+static int vw_overflow;
+
+static int tx_w(Font *f, const char *t) {
+    if (!f || !t || !t[0]) return 0;
+    return vceil(font_width(f, t));
+}
+
+/* Copy t into out, shortened with ".." until it fits in maxw pixels.
+ * Every cut is measured; nothing is estimated from a character count. */
+static void tx_fit(char *out, size_t osz, Font *f, const char *t, int maxw) {
+    if (!out || osz < 4) return;
+    out[0] = 0;
+    if (!f || !t || !t[0] || maxw < 1) return;
+    {
+        size_t len = strlen(t);
+        size_t cut;
+        int dots, budget;
+        if (len > osz - 1) len = osz - 1;
+        memcpy(out, t, len);
+        out[len] = 0;
+        if (font_width(f, out) <= (float)maxw + 0.5f) return;
+        dots = tx_w(f, "..");
+        if (maxw <= dots) { out[0] = 0; return; }
+        budget = maxw - dots;
+        cut = len;
+        while (cut > 0) {
+            out[cut] = 0;
+            if (font_width(f, out) <= (float)budget) break;
+            cut--;
+        }
+        /* never end in the middle of a UTF-8 sequence */
+        while (cut > 0 && ((unsigned char)out[cut - 1] & 0xC0u) == 0x80u) cut--;
+        if (cut + 2 >= osz) cut = osz - 3;
+        memcpy(out + cut, "..", 3);
+    }
+}
+
+/* Keep the END of a string: a path's last components are the useful part. */
+static void tx_fit_tail(char *out, size_t osz, Font *f, const char *t, int maxw) {
+    if (!out || osz < 5) return;
+    out[0] = 0;
+    if (!f || !t || !t[0] || maxw < 1) return;
+    snprintf(out, osz, "%s", t);
+    if (font_width(f, out) <= (float)maxw + 0.5f) return;
+    {
+        int dots = tx_w(f, "..");
+        int budget = maxw - dots;
+        size_t len = strlen(out);
+        size_t s = 1;
+        char tail[600];
+        if (budget < 1) { out[0] = 0; return; }
+        for (; s < len; s++)
+            if (font_width(f, out + s) <= (float)budget) break;
+        while (s < len && ((unsigned char)out[s] & 0xC0u) == 0x80u) s++;
+        if (s >= len) { out[0] = 0; return; }
+        snprintf(tail, sizeof(tail), "..%s", out + s);
+        snprintf(out, osz, "%s", tail);
+    }
+}
+
+#if defined(VIEWER_LAYOUT_TEST)
+/* The width a string will really have after fitting. Only the layout
+ * harness calls it, to prove that nothing exceeds its column. */
+static int tx_fit_w(Font *f, const char *t, int maxw) {
+    char buf[600];
+    tx_fit(buf, sizeof(buf), f, t, maxw);
+    return tx_w(f, buf);
+}
+#endif
+
+/* The three paint calls. Left, right-aligned on an edge, centred on one.
+ * Each fits to maxw first, so a long file name can never paint over the
+ * badge and a long footer can never paint over the zoom. */
+static void tx_at(Surface *s, Font *f, int x, int y, int maxw, const char *t, u32 c) {
+    char buf[600];
+    if (!s || !f || !t || !t[0] || maxw < 1) return;
+    tx_fit(buf, sizeof(buf), f, t, maxw);
+    if (!buf[0]) return;
+    if (font_width(f, buf) > (float)maxw + 0.5f) vw_overflow++;
+    font_draw(s, f, (float)x, (float)y, buf, c);
+}
+
+static void tx_right(Surface *s, Font *f, int right, int y, int maxw, const char *t, u32 c) {
+    char buf[600];
+    if (!s || !f || !t || !t[0] || maxw < 1) return;
+    tx_fit(buf, sizeof(buf), f, t, maxw);
+    if (!buf[0]) return;
+    if (font_width(f, buf) > (float)maxw + 0.5f) vw_overflow++;
+    font_draw(s, f, (float)right - font_width(f, buf), (float)y, buf, c);
+}
+
+static void tx_center(Surface *s, Font *f, int cx, int y, int maxw, const char *t, u32 c) {
+    char buf[600];
+    if (!s || !f || !t || !t[0] || maxw < 1) return;
+    tx_fit(buf, sizeof(buf), f, t, maxw);
+    if (!buf[0]) return;
+    if (font_width(f, buf) > (float)maxw + 0.5f) vw_overflow++;
+    font_draw(s, f, (float)cx - font_width(f, buf) * 0.5f, (float)y, buf, c);
+}
+
+/* One tinted rectangle. surf_fill would COPY the alpha into the frame,
+ * which the compositor would then read as a translucent window, so every
+ * non-opaque pass goes through surf_blend. */
+static void tint(Surface *s, int x, int y, int w, int h, u32 c) {
+    if (w > 0 && h > 0) surf_blend(s, x, y, w, h, c);
+}
+
+/* ------------------------------------------------------------ wrapping */
+
+#define VLINE 200
+
+/* Greedy word wrap into at most maxlines measured lines. The layout owns
+ * the same array the painter walks, so the height it reserves and the
+ * height it paints cannot disagree. */
+static int wrap_text(char (*out)[VLINE], int maxlines, Font *f, int maxw,
+                     const char *text) {
+    int n = 0;
+    char cur[VLINE];
+    const char *p;
+    cur[0] = 0;
+    if (!f || !text || maxw < 1) return 0;
+    p = text;
+    while (*p && n < maxlines) {
+        const char *w;
+        size_t wl;
+        char word[VLINE];
+        char trial[VLINE];
         while (*p == ' ') p++;
-        const char *w = p;
+        if (!*p) break;
+        w = p;
         while (*p && *p != ' ') p++;
-        size_t wl = (size_t)(p - w);
-        if (wl == 0) break;
-        char word[160];
-        if (wl >= sizeof(word)) wl = sizeof(word) - 1;
+        wl = (size_t)(p - w);
+        if (wl > VLINE - 1) wl = VLINE - 1;
         memcpy(word, w, wl);
         word[wl] = 0;
-        char trial[420];
-        if (used) snprintf(trial, sizeof(trial), "%s %s", line, word);
+        if (!cur[0] && tx_w(f, word) > maxw) {
+            tx_fit(out[n], VLINE, f, word, maxw);
+            n++;
+            continue;
+        }
+        if (cur[0]) snprintf(trial, sizeof(trial), "%s %s", cur, word);
         else snprintf(trial, sizeof(trial), "%s", word);
-        if (font_width(f, trial) > (float)maxw && used) {
-            char shown[420];
-            elide_head(shown, sizeof(shown), f, line, maxw);
-            font_draw(s, f, (float)x, (float)y, shown, col);
-            y += lh;
-            snprintf(line, sizeof(line), "%s", word);
-            used = strlen(line);
+        if (cur[0] && tx_w(f, trial) > maxw) {
+            tx_fit(out[n], VLINE, f, cur, maxw);
+            n++;
+            snprintf(cur, sizeof(cur), "%s", word);
         } else {
-            snprintf(line, sizeof(line), "%s", trial);
-            used = strlen(line);
+            snprintf(cur, sizeof(cur), "%s", trial);
         }
     }
-    if (used) {
-        char shown[420];
-        elide_head(shown, sizeof(shown), f, line, maxw);
-        font_draw(s, f, (float)x, (float)y, shown, col);
-        y += lh;
+    if (n < maxlines && cur[0]) {
+        tx_fit(out[n], VLINE, f, cur, maxw);
+        n++;
+    } else if (n > 0 && *p) {
+        /* there is more text than the lines it was given: say so where the
+         * cut is, instead of dropping words silently */
+        char last[VLINE];
+        snprintf(last, sizeof(last), "%s ..", out[n - 1]);
+        tx_fit(out[n - 1], VLINE, f, last, maxw);
     }
-    return y;
+    return n;
 }
 
-static void draw_header(Surface *s, Viewer *v, const Chrome *C, int vw) {
-    surf_fill(s, 0, 0, vw, C->hh, C_PANEL);
-    surf_fill(s, 0, C->hh - 1, vw, 1, C_LINE);
+/* ------------------------------------------------------------ layout */
 
-    char right1[200] = "", right2[220] = "";
-    if (v->kind == DOC_IMAGE) {
-        snprintf(right1, sizeof(right1), "%s", v->img.fmt);
-        char sz[48];
+typedef struct { int x, y, w, h; } VRect;
+
+#define VINFO_MAX 10
+
+typedef struct {
+    char label[32];
+    char value[360];
+} VInfoRow;
+
+typedef struct {
+    VFonts f;
+    int m, gap, rule, header_h, footer_h, row_h;
+    VRect header, body, footer;
+
+    /* header: the file's name on the left, one type badge on the right */
+    char title[320];
+    int  title_x, title_y, title_w;
+    char badge[96];
+    int  show_badge, badge_x, badge_y, badge_w, badge_h, badge_dy;
+    u32  badge_col;
+
+    /* image: the picture's box and the one caption line under it */
+    VRect pic;
+    int  caption_y, caption_w;
+    char caption[260];
+
+    /* text: the reading column and its gutter */
+    int  gutter_w, text_x, text_y, text_w, text_rows, text_cols, line_h, cell_w;
+    int  bar_w;
+
+    /* centred state: a mark, a sentence, and one line under it */
+    int  icon_sz, icon_x, icon_y;
+    int  head_lh, sub_lh, state_w;
+    char state_head[3][VLINE];
+    int  state_head_n;
+    char state_sub[3][VLINE];
+    int  state_sub_n;
+    int  state_head_y, state_sub_y;
+
+    /* footer: one hint on the left, one fact on the right */
+    int  foot_y, foot_left_w, foot_right_w;
+    char foot_left[360];
+    char foot_right[160];
+
+    /* the 'i' sheet */
+    int  info_open;
+    VRect info;
+    int  info_title_y, info_rows_y, info_row_h, info_rows_vis, info_scroll;
+    int  info_label_right, info_value_x, info_value_w;
+    int  info_label_dy, info_value_dy;
+    char info_title[48], info_hint[40];
+    VInfoRow row[VINFO_MAX];
+    int  nrow;
+} VLayout;
+
+static int rect_hit(VRect r, int x, int y) {
+    return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+}
+
+static int digits_of(int n) {
+    int d = 1;
+    if (n < 0) n = 0;
+    while (n >= 10) { d++; n /= 10; }
+    return d;
+}
+
+/* -------- the two clamps layout and input share -------- */
+
+static void text_clamp(Viewer *v, const VLayout *L) {
+    int maxfirst = vmax_i(0, v->nlines - L->text_rows);
+    if (v->first_line > maxfirst) v->first_line = maxfirst;
+    if (v->first_line < 0) v->first_line = 0;
+    {
+        int maxcol = vmax_i(0, v->max_cols - L->text_cols);
+        if (v->col_off > maxcol) v->col_off = maxcol;
+        if (v->col_off < 0) v->col_off = 0;
+    }
+}
+
+static void image_clamp_pan(Viewer *v, float z, int cw, int ch) {
+    float mx, my;
+    int sw, sh;
+    if (v->img.w <= 0 || v->img.h <= 0) return;
+    sw = iround((float)v->img.w * z);
+    sh = iround((float)v->img.h * z);
+    mx = sw > cw ? (float)(sw - cw) * 0.5f : 0.0f;
+    my = sh > ch ? (float)(sh - ch) * 0.5f : 0.0f;
+    if (v->pan_x > mx) v->pan_x = mx;
+    if (v->pan_x < -mx) v->pan_x = -mx;
+    if (v->pan_y > my) v->pan_y = my;
+    if (v->pan_y < -my) v->pan_y = -my;
+}
+
+/* -------- the strings -------- */
+
+/* The real facts, in the one place that prints them: the 'i' sheet.
+ * Nothing here is invented - each value is a field of the stat(2) result,
+ * a field of the decoded header, or a count taken from the loaded bytes. */
+static void info_add(VLayout *L, const char *label, const char *value) {
+    VInfoRow *r;
+    if (L->nrow >= VINFO_MAX) return;
+    r = &L->row[L->nrow++];
+    snprintf(r->label, sizeof(r->label), "%s", label);
+    snprintf(r->value, sizeof(r->value), "%s", value);
+}
+
+static void info_rows_build(VLayout *L, const Viewer *v) {
+    char a[360];
+    L->nrow = 0;
+    info_add(L, "Type", v->type_name[0] ? v->type_name : "unknown");
+    info_add(L, "Where", v->path[0] ? v->path : "no path was given");
+
+    if (v->have_st) {
+        char sz[64];
         fmt_size(sz, sizeof(sz), (unsigned long long)v->st.st_size);
-        snprintf(right2, sizeof(right2), "%dx%d  %s", v->img.w, v->img.h, sz);
+        snprintf(a, sizeof(a), "%s (%lld bytes)", sz, (long long)v->st.st_size);
+        info_add(L, "Size", a);
+        fmt_time(a, sizeof(a), v->st.st_mtime);
+        info_add(L, "Modified", a);
+        fmt_mode(a, sizeof(a), (unsigned)v->st.st_mode);
+        info_add(L, "Permissions", a);
+        snprintf(a, sizeof(a), "uid %u · gid %u",
+                 (unsigned)v->st.st_uid, (unsigned)v->st.st_gid);
+        info_add(L, "Owner", a);
+        snprintf(a, sizeof(a), "%llu · %llu links",
+                 (unsigned long long)v->st.st_ino,
+                 (unsigned long long)v->st.st_nlink);
+        info_add(L, "Inode", a);
+    }
+    if (v->kind == DOC_IMAGE && v->img.w > 0) {
+        snprintf(a, sizeof(a), "%d × %d", v->img.w, v->img.h);
+        info_add(L, "Dimensions", a);
+        info_add(L, "Format", v->img.fmt);
     } else if (v->kind == DOC_TEXT) {
-        snprintf(right1, sizeof(right1), "%s", v->type_name);
-        char sz[48];
-        fmt_size(sz, sizeof(sz), (unsigned long long)v->st.st_size);
-        snprintf(right2, sizeof(right2), "%d lines  %s", v->nlines, sz);
-    } else {
-        snprintf(right1, sizeof(right1), "%s", v->type_name);
-        if (v->have_st) {
-            char sz[48];
-            fmt_size(sz, sizeof(sz), (unsigned long long)v->st.st_size);
-            char mode[24];
-            fmt_mode(mode, sizeof(mode), (unsigned)v->st.st_mode);
-            snprintf(right2, sizeof(right2), "%s  %s", sz, mode);
-        }
+        snprintf(a, sizeof(a), "%d", v->nlines);
+        info_add(L, "Lines", a);
+        snprintf(a, sizeof(a), "%s · %s", v->encoding, v->eol);
+        info_add(L, "Encoding", a);
     }
-
-    char r1[200], r2[220];
-    elide_head(r1, sizeof(r1), C->small, right1, vw / 2);
-    elide_head(r2, sizeof(r2), C->small, right2, vw / 2);
-    snprintf(right1, sizeof(right1), "%s", r1);
-    snprintf(right2, sizeof(right2), "%s", r2);
-
-    int y1 = C->pad / 2;
-    int y2 = y1 + C->uh + 2;
-
-    int rw1 = C->small ? (int)font_width(C->small, right1) : 0;
-    int rw2 = C->small ? (int)font_width(C->small, right2) : 0;
-    int rw = vmax_i(rw1, rw2);
-    int maxw = vw - 2 * C->pad - rw - 10;
-    if (maxw < 20) maxw = 20;
-
-    char name[320];
-    elide_head(name, sizeof(name), C->title, v->name, maxw);
-    if (C->title) font_draw(s, C->title, (float)C->pad, (float)y1, name, C_TEXT);
-    if (C->small && right1[0])
-        font_draw(s, C->small, (float)(vw - C->pad - rw1), (float)(y1 + 2), right1, C_ACCENT);
-
-    char path[640];
-    elide_tail(path, sizeof(path), C->small, v->path, maxw);
-    if (C->small) font_draw(s, C->small, (float)C->pad, (float)y2, path, C_DIM);
-    if (C->small && right2[0])
-        font_draw(s, C->small, (float)(vw - C->pad - rw2), (float)(y2 + 2), right2, C_DIM);
 }
 
-static void draw_footer(Surface *s, Viewer *v, const Chrome *C, const Layout *L, int vw, int vh) {
-    surf_fill(s, 0, L->footer.y, vw, L->footer.h, C_PANEL);
-    surf_fill(s, 0, L->footer.y, vw, 1, C_LINE);
-    int y = L->footer.y + (L->footer.h - C->uh) / 2;
+/* Lower-case "needs a video decoder" reads as a fragment under a heading,
+ * so the sentence is capitalised where it is displayed. */
+static void cap_first(char *s) {
+    if (s[0] >= 'a' && s[0] <= 'z') s[0] = (char)(s[0] - 'a' + 'A');
+}
 
-    char hint[256];
-    char right[200] = "";
-    if (v->kind == DOC_IMAGE) {
-        float z = image_effective_zoom(v, L->body.w, L->body.h);
-        snprintf(hint, sizeof(hint),
-                 "wheel: zoom     drag: pan     +/-: zoom     0 or F: fit     Q: quit     "
-                 "showing %.1f%%", (double)(z * 100.0f));
-        if (rect_hit(L->body, v->mx, v->my)) {
+/* The centred sentence for a state that has no content to paint. */
+static void state_build(VLayout *L, Viewer *v) {
+    char head[420];
+    char sub[420];
+    head[0] = sub[0] = 0;
+    L->state_head_n = 0;
+    L->state_sub_n = 0;
+
+    switch (v->kind) {
+    case DOC_NONE:
+        snprintf(head, sizeof(head), "Nothing to open.");
+        snprintf(sub, sizeof(sub),
+                 "Open a file from Files, or run: viewer <path>");
+        break;
+    case DOC_MISSING:
+        snprintf(head, sizeof(head), "%s", v->error[0] ? v->error : "cannot read this file");
+        cap_first(head);
+        snprintf(sub, sizeof(sub), "%s", v->path[0] ? v->path : "");
+        break;
+    case DOC_EMPTY:
+        snprintf(head, sizeof(head), "This file is empty.");
+        if (v->type_name[0] && strcmp(v->type_name, "unknown") != 0)
+            snprintf(sub, sizeof(sub), "%s · 0 bytes", v->type_name);
+        else
+            snprintf(sub, sizeof(sub), "0 bytes · nothing to read");
+        break;
+    default:                       /* DOC_OTHER */
+        snprintf(head, sizeof(head), "%s", v->type_name[0] ? v->type_name : "unknown file");
+        snprintf(sub, sizeof(sub), "%s",
+                 v->other_note[0] ? v->other_note : cat_needs(v->cat));
+        cap_first(sub);
+        break;
+    }
+
+    L->state_head_n = wrap_text(L->state_head, 3, L->f.body, L->state_w, head);
+    if (v->kind == DOC_MISSING) {
+        /* a path has no spaces: keep its tail rather than wrap the head */
+        tx_fit_tail(L->state_sub[0], VLINE, L->f.small, sub, L->state_w);
+        L->state_sub_n = L->state_sub[0][0] ? 1 : 0;
+    } else {
+        L->state_sub_n = wrap_text(L->state_sub, 3, L->f.small, L->state_w, sub);
+    }
+}
+
+static void foot_build(VLayout *L, Viewer *v) {
+    L->foot_left[0] = L->foot_right[0] = 0;
+
+    switch (v->kind) {
+    case DOC_TEXT: {
+        char sz[48], tot[48];
+        if (v->truncated) {
+            fmt_size(sz, sizeof(sz), (unsigned long long)v->text_len);
+            fmt_size(tot, sizeof(tot), (unsigned long long)v->st.st_size);
+            snprintf(L->foot_left, sizeof(L->foot_left),
+                     "first %s of %s · %s · %s", sz, tot, v->encoding, v->eol);
+        } else {
+            fmt_size(sz, sizeof(sz), (unsigned long long)v->st.st_size);
+            snprintf(L->foot_left, sizeof(L->foot_left),
+                     "%s · %s · %s", sz, v->encoding, v->eol);
+        }
+        snprintf(L->foot_right, sizeof(L->foot_right), "%d lines", v->nlines);
+        break;
+    }
+    case DOC_IMAGE: {
+        float z = image_effective_zoom(v, L->pic.w, L->pic.h);
+        int pct = (int)(z * 100.0f + 0.5f);
+        int hover = 0;
+        if (v->img.px && v->img.w > 0 && v->img.h > 0 &&
+            rect_hit(L->pic, v->mx, v->my)) {
             int sw = iround((float)v->img.w * z);
             int sh = iround((float)v->img.h * z);
-            int ox = L->body.x + (L->body.w - sw) / 2 + iround(v->pan_x);
-            int oy = L->body.y + (L->body.h - sh) / 2 + iround(v->pan_y);
+            int ox = L->pic.x + (L->pic.w - sw) / 2 + iround(v->pan_x);
+            int oy = L->pic.y + (L->pic.h - sh) / 2 + iround(v->pan_y);
             int ix = (int)((float)(v->mx - ox) / z);
             int iy = (int)((float)(v->my - oy) / z);
             if (ix >= 0 && ix < v->img.w && iy >= 0 && iy < v->img.h) {
                 u32 p = v->img.px[(size_t)iy * (size_t)v->img.w + (size_t)ix];
-                snprintf(right, sizeof(right), "x %d  y %d  #%02X%02X%02X  a%d",
-                         ix, iy, GET_R(p), GET_G(p), GET_B(p), GET_A(p));
+                snprintf(L->foot_left, sizeof(L->foot_left),
+                         "x %d · y %d · #%02X%02X%02X", ix, iy,
+                         GET_R(p), GET_G(p), GET_B(p));
+                hover = 1;
             }
         }
-    } else if (v->kind == DOC_TEXT) {
-        if (v->truncated) {
-            char tot[48], cap[48];
-            fmt_size(tot, sizeof(tot), (unsigned long long)v->st.st_size);
-            fmt_size(cap, sizeof(cap), (unsigned long long)MAX_TEXT_BYTES);
-            snprintf(hint, sizeof(hint),
-                     "SHOWING FIRST %s OF %s (truncated)     arrows scroll     PgUp/PgDn     Home/End     Q: quit",
-                     cap, tot);
+        if (!hover)
+            snprintf(L->foot_left, sizeof(L->foot_left), "wheel · zoom     drag · pan");
+        if (v->zoom <= 0.0f) {
+            if (pct < 1) snprintf(L->foot_right, sizeof(L->foot_right), "fit · <1%%");
+            else snprintf(L->foot_right, sizeof(L->foot_right), "fit · %d%%", pct);
         } else {
-            snprintf(hint, sizeof(hint),
-                     "up/down: line     left/right: column (shift=8)     PgUp/PgDn     Home/End     Q: quit");
+            if (pct < 1) snprintf(L->foot_right, sizeof(L->foot_right), "<1%%");
+            else snprintf(L->foot_right, sizeof(L->foot_right), "%d%%", pct);
         }
-        snprintf(right, sizeof(right), "line %d/%d  col %d  tabs=8",
-                 v->first_line + 1, v->nlines, v->col_off);
-    } else {
-        snprintf(hint, sizeof(hint), "Q: quit");
-        snprintf(right, sizeof(right), "read-only");
+        break;
     }
-
-    int rw = C->small ? (int)font_width(C->small, right) : 0;
-    int maxw = vw - 2 * C->pad - rw - 10;
-    if (maxw < 20) maxw = 20;
-    char left[320];
-    elide_head(left, sizeof(left), C->small, hint, maxw);
-    if (C->small) font_draw(s, C->small, (float)C->pad, (float)y, left,
-                            v->truncated && v->kind == DOC_TEXT ? C_WARN : C_DIM);
-    if (C->small && right[0])
-        font_draw(s, C->small, (float)(vw - C->pad - rw), (float)y, right, C_DIM);
+    case DOC_OTHER:
+        snprintf(L->foot_left, sizeof(L->foot_left), "i · file details");
+        if (v->have_st) {
+            char sz[48];
+            fmt_size(sz, sizeof(sz), (unsigned long long)v->st.st_size);
+            snprintf(L->foot_right, sizeof(L->foot_right), "%s", sz);
+        }
+        break;
+    case DOC_EMPTY:
+        snprintf(L->foot_left, sizeof(L->foot_left), "i · file details");
+        snprintf(L->foot_right, sizeof(L->foot_right), "0 bytes");
+        break;
+    case DOC_MISSING:
+        snprintf(L->foot_left, sizeof(L->foot_left), "q · close");
+        if (v->have_st) {
+            char sz[48];
+            fmt_size(sz, sizeof(sz), (unsigned long long)v->st.st_size);
+            snprintf(L->foot_right, sizeof(L->foot_right), "%s", sz);
+        }
+        break;
+    default:                       /* DOC_NONE */
+        snprintf(L->foot_left, sizeof(L->foot_left), "q · close");
+        break;
+    }
 }
 
-static void draw_text_view(Surface *s, Viewer *v, const Chrome *C, VRect body) {
-    surf_fill(s, body.x, body.y, body.w, body.h, C_BG2);
-    int rows, cols, gutter;
-    text_metrics(v, C, body, &rows, &cols, &gutter);
-    text_clamp(v, C, body);
+static void layout_build(VLayout *L, Viewer *v, int w, int h) {
+    memset(L, 0, sizeof(*L));
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
 
-    int first = v->first_line;
-    int coloff = v->col_off;
-    int hsb = 6;
+    L->f = vfonts();
+    L->m = SP(2);
+    L->gap = SP(1);
+    L->rule = ui_px(1);
+    L->bar_w = ui_px(3);
+    L->row_h = vceil(font_height(L->f.body)) + L->gap;
+    if (L->row_h < SP(3)) L->row_h = SP(3);
 
-    surf_fill(s, body.x, body.y, gutter, body.h - hsb, C_GUTTER);
-    surf_fill(s, body.x + gutter - 1, body.y, 1, body.h - hsb, C_LINE);
+    L->header_h = vceil(font_height(L->f.title)) + 2 * L->gap;
+    L->footer_h = vceil(font_height(L->f.small)) + 2 * L->gap;
 
-    char *disp = malloc((size_t)cols * 4u + 8u);
+    /* Bands. A short window gives up the footer band before it gives up
+     * content: below four rows of air the footer's one line costs more
+     * than it is worth, so the page keeps the space. The header stays
+     * longest, because the file's name is the last thing to go. */
+    {
+        int body_h = h - L->header_h - L->footer_h - 2 * L->gap;
+        if (body_h < 4 * L->row_h) {
+            L->footer_h = 0;
+            body_h = h - L->header_h - L->gap;
+        }
+        if (body_h < L->row_h) {
+            L->header_h = h / 3;
+            body_h = h - L->header_h - (L->footer_h ? L->footer_h + L->gap : 0);
+        }
+        if (body_h < 1) body_h = 1;
+
+        L->header = (VRect){ 0, 0, w, L->header_h };
+        L->footer = (VRect){ 0, h - L->footer_h, w, L->footer_h };
+        L->body = (VRect){ L->m, L->header_h + L->gap,
+                           w - 2 * L->m, body_h };
+        if (L->body.w < 1) L->body.w = 1;
+    }
+
+    /* Header: the name on the left, one type badge on the right, nothing
+     * else. The badge is dropped before it is allowed to squeeze the name. */
+    L->badge_col = (v->kind == DOC_MISSING) ? C_WARN :
+                   (v->kind == DOC_EMPTY || v->kind == DOC_NONE) ? C_DIM : C_ACCENT;
+    L->title_x = L->body.x;
+    L->title_y = vtop(L->f.title, L->header_h);
+    snprintf(L->badge, sizeof(L->badge), "%s", v->badge);
+    if (L->badge[0]) {
+        int bh = vceil(font_height(L->f.small)) + L->gap;
+        int bw = tx_w(L->f.small, L->badge) + 2 * L->gap;
+        if (bw <= (w - 2 * L->m) / 2) {
+            L->show_badge = 1;
+            L->badge_h = bh;
+            L->badge_w = bw;
+            L->badge_x = w - L->m - bw;
+            L->badge_y = (L->header_h - bh) / 2;
+            L->badge_dy = L->badge_y + vtop(L->f.small, bh);
+        }
+    }
+    L->title_w = (L->show_badge ? L->badge_x - L->gap : w - L->m) - L->title_x;
+    if (L->title_w < SP(6)) {          /* no room for both: keep the name */
+        L->show_badge = 0;
+        L->title_w = w - L->m - L->title_x;
+    }
+    if (L->title_w < 1) L->title_w = 1;
+    tx_fit(L->title, sizeof(L->title), L->f.title, v->name, L->title_w);
+
+    /* Body, by kind. */
+    if (v->kind == DOC_TEXT) {
+        L->line_h = vceil(font_height(L->f.mono));
+        if (L->line_h < SP(2)) L->line_h = SP(2);
+        L->cell_w = tx_w(L->f.mono, "M");
+        if (L->cell_w < 1) L->cell_w = 1;
+        L->gutter_w = digits_of(v->nlines) * L->cell_w + 2 * L->gap;
+        if (L->gutter_w > L->body.w / 2) L->gutter_w = L->body.w / 2;
+        if (L->gutter_w < L->cell_w + L->gap) L->gutter_w = L->cell_w + L->gap;
+        L->text_x = L->body.x + L->gutter_w;
+        L->text_w = L->body.x + L->body.w - L->gap - (L->bar_w + L->gap) - L->text_x;
+        if (L->text_w < 1) L->text_w = 1;
+        L->text_y = L->body.y + L->gap;
+        L->text_rows = (L->body.h - 2 * L->gap) / L->line_h;
+        if (L->text_rows < 1) L->text_rows = 1;
+        L->text_cols = L->text_w / L->cell_w;
+        if (L->text_cols < 1) L->text_cols = 1;
+        text_clamp(v, L);
+    } else if (v->kind == DOC_IMAGE) {
+        int cap_h = vceil(font_height(L->f.small));
+        L->caption_y = L->body.y + L->body.h - L->gap - cap_h;
+        L->pic.x = L->body.x + L->gap;
+        L->pic.y = L->body.y + L->gap;
+        L->pic.w = L->body.w - 2 * L->gap;
+        L->pic.h = L->caption_y - L->gap - L->pic.y;
+        if (L->pic.w < 1) L->pic.w = 1;
+        if (L->pic.h < 1) L->pic.h = 1;
+        L->caption_w = L->body.w - 2 * L->gap;
+        {
+            char sz[48], fmt[24];
+            const char *fw = v->img.fmt;
+            size_t n = 0;
+            while (fw[n] && fw[n] != ' ' && fw[n] != ',' && n < sizeof(fmt) - 1) {
+                fmt[n] = fw[n];
+                n++;
+            }
+            fmt[n] = 0;
+            fmt_size(sz, sizeof(sz), (unsigned long long)v->st.st_size);
+            snprintf(L->caption, sizeof(L->caption), "%d × %d · %s · %s",
+                     v->img.w, v->img.h, fmt[0] ? fmt : "image", sz);
+        }
+        /* clamp the pan here too, so the footer's pixel readout is taken
+         * from the pan the painter is about to use */
+        image_clamp_pan(v, image_effective_zoom(v, L->pic.w, L->pic.h),
+                        L->pic.w, L->pic.h);
+    } else {
+        /* the centred state: a mark above a sentence, centred as one block */
+        L->head_lh = vceil(font_height(L->f.body));
+        L->sub_lh = vceil(font_height(L->f.small));
+        L->state_w = L->body.w - 4 * L->gap;
+        if (L->state_w > SP(52)) L->state_w = SP(52);
+        if (L->state_w < SP(8)) L->state_w = L->body.w - 2 * L->gap;
+        if (L->state_w < 1) L->state_w = 1;
+        L->icon_sz = SP(9);
+        if (L->icon_sz > L->body.w / 4) L->icon_sz = L->body.w / 4;
+        if (L->icon_sz > L->body.h / 3) L->icon_sz = L->body.h / 3;
+        if (L->icon_sz < SP(3)) L->icon_sz = SP(3);
+
+        state_build(L, v);
+
+        /* Fit the block to the page. The sentence is what the state is
+         * FOR, so it is the last thing shortened: the mark shrinks first,
+         * then (never for an unsupported type, whose sentence this is) the
+         * line under it, and only then the sentence itself. */
+        {
+            int avail = L->body.h - 2 * L->gap;
+            int text_h = L->state_head_n * L->head_lh
+                       + (L->state_sub_n ? L->gap + L->state_sub_n * L->sub_lh : 0);
+            int block;
+
+            while (L->state_sub_n > 0 && v->kind != DOC_OTHER &&
+                   text_h + L->gap + L->icon_sz > avail) {
+                L->state_sub_n--;
+                text_h = L->state_head_n * L->head_lh
+                       + (L->state_sub_n ? L->gap + L->state_sub_n * L->sub_lh : 0);
+            }
+            if (text_h + L->gap + L->icon_sz > avail) {
+                int room = avail - L->gap - text_h;
+                L->icon_sz = room > 0 ? room : 0;
+            }
+            if (L->icon_sz < SP(2)) L->icon_sz = 0;
+            block = L->icon_sz + L->gap
+                  + L->state_head_n * L->head_lh
+                  + (L->state_sub_n ? L->gap + L->state_sub_n * L->sub_lh : 0);
+            while (L->state_head_n > 1 && block > avail) {
+                L->state_head_n--;
+                block = L->icon_sz + L->gap
+                      + L->state_head_n * L->head_lh
+                      + (L->state_sub_n ? L->gap + L->state_sub_n * L->sub_lh : 0);
+            }
+
+            {
+                int top = L->body.y + (L->body.h - block) / 2;
+                if (top < L->body.y + L->gap) top = L->body.y + L->gap;
+                L->icon_y = top;
+                L->icon_x = L->body.x + L->body.w / 2;
+                L->state_head_y = L->icon_y + (L->icon_sz ? L->icon_sz + L->gap : 0);
+                L->state_sub_y = L->state_head_y + L->state_head_n * L->head_lh + L->gap;
+            }
+        }
+    }
+
+    foot_build(L, v);
+    L->foot_y = L->footer.y + vtop(L->f.small, L->footer.h);
+    L->foot_right_w = tx_w(L->f.small, L->foot_right);
+    {
+        int room = w - 2 * L->m;
+        L->foot_left_w = L->foot_right_w > 0
+                       ? room - L->foot_right_w - 2 * L->gap : room;
+        if (L->foot_left_w < SP(2)) L->foot_left_w = SP(2);
+        if (L->foot_right_w > room / 2) L->foot_right_w = room / 2;
+    }
+
+    /* The 'i' sheet: the only place stat(2) fields are painted. */
+    L->info_open = v->info_open;
+    if (L->info_open) {
+        int pad = L->m;
+        int th = vceil(font_height(L->f.title));
+        int iw = w - 2 * L->m;
+        int ih, vis;
+        info_rows_build(L, v);
+
+        if (iw > SP(52)) iw = SP(52);
+        if (iw < SP(20)) iw = w - 2 * L->m;
+        if (iw < 1) iw = 1;
+
+        ih = 2 * pad + th + 2 * L->gap + L->nrow * L->row_h;
+        if (ih > h - 2 * L->gap) ih = h - 2 * L->gap;
+        if (ih < 1) ih = 1;
+        vis = (ih - 2 * pad - th - 2 * L->gap) / L->row_h;
+        if (vis < 1) vis = 1;
+        if (vis > L->nrow) vis = L->nrow;
+        if (vis < 1) vis = 1;
+
+        L->info = (VRect){ (w - iw) / 2, (h - ih) / 2, iw, ih };
+        L->info_title_y = L->info.y + pad + vtop(L->f.title, th);
+        L->info_rows_y = L->info.y + pad + th + 2 * L->gap;
+        L->info_row_h = L->row_h;
+        L->info_rows_vis = vis;
+        {
+            int maxs = L->nrow - vis;
+            if (maxs < 0) maxs = 0;
+            if (v->info_scroll > maxs) v->info_scroll = maxs;
+            if (v->info_scroll < 0) v->info_scroll = 0;
+            L->info_scroll = v->info_scroll;
+        }
+        L->info_label_dy = vbaseline(L->f.body, L->f.small, L->row_h);
+        L->info_value_dy = vtop(L->f.body, L->row_h);
+        {
+            int lw = 0;
+            int cap = (iw - 2 * pad) / 3;
+            for (int i = 0; i < L->nrow; i++) {
+                int rw = tx_w(L->f.small, L->row[i].label);
+                if (rw > lw) lw = rw;
+            }
+            if (lw > cap) lw = cap;
+            L->info_label_right = L->info.x + pad + lw;
+            L->info_value_x = L->info_label_right + 2 * L->gap;
+            L->info_value_w = L->info.x + iw - pad - L->info_value_x;
+            if (L->info_value_w < SP(2)) L->info_value_w = SP(2);
+        }
+        snprintf(L->info_title, sizeof(L->info_title), "File info");
+        snprintf(L->info_hint, sizeof(L->info_hint), "i or esc closes");
+    }
+}
+
+/* ------------------------------------------------------------ drawing */
+
+/* The marks the centred states use. One rounded sheet with a glyph inside
+ * it, drawn from the same primitives as the rest of the desktop: no
+ * bitmaps and no invented icon font. */
+static void draw_mark(Surface *s, int kind, int cx, int y, int sz, u32 tint_col) {
+    int x = cx - sz / 2;
+    float fx = (float)x, fy = (float)y, fs = (float)sz;
+    float r = fs * 0.18f;
+    u32 line = color_alpha(tint_col, 0.52f);
+    u32 faint = color_alpha(tint_col, 0.28f);
+    u32 fill = color_alpha(tint_col, 0.055f);
+    float lw = (float)ui_px(2) * 0.8f;
+    int i;
+
+    if (sz < SP(2)) return;
+    if (lw < 1.0f) lw = 1.0f;
+
+    if (kind == MARK_FOLDER) {
+        gfx_rrect_aa(s, fx, fy + fs * 0.26f, fs * 0.46f, fs * 0.18f,
+                     r * 0.5f, line, 0, 0);
+        gfx_rrect_aa(s, fx, fy + fs * 0.36f, fs, fs * 0.42f,
+                     r, fill, line, lw);
+        return;
+    }
+
+    gfx_rrect_aa(s, fx, fy, fs, fs, r, fill, line, lw);
+
+    switch (kind) {
+    case MARK_PICTURE:
+        gfx_rrect_aa(s, fx + fs * 0.62f, fy + fs * 0.20f, fs * 0.14f, fs * 0.14f,
+                     fs * 0.07f, line, 0, 0);
+        gfx_line(s, fx + fs * 0.16f, fy + fs * 0.72f,
+                 fx + fs * 0.36f, fy + fs * 0.50f, lw, faint);
+        gfx_line(s, fx + fs * 0.36f, fy + fs * 0.50f,
+                 fx + fs * 0.54f, fy + fs * 0.70f, lw, faint);
+        gfx_line(s, fx + fs * 0.58f, fy + fs * 0.66f,
+                 fx + fs * 0.70f, fy + fs * 0.56f, lw, faint);
+        break;
+    case MARK_PLAY: {
+        float tri[6] = {
+            fx + fs * 0.42f, fy + fs * 0.30f,
+            fx + fs * 0.42f, fy + fs * 0.70f,
+            fx + fs * 0.68f, fy + fs * 0.50f
+        };
+        gfx_polygon(s, tri, 3, line);
+        break;
+    }
+    case MARK_SOUND:
+        gfx_rrect_aa(s, fx + fs * 0.28f, fy + fs * 0.56f, fs * 0.20f, fs * 0.16f,
+                     fs * 0.08f, line, 0, 0);
+        gfx_line(s, fx + fs * 0.48f, fy + fs * 0.62f,
+                 fx + fs * 0.48f, fy + fs * 0.32f, lw, line);
+        gfx_line(s, fx + fs * 0.48f, fy + fs * 0.32f,
+                 fx + fs * 0.64f, fy + fs * 0.38f, lw, line);
+        break;
+    case MARK_BOX:
+        tint(s, x + sz / 8, y + sz * 46 / 100, sz - sz / 4, ui_px(2), faint);
+        tint(s, x + sz * 42 / 100, y + sz * 58 / 100, sz * 16 / 100,
+             sz * 10 / 100, faint);
+        break;
+    case MARK_MISSING:
+        tint(s, cx - vmax_i(1, ui_px(2) / 2), y + sz * 28 / 100,
+             vmax_i(1, ui_px(2)), sz * 28 / 100, line);
+        tint(s, cx - vmax_i(1, ui_px(2) / 2), y + sz * 64 / 100,
+             vmax_i(1, ui_px(2)), vmax_i(2, sz * 8 / 100), line);
+        break;
+    default:                       /* MARK_PAGE */
+        for (i = 0; i < 3; i++) {
+            int lw2 = sz * (i == 2 ? 36 : 52) / 100;
+            tint(s, x + sz * 24 / 100, y + sz * (38 + i * 12) / 100,
+                 lw2, vmax_i(1, ui_px(2)), faint);
+        }
+        break;
+    }
+}
+
+static void draw_scroll_v(Surface *s, int x, int y, int h, int first,
+                          int total, int vis, int bw) {
+    if (h <= 0 || bw <= 0) return;
+    tint(s, x, y, bw, h, color_alpha(C_TEXT, 0.045f));
+    if (total <= vis || total < 1) return;
+    {
+        int th = h * vis / total;
+        int maxf = total - vis;
+        int ty;
+        if (th < SP(2)) th = SP(2);
+        if (th > h) th = h;
+        ty = y + (maxf > 0 ? (h - th) * first / maxf : 0);
+        tint(s, x, ty, bw, th, color_alpha(C_ACCENT, 0.42f));
+    }
+}
+
+static void draw_scroll_h(Surface *s, int x, int y, int w, int first,
+                          int total, int vis, int bh) {
+    if (w <= 0 || bh <= 0) return;
+    tint(s, x, y, w, bh, color_alpha(C_TEXT, 0.045f));
+    if (total <= vis || total < 1) return;
+    {
+        int tw = w * vis / total;
+        int maxf = total - vis;
+        int tx;
+        if (tw < SP(2)) tw = SP(2);
+        if (tw > w) tw = w;
+        tx = x + (maxf > 0 ? (w - tw) * first / maxf : 0);
+        tint(s, tx, y, tw, bh, color_alpha(C_ACCENT, 0.42f));
+    }
+}
+
+static void draw_header(Surface *s, const VLayout *L, int w) {
+    surf_fill(s, 0, 0, w, L->header.h, C_HEAD);
+    surf_fill(s, 0, L->header.h - L->rule, w, L->rule, C_LINE);
+    tx_at(s, L->f.title, L->title_x, L->title_y, L->title_w, L->title, C_TEXT);
+    if (L->show_badge) {
+        gfx_rrect_aa(s, (float)L->badge_x, (float)L->badge_y,
+                     (float)L->badge_w, (float)L->badge_h,
+                     (float)L->badge_h * 0.5f,
+                     color_alpha(L->badge_col, 0.12f),
+                     color_alpha(L->badge_col, 0.42f), 1.0f);
+        tx_center(s, L->f.small, L->badge_x + L->badge_w / 2, L->badge_dy,
+                  L->badge_w - L->gap, L->badge, L->badge_col);
+    }
+}
+
+static void draw_footer(Surface *s, const VLayout *L, int w) {
+    if (L->footer.h <= 0) return;
+    surf_fill(s, 0, L->footer.y, w, L->footer.h, C_HEAD);
+    surf_fill(s, 0, L->footer.y, w, L->rule, C_LINE);
+    tx_at(s, L->f.small, L->m, L->foot_y, L->foot_left_w, L->foot_left, C_DIM);
+    tx_right(s, L->f.small, w - L->m, L->foot_y, L->foot_right_w,
+             L->foot_right, C_DIM);
+}
+
+static void draw_text_view(Surface *s, const Viewer *v, const VLayout *L) {
+    char *disp = malloc((size_t)L->text_cols * 4u + 8u);
+    int i;
     if (!disp) return;
 
-    for (int i = 0; i < rows; i++) {
-        int ln = first + i;
+    for (i = 0; i < L->text_rows; i++) {
+        int ln = v->first_line + i;
+        int y = L->text_y + i * L->line_h;
+        char num[24];
+        size_t start, end;
         if (ln >= v->nlines) break;
-        int y = body.y + i * C->mh;
-        char num[32];
-        snprintf(num, sizeof(num), "%d", ln + 1);
-        if (C->mono)
-            font_draw(s, C->mono,
-                      (float)(body.x + gutter - C->pad) - font_width(C->mono, num),
-                      (float)y, num, C_DIM);
 
-        size_t start = v->line_off[ln];
-        size_t end = v->line_off[ln + 1];
+        snprintf(num, sizeof(num), "%d", ln + 1);
+        tx_right(s, L->f.small, L->text_x - L->gap,
+                 y + (int)(font_ascent(L->f.mono) - font_ascent(L->f.small) + 0.5f),
+                 L->gutter_w - 2 * L->gap, num, C_FAINT);
+
+        start = v->line_off[ln];
+        end = v->line_off[ln + 1];
         if (end > start && v->text[end - 1] == '\n') end--;
-        build_display(v->text + start, end - start, coloff, cols, disp,
-                      (size_t)cols * 4u + 8u);
-        Surface ts = *s;
-        ts.px = s->px + (size_t)y * (size_t)s->stride + (size_t)(body.x + gutter);
-        ts.w = body.w - gutter - 8;
-        if (ts.w < 1) ts.w = 1;
-        ts.h = C->mh;
-        surf_unclip(&ts);
-        if (C->mono) font_draw(&ts, C->mono, 2.0f, 0.0f, disp, C_TEXT);
+        build_display(v->text + start, end - start, v->col_off, L->text_cols,
+                      disp, (size_t)L->text_cols * 4u + 8u);
+        tx_at(s, L->f.mono, L->text_x, y, L->text_w, disp, C_TEXT);
     }
     free(disp);
 
-    /* vertical scrollbar: the thumb is the visible fraction of the file */
-    int track_x = body.x + body.w - 5;
-    int track_y = body.y + 2;
-    int track_h = body.h - hsb - 4;
-    if (track_h > 4) {
-        surf_fill(s, track_x, track_y, 4, track_h, C_GUTTER);
-        if (v->nlines > rows && rows > 0) {
-            int thumb_h = track_h * rows / v->nlines;
-            if (thumb_h < 16) thumb_h = 16;
-            if (thumb_h > track_h) thumb_h = track_h;
-            int maxt = v->nlines - rows;
-            int ty = track_y + (maxt > 0 ? (track_h - thumb_h) * first / maxt : 0);
-            surf_fill(s, track_x, ty, 4, thumb_h, C_LINE);
-        }
-    }
-
-    /* horizontal scrollbar */
-    int htrack_x = body.x + gutter;
-    int htrack_w = body.w - gutter - 8;
-    if (htrack_w > 4) {
-        surf_fill(s, htrack_x, body.y + body.h - 4, htrack_w, 4, C_GUTTER);
-        if (v->max_cols > cols && cols > 0) {
-            int thumb_w = htrack_w * cols / v->max_cols;
-            if (thumb_w < 16) thumb_w = 16;
-            if (thumb_w > htrack_w) thumb_w = htrack_w;
-            int maxt = v->max_cols - cols;
-            int tx = htrack_x + (maxt > 0 ? (htrack_w - thumb_w) * coloff / maxt : 0);
-            surf_fill(s, tx, body.y + body.h - 4, thumb_w, 4, C_LINE);
-        }
-    }
+    /* two bars, and only when there is something off screen */
+    draw_scroll_v(s, L->body.x + L->body.w - L->gap - L->bar_w,
+                  L->text_y, L->body.h - 2 * L->gap,
+                  v->first_line, v->nlines, L->text_rows, L->bar_w);
+    draw_scroll_h(s, L->text_x, L->body.y + L->body.h - L->gap - L->bar_w,
+                  L->text_w, v->col_off, v->max_cols, L->text_cols, L->bar_w);
 }
 
-static void draw_image_view(Surface *s, Viewer *v, const Chrome *C, VRect body) {
-    (void)C;
+static void draw_image_view(Surface *s, Viewer *v, const VLayout *L) {
+    VRect p = L->pic;
+    float z = image_effective_zoom(v, p.w, p.h);
     Surface sub = *s;
-    sub.px = s->px + (size_t)body.y * (size_t)s->stride + (size_t)body.x;
-    sub.w = body.w;
-    sub.h = body.h;
-    surf_unclip(&sub);
-    float z = image_effective_zoom(v, body.w, body.h);
-    image_clamp_pan(v, z, body.w, body.h);
+
+    image_clamp_pan(v, z, p.w, p.h);
+
+    /* the picture's own edge, when it fits: keeps a light image from
+     * bleeding into the page */
+    {
+        int sw = iround((float)v->img.w * z);
+        int sh = iround((float)v->img.h * z);
+        int ox = p.x + (p.w - sw) / 2 + iround(v->pan_x);
+        int oy = p.y + (p.h - sh) / 2 + iround(v->pan_y);
+        if (sw <= p.w && sh <= p.h)
+            gfx_rrect_aa(s, (float)ox - 0.5f, (float)oy - 0.5f,
+                         (float)sw + 1.0f, (float)sh + 1.0f, 0.0f,
+                         0, color_alpha(C_TEXT, 0.10f), 1.0f);
+    }
+
+    sub.px = s->px + (size_t)p.y * (size_t)s->stride + (size_t)p.x;
+    sub.w = p.w;
+    sub.h = p.h;
+    surf_clip(&sub, 0, 0, p.w, p.h);
     image_draw(&v->img, sub.px, sub.w, sub.h, sub.stride, z,
-               v->pan_x, v->pan_y, 1);
-    surf_fill(s, body.x, body.y, body.w, 1, C_LINE);
-    surf_fill(s, body.x, body.y + body.h - 1, body.w, 1, C_LINE);
-    surf_fill(s, body.x, body.y, 1, body.h, C_LINE);
-    surf_fill(s, body.x + body.w - 1, body.y, 1, body.h, C_LINE);
+               v->pan_x, v->pan_y, !v->img.opaque);
+
+    tx_center(s, L->f.small, L->body.x + L->body.w / 2, L->caption_y,
+              L->caption_w, L->caption, C_DIM);
 }
 
-static void fact_line(Surface *s, const Chrome *C, int x, int y, int labelw,
-                      int maxw, const char *label, const char *value) {
-    if (C->mono) font_draw(s, C->mono, (float)x, (float)y, label, C_DIM);
-    char buf[600];
-    elide_head(buf, sizeof(buf), C->mono, value, maxw);
-    if (C->mono) font_draw(s, C->mono, (float)(x + labelw), (float)y, buf, C_TEXT);
+static void draw_state(Surface *s, const Viewer *v, const VLayout *L) {
+    int cx = L->body.x + L->body.w / 2;
+    int i;
+    draw_mark(s, v->mark, cx, L->icon_y, L->icon_sz, L->badge_col);
+    for (i = 0; i < L->state_head_n; i++)
+        tx_center(s, L->f.body, cx, L->state_head_y + i * L->head_lh,
+                  L->state_w, L->state_head[i], C_TEXT);
+    for (i = 0; i < L->state_sub_n; i++)
+        tx_center(s, L->f.small, cx, L->state_sub_y + i * L->sub_lh,
+                  L->state_w, L->state_sub[i], C_DIM);
 }
 
-static void draw_facts(Surface *s, Viewer *v, const Chrome *C, VRect body) {
-    surf_fill(s, body.x, body.y, body.w, body.h, C_BG2);
-    int x = body.x + C->pad;
-    int y = body.y + C->pad;
-    int maxw = body.w - 2 * C->pad;
-    int labelw = 10 * C->mw;
+static void draw_info(Surface *s, const VLayout *L, int w, int h) {
+    int i;
+    int th = vceil(font_height(L->f.title));
 
-    if (v->kind == DOC_ERROR) {
-        if (C->ui) font_draw(s, C->ui, (float)x, (float)y, "Cannot open this file", C_WARN);
-        y += C->uh + 2;
-        y = draw_wrapped(s, C->mono, x, y, maxw, C->mh, v->error, C_TEXT);
-        y += C->pad;
-    } else {
-        if (C->ui) font_draw(s, C->ui, (float)x, (float)y, v->type_name, C_TEXT);
-        y += C->uh + 2;
-        if (v->other_note[0])
-            y = draw_wrapped(s, C->mono, x, y, maxw, C->mh, v->other_note, C_ACCENT);
-        y += C->pad;
-        if (C->small) font_draw(s, C->small, (float)x, (float)y,
-                                "the file's own facts", C_DIM);
-        y += C->small ? (int)font_height(C->small) + 4 : C->mh;
+    tint(s, 0, 0, w, h, WITH_A(0x000000u, 0x88));
+    gfx_rrect_aa(s, (float)L->info.x, (float)L->info.y, (float)L->info.w,
+                 (float)L->info.h, (float)SP(1), C_HEAD,
+                 color_alpha(C_TEXT, 0.12f), 1.0f);
+
+    tx_at(s, L->f.title, L->info.x + L->m, L->info_title_y,
+          L->info.w - 2 * L->m, L->info_title, C_TEXT);
+    tx_right(s, L->f.small, L->info.x + L->info.w - L->m,
+             L->info_title_y + (th - vceil(font_height(L->f.small))) / 2,
+             L->info.w / 2 - L->m, L->info_hint, C_DIM);
+
+    tint(s, L->info.x + L->m, L->info_rows_y - L->gap,
+         L->info.w - 2 * L->m, L->rule, color_alpha(C_TEXT, 0.08f));
+
+    for (i = 0; i < L->info_rows_vis; i++) {
+        int r = L->info_scroll + i;
+        int y;
+        if (r >= L->nrow) break;
+        y = L->info_rows_y + i * L->info_row_h;
+        tx_right(s, L->f.small, L->info_label_right, y + L->info_label_dy,
+                 L->info_label_right - (L->info.x + L->m),
+                 L->row[r].label, C_DIM);
+        tx_at(s, L->f.body, L->info_value_x, y + L->info_value_dy,
+              L->info_value_w, L->row[r].value, C_TEXT);
     }
 
-    char val[600], tmp[96];
-    fact_line(s, C, x, y, labelw, maxw - labelw, "path", v->path); y += C->mh;
-    fact_line(s, C, x, y, labelw, maxw - labelw, "type", v->type_name); y += C->mh;
-    fact_line(s, C, x, y, labelw, maxw - labelw, "category", cat_name(v->cat)); y += C->mh;
-
-    if (v->have_st) {
-        fmt_size(tmp, sizeof(tmp), (unsigned long long)v->st.st_size);
-        snprintf(val, sizeof(val), "%s (%lld bytes)", tmp, (long long)v->st.st_size);
-        fact_line(s, C, x, y, labelw, maxw - labelw, "size", val); y += C->mh;
-
-        fmt_mode(tmp, sizeof(tmp), (unsigned)v->st.st_mode);
-        fact_line(s, C, x, y, labelw, maxw - labelw, "mode", tmp); y += C->mh;
-
-        fmt_time(tmp, sizeof(tmp), v->st.st_mtime);
-        fact_line(s, C, x, y, labelw, maxw - labelw, "mtime", tmp); y += C->mh;
-
-        snprintf(val, sizeof(val), "%llu", (unsigned long long)v->st.st_ino);
-        fact_line(s, C, x, y, labelw, maxw - labelw, "inode", val); y += C->mh;
-
-        snprintf(val, sizeof(val), "%llu  uid %u  gid %u",
-                 (unsigned long long)v->st.st_nlink,
-                 (unsigned)v->st.st_uid, (unsigned)v->st.st_gid);
-        fact_line(s, C, x, y, labelw, maxw - labelw, "links", val); y += C->mh;
-
-    }
+    if (L->nrow > L->info_rows_vis)
+        draw_scroll_v(s, L->info.x + L->info.w - L->gap - L->bar_w,
+                      L->info_rows_y, L->info_rows_vis * L->info_row_h,
+                      L->info_scroll, L->nrow, L->info_rows_vis, L->bar_w);
 }
 
-static void draw_all(MClient *c, Viewer *v, Chrome *C, int vw, int vh) {
+static void draw_all(MClient *c, Viewer *v, int vw, int vh) {
     Surface s;
+    VLayout L;
+    if (vw < 1) vw = 1;
+    if (vh < 1) vh = 1;
+
     s.px = c->px;
     s.w = vw;
     s.h = vh;
-    s.stride = c->stride;
-    surf_unclip(&s);
+    s.stride = c->stride > 0 ? c->stride : vw;
+    surf_clip(&s, 0, 0, vw, vh);
+
+    layout_build(&L, v, vw, vh);
 
     gfx_gradient(&s, 0, 0, vw, vh, C_BG, C_BG2);
 
-    Layout L;
-    layout_make(&L, vw, vh, C);
+    /* the page: one rounded card, inset by the margin on every side */
+    gfx_rrect_aa(&s, (float)L.body.x, (float)L.body.y, (float)L.body.w,
+                 (float)L.body.h, (float)SP(1), C_PAGE,
+                 color_alpha(C_TEXT, 0.07f), (float)L.rule);
 
-    if (v->kind == DOC_IMAGE) draw_image_view(&s, v, C, L.body);
-    else if (v->kind == DOC_TEXT) draw_text_view(&s, v, C, L.body);
-    else draw_facts(&s, v, C, L.body);
+    if (v->kind == DOC_TEXT) draw_text_view(&s, v, &L);
+    else if (v->kind == DOC_IMAGE) draw_image_view(&s, v, &L);
+    else draw_state(&s, v, &L);
 
-    draw_header(&s, v, C, vw);
-    draw_footer(&s, v, C, &L, vw, vh);
+    draw_header(&s, &L, vw);
+    draw_footer(&s, &L, vw);
+
+    if (L.info_open) draw_info(&s, &L, vw, vh);
 }
 
-static void zoom_around(Viewer *v, const Chrome *C, VRect body,
-                        int mx, int my, float factor) {
-    float z = image_effective_zoom(v, body.w, body.h);
+/* ------------------------------------------------------------ input */
+
+#define KEY_ESC      1
+#define KEY_0       11
+#define KEY_MINUS   12
+#define KEY_EQUAL   13
+#define KEY_Q       16
+#define KEY_I       23
+#define KEY_F       33
+#define KEY_HOME   102
+#define KEY_UP     103
+#define KEY_PAGEUP 104
+#define KEY_LEFT   105
+#define KEY_RIGHT  106
+#define KEY_END    107
+#define KEY_DOWN   108
+#define KEY_PAGEDOWN 109
+
+static void info_scroll_by(Viewer *v, int delta, const VLayout *L) {
+    int maxs = L->nrow - L->info_rows_vis;
+    if (maxs < 0) maxs = 0;
+    v->info_scroll += delta;
+    if (v->info_scroll > maxs) v->info_scroll = maxs;
+    if (v->info_scroll < 0) v->info_scroll = 0;
+}
+
+static void zoom_around(Viewer *v, VRect pic, int mx, int my, float factor) {
+    float z = image_effective_zoom(v, pic.w, pic.h);
     float nz = z * factor;
-    if (nz < 0.05f) nz = 0.05f;
+    int sw, sh, nsw, nsh;
+    float ix, iy, nox, noy;
+    if (nz < 0.02f) nz = 0.02f;
     if (nz > 32.0f) nz = 32.0f;
     if (nz == z) return;
 
-    int sw = iround((float)v->img.w * z);
-    int sh = iround((float)v->img.h * z);
-    int ox = body.x + (body.w - sw) / 2 + iround(v->pan_x);
-    int oy = body.y + (body.h - sh) / 2 + iround(v->pan_y);
-    float ix = (float)(mx - ox) / z;
-    float iy = (float)(my - oy) / z;
+    sw = iround((float)v->img.w * z);
+    sh = iround((float)v->img.h * z);
+    {
+        int ox = pic.x + (pic.w - sw) / 2 + iround(v->pan_x);
+        int oy = pic.y + (pic.h - sh) / 2 + iround(v->pan_y);
+        ix = (float)(mx - ox) / z;
+        iy = (float)(my - oy) / z;
+    }
 
-    int nsw = iround((float)v->img.w * nz);
-    int nsh = iround((float)v->img.h * nz);
-    float nox = (float)mx - ix * nz;
-    float noy = (float)my - iy * nz;
+    nsw = iround((float)v->img.w * nz);
+    nsh = iround((float)v->img.h * nz);
+    nox = (float)mx - ix * nz;
+    noy = (float)my - iy * nz;
     v->zoom = nz;
-    v->pan_x = nox - (float)body.x - (float)(body.w - nsw) * 0.5f;
-    v->pan_y = noy - (float)body.y - (float)(body.h - nsh) * 0.5f;
-    image_clamp_pan(v, nz, body.w, body.h);
+    v->pan_x = nox - (float)pic.x - (float)(pic.w - nsw) * 0.5f;
+    v->pan_y = noy - (float)pic.y - (float)(pic.h - nsh) * 0.5f;
+    image_clamp_pan(v, nz, pic.w, pic.h);
 }
 
-static void handle_key(Viewer *v, const Chrome *C, int vw, int vh,
-                       int key, int mods, int *quit) {
-    Layout L;
-    layout_make(&L, vw, vh, C);
+static void handle_key(Viewer *v, int vw, int vh, int key, int mods, int *quit) {
+    VLayout L;
+    layout_build(&L, v, vw, vh);
+
+    if (key == KEY_I) {
+        v->info_open = !v->info_open;
+        v->info_scroll = 0;
+        return;
+    }
+
+    if (v->info_open) {
+        int page = L.info_rows_vis > 1 ? L.info_rows_vis - 1 : 1;
+        int step = (mods & 1) ? 5 : 1;
+        if (key == KEY_ESC) { v->info_open = 0; return; }
+        if (key == KEY_Q) { *quit = 1; return; }
+        switch (key) {
+        case KEY_UP:       info_scroll_by(v, -step, &L); break;
+        case KEY_DOWN:     info_scroll_by(v, +step, &L); break;
+        case KEY_PAGEUP:   info_scroll_by(v, -page, &L); break;
+        case KEY_PAGEDOWN: info_scroll_by(v, +page, &L); break;
+        case KEY_HOME:     v->info_scroll = -L.nrow; info_scroll_by(v, 0, &L); break;
+        case KEY_END:      v->info_scroll = L.nrow; info_scroll_by(v, 0, &L); break;
+        default: break;
+        }
+        return;
+    }
 
     if (key == KEY_Q || key == KEY_ESC) { *quit = 1; return; }
 
@@ -2338,12 +3027,12 @@ static void handle_key(Viewer *v, const Chrome *C, int vw, int vh,
         case KEY_UP:    v->pan_y += (float)step; break;
         case KEY_DOWN:  v->pan_y -= (float)step; break;
         case KEY_EQUAL:
-            zoom_around(v, C, L.body, L.body.x + L.body.w / 2,
-                        L.body.y + L.body.h / 2, 1.25f);
+            zoom_around(v, L.pic, L.pic.x + L.pic.w / 2,
+                        L.pic.y + L.pic.h / 2, 1.25f);
             break;
         case KEY_MINUS:
-            zoom_around(v, C, L.body, L.body.x + L.body.w / 2,
-                        L.body.y + L.body.h / 2, 0.8f);
+            zoom_around(v, L.pic, L.pic.x + L.pic.w / 2,
+                        L.pic.y + L.pic.h / 2, 0.8f);
             break;
         case KEY_0:
         case KEY_F:
@@ -2353,35 +3042,43 @@ static void handle_key(Viewer *v, const Chrome *C, int vw, int vh,
             break;
         default: break;
         }
-        float z = image_effective_zoom(v, L.body.w, L.body.h);
-        image_clamp_pan(v, z, L.body.w, L.body.h);
+        image_clamp_pan(v, image_effective_zoom(v, L.pic.w, L.pic.h),
+                        L.pic.w, L.pic.h);
         return;
     }
 
     if (v->kind != DOC_TEXT) return;
 
-    int rows, cols, gutter;
-    text_metrics(v, C, L.body, &rows, &cols, &gutter);
-    int page = rows > 1 ? rows - 1 : 1;
-    int step = (mods & 1) ? 8 : 1;
-    switch (key) {
-    case KEY_UP:       v->first_line -= 1; break;
-    case KEY_DOWN:     v->first_line += 1; break;
-    case KEY_PAGEUP:   v->first_line -= page; break;
-    case KEY_PAGEDOWN: v->first_line += page; break;
-    case KEY_HOME:     v->first_line = 0; break;
-    case KEY_END:      v->first_line = vmax_i(0, v->nlines - rows); break;
-    case KEY_LEFT:     v->col_off -= step; break;
-    case KEY_RIGHT:    v->col_off += step; break;
-    default: break;
+    {
+        int page = L.text_rows > 1 ? L.text_rows - 1 : 1;
+        int step = (mods & 1) ? 8 : 1;
+        switch (key) {
+        case KEY_UP:       v->first_line -= 1; break;
+        case KEY_DOWN:     v->first_line += 1; break;
+        case KEY_PAGEUP:   v->first_line -= page; break;
+        case KEY_PAGEDOWN: v->first_line += page; break;
+        case KEY_HOME:     v->first_line = 0; break;
+        case KEY_END:      v->first_line = v->nlines; break;
+        case KEY_LEFT:     v->col_off -= step; break;
+        case KEY_RIGHT:    v->col_off += step; break;
+        default: break;
+        }
+        text_clamp(v, &L);
     }
-    text_clamp(v, C, L.body);
 }
 
-static void handle_wheel(Viewer *v, const Chrome *C, int vw, int vh, int notches) {
-    Layout L;
-    layout_make(&L, vw, vh, C);
+static void handle_wheel(Viewer *v, int vw, int vh, int notches) {
+    VLayout L;
+    layout_build(&L, v, vw, vh);
     if (notches == 0) return;
+
+    if (v->info_open) {
+        int n = notches;
+        if (n > 6) n = 6;
+        if (n < -6) n = -6;
+        info_scroll_by(v, -n, &L);
+        return;
+    }
 
     if (v->kind == DOC_IMAGE) {
         float factor = 1.0f;
@@ -2390,15 +3087,17 @@ static void handle_wheel(Viewer *v, const Chrome *C, int vw, int vh, int notches
         if (n < -12) n = -12;
         while (n > 0) { factor *= 1.25f; n--; }
         while (n < 0) { factor *= 0.8f; n++; }
-        int mx = rect_hit(L.body, v->mx, v->my) ? v->mx : L.body.x + L.body.w / 2;
-        int my = rect_hit(L.body, v->mx, v->my) ? v->my : L.body.y + L.body.h / 2;
-        zoom_around(v, C, L.body, mx, my, factor);
+        {
+            int mx = rect_hit(L.pic, v->mx, v->my) ? v->mx : L.pic.x + L.pic.w / 2;
+            int my = rect_hit(L.pic, v->mx, v->my) ? v->my : L.pic.y + L.pic.h / 2;
+            zoom_around(v, L.pic, mx, my, factor);
+        }
         return;
     }
 
     if (v->kind == DOC_TEXT) {
         v->first_line -= notches * 3;
-        text_clamp(v, C, L.body);
+        text_clamp(v, &L);
     }
 }
 
@@ -2421,12 +3120,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    Chrome C;
-    chrome_init(&C);
-    if (!C.mono || !C.ui || !C.title) {
-        fprintf(stderr, "viewer: the fonts loaded but none of the four faces did\n");
-        mc_close(&c);
-        return 1;
+    {
+        VFonts f = vfonts();
+        if (!f.mono || !f.body || !f.title || !f.small) {
+            fprintf(stderr, "viewer: the fonts loaded but not all four faces did\n");
+            mc_close(&c);
+            return 1;
+        }
     }
 
     Viewer v;
@@ -2440,7 +3140,7 @@ int main(int argc, char **argv) {
 
     while (!quit) {
         if (dirty) {
-            draw_all(&c, &v, &C, vw, vh);
+            draw_all(&c, &v, vw, vh);
             mc_present(&c);
             dirty = 0;
         }
@@ -2458,17 +3158,23 @@ int main(int argc, char **argv) {
                 break;
             case MC_KEY:
                 if (ev.press) {
-                    handle_key(&v, &C, vw, vh, ev.key, ev.mods, &quit);
+                    handle_key(&v, vw, vh, ev.key, ev.mods, &quit);
                     dirty = 1;
                 }
                 break;
             case MC_MOUSE:
                 v.mx = ev.x;
                 v.my = ev.y;
-                if (v.kind == DOC_IMAGE) {
-                    Layout L;
-                    layout_make(&L, vw, vh, &C);
-                    if ((ev.buttons & 1) && rect_hit(L.body, ev.x, ev.y)) {
+                {
+                    VLayout L;
+                    layout_build(&L, &v, vw, vh);
+                    if (v.info_open) {
+                        /* a click on the dimmed page behind the sheet closes it */
+                        if ((ev.buttons & 1) && !rect_hit(L.info, ev.x, ev.y))
+                            v.info_open = 0;
+                        v.dragging = 0;
+                    } else if (v.kind == DOC_IMAGE && (ev.buttons & 1) &&
+                               rect_hit(L.pic, ev.x, ev.y)) {
                         if (!v.dragging) {
                             v.dragging = 1;
                             v.last_mx = ev.x;
@@ -2478,8 +3184,9 @@ int main(int argc, char **argv) {
                             v.pan_y += (float)(ev.y - v.last_my);
                             v.last_mx = ev.x;
                             v.last_my = ev.y;
-                            float z = image_effective_zoom(&v, L.body.w, L.body.h);
-                            image_clamp_pan(&v, z, L.body.w, L.body.h);
+                            image_clamp_pan(&v,
+                                image_effective_zoom(&v, L.pic.w, L.pic.h),
+                                L.pic.w, L.pic.h);
                         }
                     } else {
                         v.dragging = 0;
@@ -2488,7 +3195,7 @@ int main(int argc, char **argv) {
                 dirty = 1;
                 break;
             case MC_WHEEL:
-                handle_wheel(&v, &C, vw, vh, ev.wheel);
+                handle_wheel(&v, vw, vh, ev.wheel);
                 dirty = 1;
                 break;
             default:
@@ -2670,8 +3377,10 @@ static void host_report(const char *path) {
             if (b > a && v.text[b - 1] == '\n') b--;
             printf("   line %d: %.*s\n", i + 1, (int)(b - a), (const char *)(v.text + a));
         }
-    } else if (v.kind == DOC_ERROR) {
-        printf("   ERROR: %s\n", v.error);
+    } else if (v.kind == DOC_MISSING) {
+        printf("   missing: %s\n", v.error);
+    } else if (v.kind == DOC_EMPTY) {
+        printf("   empty: 0 bytes\n");
     } else {
         printf("   other: %s\n", v.other_note);
     }

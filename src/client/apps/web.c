@@ -32,8 +32,12 @@
  *  a lock and the scheme, and the status bar shows the negotiated TLS
  *  version, cipher suite, certificate CN and expiry date.
  *
- *  It still has no JavaScript, no CSS and no images - it renders text,
- *  which is the honest description of what is implemented.
+ *  It renders a real CSS subset: colours, type size/weight/style, text
+ *  alignment, line height, and block boxes with margins, padding, top and
+ *  bottom borders, backgrounds and centred max-width columns (src/css.c).
+ *  It has no JavaScript and no layout beyond ordinary block flow - no
+ *  floats, flex or grid - and that is the honest description of what is
+ *  implemented.
  *
  *  Keys
  *      Tab          focus / leave the address bar
@@ -69,6 +73,7 @@
 #include "../mystic_client.h"
 #include "../../mystic.h"
 #include "../tls.h"
+#include "../../css.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -82,8 +87,8 @@
  * pulled in only where the socket layer exists, so the host test builds
  * stay socket-free. */
 #include "../tls.c"
-#include "../img.c"
-#include "../css.c"
+#include "../../img.c"
+#include "../../css.c"
 #endif
 
 #ifndef WEB_HOST_TEST
@@ -117,6 +122,8 @@
 #define WEB_MAX_SEGS    30000         /* placed text runs              */
 #define WEB_MAX_LINES   16000
 #define WEB_MAX_LINKS   256
+#define WEB_MAX_BLOCKS  2048          /* block boxes per document      */
+#define WEB_BLOCK_DEPTH 64            /* nesting depth we can cascade  */
 
 #define WEB_CONNECT_MS  6000          /* bounded connect()             */
 #define WEB_IO_SECS     10            /* bounded send()/recv()         */
@@ -217,6 +224,7 @@ typedef struct {
     u8   level;                      /* 0 body, 1..6 heading          */
     u8   flags;                      /* AF_*                          */
     u8   gap;                        /* px of space above, with AF_BREAK */
+    u16  block;                      /* enclosing block, 0xFFFF none  */
     int16_t link;                    /* index into Doc.link, -1 none  */
 } Atom;
 
@@ -232,9 +240,42 @@ typedef struct {
     u32 first;                       /* first Seg                    */
     u32 y;                           /* px from the top of the document */
     u16 n;                           /* Seg count                    */
-    u16 h;                           /* line height in px            */
+    u16 h;                           /* line box height in px        */
+    u16 th;                          /* tallest face on the line     */
     u16 gap;                         /* space above the line         */
+    u16 block;                       /* block whose column it sits in */
 } Line;
+
+/* One block box: the part of CSS that is real vertical space, a real
+ * background and a real rule. The parser records the metrics in design
+ * pixels and the atom range; doc_layout resolves the column (width and
+ * max-width against the window) and fills the y/line geometry; the
+ * painter draws the background and the two borders. Margins collapse
+ * between boxes the way CSS says they do: max(previous bottom, next top). */
+typedef struct {
+    u16 atom_start, atom_end;        /* [start, end) in Doc.atom      */
+    u16 line_start, line_end;        /* [start, end) in Doc.line      */
+    u16 parent;                      /* enclosing block, 0xFFFF none  */
+
+    int16_t margin_top, margin_bottom; /* design px                   */
+    int16_t pad_top, pad_bottom;       /* design px                   */
+    u16 width, max_width;            /* design px; 0 = auto/none      */
+    u16 width_pct, max_width_pct;    /* 0..1000; 0 = unset            */
+
+    u16 box_x0, box_x1;              /* the block's column, page px   */
+    u32 box_y0, box_y1;              /* its border box, doc px        */
+    u32 content_y0, content_y1;      /* its content box, doc px       */
+
+    u32 background;                  /* 0x00000000 = none             */
+    u32 border_top_color, border_bottom_color;
+    u8  border_top_w, border_bottom_w;
+    u8  border_top_style, border_bottom_style;
+    u8  align;                       /* CSS_ALIGN_*                   */
+    u8  level;                       /* 0..6, the type face           */
+    u8  line_height;                 /* design px; 0 = face height    */
+    u8  has_top;                     /* box_y0 already fixed          */
+    u8  is_body;                     /* <body>: its background is the canvas */
+} Block;
 
 typedef struct {
     char url[WEB_PATH_MAX];
@@ -259,6 +300,8 @@ typedef struct {
     int  nseg;
     Line line[WEB_MAX_LINES];
     int  nline;
+    Block block[WEB_MAX_BLOCKS];
+    int  nblock;
     Link link[WEB_MAX_LINKS];
     int  nlink;
     u32  doc_h;
@@ -1254,6 +1297,9 @@ typedef struct {
     char href[WEB_PATH_MAX];
     char src[WEB_PATH_MAX];      /* <img src>  */
     char alt[96];
+    char cls[CSS_CLASS_MAX];     /* class attribute, as written */
+    char id[CSS_ID_MAX];         /* id attribute, as written    */
+    int  align;                  /* align= hint: 0/1/2/3 = left/center/right/justify */
 } Tag;
 
 /* Parse one tag starting at s[0]=='<'. Returns 1 with *used set, or 0
@@ -1341,10 +1387,33 @@ static int parse_tag(const char *s, long n, long *used, Tag *t) {
             } else if (!strcmp(an, "src") && vl < (long)sizeof(t->src)) {
                 memcpy(t->src, s + vs, (size_t)vl);
                 t->src[vl] = 0;
+            } else if (!strcmp(an, "class") && vl < (long)sizeof(t->cls)) {
+                memcpy(t->cls, s + vs, (size_t)vl);
+                t->cls[vl] = 0;
+            } else if (!strcmp(an, "id") && vl < (long)sizeof(t->id)) {
+                memcpy(t->id, s + vs, (size_t)vl);
+                t->id[vl] = 0;
+            } else if (!strcmp(an, "align")) {
+                if (ci_eq(s + vs, vl, "center")) t->align = 1;
+                else if (ci_eq(s + vs, vl, "right")) t->align = 2;
+                else if (ci_eq(s + vs, vl, "justify")) t->align = 3;
             }
         }
     }
 }
+
+typedef struct {
+    char   tag[CSS_TAG_MAX];
+    char   cls[CSS_CLASS_MAX];
+    char   id[CSS_ID_MAX];
+    CssNode node;                /* style resolved with its ancestors */
+} HtmlElem;
+
+typedef struct {
+    char tag[CSS_TAG_MAX];
+    int  block;                  /* index into Doc.block, -1 if capped */
+    int  elem;                   /* index into Html.elem, -1 if capped */
+} HtmlOpen;
 
 typedef struct {
     Doc        *d;
@@ -1361,9 +1430,6 @@ typedef struct {
     size_t      css_cap;
     size_t     *css_len;
     int         level;           /* 0 body, 1..6 heading          */
-    int         css_size;        /* px from CSS, 0 = use the level */
-    int         prev_level;      /* level of the last atom emitted; its
-                                  * AF_BREAK decides the gap below it */
     int         in_link;         /* link index, -1 when outside   */
     int         pending_break;
     int         pending_gap;
@@ -1371,9 +1437,21 @@ typedef struct {
     char        word[WEB_ATOM_TEXT];
     int         wlen;
     int         overflow;        /* a cap was hit                 */
+    HtmlElem    elem[WEB_BLOCK_DEPTH];
+    int         nelem;
+    HtmlOpen    open[WEB_BLOCK_DEPTH];
+    int         nopen;
 } Html;
 
 static int level_for_px(int px);   /* defined with the other style helpers */
+
+static int is_heading_tag(const char *n) {
+    return n[0] == 'h' && n[1] >= '1' && n[1] <= '6' && !n[2];
+}
+
+static int html_block_cur(const Html *h) {
+    return h->nopen > 0 ? h->open[h->nopen - 1].block : -1;
+}
 
 static void html_atom(Html *h, const char *text, long len, int flags, int link) {
     Doc *d = h->d;
@@ -1383,21 +1461,20 @@ static void html_atom(Html *h, const char *text, long len, int flags, int link) 
     Atom *a = &d->atom[d->natom++];
     memcpy(a->text, text, (size_t)len);
     a->text[len] = 0;
-    /* A page's own font-size wins over the tag's default level. */
-    a->level = (u8)(h->css_size ? level_for_px(h->css_size) : h->level);
+    /* The innermost block owns the type face and the column. A heading
+     * block carries its level directly; every other block maps its CSS
+     * font-size onto the same seven faces the whole renderer uses. */
+    int bi = html_block_cur(h);
+    a->level = (u8)(bi >= 0 ? d->block[bi].level : (h->level ? h->level : 0));
     a->flags = (u8)flags;
     int gap = 0;
     if (flags & AF_BREAK) {
         gap = h->pending_gap;
-        /* A heading is followed by its own space, never by whatever the
-         * next block happened to ask for: that is what makes the space
-         * below every heading the same and puts them on one grid. */
-        if (h->prev_level && gap < GAP_AFTER_HEAD_D) gap = GAP_AFTER_HEAD_D;
         if (gap > 255) gap = 255;
     }
     a->gap = (u8)gap;
+    a->block = (u16)(bi < 0 ? 0xFFFF : bi);
     a->link = (int16_t)link;
-    h->prev_level = h->level;
 }
 
 /* Ending a word is where the break/space state is spent. */
@@ -1578,6 +1655,113 @@ static void html_add_link(Html *h, const Tag *t) {
     h->in_link = idx;
 }
 
+/* ------------------------------------------------------------ boxes
+ * A block element opens a box. The box records the resolved style, the
+ * atom range it covers and the metrics doc_layout needs; layout turns
+ * the metrics into real vertical space, and the painter into a real
+ * background and real rules. Inline elements do not open a box: this
+ * text renderer does not claim to place them.
+ *
+ * The ancestor stack is kept as copies of tag/class/id, because the CssNode
+ * that css_for() matches against must outlive the Tag it came from. */
+static void html_block_open(Html *h, const Tag *t, int level)
+{
+    Doc *d = h->d;
+    html_end_word(h, 0);
+
+    int bi = -1, ei = -1;
+    if (h->nopen < WEB_BLOCK_DEPTH && h->nelem < WEB_BLOCK_DEPTH) {
+        ei = h->nelem++;
+        HtmlElem *e = &h->elem[ei];
+        snprintf(e->tag, sizeof e->tag, "%s", t->name);
+        snprintf(e->cls, sizeof e->cls, "%s", t->cls);
+        snprintf(e->id, sizeof e->id, "%s", t->id);
+
+        unsigned attrs = 0;
+        if (t->align == 1) attrs |= CSS_ATTR_CENTER;
+        else if (t->align == 2) attrs |= CSS_ATTR_RIGHT;
+        else if (t->align == 3) attrs |= CSS_ATTR_JUSTIFY;
+        const CssNode *up = ei > 0 ? &h->elem[ei - 1].node : NULL;
+        css_node_init(&e->node, e->tag, e->cls[0] ? e->cls : NULL,
+                      e->id[0] ? e->id : NULL, attrs, up, h->sheet);
+        const CssStyle *cs = &e->node.style;
+
+        if (d->nblock < WEB_MAX_BLOCKS) {
+            bi = d->nblock++;
+            Block *b = &d->block[bi];
+            memset(b, 0, sizeof *b);
+            b->atom_start = (u16)d->natom;
+            b->atom_end = (u16)d->natom;
+            b->line_start = 0xFFFF;
+            b->line_end = 0xFFFF;
+            b->parent = (u16)(h->nopen > 0 && h->open[h->nopen - 1].block >= 0
+                              ? h->open[h->nopen - 1].block : 0xFFFF);
+            /* A block tag with no margin in the sheet keeps the spacing
+             * the reader is used to (GAP_BLOCK_D); a sheet that says 0
+             * gets 0, because CSS_SET_MARGIN_* is then set. */
+            b->margin_top = (int16_t)((cs->set & CSS_SET_MARGIN_TOP) ? cs->margin_top : GAP_BLOCK_D);
+            b->margin_bottom = (int16_t)((cs->set & CSS_SET_MARGIN_BOTTOM) ? cs->margin_bottom : GAP_BLOCK_D);
+            b->pad_top = (int16_t)cs->pad_top;
+            b->pad_bottom = (int16_t)cs->pad_bottom;
+            b->width = (u16)(cs->width < 0 ? 0 : cs->width > 10000 ? 10000 : cs->width);
+            b->max_width = (u16)(cs->max_width < 0 ? 0 : cs->max_width > 10000 ? 10000 : cs->max_width);
+            b->width_pct = (u16)(cs->width_pct < 0 ? 0 : cs->width_pct);
+            b->max_width_pct = (u16)(cs->max_width_pct < 0 ? 0 : cs->max_width_pct);
+            b->background = cs->background;
+            b->border_top_w = (u8)(cs->border_top_w > 0 ? cs->border_top_w : 0);
+            b->border_bottom_w = (u8)(cs->border_bottom_w > 0 ? cs->border_bottom_w : 0);
+            b->border_top_style = (u8)cs->border_top_style;
+            b->border_bottom_style = (u8)cs->border_bottom_style;
+            b->border_top_color = cs->border_top_color;
+            b->border_bottom_color = cs->border_bottom_color;
+            b->align = (u8)cs->align;
+            b->is_body = (u8)(!strcmp(t->name, "body"));
+            b->level = (u8)(level > 0 ? level : level_for_px(cs->font_size));
+            b->line_height = (u8)(cs->line_height > 255 ? 255 :
+                                  cs->line_height < 0 ? 0 : cs->line_height);
+        }
+    }
+
+    if (h->nopen < WEB_BLOCK_DEPTH) {
+        HtmlOpen *o = &h->open[h->nopen++];
+        snprintf(o->tag, sizeof o->tag, "%s", t->name);
+        o->block = bi;
+        o->elem = ei;
+    }
+
+    h->level = level;
+    h->pending_break = 1;
+    h->pending_gap = 0;
+    h->pending_space = 0;
+}
+
+/* Close the named box. Mismatched markup (“<b><div></b></div>”) closes the
+ * inner boxes too, so the stack can never leak a box into the next page. */
+static void html_block_close(Html *h, const char *tag)
+{
+    html_end_word(h, 0);
+    int k = -1;
+    for (int i = h->nopen - 1; i >= 0; i--)
+        if (!strcmp(h->open[i].tag, tag)) { k = i; break; }
+    if (k < 0) {
+        h->pending_break = 1;
+        h->pending_gap = 0;
+        return;
+    }
+    while (h->nopen > k) {
+        HtmlOpen *o = &h->open[--h->nopen];
+        if (o->block >= 0) {
+            Block *b = &h->d->block[o->block];
+            b->atom_end = (u16)h->d->natom;
+        }
+        if (o->elem >= 0 && o->elem == h->nelem - 1) h->nelem--;
+    }
+    h->pending_break = 1;
+    h->pending_gap = 0;
+    h->pending_space = 0;
+    if (h->nopen == 0) h->level = 0;
+}
+
 static void html_tag(Html *h, const Tag *t) {
     if (!t->name[0]) return;                  /* comment, doctype, PI */
     const char *n = t->name;
@@ -1607,34 +1791,24 @@ static void html_tag(Html *h, const Tag *t) {
             }
             return;
         }
-        if (n[0] == 'h' && n[1] >= '1' && n[1] <= '6' && !n[2]) {
-            /* The space under a heading comes from GAP_AFTER_HEAD_D in
-             * html_atom(), which remembers that the previous line was a
-             * heading. Asking for a block gap here would only be a
-             * second, competing number. */
-            html_break(h, 0);       /* flush the heading while it is still one */
+        if (!strcmp(n, "li")) { html_break(h, GAP_LI_D); return; }
+        if (!strcmp(n, "td") || !strcmp(n, "th")) {
+            html_end_word(h, 0);
+            h->pending_space = 1;
+            return;
+        }
+        if (is_heading_tag(n)) {
+            html_block_close(h, n);
             h->level = 0;
             return;
         }
-        if (!strcmp(n, "li")) { html_break(h, GAP_LI_D); return; }
-        if (!strcmp(n, "p")) {
-            /* CSS decides the space above a paragraph and its text size.
-             * The size is mapped onto the renderer's level table (24/20/17/
-             * 15/13/12 px), which is how a heading can be any size a page
-             * asks for rather than only the six HTML defaults. */
-            CssStyle cs = css_for(h->sheet, "p", NULL, NULL, NULL);
-            int gap = GAP_BLOCK_D;
-            if (cs.set & CSS_SET_MARGIN_TOP) gap = cs.margin_top;
-            h->css_size = (cs.set & CSS_SET_FONT_SIZE) ? cs.font_size : 0;
-            html_break(h, gap);
-            return;
-        }
-        if (!strcmp(n, "td") || !strcmp(n, "th")) { html_end_word(h, 0); h->pending_space = 1; return; }
-        if (is_block_tag(n)) { html_break(h, GAP_BLOCK_D); return; }
+        if (is_block_tag(n)) { html_block_close(h, n); return; }
+        return;
     }
 
     /* open tags */
-    if (h->in_title && (!strcmp(n, "body") || is_block_tag(n))) h->in_title = 0;
+    if (h->in_title && (!strcmp(n, "body") || is_block_tag(n) || is_heading_tag(n)))
+        h->in_title = 0;
     if (!strcmp(n, "title")) { h->in_title = 1; return; }
     if (!strcmp(n, "script") || !strcmp(n, "style")) {
         h->skip = 1;
@@ -1643,6 +1817,8 @@ static void html_tag(Html *h, const Tag *t) {
     }
     if (!strcmp(n, "a")) { html_end_word(h, 0); html_add_link(h, t); return; }
     if (!strcmp(n, "li")) {
+        /* The bullet and its tight rhythm are the list styling this
+         * renderer already had; the enclosing ul/ol is the block box. */
         html_break(h, GAP_LI_D);
         html_end_word(h, 0);
         h->pending_break = 1;
@@ -1652,15 +1828,11 @@ static void html_tag(Html *h, const Tag *t) {
         h->pending_space = 1;
         return;
     }
-    if (n[0] == 'h' && n[1] >= '1' && n[1] <= '6' && !n[2]) {
-        h->level = n[1] - '0';
-        /* one gap above every heading, whatever its level: h1 and h6 sit
-         * on the same grid and only their font size differs */
-        html_break(h, GAP_HEAD_D);
+    if (is_heading_tag(n)) {
+        html_block_open(h, t, n[1] - '0');
         return;
     }
     if (!strcmp(n, "br")) { html_break(h, 0); return; }
-    if (!strcmp(n, "p")) { html_break(h, GAP_BLOCK_D); return; }
     if (!strcmp(n, "td") || !strcmp(n, "th")) {
         html_end_word(h, 0);
         h->pending_space = 1;
@@ -1673,11 +1845,7 @@ static void html_tag(Html *h, const Tag *t) {
         fprintf(stderr, "web: img tag src='%.60s' nimg=%d\n", t->src, h->d->nimg);
         if (t->src[0] && h->d->nimg < WEB_MAX_IMGS) {
             PageImg *pi = &h->d->img[h->d->nimg++];
-            if (t->src[0] == '/' || strstr(t->src, "://")) {
-                snprintf(pi->url, sizeof(pi->url), "%s", t->src);
-            } else {
-                snprintf(pi->url, sizeof(pi->url), "%s", t->src);
-            }
+            snprintf(pi->url, sizeof(pi->url), "%s", t->src);
             snprintf(pi->alt, sizeof(pi->alt), "%s", t->alt);
         }
         char alt[128];
@@ -1687,7 +1855,15 @@ static void html_tag(Html *h, const Tag *t) {
         html_atom_word(h, alt, (long)strlen(alt), h->in_link, 0);
         return;
     }
-    if (is_block_tag(n)) { html_break(h, GAP_BLOCK_D); return; }
+    if (!strcmp(n, "hr")) {
+        /* A void element: its box opens and closes at this one point, so
+         * the built-in border-top really becomes a rule with space around
+         * it instead of six pixels of nothing. */
+        html_block_open(h, t, 0);
+        html_block_close(h, "hr");
+        return;
+    }
+    if (is_block_tag(n)) { html_block_open(h, t, 0); return; }
 }
 
 /* Turn a body of HTML into atoms. `title` receives the <title> text
@@ -1699,6 +1875,7 @@ static int html_build(Doc *d, const char *s, long n, const Url *base,
     d->natom = 0;
     d->nseg = 0;
     d->nline = 0;
+    d->nblock = 0;
     d->nlink = 0;
     d->doc_h = 0;
     d->truncated = 0;
@@ -1741,6 +1918,14 @@ static int html_build(Doc *d, const char *s, long n, const Url *base,
         html_text(&h, s + start, i - start);
     }
     html_end_word(&h, 0);
+    /* Close whatever the page forgot to close. An unclosed <div> must not
+     * swallow the rest of the document, and its box ends at the last atom
+     * like every other box. */
+    while (h.nopen > 0) {
+        char tag[CSS_TAG_MAX];
+        snprintf(tag, sizeof(tag), "%s", h.open[h.nopen - 1].tag);
+        html_block_close(&h, tag);
+    }
     while (h.title_len > 0 && title[h.title_len - 1] == ' ') h.title_len--;
     title[h.title_len] = 0;
     return d->nlink;
@@ -1773,13 +1958,19 @@ static int fit_prefix(const WebMetrics *m, int level, const char *s, int n, floa
 typedef struct {
     Doc *d;
     const WebMetrics *m;
-    float width;
+    float page_w;                  /* full content width of the window */
+    float width;                   /* current column width             */
+    float x;                       /* current column left, page px     */
     u32 y;
     int first_seg;
     int segs_in_line;
     float pen;
-    int height;
+    int height;                    /* tallest face on the line         */
     int gap;
+    int stack[WEB_BLOCK_DEPTH];    /* open blocks, innermost last      */
+    int nopen;
+    int next_block;                /* next Doc.block to open           */
+    int pending_margin;            /* design px waiting to be applied  */
 } Layout;
 
 static void lay_emit(Layout *L, int ai, int start, int len, float x, float w, int level) {
@@ -1789,7 +1980,10 @@ static void lay_emit(Layout *L, int ai, int start, int len, float x, float w, in
     s->atom = (u16)ai;
     s->start = (u16)start;
     s->len = (u16)len;
-    s->x = (u16)(x + 0.5f);
+    /* x is the offset inside the block's column; the segment itself is
+     * stored in page coordinates, which is what the painter, the link
+     * hit test and text-align all need. */
+    s->x = (u16)(L->x + x + 0.5f);
     s->w = (u16)(w + 0.5f);
     if (L->first_seg < 0) L->first_seg = d->nseg;
     d->nseg++;
@@ -1809,10 +2003,58 @@ static int layout_gap(int design) {
 static void lay_flush(Layout *L) {
     Doc *d = L->d;
     if (L->first_seg >= 0 && L->segs_in_line > 0 && d->nline < WEB_MAX_LINES) {
+        int bi = L->nopen > 0 ? L->stack[L->nopen - 1] : -1;
+        Block *b = bi >= 0 ? &d->block[bi] : NULL;
+
+        /* A block with no top border or padding fixes its top at the first
+         * line it really produces, so its margin and its background start
+         * in one place. Every still-deferred ancestor gets the same y:
+         * that is a margin collapsing through the boxes. */
+        if (L->pending_margin > 0) {
+            L->y += (u32)layout_gap(L->pending_margin);
+            L->pending_margin = 0;
+        }
+        for (int k = 0; k < L->nopen; k++) {
+            Block *ab = &d->block[L->stack[k]];
+            if (!ab->has_top) {
+                ab->box_y0 = ab->content_y0 = L->y;
+                ab->has_top = 1;
+            }
+        }
+
+        /* text-align shifts the finished line inside the block's column,
+         * never the wrapping: a centred line is wrapped at the same width
+         * as a left one, which is how CSS defines it. */
+        float used = 0.0f;
+        for (int j = 0; j < L->segs_in_line; j++) {
+            Seg *sg = &d->seg[L->first_seg + j];
+            float right = (float)sg->x + (float)sg->w;
+            if (right > used) used = right;
+        }
+        float used_in_col = used - L->x;
+        if (used_in_col < 0.0f) used_in_col = 0.0f;
+        int align = b ? b->align : CSS_ALIGN_LEFT;
+        float off = 0.0f;
+        if (align == CSS_ALIGN_CENTER) off = (L->width - used_in_col) * 0.5f;
+        else if (align == CSS_ALIGN_RIGHT) off = L->width - used_in_col;
+        if (off > 0.5f) {
+            for (int j = 0; j < L->segs_in_line; j++)
+                d->seg[L->first_seg + j].x =
+                    (u16)((float)d->seg[L->first_seg + j].x + off + 0.5f);
+        }
+
+        int h = L->height > 0 ? L->height : 12;
+        if (b && b->line_height > 0) {
+            int blh = layout_gap(b->line_height);
+            if (blh > h) h = blh;
+        }
+
         Line *ln = &d->line[d->nline++];
         ln->first = (u32)L->first_seg;
         ln->n = (u16)L->segs_in_line;
-        ln->h = (u16)(L->height > 0 ? L->height : 12);
+        ln->th = (u16)(L->height > 0 ? L->height : 12);
+        ln->h = (u16)h;
+        ln->block = (u16)(bi < 0 ? 0xFFFF : bi);
         /* The document starts flush with the content rectangle: a heading
          * gap at the very top is not a margin, it is an offset. */
         ln->gap = (u16)(d->nline == 1 ? 0 : layout_gap(L->gap));
@@ -1829,6 +2071,110 @@ static void lay_flush(Layout *L) {
     L->gap = 0;
 }
 
+/* Enter a box: resolve its column and add its top margin, border and
+ * padding to the flow. Width and max-width are CSS lengths (design pixels
+ * here); a percentage is against the parent's content width. Any block
+ * narrower than its parent is centred in it. */
+static void lay_open_block(Layout *L, int bi) {
+    Doc *d = L->d;
+    Block *b = &d->block[bi];
+    lay_flush(L);
+    if (b->line_start == 0xFFFF) b->line_start = (u16)d->nline;
+
+    if (b->margin_top > L->pending_margin) L->pending_margin = b->margin_top;
+
+    float parent_w = L->width > 1.0f ? L->width : 1.0f;
+    float parent_x = L->x;
+    float w = (float)layout_gap(b->width);
+    if (b->width_pct) w = parent_w * (float)b->width_pct / 100.0f;
+    if (w <= 0.0f) w = parent_w;
+    if (b->max_width_pct) {
+        float mw = parent_w * (float)b->max_width_pct / 100.0f;
+        if (w > mw) w = mw;
+    } else if (b->max_width) {
+        float mw = (float)layout_gap(b->max_width);
+        if (w > mw) w = mw;
+    }
+    if (w < 1.0f) w = 1.0f;
+    if (w > parent_w) w = parent_w;      /* one column, never a sideways scroll */
+    float x = parent_x;
+    if (w < parent_w) x = parent_x + (parent_w - w) * 0.5f;
+
+    b->box_x0 = (u16)(x + 0.5f);
+    b->box_x1 = (u16)(x + w + 0.5f);
+    b->has_top = 0;
+
+    if (L->nopen >= WEB_BLOCK_DEPTH) return;   /* cannot happen; the parser caps */
+    L->stack[L->nopen++] = bi;
+    L->x = x;
+    L->width = w;
+
+    if (b->border_top_w > 0 || b->pad_top > 0) {
+        /* A border or padding cannot collapse, so the top is fixed now. */
+        if (L->pending_margin > 0) {
+            L->y += (u32)layout_gap(L->pending_margin);
+            L->pending_margin = 0;
+        }
+        b->box_y0 = L->y;
+        b->content_y0 = L->y + (u32)layout_gap(b->border_top_w) +
+                        (u32)layout_gap(b->pad_top);
+        L->y = b->content_y0;
+        b->has_top = 1;
+    }
+}
+
+/* Leave a box: close its content, add bottom padding and border, then
+ * leave its margin pending for the next box (adjacent margins collapse to
+ * the larger one, which is what keeps paragraph rhythm even). */
+static void lay_close_block(Layout *L, int bi) {
+    Doc *d = L->d;
+    Block *b = &d->block[bi];
+    lay_flush(L);
+
+    if (!b->has_top && b->pad_bottom == 0 && b->border_bottom_w == 0) {
+        /* An empty box with no drawn part: its margins collapse through. */
+        if (b->margin_bottom > L->pending_margin) L->pending_margin = b->margin_bottom;
+        b->box_y0 = b->box_y1 = b->content_y0 = b->content_y1 = L->y;
+        b->line_end = (u16)d->nline;
+        if (L->nopen > 0 && L->stack[L->nopen - 1] == bi) L->nopen--;
+        if (L->nopen > 0) {
+            Block *p = &d->block[L->stack[L->nopen - 1]];
+            L->x = p->box_x0;
+            L->width = (float)(p->box_x1 - p->box_x0);
+        } else {
+            L->x = 0.0f;
+            L->width = L->page_w;
+        }
+        return;
+    }
+
+    if (!b->has_top) {
+        /* Empty, but it has a bottom padding or border to place. */
+        if (L->pending_margin > 0) {
+            L->y += (u32)layout_gap(L->pending_margin);
+            L->pending_margin = 0;
+        }
+        b->box_y0 = b->content_y0 = L->y;
+        b->has_top = 1;
+    }
+
+    b->content_y1 = L->y;
+    L->y += (u32)layout_gap(b->pad_bottom) + (u32)layout_gap(b->border_bottom_w);
+    b->box_y1 = L->y;
+    if (b->margin_bottom > L->pending_margin) L->pending_margin = b->margin_bottom;
+    b->line_end = (u16)d->nline;
+
+    if (L->nopen > 0 && L->stack[L->nopen - 1] == bi) L->nopen--;
+    if (L->nopen > 0) {
+        Block *p = &d->block[L->stack[L->nopen - 1]];
+        L->x = p->box_x0;
+        L->width = (float)(p->box_x1 - p->box_x0);
+    } else {
+        L->x = 0.0f;
+        L->width = L->page_w;
+    }
+}
+
 static void doc_layout(Doc *d, const WebMetrics *m, int width) {
     d->nseg = 0;
     d->nline = 0;
@@ -1839,10 +2185,28 @@ static void doc_layout(Doc *d, const WebMetrics *m, int width) {
     memset(&L, 0, sizeof(L));
     L.d = d;
     L.m = m;
+    L.page_w = (float)width;
     L.width = (float)width;
     L.first_seg = -1;
 
-    for (int ai = 0; ai < d->natom; ai++) {
+    for (int ai = 0; ai <= d->natom; ai++) {
+        /* 1. close the boxes that end at this atom, innermost first */
+        while (L.nopen > 0 && d->block[L.stack[L.nopen - 1]].atom_end <= ai)
+            lay_close_block(&L, L.stack[L.nopen - 1]);
+
+        /* 2. open the boxes that start here, in document order. An empty
+         * box (an <hr>, or a <div> with nothing in it) opens and closes at
+         * this same point, so its border and padding still happen. */
+        while (L.next_block < d->nblock &&
+               d->block[L.next_block].atom_start <= ai) {
+            int bi = L.next_block++;
+            lay_open_block(&L, bi);
+            while (L.nopen > 0 && d->block[L.stack[L.nopen - 1]].atom_end <= ai)
+                lay_close_block(&L, L.stack[L.nopen - 1]);
+        }
+
+        if (ai >= d->natom) break;
+
         const Atom *a = &d->atom[ai];
         int level = a->level;
         int len = (int)strlen(a->text);
@@ -2223,8 +2587,75 @@ static void draw_page_images(Surface *v, Web *w, int top) {
     }
 }
 
+/* One CSS border, drawn as what it says: solid fills the band, dashed and
+ * dotted are real gaps, and a double border is two lines inside the width
+ * the author declared instead of a thicker solid one. */
+static void draw_rule(Surface *v, int x, int y, int w, int h, int style, u32 col) {
+    if (w <= 0 || h <= 0) return;
+    if (style == CSS_BORDER_DOTTED) {
+        int step = h * 2;
+        if (step < 2) step = 2;
+        for (int dx = 0; dx < w; dx += step)
+            surf_blend(v, x + dx, y, h, h, col);
+        return;
+    }
+    if (style == CSS_BORDER_DASHED) {
+        int dash = h * 3;
+        if (dash < 3) dash = 3;
+        int step = dash + dash / 2;
+        for (int dx = 0; dx < w; dx += step) {
+            int sad = w - dx;
+            surf_blend(v, x + dx, y, sad < dash ? sad : dash, h, col);
+        }
+        return;
+    }
+    if (style == CSS_BORDER_DOUBLE && h >= 2) {
+        surf_blend(v, x, y, w, 1, col);
+        surf_blend(v, x, y + h - 1, w, 1, col);
+        return;
+    }
+    surf_blend(v, x, y, w, h, col);
+}
+
+/* Every block's background and its top/bottom rules. Painted before the
+ * text, in document order, so a child box sits on its parent's background
+ * exactly as it does in CSS. Boxes with nothing to paint cost one branch. */
+static void draw_page_boxes(Surface *v, Web *w) {
+    Doc *d = &w->doc;
+    /* CSS propagates a body background to the canvas when the root does not
+     * set one. Painting it over the whole page view is what makes a page
+     * that says `body { background: #fff }` look like a page and not like a
+     * white strip with the desktop showing at its edges. */
+    for (int i = 0; i < d->nblock; i++) {
+        Block *b = &d->block[i];
+        if (b->is_body && (b->background >> 24)) {
+            surf_blend(v, 0, 0, v->w, v->h, b->background);
+            break;
+        }
+    }
+    for (int i = 0; i < d->nblock; i++) {
+        Block *b = &d->block[i];
+        if (b->box_x1 <= b->box_x0) continue;
+        int top = (int)b->box_y0 - w->scroll;
+        int bot = (int)b->box_y1 - w->scroll;
+        if (bot <= 0 || top >= v->h) continue;
+        int cw = (int)b->box_x1 - (int)b->box_x0;
+
+        if (b->background >> 24)
+            surf_blend(v, b->box_x0, top, cw, bot - top, b->background);
+        if (b->border_top_w > 0 && b->border_top_style != CSS_BORDER_NONE)
+            draw_rule(v, b->box_x0, top, cw, ui_px(b->border_top_w),
+                      b->border_top_style, b->border_top_color);
+        if (b->border_bottom_w > 0 && b->border_bottom_style != CSS_BORDER_NONE)
+            draw_rule(v, b->box_x0, bot - ui_px(b->border_bottom_w), cw,
+                      ui_px(b->border_bottom_w), b->border_bottom_style,
+                      b->border_bottom_color);
+    }
+}
+
 static void draw_page_lines(Surface *v, Web *w) {
     Doc *d = &w->doc;
+    draw_page_boxes(v, w);
     if (d->nline <= 0) {
         draw_page_images(v, w, 0);
         return;
@@ -2236,6 +2667,9 @@ static void draw_page_lines(Surface *v, Web *w) {
         int ly = (int)ln->y - w->scroll;
         if (ly >= v->h) break;
         if (ly + (int)ln->h <= 0) continue;
+        /* Half-leading: a line-height larger than the face puts the same
+         * amount of space above the text as below it. */
+        int ty = ly + ((int)ln->h - (int)ln->th) / 2;
 
         for (int j = 0; j < (int)ln->n; j++) {
             Seg *sg = &d->seg[ln->first + j];
@@ -2256,10 +2690,10 @@ static void draw_page_lines(Surface *v, Web *w) {
             else if (a->level) col = w->col_head ? w->col_head : C_HEAD;
             else col = w->col_text ? w->col_text : C_TEXT;
 
-            font_draw(v, f, (float)sg->x, (float)ly, tmp, col);
+            font_draw(v, f, (float)sg->x, (float)ty, tmp, col);
 
             if (a->link >= 0) {
-                int uy = ly + (int)font_ascent(f) + ui_px(2);
+                int uy = ty + (int)font_ascent(f) + ui_px(2);
                 surf_fill(v, sg->x, uy, (int)sg->w, 1, color_alpha(col, 0.45f));
             }
         }
@@ -2590,6 +3024,10 @@ static void render(Web *w) {
     s.w = w->w;
     s.h = w->h;
     s.stride = c->stride;
+    /* A Surface carries an optional clip rectangle; "cx1 <= cx0" means
+     * none. Leaving it uninitialised is undefined behaviour, and a stack
+     * word that happens to look like a clip made the whole page vanish. */
+    surf_unclip(&s);
 
     /* Always paint something. The WM can shrink an external window to a
      * 280x160 box (118 px of client at the default scale, 94 px at the
@@ -2641,6 +3079,9 @@ static void render(Web *w) {
         v.w = cw;
         v.h = ch;
         v.stride = s.stride;
+        /* draw_start(), draw_page_lines() and the painter all draw into
+         * this view; its own clip is exactly its own rectangle. */
+        surf_clip(&v, 0, 0, cw, ch);
 
         if (w->state == ST_START)      draw_start(&v, w, -w->scroll);
         else if (w->state == ST_ERROR) draw_error(&v, w, -w->scroll);
@@ -2659,6 +3100,7 @@ static void web_clear_page(Web *w) {
     w->doc.natom = 0;
     w->doc.nseg = 0;
     w->doc.nline = 0;
+    w->doc.nblock = 0;
     w->doc.nlink = 0;
     w->doc.doc_h = 0;
     w->doc.truncated = 0;

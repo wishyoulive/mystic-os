@@ -92,6 +92,7 @@
 static const u32 C_BG     = RGB(0x12, 0x16, 0x1F);
 static const u32 C_PANEL  = RGB(0x1A, 0x21, 0x2D);
 static const u32 C_LINE   = RGB(0x2A, 0x34, 0x45);
+static const u32 C_HOVER  = RGB(0x22, 0x2A, 0x38);
 static const u32 C_TEXT   = RGB(0xE8, 0xEC, 0xF6);
 static const u32 C_DIM    = RGB(0x8A, 0x93, 0xA6);
 static const u32 C_ACCENT = RGB(0x4F, 0xD1, 0xC5);
@@ -114,16 +115,13 @@ static const u32 PALETTE[PAL_N] = {
     RGB(0x94, 0xA3, 0xB8),   /* slate   */
     RGB(0x2B, 0x33, 0x42),   /* graphite*/
 };
-static const char *PAL_NAME[PAL_N] = {
-    "bone", "rust", "amber", "green", "teal", "sky",
-    "blue", "violet", "pink", "orange", "slate", "graphite"
-};
 
 /* ------------------------------------------------------------ tools */
 
 enum { T_PENCIL, T_LINE, T_RECT, T_RECTF, T_ELLIPSE, T_ELLIPSEF, T_FILL, T_PICK, T_N };
 static const char *TOOL_NAME[T_N] = {
-    "Pencil", "Line", "Rect", "Rect F", "Ellipse", "Ellip F", "Fill", "Pick"
+    "Pencil", "Line", "Rectangle", "Rect filled",
+    "Ellipse", "Ellipse filled", "Fill", "Eyedropper"
 };
 
 /* ============================================================
@@ -1286,26 +1284,101 @@ static void act_open(char *msg, size_t n) {
 
 /* ============================================================
  *  Layout and UI
+ *
+ *  One spacing scale, one type scale, one rhythm - the same block the
+ *  desktop's other apps use, so Paint does not look improvised.
+ *
+ *  SPACING.  One unit of 8 px scaled by ui_px(); every padding and every
+ *            gap below is SP(n), and there is no other kind of space.
+ *  TYPE.     Exactly three sizes and the same three faces as the rest of
+ *            the desktop: semibold 15 is the title, regular 11 is body
+ *            text, medium 9 is small print. No other font_get() call.
+ *  HEADER.   One line: the active tool in the title face on the left, a
+ *            brush stepper on the right.
+ *  STRIP.    One row of drawn icons - the eight tools, then undo, redo,
+ *            save, open, clear. It wraps to two rows rather than shrink
+ *            the icons below what the text scale can carry.
+ *  CANVAS.   All the room that is left, at 1:1 when it fits and scaled to
+ *            fit (never cropped) when the window is smaller.
+ *  PALETTE.  One row: the current colour, then the twelve inks.
+ *  MIXER.    A right-hand panel when the window is wide enough to hold it
+ *            beside the canvas, otherwise a popover over the canvas.
+ *  FOOTER.   One line: the picture folder, the undo depth, the brush size.
+ *  TEXT.     Every string is measured; anything wider than its box is cut
+ *            with an ellipsis. text_draw() is the only way this file draws
+ *            text, so a label can never run into its neighbour.
  * ============================================================ */
+
+#define UI_UNIT 8
+static int SP(int n) { return ui_px(n * UI_UNIT); }
 
 typedef struct { int x, y, w, h; } Rect;
 
+/* The five non-tool buttons, in the order they appear after the tools. */
+enum { A_UNDO, A_REDO, A_SAVE, A_OPEN, A_CLEAR, A_N };
+
+/* Icon kinds. The eight tools keep their T_* value; the actions follow. */
+enum { IC_UNDO = T_N, IC_REDO, IC_SAVE, IC_OPEN, IC_TRASH, IC_N };
+
+/* What is under the pointer: one code for hit-testing, hover and press. */
+enum {
+    H_NONE = 0,
+    H_TOOL = 10,
+    H_ACT  = 20,
+    H_SW   = 40,
+    H_CHIP = 60,
+    H_SL   = 70,
+    H_BM   = 80,
+    H_BP   = 81,
+    H_YES  = 90,
+    H_NO   = 91,
+    H_POP  = 95
+};
+
 typedef struct {
-    int  vw, vh;
-    Rect canvas;
-    Rect tool[T_N];
+    int vw, vh, pad;
+
+    /* header: tool name left, brush stepper right */
+    int header_y, header_h;
+    int title_x, title_w;
+    int brush_label_x, brush_label_w, show_brush_label;
+    int brush_num_x, brush_num_w;
     Rect brush_minus, brush_plus;
-    Rect undo_btn, redo_btn;
+
+    /* the tool strip */
+    int strip_y, strip_h, strip_rows, btn, gap, divider_x;
+    Rect tool[T_N];
+    Rect act[A_N];
+
+    /* the sheet */
+    Rect canvas;
+
+    /* the palette row: the current colour, then the twelve inks */
+    int palette_y, palette_h, sw;
+    Rect chip;
     Rect swatch[PAL_N];
+
+    /* the mixer, wherever it lives: panel or popover */
+    int mix_x, mix_w, mix_h, mix_hex_y;
+    int mix_lab_y[3];
+    Rect mix_bar;
     Rect sl[3];
-    Rect dlg_yes, dlg_no, dlg;
-    int  y_colour, y_preview, y_hex, y_mixer, y_drag, y_name;
-    int  y_info[6];
-    int  line_h;
+    int panel_on;
+    Rect panel;
+    int pop_on;
+    Rect pop;
+
+    /* the clear confirmation */
+    Rect dlg, dlg_yes, dlg_no;
+    int dlg_title_y, dlg_body_y, dlg_btn_y, dlg_btn_h;
+
+    /* the footer */
+    int footer_y, footer_h, footer_left_w;
+    int footer_right_x, footer_undo_w, footer_brush_x;
 } Layout;
 
 typedef struct {
-    Font *body, *small, *mono, *big;
+    Font *title, *body, *small;
 } Fonts;
 
 typedef struct {
@@ -1321,312 +1394,790 @@ typedef struct {
     int dialog;      /* 1 while the clear confirmation is up */
     int cursor_in;   /* pointer is over the canvas */
     int stroke;      /* this pencil stroke changed at least one pixel */
+    int hot;         /* H_* under the pointer, for the hover tint */
+    int mixer;       /* the narrow-window mixer popover is open */
 } PaintState;
 
 static Rect rect_make(int x, int y, int w, int h) { Rect r = { x, y, w, h }; return r; }
 
 static int rect_hit(const Rect *r, int x, int y) {
-    return x >= r->x && y >= r->y && x < r->x + r->w && y < r->y + r->h;
+    return r->w > 0 && r->h > 0 &&
+           x >= r->x && y >= r->y && x < r->x + r->w && y < r->y + r->h;
 }
 
-/* Every position below comes from the real font metrics, so a larger text
- * scale moves the rows instead of letting them overlap. */
-static void layout_build(int vw, int vh, const Fonts *F, Layout *L) {
-    memset(L, 0, sizeof(*L));
-    L->vw = vw;
-    L->vh = vh;
+static inline int ui_min(int a, int b) { return a < b ? a : b; }
+static inline int ui_max(int a, int b) { return a > b ? a : b; }
+static inline int ui_clamp(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+static int ui_ceil(float v) {
+    int i = (int)v;
+    return v > (float)i ? i + 1 : i;
+}
 
-    int sh = (int)font_height(F->small);
-    int mh = (int)font_height(F->mono);
-    int gh = (int)font_height(F->big);
-    if (sh < 1) sh = 1;
-    if (mh < 1) mh = 1;
-    if (gh < 1) gh = 1;
-    L->line_h = sh;
+/* The ink of one line is font_height()/1.4 tall (src/font.c); centring
+ * that box, not the line box with its leading, is what puts caps and
+ * descenders equally inside a band. */
+static int ui_top(Font *f, int band) {
+    int ink;
+    if (!f || band <= 0) return 0;
+    ink = (int)(font_height(f) / 1.4f + 0.5f);
+    if (ink >= band) return 0;
+    return (band - ink) / 2;
+}
 
-    L->canvas = rect_make(CX0, CY0, CANVAS_W, CANVAS_H);
-    if (L->canvas.x + L->canvas.w > vw) L->canvas.w = vw - L->canvas.x;
-    if (L->canvas.y + L->canvas.h > vh) L->canvas.h = vh - L->canvas.y;
-    if (L->canvas.w < 0) L->canvas.w = 0;
-    if (L->canvas.h < 0) L->canvas.h = 0;
+/* ------------------------------------------------------------
+ *  Text: measured, truncated with an ellipsis, never overflowing
+ * ------------------------------------------------------------ */
 
-    /* left rail: eight tools, then brush width and history */
-    int th = sh + 6;
-    if (th < 22) th = 22;
-    int ty = 8;
-    for (int i = 0; i < T_N; i++) {
-        L->tool[i] = rect_make(RAIL_X, ty, RAIL_W, th);
-        ty += th + 4;
+/* Copy src into dst and make it fit boxw. Whole UTF-8 characters are
+ * dropped from the end until the string plus an ellipsis fits; if not even
+ * the ellipsis fits the box, the result is empty rather than a smear.
+ * Returns 1 when the string was shortened. */
+static int text_fit(char *dst, size_t cap, Font *f, const char *src, int boxw) {
+    static const char ELL[] = "\xE2\x80\xA6";
+    size_t n;
+    float ew;
+
+    if (!dst || cap == 0) return 0;
+    if (!f || !src) { dst[0] = 0; return 0; }
+    if (src != dst) {
+        n = 0;
+        while (src[n] && n + 1 < cap) { dst[n] = src[n]; n++; }
+        dst[n] = 0;
+    } else {
+        n = strlen(dst);
     }
-    ty += 6;
-    L->brush_minus = rect_make(RAIL_X, ty + sh + 2, 40, th - 4);
-    L->brush_plus  = rect_make(RAIL_X + 44, ty + sh + 2, 40, th - 4);
-    ty += sh + 2 + (th - 4) + 8;
-    L->undo_btn = rect_make(RAIL_X, ty, 40, th - 4);
-    L->redo_btn = rect_make(RAIL_X + 44, ty, 40, th - 4);
+    if (boxw < 1) { dst[0] = 0; return 1; }
+    if (font_width(f, dst) <= (float)boxw) return 0;
 
-    /* right panel: colour preview, hex code, palette, mixer */
-    int y = 8;
-    L->y_colour = y;
-    y += sh + 2;
-    L->y_preview = y;
-    y += 32;
-    L->y_hex = y;
-    y += mh + 4;
-    for (int i = 0; i < PAL_N; i++) {
-        int c = i % 4, r = i / 4;
-        L->swatch[i] = rect_make(PANEL_X + c * 32, y + r * 26, 28, 22);
+    ew = font_width(f, ELL);
+    while (n > 0) {
+        n--;
+        while (n > 0 && ((u8)dst[n] & 0xC0) == 0x80) n--;
+        dst[n] = 0;
+        if (font_width(f, dst) + ew <= (float)boxw) break;
     }
-    y += 3 * 26 - 2;
-    L->y_mixer = y + 2;
-    y += sh + 10;
+    if (n == 0) {
+        if (ew <= (float)boxw && cap >= 4) memcpy(dst, ELL, 4);
+        else dst[0] = 0;
+        return 1;
+    }
+    if (n + 4 > cap) { dst[0] = 0; return 1; }
+    memcpy(dst + n, ELL, 4);
+    return 1;
+}
+
+/* Host proof counters: how many strings were drawn, how many still did
+ * not fit after truncation (which must stay zero). */
+static int g_text_drawn, g_text_over;
+
+static void text_draw(Surface *s, Font *f, int x, int y, int boxw, int align,
+                      const char *t, u32 c) {
+    char buf[256];
+    float w, dx;
+
+    if (!s || !f || !t || !t[0] || boxw <= 0) return;
+    text_fit(buf, sizeof(buf), f, t, boxw);
+    if (!buf[0]) return;
+    w = font_width(f, buf);
+    g_text_drawn++;
+    if (w > (float)boxw + 0.5f) {
+        g_text_over++;
+#ifdef PAINT_HOST_TEST
+        printf("TEXT OVERFLOW: box %d px, string %.1f px: \"%s\"\n",
+               boxw, (double)w, buf);
+#endif
+    }
+    dx = (float)x;
+    if (align == 1) dx = (float)(x + boxw) - w;
+    else if (align == 2) dx = (float)x + ((float)boxw - w) * 0.5f;
+    font_draw(s, f, dx, (float)y, buf, c);
+}
+
+/* ------------------------------------------------------------
+ *  Icons - drawn, not typed, on a 16x16 unit grid
+ * ------------------------------------------------------------ */
+
+static void ic_line(Surface *s, float ox, float oy, float k,
+                    float x0, float y0, float x1, float y1, float wm, u32 c) {
+    float w = wm * k;
+    if (w < 1.0f) w = 1.0f;
+    gfx_line(s, ox + x0 * k, oy + y0 * k, ox + x1 * k, oy + y1 * k, w, c);
+}
+
+static void ic_poly(Surface *s, float ox, float oy, float k,
+                    const float *pts, int n, u32 c) {
+    float p[128];
+    if (n < 3 || n > 64) return;
+    for (int i = 0; i < n * 2; i += 2) {
+        p[i] = ox + pts[i] * k;
+        p[i + 1] = oy + pts[i + 1] * k;
+    }
+    gfx_polygon(s, p, n, c);
+}
+
+static void ic_oval(Surface *s, float ox, float oy, float k, float cx, float cy,
+                    float rx, float ry, u32 c, int fill, float wm) {
+    enum { N = 36 };
+    float pts[N * 2];
+    for (int i = 0; i < N; i++) {
+        float a = (float)i * 6.2831853f / (float)N;
+        pts[i * 2] = cx + cosf(a) * rx;
+        pts[i * 2 + 1] = cy + sinf(a) * ry;
+    }
+    if (fill) {
+        float p[N * 2];
+        for (int i = 0; i < N * 2; i += 2) {
+            p[i] = ox + pts[i] * k;
+            p[i + 1] = oy + pts[i + 1] * k;
+        }
+        gfx_polygon(s, p, N, c);
+        return;
+    }
+    for (int i = 0; i < N; i++) {
+        int j = (i + 1) % N;
+        ic_line(s, ox, oy, k, pts[i * 2], pts[i * 2 + 1],
+                pts[j * 2], pts[j * 2 + 1], wm, c);
+    }
+}
+
+/* A clockwise arc in icon units; angles in radians, 0 = right. */
+static void ic_arc(Surface *s, float ox, float oy, float k, float cx, float cy,
+                   float rx, float ry, float a0, float a1, float wm, u32 c) {
+    enum { N = 22 };
+    float px = cx + cosf(a0) * rx, py = cy - sinf(a0) * ry;
+    for (int i = 1; i <= N; i++) {
+        float a = a0 + (a1 - a0) * (float)i / (float)N;
+        float nx = cx + cosf(a) * rx, ny = cy - sinf(a) * ry;
+        ic_line(s, ox, oy, k, px, py, nx, ny, wm, c);
+        px = nx;
+        py = ny;
+    }
+}
+
+static void icon_draw(Surface *s, int kind, const Rect *r, u32 c) {
+    float k = (float)r->w / 16.0f;
+    float ox = (float)r->x, oy = (float)r->y;
+    float w1 = 1.35f, w2 = 2.5f;
+
+    if (r->w <= 0 || r->h <= 0) return;
+    if (r->w < 12) { w1 = 1.7f; w2 = 2.9f; }   /* keep hairlines visible */
+
+    switch (kind) {
+    case T_PENCIL:
+        ic_line(s, ox, oy, k, 3.2f, 12.8f, 10.8f, 5.2f, w2, c);
+        ic_line(s, ox, oy, k, 10.2f, 4.6f, 11.8f, 3.0f, w2 * 1.15f, c);
+        {
+            float t[6] = { 1.7f, 14.3f, 4.1f, 13.5f, 2.6f, 12.0f };
+            ic_poly(s, ox, oy, k, t, 3, c);
+        }
+        break;
+    case T_LINE:
+        ic_line(s, ox, oy, k, 3.0f, 13.0f, 13.0f, 3.0f, w1, c);
+        gfx_rrect_aa(s, ox + 2.0f * k, oy + 12.0f * k, 2.0f * k, 2.0f * k, 0, c, 0, 0);
+        gfx_rrect_aa(s, ox + 12.0f * k, oy + 2.0f * k, 2.0f * k, 2.0f * k, 0, c, 0, 0);
+        break;
+    case T_RECT:
+        gfx_rrect_aa(s, ox + 2.2f * k, oy + 3.4f * k, 11.6f * k, 9.2f * k, 0,
+                     0, c, w1 * k);
+        break;
+    case T_RECTF:
+        gfx_rrect_aa(s, ox + 2.2f * k, oy + 3.4f * k, 11.6f * k, 9.2f * k, 0,
+                     c, 0, 0);
+        break;
+    case T_ELLIPSE:
+        ic_oval(s, ox, oy, k, 8.0f, 8.0f, 5.9f, 4.4f, c, 0, w1);
+        break;
+    case T_ELLIPSEF:
+        ic_oval(s, ox, oy, k, 8.0f, 8.0f, 5.9f, 4.4f, c, 1, 0);
+        break;
+    case T_FILL:
+        /* the bucket */
+        ic_line(s, ox, oy, k, 4.4f, 6.0f, 10.8f, 6.0f, w1, c);
+        ic_line(s, ox, oy, k, 4.4f, 6.0f, 5.7f, 12.4f, w1, c);
+        ic_line(s, ox, oy, k, 10.8f, 6.0f, 9.5f, 12.4f, w1, c);
+        ic_line(s, ox, oy, k, 5.7f, 12.4f, 9.5f, 12.4f, w1, c);
+        ic_line(s, ox, oy, k, 5.2f, 6.0f, 6.4f, 3.2f, w1, c);
+        ic_line(s, ox, oy, k, 6.4f, 3.2f, 9.4f, 3.2f, w1, c);
+        ic_line(s, ox, oy, k, 9.4f, 3.2f, 10.2f, 6.0f, w1, c);
+        /* and the drop it pours */
+        ic_oval(s, ox, oy, k, 12.6f, 11.2f, 1.6f, 2.1f, c, 1, 0);
+        break;
+    case T_PICK:
+        ic_line(s, ox, oy, k, 11.4f, 4.6f, 6.0f, 10.0f, w2, c);
+        ic_line(s, ox, oy, k, 6.0f, 10.0f, 3.4f, 12.6f, 1.0f, c);
+        ic_oval(s, ox, oy, k, 12.2f, 3.8f, 2.1f, 2.1f, c, 1, 0);
+        break;
+    case IC_UNDO:
+        ic_arc(s, ox, oy, k, 8.6f, 10.6f, 4.0f, 4.2f, 0.0f, 3.14159f, w1, c);
+        {
+            float t[6] = { 4.0f, 10.6f, 7.2f, 8.2f, 7.0f, 12.9f };
+            ic_poly(s, ox, oy, k, t, 3, c);
+        }
+        break;
+    case IC_REDO:
+        ic_arc(s, ox, oy, k, 7.4f, 10.6f, 4.0f, 4.2f, 3.14159f, 0.0f, w1, c);
+        {
+            float t[6] = { 12.0f, 10.6f, 8.8f, 8.2f, 9.0f, 12.9f };
+            ic_poly(s, ox, oy, k, t, 3, c);
+        }
+        break;
+    case IC_SAVE:
+        gfx_rrect_aa(s, ox + 2.6f * k, oy + 2.4f * k, 10.8f * k, 11.2f * k,
+                     1.0f * k, 0, c, w1 * k);
+        gfx_rrect_aa(s, ox + 5.6f * k, oy + 2.4f * k, 4.8f * k, 3.2f * k, 0, c, 0, 0);
+        gfx_rrect_aa(s, ox + 5.2f * k, oy + 9.2f * k, 5.6f * k, 4.4f * k, 0, c, 0, 0);
+        break;
+    case IC_OPEN: {
+        float t[16] = {
+            2.4f, 12.6f, 2.4f, 4.6f, 6.4f, 4.6f, 7.6f, 3.2f,
+            11.6f, 3.2f, 12.8f, 4.8f, 13.6f, 4.8f, 13.6f, 12.6f
+        };
+        ic_poly(s, ox, oy, k, t, 8, c);
+        break;
+    }
+    case IC_TRASH:
+        ic_line(s, ox, oy, k, 3.4f, 4.6f, 12.6f, 4.6f, w1 * 1.3f, c);
+        ic_line(s, ox, oy, k, 6.4f, 4.6f, 6.4f, 2.8f, w1, c);
+        ic_line(s, ox, oy, k, 6.4f, 2.8f, 9.6f, 2.8f, w1, c);
+        ic_line(s, ox, oy, k, 9.6f, 2.8f, 9.6f, 4.6f, w1, c);
+        ic_line(s, ox, oy, k, 4.8f, 4.6f, 5.7f, 13.4f, w1, c);
+        ic_line(s, ox, oy, k, 11.2f, 4.6f, 10.3f, 13.4f, w1, c);
+        ic_line(s, ox, oy, k, 5.7f, 13.4f, 10.3f, 13.4f, w1, c);
+        ic_line(s, ox, oy, k, 7.3f, 6.8f, 7.5f, 11.6f, 1.0f, c);
+        ic_line(s, ox, oy, k, 8.7f, 6.8f, 8.5f, 11.6f, 1.0f, c);
+        break;
+    default:
+        break;
+    }
+}
+
+/* ------------------------------------------------------------
+ *  The one button: an icon chip. Hover and selection are the same
+ *  rectangle with a different fill, so nothing moves.
+ * ------------------------------------------------------------ */
+
+static void strip_button(Surface *s, const PaintState *st, const Rect *r, int icon,
+                         int active, int code, int enabled) {
+    int hot = st->hot == code;
+    int isz;
+    Rect ib;
+    u32 fill, bord, ink;
+
+    if (r->w <= 0 || r->h <= 0) return;
+    fill = active ? color_alpha(C_ACCENT, 0.16f) : hot ? C_HOVER : 0;
+    bord = active ? color_alpha(C_ACCENT, 0.85f) : 0;
+    if (fill || bord)
+        gfx_rrect_aa(s, (float)r->x, (float)r->y, (float)r->w, (float)r->h,
+                     (float)ui_px(4), fill, bord, 1.0f);
+
+    isz = r->w * 11 / 20;
+    if (isz > r->h - 2) isz = r->h - 2;
+    if (isz < 4) return;
+    ib = rect_make(r->x + (r->w - isz) / 2, r->y + (r->h - isz) / 2, isz, isz);
+    ink = !enabled ? color_alpha(C_DIM, 0.35f)
+        : active ? C_ACCENT
+        : hot ? C_TEXT
+        : color_alpha(C_TEXT, 0.72f);
+    icon_draw(s, icon, &ib, ink);
+}
+
+/* The brush stepper: two small squares and the value between them. */
+static void stepper_draw(Surface *s, const Rect *r, int plus, int hot, int enabled) {
+    float cx, cy, arm;
+    u32 ink = enabled ? (hot ? C_TEXT : C_DIM) : color_alpha(C_DIM, 0.35f);
+
+    if (r->w <= 0 || r->h <= 0) return;
+    gfx_rrect_aa(s, (float)r->x, (float)r->y, (float)r->w, (float)r->h,
+                 (float)ui_px(4), hot ? C_HOVER : C_PANEL,
+                 enabled ? C_LINE : color_alpha(C_LINE, 0.5f), 1.0f);
+    cx = (float)r->x + (float)r->w * 0.5f;
+    cy = (float)r->y + (float)r->h * 0.5f;
+    arm = (float)r->w * 0.22f;
+    if (arm < 2.0f) arm = 2.0f;
+    gfx_line(s, cx - arm, cy, cx + arm, cy, 1.4f, ink);
+    if (plus) gfx_line(s, cx, cy - arm, cx, cy + arm, 1.4f, ink);
+}
+
+static void slider_draw(Surface *s, const Rect *r, int v, u32 col, int hot) {
+    float kx;
+    int kh, fillw;
+
+    if (r->w <= 0 || r->h <= 0) return;
+    kh = r->h + 2 * ui_px(2);
+    gfx_rrect_aa(s, (float)r->x, (float)r->y, (float)r->w, (float)r->h,
+                 (float)r->h * 0.5f, color_alpha(C_TEXT, 0.09f), 0, 0);
+    fillw = (r->w * v) / 255;
+    if (fillw > 1)
+        gfx_rrect_aa(s, (float)r->x, (float)r->y, (float)fillw, (float)r->h,
+                     (float)r->h * 0.5f, color_alpha(col, 0.55f), 0, 0);
+    kx = (float)r->x + (float)(r->w - 1) * (float)v / 255.0f;
+    gfx_rrect_aa(s, kx - (float)kh * 0.5f, (float)r->y - ui_px(2),
+                 (float)kh, (float)kh, (float)kh * 0.5f, C_TEXT,
+                 hot ? C_ACCENT : C_LINE, 1.0f);
+}
+
+/* ------------------------------------------------------------
+ *  Layout - the single source of every number in this window
+ * ------------------------------------------------------------ */
+
+/* Place the mixer's rows inside (x,y,w). with_bar draws the current
+ * colour as a wide chip at the top of the panel; the popover has the
+ * palette row's chip right underneath it instead. */
+static void mixer_build(Layout *L, const Fonts *F, int x, int y, int w, int with_bar) {
+    int sh = ui_ceil(font_height(F->small));
+    int gap = SP(1);
+    int sl_h = ui_max(ui_px(4), gap);
+    int yy = y;
+
+    L->mix_x = x;
+    L->mix_w = w;
+    if (with_bar) {
+        L->mix_bar = rect_make(x, y, w, SP(4));
+        yy += SP(4) + gap;
+    } else {
+        L->mix_bar = rect_make(0, 0, 0, 0);
+    }
+    L->mix_hex_y = yy;
+    yy += sh + gap;
     for (int i = 0; i < 3; i++) {
-        L->sl[i] = rect_make(PANEL_X + 16, y + sh - 2, 78, 10);
-        y += sh + 12;
+        L->mix_lab_y[i] = yy;
+        L->sl[i] = rect_make(x, yy + sh, w, sl_h);
+        yy += sh + sl_h + SP(2);
     }
-    L->y_drag = y + 2;
-    L->y_name = y + sh + 2;
-
-    /* the six information lines, anchored to the bottom of the window */
-    int dy = sh + 3;
-    int start = CY0 + CANVAS_H + 16;
-    if (start + 6 * dy > vh - 4) start = vh - 4 - 6 * dy;
-    if (start < CY0 + CANVAS_H + 4) start = CY0 + CANVAS_H + 4;
-    for (int i = 0; i < 6; i++) L->y_info[i] = start + i * dy;
-
-    /* the clear confirmation */
-    int dw = 340;
-    if (dw > vw - 20) dw = vw - 20;
-    if (dw < 120) dw = 120;
-    int dh = 14 + gh + 6 + sh + 14 + 26 + 14;
-    L->dlg = rect_make((vw - dw) / 2, (vh - dh) / 2, dw, dh);
-    L->dlg_yes = rect_make(L->dlg.x + 16, L->dlg.y + dh - 40, 140, 26);
-    L->dlg_no  = rect_make(L->dlg.x + dw - 156, L->dlg.y + dh - 40, 140, 26);
+    L->mix_h = yy - SP(2) - y;
 }
 
-/* Copy t into buf, cutting whole UTF-8 characters until it fits maxw. */
-static void fit_text(char *buf, size_t bsz, Font *f, const char *t, int maxw) {
-    if (buf != t) snprintf(buf, bsz, "%s", t);   /* callers pass buf as t too */
-    size_t n = strlen(buf);
-    while (n > 1 && font_width(f, buf) > (float)maxw) {
-        buf[--n] = 0;
-        while (n > 1 && ((u8)buf[n] & 0xC0) == 0x80) buf[--n] = 0;
+static void layout_build(int vw, int vh, const Fonts *F, const PaintState *st, Layout *L) {
+    int th, sh, pad, gap, over, availw, btn, need, cells, sw, area_top, area_bot;
+    int area_x, area_w, area_h, rows_h, row_adv, sl_h, mix_need, panel_w;
+    int cvw, cvh, block_w, block_h, block_x, canvas_y, row_x, row_w, panel_on;
+    int dw, dh, bx, step, num_w, label_w, title_right;
+
+    memset(L, 0, sizeof(*L));
+    L->vw = vw > 0 ? vw : 1;
+    L->vh = vh > 0 ? vh : 1;
+    L->pad = SP(1);
+    pad = L->pad;
+    gap = SP(1);
+    over = SP(2);
+
+    th = ui_ceil(font_height(F->title));
+    sh = ui_ceil(font_height(F->small));
+    L->gap = gap;
+
+    /* ---- header ---- */
+    L->header_y = pad;
+    L->header_h = th;
+
+    step = ui_max(SP(2), sh + SP(1));
+    num_w = ui_max(SP(2), (int)font_width(F->body, "00") + gap);
+    label_w = (int)font_width(F->small, "Brush") + gap;
+    bx = L->vw - pad;
+    L->brush_plus = rect_make(bx - step, L->header_y + (th - step) / 2, step, step);
+    bx = L->brush_plus.x - gap;
+    L->brush_num_x = bx - num_w;
+    L->brush_num_w = num_w;
+    bx = L->brush_num_x;
+    L->brush_minus = rect_make(bx - step, L->header_y + (th - step) / 2, step, step);
+    bx = L->brush_minus.x - gap;
+    L->show_brush_label = 1;
+    L->brush_label_x = bx - label_w;
+    L->brush_label_w = label_w;
+    title_right = L->brush_label_x;
+    if (title_right - pad < SP(9)) {
+        L->show_brush_label = 0;
+        L->brush_label_w = 0;
+        L->brush_label_x = L->brush_minus.x;
+        title_right = L->brush_minus.x;
+    }
+    L->title_x = pad;
+    L->title_w = ui_max(1, title_right - gap - pad);
+
+    /* ---- the tool strip; it wraps instead of shrinking past legibility ---- */
+    availw = L->vw - 2 * pad;
+    btn = (int)(font_height(F->small) * 2.0f + 0.5f);
+    if (btn < SP(2)) btn = SP(2);
+    if (btn > SP(4)) btn = SP(4);
+    need = (T_N + A_N) * btn + (T_N + A_N - 1) * gap + 2 * over - gap;
+    L->strip_rows = (need <= availw) ? 1 : 2;
+    if (L->strip_rows == 2) {
+        int fit_t = (availw - (T_N - 1) * gap) / T_N;
+        int fit_a = (availw - (A_N - 1) * gap) / A_N;
+        int fit = ui_min(fit_t, fit_a);
+        if (btn > fit) btn = fit;
+        if (btn < 12) btn = 12;
+    }
+    L->btn = btn;
+    L->strip_y = L->header_y + L->header_h + pad;
+    L->strip_h = L->strip_rows * btn + (L->strip_rows - 1) * gap;
+    L->divider_x = -1;
+    if (L->strip_rows == 1) {
+        int x = pad;
+        for (int i = 0; i < T_N; i++) {
+            L->tool[i] = rect_make(x, L->strip_y, btn, btn);
+            x += btn + gap;
+        }
+        L->divider_x = x - gap / 2;
+        x += 2 * over - gap;
+        for (int i = 0; i < A_N; i++) {
+            L->act[i] = rect_make(x, L->strip_y, btn, btn);
+            x += btn + gap;
+        }
+    } else {
+        for (int i = 0; i < T_N; i++)
+            L->tool[i] = rect_make(pad + i * (btn + gap), L->strip_y, btn, btn);
+        for (int i = 0; i < A_N; i++)
+            L->act[i] = rect_make(pad + i * (btn + gap), L->strip_y + btn + gap, btn, btn);
+    }
+
+    /* ---- the footer ---- */
+    L->footer_h = sh;
+    L->footer_y = L->vh - pad - sh;
+    if (L->footer_y < 0) L->footer_y = 0;
+    L->footer_undo_w = ui_ceil(font_width(F->small, "undo 00/00"));
+    L->footer_brush_x = L->vw - pad - ui_ceil(font_width(F->small, "brush 00"));
+    L->footer_right_x = L->footer_brush_x - SP(2) - L->footer_undo_w;
+    L->footer_left_w = L->footer_right_x - SP(2) - pad;
+    if (L->footer_left_w < SP(4)) L->footer_left_w = SP(4);
+
+    /* ---- the palette, the canvas and the mixer ----
+     * They are one block: the sheet, the row of inks under it, and the
+     * mixer beside it when the window can hold all three. The block is
+     * centred in the area between the strip and the footer, so a large
+     * window shows a centred artboard rather than a sheet pinned to the
+     * top with its palette stranded at the bottom. */
+    area_top = L->strip_y + L->strip_h + pad;
+    area_bot = L->footer_y - pad;
+    if (area_bot <= area_top) area_bot = area_top + 1;
+    area_x = pad;
+    area_w = availw;
+    area_h = area_bot - area_top;
+
+    sl_h = ui_max(ui_px(4), gap);
+    row_adv = sh + sl_h + SP(2);
+    rows_h = 3 * row_adv - SP(2);
+    mix_need = SP(4) + gap + sh + gap + rows_h;   /* bar, hex, three rows */
+    panel_w = ui_max(SP(18), (int)font_width(F->small, "#FFFFFF") + 2 * gap);
+
+    cells = PAL_N + 1;
+    sw = (area_w - (cells - 1) * gap) / cells;
+    if (sw > SP(3)) sw = SP(3);
+    if (sw < 3) sw = 3;
+    L->palette_h = sw;
+
+    panel_on = (area_w - panel_w - 2 * gap >= SP(30) && area_h - gap - sw >= SP(20));
+    for (;;) {
+        cvw = area_w - (panel_on ? panel_w + 2 * gap : 0);
+        cvh = area_h - gap - L->palette_h;
+        if (cvw < 1) cvw = 1;
+        if (cvh < 1) cvh = 1;
+        dw = cvw;
+        dh = (int)((long)dw * CANVAS_H / CANVAS_W);
+        if (dw > CANVAS_W) { dw = CANVAS_W; dh = CANVAS_H; }
+        if (dh > cvh) { dh = cvh; dw = (int)((long)dh * CANVAS_W / CANVAS_H); }
+        if (dw > cvw) { dw = cvw; dh = (int)((long)dw * CANVAS_H / CANVAS_W); }
+        if (dw < 1) dw = 1;
+        if (dh < 1) dh = 1;
+        if (!panel_on || dh >= 2 * pad + mix_need) break;
+        panel_on = 0;                    /* the mixer's rows do not fit */
+    }
+    L->panel_on = panel_on;
+
+    block_w = dw + (panel_on ? 2 * gap + panel_w : 0);
+    block_h = dh + gap + L->palette_h;
+    if (block_w > area_w) block_w = area_w;
+    block_x = area_x + (area_w - block_w) / 2;
+    canvas_y = area_top + (area_h - block_h) / 2;
+    if (canvas_y < area_top) canvas_y = area_top;
+    L->canvas = rect_make(block_x, canvas_y, dw, dh);
+
+    /* the row of inks sits under the sheet: on the sheet's width when the
+     * mixer is beside it, on the window's width when it is not */
+    L->palette_y = canvas_y + dh + gap;
+    row_x = panel_on ? L->canvas.x : area_x;
+    row_w = panel_on ? L->canvas.w : area_w;
+    sw = (row_w - (cells - 1) * gap) / cells;
+    if (sw > SP(3)) sw = SP(3);
+    if (sw < 3) sw = 3;
+    L->sw = sw;
+    L->palette_h = sw;
+    L->chip = rect_make(row_x, L->palette_y, sw, sw);
+    for (int i = 0; i < PAL_N; i++)
+        L->swatch[i] = rect_make(row_x + (i + 1) * (sw + gap), L->palette_y, sw, sw);
+
+    if (panel_on) {
+        int ph = ui_min(dh, 2 * pad + mix_need);   /* the card's own height */
+        L->panel = rect_make(L->canvas.x + dw + 2 * gap, canvas_y, panel_w, ph);
+        mixer_build(L, F, L->panel.x + pad, L->panel.y + pad,
+                    L->panel.w - 2 * pad, 1);
+    } else {
+        int pw = ui_min(SP(28), L->vw - 2 * pad);
+        int ph = 2 * pad + sh + gap + rows_h;
+        int px, py;
+        if (pw < SP(10)) pw = SP(10);
+        if (ph > L->vh - 2 * pad) ph = L->vh - 2 * pad;
+        if (ph < 1) ph = 1;
+        px = ui_clamp(L->chip.x, pad, ui_max(pad, L->vw - pad - pw));
+        py = L->palette_y - gap - ph;
+        if (py < L->header_y + L->header_h + gap)
+            py = ui_max(pad, (L->vh - ph) / 2);
+        L->pop = rect_make(px, py, pw, ph);
+        L->pop_on = (st && st->mixer) ? 1 : 0;
+        if (L->pop_on)
+            mixer_build(L, F, L->pop.x + pad, L->pop.y + pad,
+                        L->pop.w - 2 * pad, 0);
+    }
+
+    /* ---- the clear confirmation ---- */
+    {
+        int m = SP(1), b_h = ui_max(SP(3), sh + SP(1));
+        int dw2 = ui_min(SP(42), L->vw - 2 * pad);
+        int dh2 = m + th + m + sh + SP(2) + b_h + m;
+        int bw;
+        if (dw2 < 100) dw2 = ui_min(100, L->vw);
+        if (dh2 > L->vh) dh2 = L->vh;
+        L->dlg = rect_make((L->vw - dw2) / 2, (L->vh - dh2) / 2, dw2, dh2);
+        L->dlg_title_y = L->dlg.y + m;
+        L->dlg_body_y = L->dlg_title_y + th + m;
+        L->dlg_btn_h = b_h;
+        L->dlg_btn_y = L->dlg.y + dh2 - m - b_h;
+        if (L->dlg_btn_y < L->dlg_body_y + sh) L->dlg_btn_y = L->dlg_body_y + sh;
+        bw = ui_min(SP(14), (dw2 - 3 * m) / 2);
+        L->dlg_no = rect_make(L->dlg.x + m, L->dlg_btn_y, bw, b_h);
+        L->dlg_yes = rect_make(L->dlg.x + dw2 - m - bw, L->dlg_btn_y, bw, b_h);
     }
 }
 
-static void draw_button(Surface *s, Font *f, Rect r, const char *label,
-                        int active, int enabled) {
-    u32 fill = active ? color_alpha(C_ACCENT, 0.20f) : C_PANEL;
-    u32 border = active ? C_ACCENT : C_LINE;
-    gfx_rrect_aa(s, (float)r.x, (float)r.y, (float)r.w, (float)r.h, 4.0f,
-                 fill, border, 1.0f);
-    u32 tc = enabled ? (active ? C_TEXT : C_DIM) : color_alpha(C_DIM, 0.45f);
-    char buf[64];
-    fit_text(buf, sizeof(buf), f, label, r.w - 6);
-    float tw = font_width(f, buf);
-    float ty = (float)r.y + ((float)r.h - font_height(f)) * 0.5f;
-    if (ty < (float)r.y + 1.0f) ty = (float)r.y + 1.0f;
-    font_draw(s, f, (float)r.x + ((float)r.w - tw) * 0.5f, ty, buf, tc);
+/* ------------------------------------------------------------
+ *  The canvas, scaled to fit when the window is too small
+ * ------------------------------------------------------------ */
+
+static u32 stage[CANVAS_PX];
+
+static void blit_canvas(Surface *s, const Rect *d, const u32 *src) {
+    if (d->w <= 0 || d->h <= 0) return;
+    if (d->w == CANVAS_W && d->h == CANVAS_H) {
+        for (int y = 0; y < CANVAS_H; y++) {
+            int dy = d->y + y;
+            if ((unsigned)dy >= (unsigned)s->h) continue;
+            for (int x = 0; x < CANVAS_W; x++) {
+                int dx = d->x + x;
+                if ((unsigned)dx >= (unsigned)s->w) continue;
+                s->px[(size_t)dy * s->stride + dx] = src[(size_t)y * CANVAS_W + x];
+            }
+        }
+        return;
+    }
+    /* shrinking: one box average per destination pixel, so a fit-to-window
+     * view stays readable instead of dropping every other pixel. */
+    for (int y = 0; y < d->h; y++) {
+        int sy0 = (int)((long)y * CANVAS_H / d->h);
+        int sy1 = (int)((long)(y + 1) * CANVAS_H / d->h);
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        if (sy1 > CANVAS_H) sy1 = CANVAS_H;
+        for (int x = 0; x < d->w; x++) {
+            int sx0 = (int)((long)x * CANVAS_W / d->w);
+            int sx1 = (int)((long)(x + 1) * CANVAS_W / d->w);
+            unsigned long r = 0, g = 0, b = 0, n = 0;
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            if (sx1 > CANVAS_W) sx1 = CANVAS_W;
+            for (int sy = sy0; sy < sy1; sy++)
+                for (int sx = sx0; sx < sx1; sx++) {
+                    u32 c = src[(size_t)sy * CANVAS_W + sx];
+                    r += GET_R(c);
+                    g += GET_G(c);
+                    b += GET_B(c);
+                    n++;
+                }
+            if (!n) n = 1;
+            surf_set(s, d->x + x, d->y + y,
+                     RGB((int)(r / n), (int)(g / n), (int)(b / n)));
+        }
+    }
 }
 
-static void draw_slider(Surface *s, Rect r, int v, u32 channel_col, int active) {
-    gfx_rrect_aa(s, (float)r.x, (float)r.y, (float)r.w, (float)r.h,
-                 (float)r.h * 0.5f, color_alpha(C_TEXT, 0.10f), 0, 0);
-    float knob = (float)r.x + ((float)(r.w - 1) * (float)v) / 255.0f;
-    float kw = (float)r.h + 4.0f;
-    gfx_rrect_aa(s, knob - kw * 0.5f, (float)r.y - 2.0f, kw, (float)r.h + 4.0f,
-                 kw * 0.5f, channel_col, active ? C_TEXT : C_LINE, active ? 1.5f : 1.0f);
+/* Window point -> canvas pixel, the exact inverse of blit_canvas's box. */
+static void canvas_map(const Layout *L, int x, int y, int *cx, int *cy) {
+    int w = L->canvas.w > 0 ? L->canvas.w : 1;
+    int h = L->canvas.h > 0 ? L->canvas.h : 1;
+    *cx = (int)((long)(x - L->canvas.x) * CANVAS_W / w);
+    *cy = (int)((long)(y - L->canvas.y) * CANVAS_H / h);
+}
+
+/* ------------------------------------------------------------
+ *  Draw
+ * ------------------------------------------------------------ */
+
+static void mixer_draw(Surface *s, const Layout *L, const Fonts *F,
+                       const PaintState *st) {
+    static const char *NM[3] = { "R", "G", "B" };
+    static const u32 CC[3] = {
+        RGB(0xE0, 0x6C, 0x5C), RGB(0x7B, 0xD8, 0x8F), RGB(0x7A, 0xA2, 0xF7)
+    };
+    int v[3] = { st->r, st->g, st->b };
+    char hex[16];
+
+    snprintf(hex, sizeof(hex), "#%02X%02X%02X", st->r, st->g, st->b);
+    text_draw(s, F->small, L->mix_x, L->mix_hex_y, L->mix_w, 0, hex, C_DIM);
+    for (int i = 0; i < 3; i++) {
+        char val[8];
+        snprintf(val, sizeof(val), "%d", v[i]);
+        text_draw(s, F->small, L->mix_x, L->mix_lab_y[i], L->mix_w, 0, NM[i], CC[i]);
+        text_draw(s, F->small, L->mix_x, L->mix_lab_y[i], L->mix_w, 1, val, C_TEXT);
+        slider_draw(s, &L->sl[i], v[i], CC[i], st->slider == i || st->hot == H_SL + i);
+    }
 }
 
 static void draw_ui(MClient *c, const Layout *L, const Fonts *F,
                     const PaintState *st, const char *msg, int msg_warn) {
     int vw = L->vw, vh = L->vh;
-    if (vw <= 0 || vh <= 0) return;
-    Surface s = { .px = c->px, .w = vw, .h = vh, .stride = c->stride };
+    Surface s;
+    u32 cur = RGB(st->r, st->g, st->b);
 
+    if (vw <= 0 || vh <= 0) return;
+    s.px = c->px;
+    s.w = vw;
+    s.h = vh;
+    s.stride = c->stride;
+    s.cx0 = s.cy0 = s.cx1 = s.cy1 = 0;
     surf_fill(&s, 0, 0, vw, vh, C_BG);
 
-    /* ---- canvas ---- */
+    /* ---- the sheet, with the shape being dragged on top of it ---- */
     if (L->canvas.w > 0 && L->canvas.h > 0) {
-        gfx_rrect_aa(&s, (float)L->canvas.x - 2, (float)L->canvas.y - 2,
-                     (float)L->canvas.w + 4, (float)L->canvas.h + 4, 3.0f,
-                     0, C_LINE, 2.0f);
-        Surface cv = { .px = canvas, .w = CANVAS_W, .h = CANVAS_H, .stride = CANVAS_W };
-        surf_push(&s, L->canvas.x, L->canvas.y, &cv, 0, 0,
-                  L->canvas.w, L->canvas.h);
-    }
-
-    /* ---- live preview of the shape being dragged ---- */
-    if (st->drag && L->canvas.w > 0) {
-        Ink k;
-        int x1 = st->px, y1 = st->py;
-        int x0 = st->sx, y0 = st->sy;
-        if (st->shift) {
-            int dx = x1 - x0, dy = y1 - y0;
-            int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
-            if (st->tool == T_LINE) {
-                if (adx > 2 * ady) y1 = y0;
-                else if (ady > 2 * adx) x1 = x0;
-                else {
+        const u32 *src = canvas;
+        if (st->drag) {
+            Ink k;
+            int x0 = st->sx, y0 = st->sy, x1 = st->px, y1 = st->py;
+            if (st->shift) {
+                int dx = x1 - x0, dy = y1 - y0;
+                int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+                if (st->tool == T_LINE) {
+                    if (adx > 2 * ady) y1 = y0;
+                    else if (ady > 2 * adx) x1 = x0;
+                    else {
+                        int m = adx > ady ? adx : ady;
+                        x1 = x0 + (dx < 0 ? -m : m);
+                        y1 = y0 + (dy < 0 ? -m : m);
+                    }
+                } else {
                     int m = adx > ady ? adx : ady;
                     x1 = x0 + (dx < 0 ? -m : m);
                     y1 = y0 + (dy < 0 ? -m : m);
                 }
-            } else {
-                int m = adx > ady ? adx : ady;
-                x1 = x0 + (dx < 0 ? -m : m);
-                y1 = y0 + (dy < 0 ? -m : m);
             }
+            memcpy(stage, canvas, CANVAS_BYTES);
+            ink_init(&k, stage, CANVAS_W, 0, 0, 0, 0, CANVAS_W, CANVAS_H,
+                     cur, st->brush);
+            shape_draw(&k, st->tool, x0, y0, x1, y1);
+            src = stage;
         }
-        ink_init(&k, s.px, s.stride, L->canvas.x, L->canvas.y,
-                 L->canvas.x, L->canvas.y,
-                 L->canvas.x + L->canvas.w, L->canvas.y + L->canvas.h,
-                 RGB(st->r, st->g, st->b), st->brush);
-        shape_draw(&k, st->tool, x0, y0, x1, y1);
+        blit_canvas(&s, &L->canvas, src);
+        gfx_rrect_aa(&s, (float)L->canvas.x - 1.0f, (float)L->canvas.y - 1.0f,
+                     (float)L->canvas.w + 2.0f, (float)L->canvas.h + 2.0f,
+                     2.0f, 0, C_LINE, 1.0f);
     }
 
-    /* ---- tool rail ---- */
-    for (int i = 0; i < T_N; i++) {
-        char lab[32];
-        snprintf(lab, sizeof(lab), "%d %s", i + 1, TOOL_NAME[i]);
-        draw_button(&s, F->small, L->tool[i], lab, st->tool == i, 1);
+    /* ---- the tool strip ---- */
+    for (int i = 0; i < T_N; i++)
+        strip_button(&s, st, &L->tool[i], i, st->tool == i, H_TOOL + i, 1);
+    for (int i = 0; i < A_N; i++) {
+        int en = 1;
+        if (i == A_UNDO) en = hist_at > 0;
+        else if (i == A_REDO) en = hist_at + 1 < hist_n;
+        strip_button(&s, st, &L->act[i], IC_UNDO + i, 0, H_ACT + i, en);
     }
-    {
-        char b[16];
-        int by = L->brush_minus.y - L->line_h - 2;
-        snprintf(b, sizeof(b), "BRUSH %d", st->brush);
-        font_draw(&s, F->small, (float)RAIL_X, (float)by, b, color_alpha(C_TEXT, 0.5f));
-        draw_button(&s, F->body, L->brush_minus, "-", 0, st->brush > 1);
-        draw_button(&s, F->body, L->brush_plus, "+", 0, st->brush < MAX_BRUSH);
-        draw_button(&s, F->small, L->undo_btn, "undo", 0, hist_at > 0);
-        draw_button(&s, F->small, L->redo_btn, "redo", 0, hist_at + 1 < hist_n);
-    }
+    if (L->strip_rows == 1 && L->divider_x > 0)
+        surf_fill(&s, L->divider_x, L->strip_y + L->btn / 3, 1,
+                  ui_max(1, L->btn / 3), C_LINE);
 
-    /* ---- colour panel ---- */
-    font_draw(&s, F->small, (float)PANEL_X, (float)L->y_colour, "COLOUR",
-              color_alpha(C_TEXT, 0.5f));
-    gfx_rrect_aa(&s, (float)PANEL_X, (float)L->y_preview, (float)PANEL_W, 30.0f,
-                 5.0f, RGB(st->r, st->g, st->b), C_LINE, 1.0f);
-    {
-        char hex[16];
-        snprintf(hex, sizeof(hex), "#%02X%02X%02X", st->r, st->g, st->b);
-        font_draw(&s, F->mono, (float)PANEL_X, (float)L->y_hex, hex, C_TEXT);
-    }
+    /* ---- the palette row: current colour, then the twelve inks ---- */
+    gfx_rrect_aa(&s, (float)L->chip.x, (float)L->chip.y,
+                 (float)L->chip.w, (float)L->chip.h, 3.0f, cur,
+                 (L->panel_on || L->pop_on) ? C_ACCENT : C_LINE, 1.0f);
     for (int i = 0; i < PAL_N; i++) {
+        const Rect *r = &L->swatch[i];
         int chosen = st->r == (int)GET_R(PALETTE[i]) &&
                      st->g == (int)GET_G(PALETTE[i]) &&
                      st->b == (int)GET_B(PALETTE[i]);
-        if (chosen)
-            gfx_rrect_aa(&s, (float)L->swatch[i].x - 2, (float)L->swatch[i].y - 2,
-                         (float)L->swatch[i].w + 4, (float)L->swatch[i].h + 4, 6.0f,
-                         color_mix(PALETTE[i], C_TEXT, 0.55f), 0, 0);
-        gfx_rrect_aa(&s, (float)L->swatch[i].x, (float)L->swatch[i].y,
-                     (float)L->swatch[i].w, (float)L->swatch[i].h, 4.0f,
-                     PALETTE[i], 0, 0);
-    }
-    font_draw(&s, F->small, (float)PANEL_X, (float)L->y_mixer, "MIXER  24-BIT",
-              color_alpha(C_TEXT, 0.5f));
-    {
-        static const char *nm[3] = { "R", "G", "B" };
-        int v[3] = { st->r, st->g, st->b };
-        u32 cc[3] = { RGB(0xE0, 0x6C, 0x5C), RGB(0x7B, 0xD8, 0x8F), RGB(0x7A, 0xA2, 0xF7) };
-        for (int i = 0; i < 3; i++) {
-            float y = (float)L->sl[i].y - L->line_h + 2.0f;
-            font_draw(&s, F->small, (float)PANEL_X, y, nm[i], cc[i]);
-            draw_slider(&s, L->sl[i], v[i], cc[i], st->slider == i);
-            char num[8];
-            snprintf(num, sizeof(num), "%d", v[i]);
-            font_draw(&s, F->mono, (float)(PANEL_X + PANEL_W) - font_width(F->mono, num),
-                      y, num, C_TEXT);
-        }
-    }
-    {
-        /* at the largest text scale the panel is taller than the canvas; do
-         * not let its last rows run into the information block */
-        int room = L->y_info[0] - 8;
-        char nm2[32];
-        snprintf(nm2, sizeof(nm2), "%s", PAL_NAME[0]);
-        for (int i = 0; i < PAL_N; i++)
-            if (st->r == (int)GET_R(PALETTE[i]) && st->g == (int)GET_G(PALETTE[i]) &&
-                st->b == (int)GET_B(PALETTE[i]))
-                snprintf(nm2, sizeof(nm2), "%s", PAL_NAME[i]);
-        if (L->y_drag + L->line_h <= room)
-            font_draw(&s, F->small, (float)PANEL_X, (float)L->y_drag, "drag R G B",
-                      color_alpha(C_TEXT, 0.4f));
-        if (L->y_name + L->line_h <= room)
-            font_draw(&s, F->small, (float)PANEL_X, (float)L->y_name, nm2, C_DIM);
+        int hot = st->hot == H_SW + i;
+        u32 bord = chosen ? C_TEXT : hot ? C_DIM : 0;
+        gfx_rrect_aa(&s, (float)r->x, (float)r->y, (float)r->w, (float)r->h,
+                     2.0f, PALETTE[i], bord, bord ? 1.2f : 0.0f);
     }
 
-    /* ---- information lines ---- */
-    surf_blend(&s, RAIL_X, L->y_info[0] - 8, vw - 2 * RAIL_X, 1,
-               color_alpha(C_TEXT, 0.10f));
+    /* ---- the mixer: a panel beside the canvas, or a popover on it ---- */
+    if (L->panel_on) {
+        gfx_rrect_aa(&s, (float)L->panel.x, (float)L->panel.y,
+                     (float)L->panel.w, (float)L->panel.h, 6.0f,
+                     C_PANEL, C_LINE, 1.0f);
+        gfx_rrect_aa(&s, (float)L->mix_bar.x, (float)L->mix_bar.y,
+                     (float)L->mix_bar.w, (float)L->mix_bar.h, 4.0f, cur, 0, 0);
+        mixer_draw(&s, L, F, st);
+    } else if (L->pop_on) {
+        gfx_rrect_aa(&s, (float)L->pop.x, (float)L->pop.y,
+                     (float)L->pop.w, (float)L->pop.h, 8.0f,
+                     C_PANEL, C_ACCENT, 1.0f);
+        mixer_draw(&s, L, F, st);
+    }
+
+    /* ---- the header ---- */
     {
-        char line[220];
+        int ty = L->header_y + ui_top(F->title, L->header_h);
+        char num[8];
+        text_draw(&s, F->title, L->title_x, ty, L->title_w, 0,
+                  TOOL_NAME[st->tool], C_TEXT);
+        if (L->show_brush_label) {
+            int ly = L->header_y + ui_top(F->small, L->header_h);
+            text_draw(&s, F->small, L->brush_label_x, ly, L->brush_label_w, 1,
+                      "Brush", C_DIM);
+        }
+        snprintf(num, sizeof(num), "%d", st->brush);
+        text_draw(&s, F->body, L->brush_num_x,
+                  L->header_y + ui_top(F->body, L->header_h),
+                  L->brush_num_w, 1, num, C_TEXT);
+        stepper_draw(&s, &L->brush_minus, 0, st->hot == H_BM, st->brush > 1);
+        stepper_draw(&s, &L->brush_plus, 1, st->hot == H_BP, st->brush < MAX_BRUSH);
+    }
+
+    /* ---- the footer: the folder, the undo depth, the brush ---- */
+    {
         char why[120];
         const char *dir = paint_dir(why, sizeof(why));
-        snprintf(line, sizeof(line), "FILE  %s", dir ? dir : "(no writable folder)");
-        fit_text(line, sizeof(line), F->small, line, vw - 2 * RAIL_X - 170);
-        font_draw(&s, F->small, (float)RAIL_X, (float)L->y_info[0], line, C_DIM);
+        char und[24], br[16];
+        int fy = L->footer_y + ui_top(F->small, L->footer_h);
+
+        text_draw(&s, F->small, L->pad, fy, L->footer_left_w, 0,
+                  dir ? dir : "no writable picture folder", dir ? C_DIM : C_WARN);
+        if (!hist_ok) snprintf(und, sizeof(und), "undo --");
+        else snprintf(und, sizeof(und), "undo %d/%d", hist_at, HIST_STATES - 1);
+        text_draw(&s, F->small, L->footer_right_x, fy, L->footer_undo_w, 1,
+                  und, hist_oom ? C_WARN : C_DIM);
+        snprintf(br, sizeof(br), "brush %d", st->brush);
+        text_draw(&s, F->small, L->footer_brush_x, fy,
+                  (L->vw - L->pad) - L->footer_brush_x, 1, br, C_DIM);
     }
-    {
-        char right[64], buf[64];
-        snprintf(right, sizeof(right), "%s   brush %d", TOOL_NAME[st->tool], st->brush);
-        fit_text(buf, sizeof(buf), F->small, right, 160);
-        float rw = font_width(F->small, buf);
-        font_draw(&s, F->small, (float)(vw - RAIL_X) - rw, (float)L->y_info[0], buf,
-                  C_ACCENT);
-    }
-    {
-        char line[200];
-        unsigned long used_t = (unsigned long)(hist_bytes * 10u / (1024u * 1024u));
-        unsigned long cap_t  = (unsigned long)((size_t)HIST_STATES * CANVAS_BYTES * 10u /
-                                               (1024u * 1024u));
-        if (!hist_ok)
-            snprintf(line, sizeof(line), "UNDO  unavailable: out of memory for a snapshot");
-        else
-            snprintf(line, sizeof(line),
-                     "UNDO  %d of %d steps   history %lu.%lu MB of %lu.%lu MB   redo %d",
-                     hist_at, HIST_STATES - 1, used_t / 10ul, used_t % 10ul,
-                     cap_t / 10ul, cap_t % 10ul, hist_n - 1 - hist_at);
-        font_draw(&s, F->small, (float)RAIL_X, (float)L->y_info[1], line,
-                  hist_oom ? C_WARN : C_DIM);
-    }
-    {
-        char line[200];
-        snprintf(line, sizeof(line),
-                 "1-8 tool   [ ] brush   u undo   y redo   s save   o open   c clear   q quit");
-        fit_text(line, sizeof(line), F->small, line, vw - 2 * RAIL_X);
-        font_draw(&s, F->small, (float)RAIL_X, (float)L->y_info[2], line,
-                  color_alpha(C_TEXT, 0.55f));
-        snprintf(line, sizeof(line),
-                 "drag to draw   shift = 45 deg lines and square/circle boxes   k picks a colour");
-        fit_text(line, sizeof(line), F->small, line, vw - 2 * RAIL_X);
-        font_draw(&s, F->small, (float)RAIL_X, (float)L->y_info[3], line,
-                  color_alpha(C_TEXT, 0.40f));
-    }
-    if (msg && msg[0]) {
-        char line[220];
-        fit_text(line, sizeof(line), F->small, msg, vw - 2 * RAIL_X - 130);
-        font_draw(&s, F->small, (float)RAIL_X, (float)L->y_info[4], line,
-                  msg_warn ? C_WARN : C_ACCENT);
-    }
-    {
-        char pos[48];
-        if (st->cursor_in)
-            snprintf(pos, sizeof(pos), "pen %d,%d", st->px, st->py);
-        else
-            snprintf(pos, sizeof(pos), "pen -, -");
-        float pw = font_width(F->mono, pos);
-        font_draw(&s, F->mono, (float)(vw - RAIL_X) - pw, (float)L->y_info[4], pos,
-                  color_alpha(C_TEXT, 0.45f));
-    }
-    {
-        char line[200];
-        snprintf(line, sizeof(line),
-                 "saves a real PNG (zlib stored blocks); opens 8-bit grey/RGB/palette/RGBA PNGs");
-        fit_text(line, sizeof(line), F->small, line, vw - 2 * RAIL_X);
-        font_draw(&s, F->small, (float)RAIL_X, (float)L->y_info[5], line,
-                  color_alpha(C_TEXT, 0.30f));
+
+    /* ---- what just happened, as a toast over the sheet ---- */
+    if (msg && msg[0] && !L->pop_on) {
+        char t[224];
+        int inner = ui_min(vw - 2 * L->pad - 2 * SP(2),
+                           ui_ceil(font_width(F->small, msg)));
+        int w, h, tx, ty;
+        text_fit(t, sizeof(t), F->small, msg, inner);
+        w = ui_ceil(font_width(F->small, t)) + 2 * SP(2);
+        h = ui_ceil(font_height(F->small)) + 2 * SP(1);
+        if (w > vw - 2 * L->pad) w = vw - 2 * L->pad;
+        tx = L->canvas.x + (L->canvas.w - w) / 2;
+        tx = ui_clamp(tx, L->pad, ui_max(L->pad, vw - L->pad - w));
+        ty = L->canvas.y + L->canvas.h - h - SP(1);
+        if (ty < L->canvas.y) ty = L->canvas.y + SP(1);
+        gfx_rrect_aa(&s, (float)tx, (float)ty, (float)w, (float)h,
+                     (float)h * 0.5f, C_PANEL,
+                     msg_warn ? C_WARN : C_ACCENT, 1.0f);
+        text_draw(&s, F->small, tx + SP(2), ty + SP(1), w - 2 * SP(2), 0, t,
+                  msg_warn ? C_WARN : C_TEXT);
     }
 
     /* ---- the clear confirmation ---- */
@@ -1634,25 +2185,68 @@ static void draw_ui(MClient *c, const Layout *L, const Fonts *F,
         surf_blend(&s, 0, 0, vw, vh, color_alpha(RGB(0, 0, 0), 0.55f));
         gfx_rrect_aa(&s, (float)L->dlg.x, (float)L->dlg.y,
                      (float)L->dlg.w, (float)L->dlg.h, 8.0f,
-                     C_PANEL, C_ACCENT, 1.5f);
-        font_draw(&s, F->big, (float)L->dlg.x + 16.0f, (float)L->dlg.y + 14.0f,
-                  "Clear the canvas?", C_TEXT);
+                     C_PANEL, C_ACCENT, 1.0f);
+        text_draw(&s, F->title, L->dlg.x + SP(1), L->dlg_title_y,
+                  L->dlg.w - 2 * SP(1), 0, "Clear the canvas?", C_TEXT);
+        text_draw(&s, F->small, L->dlg.x + SP(1), L->dlg_body_y,
+                  L->dlg.w - 2 * SP(1), 0,
+                  "Every pixel goes; undo (u) brings the last state back.", C_DIM);
         {
-            char line[200];
-            snprintf(line, sizeof(line), "Undo (u) brings the last state back.");
-            fit_text(line, sizeof(line), F->small, line, L->dlg.w - 32);
-            font_draw(&s, F->small, (float)L->dlg.x + 16.0f,
-                      (float)L->dlg.y + 14.0f + font_height(F->big) + 6.0f,
-                      line, C_DIM);
+            const Rect *r = &L->dlg_no;
+            u32 fill = st->hot == H_NO ? C_HOVER : 0;
+            gfx_rrect_aa(&s, (float)r->x, (float)r->y, (float)r->w, (float)r->h,
+                         4.0f, fill, C_LINE, 1.0f);
+            text_draw(&s, F->body, r->x, r->y + ui_top(F->body, r->h),
+                      r->w, 2, "Cancel", C_TEXT);
         }
-        draw_button(&s, F->body, L->dlg_yes, "Clear", 1, 1);
-        draw_button(&s, F->body, L->dlg_no, "Cancel", 0, 1);
+        {
+            const Rect *r = &L->dlg_yes;
+            gfx_rrect_aa(&s, (float)r->x, (float)r->y, (float)r->w, (float)r->h,
+                         4.0f, color_alpha(C_ACCENT, 0.24f),
+                         color_alpha(C_ACCENT, 0.85f), 1.0f);
+            text_draw(&s, F->body, r->x, r->y + ui_top(F->body, r->h),
+                      r->w, 2, "Clear", C_TEXT);
+        }
     }
 }
 
 /* ============================================================
  *  Input
  * ============================================================ */
+
+static int hit_code(const Layout *L, const PaintState *st, int x, int y) {
+    if (st->dialog) {
+        if (rect_hit(&L->dlg_yes, x, y)) return H_YES;
+        if (rect_hit(&L->dlg_no, x, y)) return H_NO;
+        return H_NONE;
+    }
+    for (int i = 0; i < 3; i++) {
+        const Rect *r = &L->sl[i];
+        if (r->w > 0 &&
+            x >= r->x - SP(1) && x < r->x + r->w + SP(1) &&
+            y >= r->y - SP(1) && y < r->y + r->h + SP(1))
+            return H_SL + i;
+    }
+    if (L->pop_on && rect_hit(&L->pop, x, y)) return H_POP;
+    if (rect_hit(&L->brush_minus, x, y)) return H_BM;
+    if (rect_hit(&L->brush_plus, x, y)) return H_BP;
+    if (rect_hit(&L->chip, x, y)) return H_CHIP;
+    for (int i = 0; i < T_N; i++)
+        if (rect_hit(&L->tool[i], x, y)) return H_TOOL + i;
+    for (int i = 0; i < A_N; i++)
+        if (rect_hit(&L->act[i], x, y)) return H_ACT + i;
+    for (int i = 0; i < PAL_N; i++)
+        if (rect_hit(&L->swatch[i], x, y)) return H_SW + i;
+    return H_NONE;
+}
+
+static void slider_set(PaintState *st, const Rect *r, int x, int i) {
+    int v = r->w > 1 ? (x - r->x) * 255 / (r->w - 1) : 0;
+    v = ui_clamp(v, 0, 255);
+    if (i == 0) st->r = v;
+    else if (i == 1) st->g = v;
+    else st->b = v;
+}
 
 static void set_tool(PaintState *st, int t) {
     if (t >= 0 && t < T_N) st->tool = t;
@@ -1702,9 +2296,12 @@ static void handle_text(PaintState *st, const char *t, char *msg, size_t n,
             *dirty = 1;
         } else if (c == 'q' || c == 'Q') {
             *quit = 1;
+        } else if (c == 'm' || c == 'M') {
+            if (!L->panel_on) { st->mixer = !st->mixer; *dirty = 1; }
         } else if (c == 'k' || c == 'K') {
             if (st->cursor_in &&
-                (unsigned)st->px < (unsigned)CANVAS_W && (unsigned)st->py < (unsigned)CANVAS_H) {
+                (unsigned)st->px < (unsigned)CANVAS_W &&
+                (unsigned)st->py < (unsigned)CANVAS_H) {
                 u32 v = canvas[(size_t)st->py * CANVAS_W + (size_t)st->px];
                 st->r = GET_R(v);
                 st->g = GET_G(v);
@@ -1716,70 +2313,82 @@ static void handle_text(PaintState *st, const char *t, char *msg, size_t n,
     }
 }
 
-/* Apply a press: buttons, swatches, sliders, the canvas. */
+/* Apply a press: the stepper, the strip, the palette, the mixer, or the
+ * sheet. The hit test is the same one the hover tint uses. */
 static void press_at(PaintState *st, const Layout *L, int x, int y,
                      char *msg, size_t n, int *dirty) {
+    int h = hit_code(L, st, x, y);
+
     if (st->dialog) {
-        if (rect_hit(&L->dlg_yes, x, y)) do_clear(L, st, msg, n, dirty);
-        else if (rect_hit(&L->dlg_no, x, y)) { st->dialog = 0; *dirty = 1; }
+        if (h == H_YES) do_clear(L, st, msg, n, dirty);
+        else if (h == H_NO) { st->dialog = 0; *dirty = 1; }
         return;
     }
-
-    /* mixer sliders first: their knob sticks out of the track */
-    for (int i = 0; i < 3; i++) {
-        Rect r = L->sl[i];
-        if (x >= r.x - 4 && x < r.x + r.w + 4 && y >= r.y - 8 && y < r.y + r.h + 8) {
-            int v = (x - r.x) * 255 / (r.w - 1);
-            if (v < 0) v = 0;
-            if (v > 255) v = 255;
-            if (i == 0) st->r = v;
-            else if (i == 1) st->g = v;
-            else st->b = v;
-            st->slider = i;
-            *dirty = 1;
-            return;
+    if (h >= H_SL && h < H_SL + 3) {
+        st->slider = h - H_SL;
+        slider_set(st, &L->sl[st->slider], x, st->slider);
+        *dirty = 1;
+        return;
+    }
+    if (h == H_POP) return;                       /* the popover's own body */
+    if (h >= H_TOOL && h < H_TOOL + T_N) {
+        set_tool(st, h - H_TOOL);
+        st->mixer = 0;
+        *dirty = 1;
+        return;
+    }
+    if (h >= H_ACT && h < H_ACT + A_N) {
+        switch (h - H_ACT) {
+        case A_UNDO:
+            if (hist_undo()) snprintf(msg, n, "undo");
+            else snprintf(msg, n, "nothing to undo");
+            break;
+        case A_REDO:
+            if (hist_redo()) snprintf(msg, n, "redo");
+            else snprintf(msg, n, "nothing to redo");
+            break;
+        case A_SAVE: act_save(msg, n); break;
+        case A_OPEN: act_open(msg, n); break;
+        case A_CLEAR: st->dialog = 1; break;
+        default: break;
         }
+        *dirty = 1;
+        return;
     }
-    for (int i = 0; i < PAL_N; i++) {
-        if (rect_hit(&L->swatch[i], x, y)) {
-            st->r = GET_R(PALETTE[i]);
-            st->g = GET_G(PALETTE[i]);
-            st->b = GET_B(PALETTE[i]);
-            *dirty = 1;
-            return;
-        }
+    if (h >= H_SW && h < H_SW + PAL_N) {
+        int i = h - H_SW;
+        st->r = GET_R(PALETTE[i]);
+        st->g = GET_G(PALETTE[i]);
+        st->b = GET_B(PALETTE[i]);
+        *dirty = 1;
+        return;
     }
-    for (int i = 0; i < T_N; i++) {
-        if (rect_hit(&L->tool[i], x, y)) { set_tool(st, i); *dirty = 1; return; }
+    if (h == H_CHIP) {
+        if (!L->panel_on) st->mixer = !st->mixer;
+        *dirty = 1;
+        return;
     }
-    if (rect_hit(&L->brush_minus, x, y)) {
+    if (h == H_BM) {
         if (st->brush > 1) st->brush--;
         *dirty = 1;
         return;
     }
-    if (rect_hit(&L->brush_plus, x, y)) {
+    if (h == H_BP) {
         if (st->brush < MAX_BRUSH) st->brush++;
         *dirty = 1;
         return;
     }
-    if (rect_hit(&L->undo_btn, x, y)) {
-        if (hist_undo()) { snprintf(msg, n, "undo"); *dirty = 1; }
-        else snprintf(msg, n, "nothing to undo");
+    if (h == H_NONE && st->mixer) {
+        st->mixer = 0;                            /* a click outside closes it */
         *dirty = 1;
-        return;
-    }
-    if (rect_hit(&L->redo_btn, x, y)) {
-        if (hist_redo()) { snprintf(msg, n, "redo"); *dirty = 1; }
-        else snprintf(msg, n, "nothing to redo");
-        *dirty = 1;
-        return;
     }
     if (!rect_hit(&L->canvas, x, y)) return;
 
-    int cx = x - L->canvas.x, cy = y - L->canvas.y;
-    if ((unsigned)cx >= (unsigned)CANVAS_W || (unsigned)cy >= (unsigned)CANVAS_H) return;
-    st->px = cx;
-    st->py = cy;
+    canvas_map(L, x, y, &st->px, &st->py);
+    if (st->px < 0) st->px = 0;
+    if (st->py < 0) st->py = 0;
+    if (st->px > CANVAS_W - 1) st->px = CANVAS_W - 1;
+    if (st->py > CANVAS_H - 1) st->py = CANVAS_H - 1;
     st->cursor_in = 1;
 
     switch (st->tool) {
@@ -1787,9 +2396,9 @@ static void press_at(PaintState *st, const Layout *L, int x, int y,
         Ink k;
         ink_init(&k, canvas, CANVAS_W, 0, 0, 0, 0, CANVAS_W, CANVAS_H,
                  RGB(st->r, st->g, st->b), st->brush);
-        ink_stamp(&k, cx, cy);
-        st->lx = cx;
-        st->ly = cy;
+        ink_stamp(&k, st->px, st->py);
+        st->lx = st->px;
+        st->ly = st->py;
         st->down = 1;
         st->stroke = k.hits > 0;
         if (k.hits) *dirty = 1;
@@ -1797,7 +2406,7 @@ static void press_at(PaintState *st, const Layout *L, int x, int y,
     }
     case T_FILL: {
         char err[96];
-        long got = flood_fill(cx, cy, RGB(st->r, st->g, st->b), err, sizeof(err));
+        long got = flood_fill(st->px, st->py, RGB(st->r, st->g, st->b), err, sizeof(err));
         g_msg_bad = err[0] != 0;
         if (got > 0 && hist_commit() != 0) err[0] = 0;
         if (err[0])
@@ -1810,7 +2419,7 @@ static void press_at(PaintState *st, const Layout *L, int x, int y,
         break;
     }
     case T_PICK: {
-        u32 v = canvas[(size_t)cy * CANVAS_W + (size_t)cx];
+        u32 v = canvas[(size_t)st->py * CANVAS_W + (size_t)st->px];
         st->r = GET_R(v);
         st->g = GET_G(v);
         st->b = GET_B(v);
@@ -1819,10 +2428,8 @@ static void press_at(PaintState *st, const Layout *L, int x, int y,
         break;
     }
     default:
-        st->sx = cx;
-        st->sy = cy;
-        st->px = cx;
-        st->py = cy;
+        st->sx = st->px;
+        st->sy = st->py;
         st->drag = 1;
         *dirty = 1;
         break;
@@ -1907,6 +2514,13 @@ static void release_at(PaintState *st, char *msg, size_t n, int *dirty) {
 
 #ifndef PAINT_HOST_TEST
 
+/* Monotonic milliseconds: how long a message stays on screen. */
+static u64 now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (u64)ts.tv_sec * 1000u + (u64)(ts.tv_nsec / 1000000);
+}
+
 int main(void) {
     MClient c;
     if (mc_open(&c, "paint", "Paint", WIN_W, WIN_H) < 0) {
@@ -1917,11 +2531,10 @@ int main(void) {
 
     font_init("/usr/share/fonts");
     Fonts F;
+    F.title = font_get(FONT_SEMIBOLD, 15);
     F.body  = font_get(FONT_REGULAR, 11);
-    F.small = font_get(FONT_REGULAR, 10);
-    F.mono  = font_get(FONT_MONO, 10);
-    F.big   = font_get(FONT_SEMIBOLD, 14);
-    if (!F.body || !F.small || !F.mono || !F.big) {
+    F.small = font_get(FONT_MEDIUM, 9);
+    if (!F.title || !F.body || !F.small) {
         fprintf(stderr, "paint: no fonts in /usr/share/fonts\n");
         mc_close(&c);
         return 1;
@@ -1942,17 +2555,34 @@ int main(void) {
     st.g = GET_G(PALETTE[0]);
     st.b = GET_B(PALETTE[0]);
     st.slider = -1;
+    st.hot = H_NONE;
 
     char msg[200];
-    snprintf(msg, sizeof(msg), "ready - %d undo steps of %lu KB each",
-             HIST_STATES - 1,
-             (unsigned long)(CANVAS_BYTES / 1024u));
+    char shown[sizeof(msg)];
+    msg[0] = 0;
+    shown[0] = 0;
+    u64 msg_until = 0;
+
     Layout L;
     int dirty = 1;
     int was_down = 0;
 
     for (;;) {
-        layout_build(vw, vh, &F, &L);
+        layout_build(vw, vh, &F, &st, &L);
+
+        /* A message appears when it changes and leaves on its own; it is
+         * not part of the layout, so it can never push a row around. */
+        if (strcmp(msg, shown) != 0) {
+            snprintf(shown, sizeof(shown), "%s", msg);
+            msg_until = now_ms() + 3200u;
+            dirty = 1;
+        }
+        if (msg[0] && now_ms() > msg_until) {
+            msg[0] = 0;
+            shown[0] = 0;
+            msg_until = 0;
+            dirty = 1;
+        }
 
         if (dirty) {
             draw_ui(&c, &L, &F, &st, msg, g_msg_bad);
@@ -1983,10 +2613,11 @@ int main(void) {
                 if (ev.press) {
                     st.shift = ev.mods & 1;
                     if (ev.key == 1) {                        /* KEY_ESC */
-                        if (st.dialog || st.drag) {
+                        if (st.dialog || st.drag || st.down || st.mixer) {
                             st.dialog = 0;
                             st.drag = 0;
                             st.down = 0;
+                            st.mixer = 0;
                             snprintf(msg, sizeof(msg), "cancelled");
                             dirty = 1;
                         }
@@ -2005,30 +2636,26 @@ int main(void) {
             case MC_MOUSE: {
                 int x = ev.x, y = ev.y;
                 int down = ev.buttons & 1;
-                st.cursor_in = rect_hit(&L.canvas, x, y);
+                int hot = hit_code(&L, &st, x, y);
+                int cx, cy;
+                if (hot != st.hot) { st.hot = hot; dirty = 1; }
+                st.cursor_in = rect_hit(&L.canvas, x, y) && !L.pop_on;
                 if (st.cursor_in) {
-                    st.px = x - L.canvas.x;
-                    st.py = y - L.canvas.y;
+                    canvas_map(&L, x, y, &st.px, &st.py);
                 }
 
                 if (down && !was_down) {
                     press_at(&st, &L, x, y, msg, sizeof(msg), &dirty);
                 } else if (down && was_down) {
                     if (st.slider >= 0) {
-                        Rect r = L.sl[st.slider];
-                        int v = (x - r.x) * 255 / (r.w - 1);
-                        if (v < 0) v = 0;
-                        if (v > 255) v = 255;
-                        if (st.slider == 0) st.r = v;
-                        else if (st.slider == 1) st.g = v;
-                        else st.b = v;
+                        slider_set(&st, &L.sl[st.slider], x, st.slider);
                         dirty = 1;
                     } else if (st.drag) {
-                        st.px = x - L.canvas.x;
-                        st.py = y - L.canvas.y;
+                        canvas_map(&L, x, y, &st.px, &st.py);
                         dirty = 1;
                     } else if (st.down) {
-                        drag_at(&st, x - L.canvas.x, y - L.canvas.y, msg, sizeof(msg), &dirty);
+                        canvas_map(&L, x, y, &cx, &cy);
+                        drag_at(&st, cx, cy, msg, sizeof(msg), &dirty);
                     }
                 } else if (!down && was_down) {
                     release_at(&st, msg, sizeof(msg), &dirty);
@@ -2313,62 +2940,353 @@ static void render_bmp(const char *path, const u32 *px, int w, int h) {
     free(b);
 }
 
-int paint_render(float scale, const char *drag_out, const char *dialog_out);
+/* ------------------------------------------------------------
+ *  A canvas with real art on it, drawn by the shipped rasterisers, so
+ *  the render is a picture of the program rather than an empty sheet.
+ * ------------------------------------------------------------ */
 
-int paint_render(float scale, const char *drag_out, const char *dialog_out) {
+static char g_fill_msg[64];
+
+static void demo_art(void) {
+    Ink k;
+    char err[64];
+    long got;
+
+    stamps_build();
+    canvas_reset();
+    ink_init(&k, canvas, CANVAS_W, 0, 0, 0, 0, CANVAS_W, CANVAS_H,
+             RGB(0xF5, 0xC5, 0x42), 6);
+    ink_ellipse(&k, 42, 46, 206, 196, 0);
+    ink_init(&k, canvas, CANVAS_W, 0, 0, 0, 0, CANVAS_W, CANVAS_H,
+             RGB(0x4F, 0xD1, 0xC5), 3);
+    ink_line(&k, 214, 56, 356, 246);
+    ink_init(&k, canvas, CANVAS_W, 0, 0, 0, 0, CANVAS_W, CANVAS_H,
+             RGB(0xF7, 0x8F, 0xB3), 9);
+    ink_rect(&k, 236, 206, 362, 292, 1);
+    ink_init(&k, canvas, CANVAS_W, 0, 0, 0, 0, CANVAS_W, CANVAS_H,
+             RGB(0x7A, 0xA2, 0xF7), 2);
+    ink_rect(&k, 58, 238, 184, 292, 0);
+    /* a real flood fill, and the real number of pixels it changed */
+    got = flood_fill(120, 120, RGB(0x1E, 0x3A, 0x3E), err, sizeof(err));
+    if (got > 0) snprintf(g_fill_msg, sizeof(g_fill_msg), "filled %ld px", got);
+    else snprintf(g_fill_msg, sizeof(g_fill_msg), "fill: %s", err);
+}
+
+/* ------------------------------------------------------------
+ *  The layout proof: every box inside the window, the bands in order,
+ *  and every drawn string measured against its box.
+ * ------------------------------------------------------------ */
+
+static int g_audit_fail;
+
+static void audit(int cond, const char *what) {
+    printf("    %-56s %s\n", what, cond ? "ok" : "FAIL");
+    if (!cond) g_audit_fail++;
+}
+
+static void layout_audit(const Layout *L) {
+    int pad = L->pad;
+    long aspect;
+
+    printf("    layout %dx%d: header %d..%d  strip %d..%d (%d row%s)  "
+           "canvas %d,%d %dx%d  palette %d  footer %d..%d%s\n",
+           L->vw, L->vh, L->header_y, L->header_y + L->header_h,
+           L->strip_y, L->strip_y + L->strip_h, L->strip_rows,
+           L->strip_rows == 1 ? "" : "s",
+           L->canvas.x, L->canvas.y, L->canvas.w, L->canvas.h,
+           L->palette_y, L->footer_y, L->footer_y + L->footer_h,
+           L->panel_on ? "  panel" : "  no panel");
+    audit(L->header_y >= 0 && L->header_y + L->header_h <= L->vh,
+          "header inside the window");
+    audit(L->strip_y >= L->header_y + L->header_h, "strip below the header");
+    audit(L->strip_y + L->strip_h <= L->canvas.y, "canvas below the strip");
+    audit(L->canvas.x >= 0 && L->canvas.x + L->canvas.w <= L->vw,
+          "canvas inside the window (x)");
+    audit(L->canvas.y >= 0 && L->canvas.y + L->canvas.h <= L->vh,
+          "canvas inside the window (y)");
+    audit(L->canvas.y + L->canvas.h <= L->palette_y, "palette below the canvas");
+    audit(L->palette_y + L->palette_h <= L->footer_y, "footer below the palette");
+    audit(L->footer_y + L->footer_h <= L->vh, "footer inside the window");
+    audit(L->title_x + L->title_w < L->brush_minus.x, "title left of the stepper");
+    audit(L->brush_plus.x + L->brush_plus.w <= L->vw - pad + 1,
+          "brush stepper inside the window");
+    audit(L->chip.x + L->chip.w <= L->swatch[0].x, "current colour left of the swatches");
+    audit(L->swatch[PAL_N - 1].x + L->swatch[PAL_N - 1].w <= L->vw - pad + 1,
+          "palette row inside the window");
+    audit(L->footer_right_x > L->pad && L->footer_brush_x > L->footer_right_x,
+          "footer columns do not cross");
+    aspect = (long)L->canvas.w * CANVAS_H - (long)L->canvas.h * CANVAS_W;
+    audit(aspect <= CANVAS_W && aspect >= -CANVAS_W, "canvas keeps its aspect");
+    if (L->panel_on) {
+        audit(L->panel.x >= L->canvas.x + L->canvas.w, "mixer panel right of the canvas");
+        audit(L->panel.x + L->panel.w <= L->vw - pad, "mixer panel inside the window");
+        audit(L->panel.y + L->panel.h <= L->palette_y, "mixer panel above the palette");
+        audit(L->sl[2].y + L->sl[2].h <= L->panel.y + L->panel.h,
+              "mixer rows inside the panel");
+        audit(!L->pop_on, "the mixer is shown once (panel, not popover)");
+    }
+    if (L->pop_on) {
+        audit(L->pop.x >= 0 && L->pop.x + L->pop.w <= L->vw, "popover inside the window (x)");
+        audit(L->pop.y >= 0 && L->pop.y + L->pop.h <= L->vh, "popover inside the window (y)");
+        audit(L->pop.w > 0 && L->pop.h > 0, "popover has room");
+        audit(L->sl[0].w > 0, "popover sliders are laid out");
+    }
+    if (L->dlg.w > 0) {
+        audit(L->dlg.x >= 0 && L->dlg.x + L->dlg.w <= L->vw, "dialog inside the window (x)");
+        audit(L->dlg_yes.x > L->dlg_no.x + L->dlg_no.w, "dialog buttons do not overlap");
+        audit(L->dlg_btn_y + L->dlg_btn_h <= L->dlg.y + L->dlg.h,
+              "dialog buttons inside the dialog");
+    }
+}
+
+static int render_scene(float scale, int vw, int vh, int scene,
+                        const char *png, const char *bmp) {
+    u32 *px;
+    MClient c;
+    Layout L;
+    PaintState st;
+    Fonts F;
+    const char *msg = "";
+    char err[160];
+
+    g_audit_fail = 0;
+    g_text_drawn = 0;
+    g_text_over = 0;
+
     ui_scale_set_effective(scale);
     if (font_init("assets/fonts") != 0) { printf("fonts: font_init failed\n"); return 2; }
-    Fonts F;
+    F.title = font_get(FONT_SEMIBOLD, 15);
     F.body  = font_get(FONT_REGULAR, 11);
-    F.small = font_get(FONT_REGULAR, 10);
-    F.mono  = font_get(FONT_MONO, 10);
-    F.big   = font_get(FONT_SEMIBOLD, 14);
-    if (!F.body || !F.small || !F.mono || !F.big) { printf("fonts: missing faces\n"); return 2; }
-    printf("render scale %.2f: body %.2f high, small %.2f, mono %.2f wide for '#'\n",
-           (double)scale, (double)font_height(F.body), (double)font_height(F.small),
-           (double)font_width(F.mono, "#"));
+    F.small = font_get(FONT_MEDIUM, 9);
+    if (!F.title || !F.body || !F.small) { printf("fonts: missing faces\n"); return 2; }
 
-    int vw = WIN_W, vh = WIN_H;
-    u32 *px = calloc((size_t)vw * (size_t)vh, sizeof(u32));
+    px = calloc((size_t)vw * (size_t)vh, sizeof(u32));
     if (!px) return 2;
-    MClient c;
     memset(&c, 0, sizeof(c));
     c.px = px;
     c.w = vw;
     c.h = vh;
     c.stride = vw;
 
-    /* the render must not touch /root; pretend the probe already failed */
+    /* The render must not touch the filesystem, but the footer must show
+     * the folder this build actually saves to - so the probe is marked as
+     * done with the configured path instead of calling mkdir(2). */
     g_dir_tried = 1;
-    g_dir[0] = 0;
+    snprintf(g_dir, sizeof(g_dir), "%s", PIC_DIR);
 
-    Layout L;
-    layout_build(vw, vh, &F, &L);
-
-    PaintState st;
+    demo_art();
     memset(&st, 0, sizeof(st));
     st.tool = T_ELLIPSE;
     st.brush = 6;
     st.r = 0xF5; st.g = 0xC5; st.b = 0x42;
-    st.drag = 1;
-    st.sx = 40; st.sy = 60;
-    st.px = 330; st.py = 250;
-    st.cursor_in = 1;
     st.slider = -1;
-    draw_ui(&c, &L, &F, &st, "dragging an ellipse - release to commit", 0);
-    render_bmp(drag_out, px, vw, vh);
-    printf("render          %s (shape drag in progress)\n", drag_out);
+    st.hot = H_TOOL + T_FILL;
+    if (scene == 0) {
+        st.drag = 1;
+        st.sx = 40; st.sy = 60;
+        st.px = 330; st.py = 250;
+        st.cursor_in = 1;
+        msg = "dragging an ellipse - release to commit";
+    } else if (scene == 1) {
+        st.dialog = 1;
+        st.tool = T_RECTF;
+        st.r = 0x7B; st.g = 0xD8; st.b = 0x8F;
+        st.hot = H_YES;
+    } else {
+        st.mixer = 1;
+        msg = g_fill_msg;
+    }
 
-    st.drag = 0;
-    st.dialog = 1;
-    st.tool = T_RECTF;
-    st.r = 0x7B; st.g = 0xD8; st.b = 0x8F;
-    draw_ui(&c, &L, &F, &st, "saved /root/Pictures/paint-0001.png (512423 bytes)", 0);
-    render_bmp(dialog_out, px, vw, vh);
-    printf("render          %s (clear confirmation)\n", dialog_out);
+    layout_build(vw, vh, &F, &st, &L);
+    printf("  %dx%d at scale %.2f (title %.0fx%.0f, small %.0fx%.0f)%s\n",
+           vw, vh, (double)scale,
+           (double)font_height(F.title), (double)font_width(F.title, "M"),
+           (double)font_height(F.small), (double)font_width(F.small, "M"),
+           L.panel_on ? ", mixer panel" : (L.pop_on ? ", mixer popover" : ""));
+    layout_audit(&L);
 
+    draw_ui(&c, &L, &F, &st, msg, 0);
+    audit(g_text_over == 0, "every drawn string fits its box");
+
+    if (png) {
+        remove(png);
+        if (png_write_file(png, px, vw, vh, err, sizeof(err)) <= 0) {
+            printf("    png %s: %s\n", png, err);
+            g_audit_fail++;
+        } else {
+            printf("    -> %s (%d strings drawn, %d over)\n", png, g_text_drawn, g_text_over);
+        }
+    }
+    if (bmp) {
+        render_bmp(bmp, px, vw, vh);
+        printf("    -> %s\n", bmp);
+    }
     free(px);
-    return 0;
+    return g_audit_fail;
+}
+
+/* Render one size and scale and write a real PNG of the whole window. */
+int paint_render_at(float scale, int vw, int vh, const char *png, int scene);
+
+int paint_render_at(float scale, int vw, int vh, const char *png, int scene) {
+    return render_scene(scale, vw, vh, scene, png, NULL);
+}
+
+/* The older harness entry point: the app's own window size, BMP output. */
+int paint_render(float scale, const char *drag_out, const char *dialog_out);
+
+int paint_render(float scale, const char *drag_out, const char *dialog_out) {
+    int rc = 0;
+    rc |= render_scene(scale, WIN_W, WIN_H, 0, NULL, drag_out);
+    rc |= render_scene(scale, WIN_W, WIN_H, 1, NULL, dialog_out);
+    return rc ? 1 : 0;
+}
+
+/* ------------------------------------------------------------
+ *  The input proof: drive the shipped press_at() with the shipped
+ *  layout at both ends of the size range, and check that every
+ *  capability the old window had still has a control that works.
+ * ------------------------------------------------------------ */
+
+static int ui_fails;
+
+static void uichk(int cond, const char *what) {
+    printf("    %-56s %s\n", what, cond ? "ok" : "FAIL");
+    if (!cond) ui_fails++;
+}
+
+int paint_ui_test(void);
+
+int paint_ui_test(void) {
+    Layout L;
+    PaintState st;
+    Fonts F;
+    char msg[200];
+    int dirty, cx, cy;
+
+    ui_fails = 0;
+    ui_scale_set_effective(1.0f);
+    if (font_init("assets/fonts") != 0) { printf("fonts: font_init failed\n"); return 2; }
+    F.title = font_get(FONT_SEMIBOLD, 15);
+    F.body  = font_get(FONT_REGULAR, 11);
+    F.small = font_get(FONT_MEDIUM, 9);
+    if (!F.title || !F.body || !F.small) { printf("fonts: missing faces\n"); return 2; }
+
+    g_dir_tried = 1;
+    snprintf(g_dir, sizeof(g_dir), "%s", PIC_DIR);
+    stamps_build();
+    canvas_reset();
+    hist_init();
+    msg[0] = 0;
+
+    memset(&st, 0, sizeof(st));
+    st.tool = T_PENCIL;
+    st.brush = 3;
+    st.slider = -1;
+    st.r = GET_R(PALETTE[0]);
+    st.g = GET_G(PALETTE[0]);
+    st.b = GET_B(PALETTE[0]);
+
+    /* ---- the narrow window: two-row strip, popover mixer ---- */
+    layout_build(380, 280, &F, &st, &L);
+    uichk(!L.panel_on, "380x280: the mixer is a popover, not a panel");
+    uichk(L.strip_rows == 2, "380x280: the strip wrapped instead of shrinking");
+
+    for (int i = 0; i < T_N; i++) {
+        Rect r = L.tool[i];
+        dirty = 0;
+        press_at(&st, &L, r.x + r.w / 2, r.y + r.h / 2, msg, sizeof(msg), &dirty);
+        if (st.tool != i || !dirty) uichk(0, TOOL_NAME[i]);
+    }
+    uichk(1, "every tool button selects its tool");
+
+    {
+        Rect r = L.swatch[4];
+        dirty = 0;
+        press_at(&st, &L, r.x + r.w / 2, r.y + r.h / 2, msg, sizeof(msg), &dirty);
+        uichk(st.r == (int)GET_R(PALETTE[4]) && st.g == (int)GET_G(PALETTE[4]) &&
+              st.b == (int)GET_B(PALETTE[4]), "a palette swatch sets the ink");
+    }
+    {
+        Rect r = L.brush_plus;
+        dirty = 0;
+        press_at(&st, &L, r.x + r.w / 2, r.y + r.h / 2, msg, sizeof(msg), &dirty);
+        uichk(st.brush == 4, "the brush stepper's plus grows the brush");
+        r = L.brush_minus;
+        press_at(&st, &L, r.x + r.w / 2, r.y + r.h / 2, msg, sizeof(msg), &dirty);
+        uichk(st.brush == 3, "the brush stepper's minus shrinks it");
+    }
+
+    /* ---- a stroke on the canvas goes through the fit scale ---- */
+    st.tool = T_PENCIL;
+    dirty = 0;
+    canvas_map(&L, L.canvas.x + L.canvas.w / 2, L.canvas.y + L.canvas.h / 2, &cx, &cy);
+    press_at(&st, &L, L.canvas.x + L.canvas.w / 2, L.canvas.y + L.canvas.h / 2,
+             msg, sizeof(msg), &dirty);
+    release_at(&st, msg, sizeof(msg), &dirty);
+    uichk(abs(cx - CANVAS_W / 2) <= CANVAS_W / (L.canvas.w > 0 ? L.canvas.w : 1) + 1 &&
+          abs(cy - CANVAS_H / 2) <= CANVAS_H / (L.canvas.h > 0 ? L.canvas.h : 1) + 1,
+          "the pointer maps onto the canvas through the fit scale");
+    uichk(canvas[(size_t)cy * CANVAS_W + cx] == RGB(st.r, st.g, st.b),
+          "the pencil wrote the pixel under the pointer");
+    uichk(hist_at == 1, "the stroke committed one undo state");
+
+    /* ---- undo and redo ---- */
+    {
+        Rect r = L.act[A_UNDO];
+        int before = hist_at;
+        press_at(&st, &L, r.x + r.w / 2, r.y + r.h / 2, msg, sizeof(msg), &dirty);
+        uichk(hist_at == before - 1, "the undo button undoes");
+        r = L.act[A_REDO];
+        press_at(&st, &L, r.x + r.w / 2, r.y + r.h / 2, msg, sizeof(msg), &dirty);
+        uichk(hist_at == before, "the redo button redoes");
+    }
+
+    /* ---- clear asks first, and the clear is undoable ---- */
+    {
+        Rect r = L.act[A_CLEAR];
+        press_at(&st, &L, r.x + r.w / 2, r.y + r.h / 2, msg, sizeof(msg), &dirty);
+        uichk(st.dialog == 1, "the clear button asks first");
+        r = L.dlg_yes;
+        press_at(&st, &L, r.x + r.w / 2, r.y + r.h / 2, msg, sizeof(msg), &dirty);
+        uichk(st.dialog == 0 && canvas[0] == CANVAS_BG && canvas[CANVAS_PX - 1] == CANVAS_BG,
+              "confirming clear empties the sheet");
+        uichk(hist_undo() == 1 && canvas[(size_t)cy * CANVAS_W + cx] == RGB(st.r, st.g, st.b),
+              "the clear is undoable");
+    }
+
+    /* ---- the popover mixer in the narrow window ---- */
+    {
+        Rect r = L.chip;
+        press_at(&st, &L, r.x + r.w / 2, r.y + r.h / 2, msg, sizeof(msg), &dirty);
+        uichk(st.mixer == 1, "the colour chip opens the mixer popover");
+        layout_build(380, 280, &F, &st, &L);
+        uichk(L.pop_on && L.sl[0].w > 0, "the popover has its three sliders");
+        r = L.sl[0];
+        press_at(&st, &L, r.x + r.w / 2, r.y + r.h / 2, msg, sizeof(msg), &dirty);
+        uichk(st.r >= 126 && st.r <= 129, "dragging the R slider sets the red channel");
+        press_at(&st, &L, L.vw - 1, L.vh - 1, msg, sizeof(msg), &dirty);
+        uichk(st.mixer == 0, "a click outside closes the popover");
+    }
+
+    /* ---- the wide window: the mixer is a panel ---- */
+    layout_build(900, 600, &F, &st, &L);
+    uichk(L.panel_on, "900x600: the mixer is a panel beside the sheet");
+    if (L.panel_on) {
+        Rect r = L.sl[2];
+        press_at(&st, &L, r.x + r.w / 4, r.y + r.h / 2, msg, sizeof(msg), &dirty);
+        uichk(st.b >= 62 && st.b <= 65, "the panel's B slider sets the blue channel");
+    }
+
+    /* ---- hover is the same hit test ---- */
+    {
+        Rect r = L.tool[T_FILL];
+        uichk(hit_code(&L, &st, r.x + r.w / 2, r.y + r.h / 2) == H_TOOL + T_FILL,
+              "the hover test finds the same button");
+    }
+
+    printf("  input: %s (%d failures)\n", ui_fails ? "FAIL" : "PASS", ui_fails);
+    return ui_fails;
 }
 
 /* Decode two PNGs and compare them pixel for pixel. Used by the harness

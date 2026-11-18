@@ -345,6 +345,57 @@ static int parse_int(const char *s, int lo, int hi, int *out)
     return 1;
 }
 
+/* A bare percentage, 0..1000: "60%". Used by width/max-width, where a
+ * percentage has to wait for the renderer to know its column, and by
+ * line-height, where it is relative to the element's own font size. */
+static int parse_percent(const char *s, int *out)
+{
+    const char *p = s;
+    float v = 0.0f;
+    int digits = 0;
+    while (*p == ' ' || *p == '\t') p++;
+    while (is_digit((unsigned char)*p)) { v = v * 10.0f + (float)(*p - '0'); p++; digits++; }
+    if (*p == '.') {
+        float f = 0.1f;
+        p++;
+        while (is_digit((unsigned char)*p)) { v += (float)(*p - '0') * f; f *= 0.1f; p++; digits++; }
+    }
+    if (!digits) return 0;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '%') return 0;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p) return 0;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1000.0f) v = 1000.0f;
+    *out = (int)(v + 0.5f);
+    return 1;
+}
+
+/* A unitless number: "1.5". line-height is the only property that takes
+ * one, and there it means a multiple of the element's font size. */
+static int parse_multiplier(const char *s, int *pct)
+{
+    const char *p = s;
+    float v = 0.0f;
+    int digits = 0;
+    while (*p == ' ' || *p == '\t') p++;
+    while (is_digit((unsigned char)*p)) { v = v * 10.0f + (float)(*p - '0'); p++; digits++; }
+    if (*p == '.') {
+        float f = 0.1f;
+        p++;
+        while (is_digit((unsigned char)*p)) { v += (float)(*p - '0') * f; f *= 0.1f; p++; digits++; }
+    }
+    if (!digits) return 0;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p) return 0;                       /* a unit means it is not a multiplier */
+    v *= 100.0f;
+    if (v < 1.0f) v = 1.0f;
+    if (v > 1000.0f) v = 1000.0f;
+    *pct = (int)(v + 0.5f);
+    return 1;
+}
+
 /* ------------------------------------------------------------
  *  The cursor.
  * ------------------------------------------------------------ */
@@ -879,6 +930,62 @@ static int decl_apply(CssStyle *st, const char *name, const char *val,
         else { st->border_bottom_color = c; st->set |= CSS_SET_BORDER_BOTTOM_C; }
         return 1;
     }
+    if (ieq(name, "width") || ieq(name, "max-width")) {
+        int px = 0, pct = 0;
+        int is_max = (name[0] == 'm');
+        if (is_max && ieq(val, "none")) {
+            /* none is a real value: no maximum, whatever an ancestor said */
+            st->max_width = 0;
+            st->max_width_pct = 0;
+            st->set |= CSS_SET_MAX_WIDTH;
+            return 1;
+        }
+        if (!is_max && ieq(val, "auto")) {
+            st->width = 0;
+            st->width_pct = 0;
+            st->set |= CSS_SET_WIDTH;
+            return 1;
+        }
+        if (parse_percent(val, &pct)) { px = 0; }
+        else if (!parse_length(val, &px) || px < 0) {
+            if (sh) sh->stats.bad_values++;
+            note(sh, line, "bad value for", name);
+            return 0;
+        }
+        if (is_max) {
+            st->max_width = px;
+            st->max_width_pct = pct;
+            st->set |= CSS_SET_MAX_WIDTH;
+        } else {
+            st->width = px;
+            st->width_pct = pct;
+            st->set |= CSS_SET_WIDTH;
+        }
+        return 1;
+    }
+    if (ieq(name, "line-height")) {
+        int px = 0, pct = 0;
+        if (ieq(val, "normal")) {
+            px = 0;
+            pct = 0;
+        } else if (parse_percent(val, &pct)) {
+            px = 0;
+            if (pct == 0) pct = 1;
+        } else if (parse_multiplier(val, &pct)) {
+            px = 0;
+        } else if (parse_length(val, &px)) {
+            pct = 0;
+            if (px < 1) px = 1;
+        } else {
+            if (sh) sh->stats.bad_values++;
+            note(sh, line, "bad value for", name);
+            return 0;
+        }
+        st->line_height = px;
+        st->line_height_pct = pct;
+        st->set |= CSS_SET_LINE_HEIGHT;
+        return 1;
+    }
     if (ieq(name, "list-style-type")) {
         if (!parse_list_style(val, &n)) {
             if (sh) sh->stats.bad_values++;
@@ -1101,11 +1208,13 @@ int css_parse(const char *text, size_t len, CssSheet *sheet)
  *  origin: any author rule, even a bare tag selector, beats all of it.
  *
  *  Sizes are web.c's document sizes (src/client/apps/web.c:1822):
- *  12 px body, 24/20/17/15/13/12 for h1..h6. The heading margins are
- *  the HTML specification's suggested rendering factors - 0.67, 0.83,
- *  1, 1.33, 1.67 and 2.33 em of the heading's own size - rounded to
- *  whole pixels, which is why they grow as the heading shrinks:
- *  16, 17, 17, 20, 22 and 28 px.
+ *  12 px body, 24/20/17/15/13/12 for h1..h6. All six headings share one
+ *  vertical margin - 16 px above and 16 px below - because the browser
+ *  puts every heading on one grid and lets only the type size tell them
+ *  apart. The earlier per-level em factors (0.67, 0.83, 1, 1.33, 1.67,
+ *  2.33) made h6 float 12 px further from its neighbour than h1; that
+ *  is a typographic decision the renderer does not make, so the built-in
+ *  sheet states the one value instead of hiding it in six rules.
  *
  *  Margins are the element's own; collapsing two adjacent margins is a
  *  layout decision and is left to the renderer.
@@ -1113,13 +1222,7 @@ int css_parse(const char *text, size_t len, CssSheet *sheet)
 static const char kDefaultCss[] =
 "body { margin-top: 0; margin-bottom: 0; }\n"
 "p { margin-top: 12px; margin-bottom: 12px; }\n"
-"h1, h2, h3, h4, h5, h6 { font-weight: bold; }\n"
-"h1 { margin-top: 16px; margin-bottom: 16px; }\n"
-"h2 { margin-top: 17px; margin-bottom: 17px; }\n"
-"h3 { margin-top: 17px; margin-bottom: 17px; }\n"
-"h4 { margin-top: 20px; margin-bottom: 20px; }\n"
-"h5 { margin-top: 22px; margin-bottom: 22px; }\n"
-"h6 { margin-top: 28px; margin-bottom: 28px; }\n"
+"h1, h2, h3, h4, h5, h6 { font-weight: bold; margin-top: 16px; margin-bottom: 16px; }\n"
 "ul, ol, menu, dir { margin-top: 12px; margin-bottom: 12px; }\n"
 "ul { list-style-type: disc; }\n"
 "ol { list-style-type: decimal; }\n"
@@ -1265,7 +1368,7 @@ enum {
     P_COLOR, P_BG, P_WEIGHT, P_ITALIC, P_DECOR, P_ALIGN,
     P_MT, P_MB, P_PT, P_PB,
     P_BTW, P_BTS, P_BTC, P_BBW, P_BBS, P_BBC,
-    P_LIST, P_WS, P_COUNT
+    P_LIST, P_WS, P_WIDTH, P_MAXW, P_LH, P_COUNT
 };
 
 #define CSS_SPEC_UA   (-1000000)
@@ -1334,6 +1437,18 @@ static void cascade(CssStyle *dst, const CssStyle *src, int spec, int *best)
     }
     if (TAKE(CSS_SET_WHITE_SPACE, P_WS)) {
         dst->white_space = src->white_space; best[P_WS] = spec; dst->set |= CSS_SET_WHITE_SPACE;
+    }
+    if (TAKE(CSS_SET_WIDTH, P_WIDTH)) {
+        dst->width = src->width; dst->width_pct = src->width_pct;
+        best[P_WIDTH] = spec; dst->set |= CSS_SET_WIDTH;
+    }
+    if (TAKE(CSS_SET_MAX_WIDTH, P_MAXW)) {
+        dst->max_width = src->max_width; dst->max_width_pct = src->max_width_pct;
+        best[P_MAXW] = spec; dst->set |= CSS_SET_MAX_WIDTH;
+    }
+    if (TAKE(CSS_SET_LINE_HEIGHT, P_LH)) {
+        dst->line_height = src->line_height; dst->line_height_pct = src->line_height_pct;
+        best[P_LH] = spec; dst->set |= CSS_SET_LINE_HEIGHT;
     }
 #undef TAKE
 }
@@ -1448,6 +1563,11 @@ CssStyle css_for(const CssSheet *sheet, const char *tag, const char *class_attr,
         out.white_space = parent->white_space;
         out.monospace = parent->monospace;
         out.indent = parent->indent;
+        /* line-height inherits: a px value as px, a multiplier as a
+         * multiplier, so a heading under a 1.5 body gets 1.5 of its own
+         * larger size rather than the body's absolute number. */
+        out.line_height = parent->line_height;
+        out.line_height_pct = parent->line_height_pct;
     }
 
     /* 2. The parts of the document defaults that are presentation
@@ -1490,6 +1610,9 @@ CssStyle css_for(const CssSheet *sheet, const char *tag, const char *class_attr,
     if (out.font_size <= 0) out.font_size = CSS_BASE_FONT_SIZE;
     if (out.weight < 100) out.weight = 100;
     if (out.weight > 900) out.weight = 900;
+    if (out.line_height_pct > 0)
+        out.line_height = (out.font_size * out.line_height_pct + 50) / 100;
+    if (out.line_height < 0) out.line_height = 0;
 
     return out;
 }
@@ -1525,5 +1648,7 @@ int css_inline(CssStyle *style, const char *decls, size_t len)
         if (r < 0) break;
         if (r > 0) applied++;
     }
+    if (style->line_height_pct > 0)
+        style->line_height = (style->font_size * style->line_height_pct + 50) / 100;
     return applied;
 }
