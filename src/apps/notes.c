@@ -44,6 +44,31 @@
  *                memmove inside the same 64 KB block, never a new
  *                allocation. Ctrl+R replaces every occurrence it can
  *                fit and reports the real count.
+ *    select      an anchor byte and the caret make a range, in either
+ *                direction. Shift+arrows, Shift+Home/End and
+ *                Ctrl+Shift+arrows move the caret and keep the anchor
+ *                (the key's CSI modifier parameter says which: ESC[1;2D
+ *                is Shift+Left, ESC[1;6D is Ctrl+Shift+Left); Ctrl+A
+ *                selects the whole buffer. The range is painted behind
+ *                the glyphs, and the caret is still painted last, so a
+ *                selected caret is visible. Clicking and a plain arrow
+ *                end the selection; typing, Backspace and Delete end it
+ *                by replacing it with what the key itself does.
+ *    clipboard   Ctrl+C hands the selected bytes to clip_set_text() as
+ *                plain UTF-8, Ctrl+X copies them and then removes them
+ *                (only after the clipboard accepted them - a refused
+ *                copy never costs the user text), and Ctrl+V reads
+ *                clip_get_current(CLIP_TYPE_TEXT) and inserts it at the
+ *                caret, replacing any selection. The linked clipboard
+ *                library is src/clipboard.c, the same one the terminal,
+ *                the browser and Files use, so text crosses between all
+ *                of them. A paste is filtered into a temporary FIRST -
+ *                CR LF and a lone CR become one LF, NUL is dropped
+ *                because the buffer is a C string - and the tail is then
+ *                moved by that filtered length, the same number that is
+ *                copied in, so CRLF in the clipboard cannot shift the
+ *                tail past what was written. The status line quotes the
+ *                real byte counts ("copied 34 bytes", "pasted 12 bytes").
  *    counts      words/chars/lines computed from the buffer on every
  *                frame (chars counts UTF-8 code points, not continuation
  *                bytes). The painter decodes the same sequences, so a
@@ -88,11 +113,14 @@
  *
  *  There is no unbounded allocation: the two 64 KB blocks are fixed,
  *  the document table is capped at MAX_DOCS and the result table at
- *  MAX_HITS. A file larger than the buffer is never silently
- *  truncated on disk: autosave is off for it and Ctrl+S asks first,
- *  with the real byte counts.
+ *  MAX_HITS, and the one temporary a clipboard copy or paste needs is
+ *  bounded by the buffer (64 KB) and freed before the call returns. A
+ *  file larger than the buffer is never silently truncated on disk:
+ *  autosave is off for it and Ctrl+S asks first, with the real byte
+ *  counts.
  * ============================================================ */
 #include "mystic.h"
+#include "clipboard.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -157,6 +185,10 @@ typedef struct {
     char  *buf;                 /* fixed 64 KB: the open document     */
     char  *scan;                /* fixed 64 KB: search / replace work */
     int    len, cur;
+    int    sel_anchor;          /* selection anchor byte, -1 = none.  The
+                                 * caret is the other end; the two are
+                                 * stored unordered and sel_range() orders
+                                 * them.                            */
     int    w, h;
     int    dirty;
     NotesFsCache fsc;
@@ -209,6 +241,7 @@ typedef struct {
     int    status_err;
 
     int    esc, esc_param, esc_digits, esc_mod;
+    int    esc_mval, esc_mdigits;   /* the CSI modifier parameter    */
 
     /* Last pointer position the desktop reported with a click. The AppVT
      * wheel event carries no position, so this is the only honest way to
@@ -222,6 +255,7 @@ typedef struct {
 static void ensure_visible(Notes *n, Font *fr, Font *fd);
 static void prompt_delete(Notes *n);
 static void search_all(Notes *n);
+static void sel_clear(Notes *n);
 
 static int clampi(int v, int lo, int hi) {
     if (v < lo) return lo;
@@ -903,6 +937,7 @@ static int doc_load(Notes *n, int idx) {
 
     Doc *doc = &n->docs[idx];
     n->cur = clampi(doc->cur, 0, n->len);
+    sel_clear(n);                  /* the old range belongs to the old buffer */
     n->pcol = n->cur - line_start_at(n, n->cur);
     n->top = doc->top;
     n->top_row = doc->top_row;
@@ -1079,13 +1114,22 @@ static void caret_end_line(Notes *n) {
     note_pcol(n);
 }
 
+/* Step over a whole UTF-8 character. A byte-at-a-time caret let a selection
+ * split a two-byte character, and copying it then put invalid UTF-8 on the
+ * clipboard (a lone 0xA9 instead of C3 A9). */
 static void caret_left(Notes *n) {
-    if (n->cur > 0) n->cur--;
+    if (n->cur > 0) {
+        n->cur--;
+        while (n->cur > 0 && ((unsigned char)n->buf[n->cur] & 0xC0) == 0x80) n->cur--;
+    }
     note_pcol(n);
 }
 
 static void caret_right(Notes *n) {
-    if (n->cur < n->len) n->cur++;
+    if (n->cur < n->len) {
+        n->cur++;
+        while (n->cur < n->len && ((unsigned char)n->buf[n->cur] & 0xC0) == 0x80) n->cur++;
+    }
     note_pcol(n);
 }
 
@@ -1196,9 +1240,114 @@ static void caret_page(Notes *n, Font *fr, Font *fd, int dir) {
 }
 
 /* ------------------------------------------------------------
+ *  Selection: an anchor and the caret
+ *
+ *  The range is the bytes between the anchor and the caret, in either
+ *  order - a backward selection has the caret at its low end. Nothing
+ *  here is a copy of the text: the buffer stays the only copy, so an
+ *  edit cannot leave the selection describing bytes that are gone.
+ * ------------------------------------------------------------ */
+static int sel_active(const Notes *n) {
+    return n->sel_anchor >= 0 && n->sel_anchor != n->cur;
+}
+
+static void sel_clear(Notes *n) {
+    n->sel_anchor = -1;
+}
+
+/* Keep (or start) a selection. Called once per Shift+arrow before the
+ * caret moves: the anchor is where the caret was when Shift was first
+ * held, and the caret is wherever the arrow has taken it since. */
+static void sel_extend(Notes *n) {
+    if (n->sel_anchor < 0) n->sel_anchor = n->cur;
+    else if (n->sel_anchor > n->len) n->sel_anchor = n->len;
+    /* A shift move that comes back to where it started leaves NO selection.
+     * Without this the zero-length anchor stayed armed, and the next typed
+     * character was taken as "replace the selection" - so the first keystroke
+     * after Ctrl+A on an empty note vanished, and cancelling a shift selection
+     * then typing ate the character before the caret. */
+    if (n->sel_anchor == n->cur) n->sel_anchor = -1;
+}
+
+/* The ordered range. With no anchor both ends are the caret, which is
+ * what an edit wants when nothing is selected. */
+static void sel_range(const Notes *n, int *lo, int *hi) {
+    int a = n->sel_anchor < 0 ? n->cur : n->sel_anchor;
+    int c = n->cur;
+    if (a < 0) a = 0;
+    if (c < 0) c = 0;
+    if (a > n->len) a = n->len;
+    if (c > n->len) c = n->len;
+    if (a <= c) { *lo = a; *hi = c; }
+    else        { *lo = c; *hi = a; }
+}
+
+/* The one place the buffer grows or shrinks: replace [lo,hi) with `ins`
+ * (which may be NULL) and leave the caret after what was inserted. The
+ * tail is moved by the number of bytes actually copied in - the caller
+ * hands over the bytes it wants, not a longer source it filtered - so the
+ * tail can never be shifted by a count that was never written. Returns the
+ * number of bytes inserted (which is fewer than ilen only when the buffer
+ * is full). */
+static int buf_splice(Notes *n, int lo, int hi, const char *ins, int ilen) {
+    if (lo < 0) lo = 0;
+    if (hi < lo) hi = lo;
+    if (lo > n->len) lo = n->len;
+    if (hi > n->len) hi = n->len;
+    if (ilen < 0) ilen = 0;
+    int drop = hi - lo;
+    int room = NOTES_MAX - 1 - (n->len - drop);
+    if (room < 0) room = 0;
+    if (ilen > room) ilen = room;
+    if (drop == 0 && ilen == 0) return 0;
+    memmove(n->buf + lo + ilen, n->buf + hi, (size_t)(n->len - hi));
+    if (ilen > 0) memcpy(n->buf + lo, ins, (size_t)ilen);
+    n->len += ilen - drop;
+    n->buf[n->len] = 0;
+    n->cur = lo + ilen;
+    mark_dirty(n);
+    note_pcol(n);
+    return ilen;
+}
+
+/* Delete the selection. Returns the bytes removed. */
+static int sel_delete(Notes *n) {
+    if (!sel_active(n)) return 0;
+    int lo, hi;
+    sel_range(n, &lo, &hi);
+    buf_splice(n, lo, hi, NULL, 0);
+    sel_clear(n);
+    return hi - lo;
+}
+
+/* Word boundaries for Ctrl+arrows: a word byte is ASCII alphanumeric, '_'
+ * or any byte of a multi-byte UTF-8 sequence, so an accented word moves as
+ * one word and its bytes are never split. Punctuation, spaces and newlines
+ * are the gaps a word move steps over. */
+static int word_byte(unsigned char c) {
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+           (c >= 'a' && c <= 'z') || c == '_' || c >= 0x80;
+}
+
+static void caret_word(Notes *n, int dir) {
+    int i = n->cur;
+    if (dir < 0) {
+        while (i > 0 && !word_byte((unsigned char)n->buf[i - 1])) i--;
+        while (i > 0 && word_byte((unsigned char)n->buf[i - 1])) i--;
+    } else {
+        while (i < n->len && !word_byte((unsigned char)n->buf[i])) i++;
+        while (i < n->len && word_byte((unsigned char)n->buf[i])) i++;
+    }
+    n->cur = i;
+    note_pcol(n);
+}
+
+/* ------------------------------------------------------------
  *  Editing in the fixed buffer
  * ------------------------------------------------------------ */
 static void insert(Notes *n, char c) {
+    if (sel_active(n)) sel_delete(n);   /* typing replaces the selection */
+    else if (n->sel_anchor >= 0) n->sel_anchor = -1;  /* no live range: never leave one armed */
     if (n->len >= NOTES_MAX - 1) return;
     memmove(n->buf + n->cur + 1, n->buf + n->cur, (size_t)(n->len - n->cur));
     n->buf[n->cur] = c;
@@ -1210,6 +1359,8 @@ static void insert(Notes *n, char c) {
 }
 
 static void erase_one(Notes *n) {
+    if (sel_active(n)) { sel_delete(n); return; }
+    if (n->sel_anchor >= 0) n->sel_anchor = -1;   /* stale anchor: drop it */
     if (n->cur <= 0) return;
     memmove(n->buf + n->cur - 1, n->buf + n->cur, (size_t)(n->len - n->cur));
     n->cur--;
@@ -1220,6 +1371,8 @@ static void erase_one(Notes *n) {
 }
 
 static void erase_forward(Notes *n) {
+    if (sel_active(n)) { sel_delete(n); return; }
+    if (n->sel_anchor >= 0) n->sel_anchor = -1;   /* stale anchor: drop it */
     if (n->cur >= n->len) return;
     memmove(n->buf + n->cur, n->buf + n->cur + 1, (size_t)(n->len - n->cur - 1));
     n->len--;
@@ -1238,12 +1391,14 @@ static int find_next_in(Notes *n, int from) {
     for (int i = from; i + len <= n->len; i++)
         if (ci_match(n->buf, n->len, i, n->find, len)) {
             n->cur = i;
+            sel_clear(n);
             note_pcol(n);
             return 1;
         }
     for (int i = 0; i + len <= n->len && i < from; i++)
         if (ci_match(n->buf, n->len, i, n->find, len)) {
             n->cur = i;
+            sel_clear(n);
             note_pcol(n);
             return 1;
         }
@@ -1264,6 +1419,7 @@ static int replace_current(Notes *n) {
     n->len = newlen;
     n->buf[n->len] = 0;
     n->cur += n->repl_len;
+    sel_clear(n);
     mark_dirty(n);
     note_pcol(n);
     return 1;
@@ -1310,6 +1466,7 @@ static void replace_all(Notes *n) {
     n->buf[n->len] = 0;
     n->cur = 0;
     n->pcol = 0;
+    sel_clear(n);
     mark_dirty(n);
 
     char b[160];
@@ -1738,13 +1895,36 @@ static void esc_action(Notes *n, int param, int final, Font *fr, Font *fd) {
         return;
     }
 
+    /* The CSI modifier parameter is 1 + a bit mask: bit 0 Shift, bit 1
+     * Alt, bit 2 Ctrl. So ESC[1;2D is Shift+Left, ESC[1;6D is
+     * Ctrl+Shift+Left and ESC[1;5C is Ctrl+Right; a plain arrow carries no
+     * modifier parameter at all. Shift keeps the anchor, so every arrow
+     * below extends the range; without it the selection is ended before the
+     * caret moves, which is what a plain arrow means. */
+    int mod = n->esc_mod ? n->esc_mval : 0;
+    int bits = mod >= 2 ? mod - 1 : 0;
+    int shift = bits & 1;
+    int ctrl = (bits >> 2) & 1;
+
+    /* Delete keeps the range for itself: Delete with a selection removes
+     * exactly that range, so the range must not be cleared first. */
+    int keeps_sel = (final == '~' && param == 3);
+    if (!keeps_sel) {
+        if (shift) sel_extend(n);
+        else sel_clear(n);
+    }
+
     switch (final) {
         case 'A': caret_vertical(n, -1); break;
         case 'B': caret_vertical(n, +1); break;
-        case 'C': caret_right(n); break;
-        case 'D': caret_left(n); break;
-        case 'H': caret_home_line(n); break;
-        case 'F': caret_end_line(n); break;
+        case 'C': if (ctrl) caret_word(n, +1); else caret_right(n); break;
+        case 'D': if (ctrl) caret_word(n, -1); else caret_left(n); break;
+        case 'H': if (ctrl && shift) { n->cur = 0; note_pcol(n); }
+                  else caret_home_line(n);
+                  break;
+        case 'F': if (ctrl && shift) { n->cur = n->len; note_pcol(n); }
+                  else caret_end_line(n);
+                  break;
         case '~':
             switch (param) {
                 case 1: case 7: caret_home_line(n); break;
@@ -1765,6 +1945,7 @@ static int esc_feed(Notes *n, unsigned char c, Font *fr, Font *fd) {
         case 1:
             if (c == '[') {
                 n->esc = 2; n->esc_param = 0; n->esc_digits = 0; n->esc_mod = 0;
+                n->esc_mval = 0; n->esc_mdigits = 0;
                 return 1;
             }
             if (c == 'O') { n->esc = 3; return 1; }
@@ -1773,9 +1954,15 @@ static int esc_feed(Notes *n, unsigned char c, Font *fr, Font *fd) {
             return 0;
         case 2:
             if (c >= '0' && c <= '9') {
-                if (!n->esc_mod && n->esc_digits < 4) {
-                    n->esc_param = n->esc_param * 10 + (c - '0');
-                    n->esc_digits++;
+                if (!n->esc_mod) {
+                    if (n->esc_digits < 4) {
+                        n->esc_param = n->esc_param * 10 + (c - '0');
+                        n->esc_digits++;
+                    }
+                } else if (n->esc_mdigits < 3) {
+                    /* The parameter after ';' is the modifier mask. */
+                    n->esc_mval = n->esc_mval * 10 + (c - '0');
+                    n->esc_mdigits++;
                 }
                 return 1;
             }
@@ -2386,7 +2573,7 @@ static void draw_footer(Notes *n, Surface *s, const Layout *L, Font *fd,
     const char *hint;
     if (n->find_open)      hint = "Enter next - Tab field - Ctrl+R replace all - Ctrl+Q close";
     else if (n->view_preview) hint = "Ctrl+T back to the editor - Up/Down scrolls";
-    else                   hint = "Ctrl+F find - Ctrl+T preview - Ctrl+G search";
+    else                   hint = "Ctrl+C copy - Ctrl+V paste - Ctrl+F find";
     snprintf(l2, sizeof(l2), "%d words - %d chars - %d lines - %s",
              words, chars, lines, hint);
 
@@ -2484,6 +2671,12 @@ static void draw_editor(Notes *n, Surface *s, const Layout *L,
     if (n->find_open && n->find_len > 0) { needle = n->find; nlen = n->find_len; }
     else if (n->filter_len > 0) { needle = n->filter; nlen = n->filter_len; }
 
+    /* The selection is resolved once per paint; every glyph then asks a
+     * containment question with no arithmetic in it. */
+    int sel_lo = 0, sel_hi = 0;
+    int have_sel = sel_active(n);
+    if (have_sel) sel_range(n, &sel_lo, &sel_hi);
+
     int pos = line_start_of_index(n, n->top);
     int line = n->top;
     int row = 0;
@@ -2551,6 +2744,19 @@ static void draw_editor(Notes *n, Surface *s, const Layout *L,
                     }
                 }
 
+                /* The selection is behind the glyph: one rect per glyph
+                 * it covers, painted before the glyph and before the
+                 * caret, so neither can ever be covered by it. */
+                if (have_sel && i < sel_hi && i + gl > sel_lo) {
+                    int hx0 = (int)(px + 0.5f);
+                    int hx1 = (int)(px + cw + 0.5f);
+                    if (hx1 <= hx0) hx1 = hx0 + 1;
+                    if (hx1 > (int)g->text_r) hx1 = (int)g->text_r;
+                    if (hx1 > hx0)
+                        surf_blend(s, hx0, (int)band, hx1 - hx0, (int)g->lh,
+                                   color_alpha(th->accent, 0.30f));
+                }
+
                 font_draw(s, fr, px, ink_y(fr, band, g->lh), glyph, th->text);
             }
             px += cw;
@@ -2562,6 +2768,22 @@ static void draw_editor(Notes *n, Surface *s, const Layout *L,
             caret_x = px;
             caret_top = band + (g->lh - ink) * 0.5f;
             caret_painted = 1;
+        }
+
+        /* A selected line break has no glyph of its own, so the row would
+         * look unselected at its end. One small block past the last glyph
+         * makes a multi-line selection read as one range. */
+        if (have_sel && row >= base_row && row < last_row && end < n->len &&
+            sel_lo <= end && sel_hi > end) {
+            float nband = g->oy + g->pad_t + (float)(row - base_row) * g->lh;
+            int hx0 = (int)(px + 0.5f);
+            int hx1 = hx0 + ui_px(4);
+            if (hx0 < (int)g->text_r) {
+                if (hx1 > (int)g->text_r) hx1 = (int)g->text_r;
+                if (hx1 > hx0)
+                    surf_blend(s, hx0, (int)nband, hx1 - hx0, (int)g->lh,
+                               color_alpha(th->accent, 0.30f));
+            }
         }
 
         pos = end < n->len ? end + 1 : end;
@@ -2884,28 +3106,175 @@ static void preview_key(Notes *n, unsigned char c, Font *fr) {
 }
 
 /* ------------------------------------------------------------
+ *  Clipboard: copy, cut, paste
+ *
+ *  src/clipboard.c is linked into this desktop, so Notes calls the same
+ *  clip_set_text() / clip_get_current() the terminal, the browser and
+ *  Files use - no socket of its own, no private buffer that only Notes
+ *  can read. What crosses that boundary is plain UTF-8: exactly the
+ *  selected bytes on the way out, and whatever the newest text entry
+ *  holds on the way in, so text copied in Notes pastes into the browser
+ *  and text copied there pastes here.
+ * ------------------------------------------------------------ */
+/* A malloc'ed NUL-terminated copy of [lo,hi): clip_set_text() takes a C
+ * string and the selection is a range, not a terminated string. Bounded by
+ * the 64 KB buffer; the caller frees it. */
+static char *sel_copy_range(const Notes *n, int lo, int hi) {
+    if (hi <= lo) return NULL;
+    size_t nbytes = (size_t)(hi - lo);
+    char *tmp = malloc(nbytes + 1);
+    if (!tmp) return NULL;
+    memcpy(tmp, n->buf + lo, nbytes);
+    tmp[nbytes] = 0;
+    return tmp;
+}
+
+/* Ctrl+C. The count on the status line is the number of bytes that went to
+ * clip_set_text(), so it is the clipboard's own length and not a guess. */
+static void note_copy(Notes *n) {
+    if (!sel_active(n)) {
+        set_status(n, 1, "copy: nothing selected");
+        return;
+    }
+    int lo, hi;
+    sel_range(n, &lo, &hi);
+    char *tmp = sel_copy_range(n, lo, hi);
+    if (!tmp) { set_status(n, 1, "copy: out of memory"); return; }
+    int rc = clip_set_text(tmp);
+    free(tmp);
+
+    char b[160];
+    if (rc != CLIP_OK) {
+        snprintf(b, sizeof(b), "copy: clipboard refused - %s", clip_strerror(rc));
+        set_status(n, 1, b);
+        return;
+    }
+    snprintf(b, sizeof(b), "copied %d bytes", hi - lo);
+    set_status(n, 0, b);
+}
+
+/* Ctrl+X: copy first, and only remove the bytes once the clipboard has
+ * them. A refused copy must not cost the user the text. */
+static void note_cut(Notes *n) {
+    if (!sel_active(n)) {
+        set_status(n, 1, "cut: nothing selected");
+        return;
+    }
+    int lo, hi;
+    sel_range(n, &lo, &hi);
+    int removed = hi - lo;
+    char *tmp = sel_copy_range(n, lo, hi);
+    if (!tmp) { set_status(n, 1, "cut: out of memory"); return; }
+    int rc = clip_set_text(tmp);
+    free(tmp);
+
+    char b[180];
+    if (rc != CLIP_OK) {
+        snprintf(b, sizeof(b), "cut: clipboard refused - %s (buffer kept)",
+                 clip_strerror(rc));
+        set_status(n, 1, b);
+        return;
+    }
+    buf_splice(n, lo, hi, NULL, 0);
+    sel_clear(n);
+    snprintf(b, sizeof(b), "cut %d bytes", removed);
+    set_status(n, 0, b);
+}
+
+/* Ctrl+V: paste at the caret, replacing any selection.
+ *
+ * The clipboard text is filtered into a temporary FIRST - CR LF and a lone
+ * CR become one LF, and NUL is dropped because the buffer is a C string -
+ * and only the filtered bytes are handed to buf_splice(). The tail is then
+ * moved by the filtered length: the number that decides where the tail
+ * starts is the same number that is copied in, so pasting text with CRLF
+ * cannot overwrite the bytes after the caret and autosave cannot persist
+ * damage. The status line counts what was really inserted. */
+static void note_paste(Notes *n, Font *fr, Font *fd) {
+    ClipEntry *e = clip_get_current(CLIP_TYPE_TEXT);
+    if (!e || e->type != CLIP_TYPE_TEXT || !e->text || e->text_len == 0) {
+        clip_entry_free(e);
+        set_status(n, 1, "paste: the clipboard holds no text");
+        return;
+    }
+    uint32_t raw = e->text_len;
+
+    int lo, hi;
+    sel_range(n, &lo, &hi);          /* lo == hi == caret with no selection */
+    int drop = hi - lo;
+    int cap = NOTES_MAX - 1 - (n->len - drop);
+    if (cap < 0) cap = 0;
+
+    char *clean = malloc((size_t)cap + 1);
+    if (!clean) {
+        clip_entry_free(e);
+        set_status(n, 1, "paste: out of memory");
+        return;
+    }
+    int o = 0;
+    int clipped = 0;
+    for (uint32_t k = 0; k < raw; k++) {
+        unsigned char ch = (unsigned char)e->text[k];
+        if (ch == 0) continue;              /* cannot live in a C string */
+        if (ch == '\r') {
+            ch = '\n';
+            if (k + 1 < raw && e->text[k + 1] == '\n') k++;   /* CR LF */
+        }
+        if (o >= cap) { clipped = 1; continue; }
+        clean[o++] = (char)ch;
+    }
+
+    int put = buf_splice(n, lo, hi, clean, o);
+    free(clean);
+    clip_entry_free(e);
+    sel_clear(n);
+
+    char b[140];
+    if (clipped || put < o)
+        snprintf(b, sizeof(b), "pasted %d of %u bytes - buffer full",
+                 put, (unsigned)raw);
+    else if (drop > 0)
+        snprintf(b, sizeof(b), "pasted %d bytes, replaced %d", put, drop);
+    else if ((uint32_t)put != raw)
+        snprintf(b, sizeof(b), "pasted %d of %u bytes", put, (unsigned)raw);
+    else
+        snprintf(b, sizeof(b), "pasted %d bytes", put);
+    set_status(n, 0, b);
+    ensure_visible(n, fr, fd);
+}
+
+/* ------------------------------------------------------------
  *  Key handling: the editor
  * ------------------------------------------------------------ */
 static void editor_key(Notes *n, unsigned char c, Font *fr, Font *fd) {
     if (c == 8 || c == 127) {
-        erase_one(n);
+        erase_one(n);                   /* removes the selection if any  */
     } else if (c == 10 || c == 13) {
         insert(n, '\n');
     } else if (c == 9) {
         insert(n, ' ');
         insert(n, ' ');
     } else if (c == 0x04) {
-        erase_forward(n);
-    } else if (c == 0x01) {
-        caret_home_line(n);
+        erase_forward(n);               /* removes the selection if any  */
+    } else if (c == 0x01) {             /* Ctrl+A: select the whole buffer */
+        if (n->len == 0) {                 /* nothing to select: arm nothing */
+            sel_clear(n);
+        } else {
+            n->sel_anchor = 0;
+            n->cur = n->len;
+        }
+        note_pcol(n);
     } else if (c == 0x05) {
+        sel_clear(n);
         caret_end_line(n);
     } else if (c == 0x0E) {
+        sel_clear(n);
         caret_vertical(n, +1);
     } else if (c == 0x10) {
+        sel_clear(n);
         caret_vertical(n, -1);
     } else if (c >= 32) {
-        insert(n, (char)c);
+        insert(n, (char)c);             /* typing replaces the selection */
     }
     ensure_visible(n, fr, fd);
 }
@@ -2954,6 +3323,18 @@ static void notes_key(App *a, const char *bytes, int count) {
             } else {
                 set_status(n, 1, "save failed - buffer kept");
             }
+            continue;
+        }
+
+        /* Clipboard. The editor pane owns the selection and the caret; the
+         * list, the filter box, the preview and the modal prompt have
+         * neither, and the find bar keeps its own Ctrl+R/Ctrl+X meanings
+         * (see below), so none of them can paste over a document. */
+        if ((c == 0x03 || c == 0x16 || c == 0x18) &&
+            n->focus == FOCUS_EDIT && !n->view_preview && !n->find_open) {
+            if (c == 0x03)      note_copy(n);
+            else if (c == 0x18) note_cut(n);
+            else                note_paste(n, fr, fd);
             continue;
         }
         if (c == 0x11) { global_cancel(n); continue; }
@@ -3062,6 +3443,7 @@ static void click_text(Notes *n, const Layout *L, Font *fr, Font *fd,
 
     if (best >= 0) {
         n->cur = best > n->len ? n->len : best;
+        sel_clear(n);              /* a fresh click starts a new caret  */
         note_pcol(n);
         n->find_open = 0;
         ensure_visible(n, fr, fd);
@@ -3297,6 +3679,7 @@ static void notes_init(App *a, int w, int h) {
     n->h = h;
     n->disk_len = -1;
     n->cur_doc = -1;
+    n->sel_anchor = -1;          /* no selection: the caret is the only end */
     n->focus = FOCUS_EDIT;
     n->find_field = 0;
     n->fitted_w = -1;

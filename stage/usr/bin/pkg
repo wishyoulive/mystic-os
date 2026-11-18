@@ -756,9 +756,15 @@ fetch_index() {
 }
 
 ensure_index() {
+    # The cache lives in /tmp, and EVERY reader goes through here. Check the
+    # directory's owner before the cached index is even looked at: a cache an
+    # unprivileged user can write would let the index be swapped between the
+    # signature check and the read (cmd_install used to reach that check only
+    # after ensure_index had already read a row; list never reached it at all).
+    prepare_cache || return 1
     [ -f "$INDEX" ] || { fetch_index; return $?; }
-    # The cache lives in /tmp. Every read re-checks the signature, so a file
-    # that cannot be authenticated is treated as absent, not as an index.
+    # Every read re-checks the signature, so a file that cannot be
+    # authenticated is treated as absent, not as an index.
     if verify_index "$INDEX" "$INDEX_SIG" 2>/dev/null; then
         return 0
     fi

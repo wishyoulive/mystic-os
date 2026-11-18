@@ -46,16 +46,17 @@ These are the honest limits, not a wish list:
 * **One signature covers all rows.** There is no per-package signature;
   the index is the signed unit, and every tarball is covered through the
   sha256 it lists.
-* **The `size` column is informational.** `pkg` uses it to print
-  "installing web (1.2 MB)", and it is part of the signed bytes, but the
-  enforcement is the sha256, not the size.
+* **The `size` column is checked, not trusted on its own.** `pkg` compares
+  the transfer against it and refuses a short or long download before the
+  sha256, but the enforcement is the sha256: a false size cannot make
+  different bytes acceptable.
 * **Availability is not protected.** An attacker can still block, delay or
   404 the repository. That is a denial of service, not a forgery.
 * **The Store's browsing list is still unauthenticated.** Installation is
   gated (the Store only asks for a *name*, and `pkg install` re-verifies the
   index before it looks that name up), but the rows the Store *shows* come
   from a plain `wget` copy of the index written by the desktop. See section
-  5 for the exact lines and the one-line fix, and section 8 for the risk.
+  5 for the code path and the one-line fix, and section 8 for the risk.
 
 ---
 
@@ -125,6 +126,38 @@ if they differ, packages from that publisher will be refused.
 `pkg repo` also prints the key path and fingerprint next to the index
 state, so a support question can always be answered from the machine.
 
+### The key is part of the image, not part of the network
+
+Nothing downloads this file. `pkg` opens `/etc/mystic/repo.pub` directly;
+the only writers in the tree are the publisher tools (`sign-index.py
+keygen`, `serve-repo.sh`, `fetch-vlc.py`), which write it while building a
+repository, never at runtime. The built initramfs carries it root-owned,
+mode 0644:
+
+```
+$ python tools/mkimage.py --stage stage -o build/stage.cpio.gz  # what image.sh does
+$ gzip -dc build/stage.cpio.gz | (parse the cpio newc headers)
+etc/mystic/repo.pub                mode=0644 uid=0 gid=0 bytes=32
+usr/bin/ed25519-verify             mode=0755 uid=0 gid=0 bytes=37784
+usr/bin/pkg                        mode=0755 uid=0 gid=0 bytes=58120
+```
+
+The write permission is the root user's alone: no app bundle, no Store
+row and no `pkg` command can change the key. Replacing it means booting
+something else (root) or rebuilding the image, which is the honest limit
+of this trust model - there is no secure boot in Mystic OS.
+
+`stage/usr/bin/ed25519-verify` in the tree is the Linux binary produced by
+`tools/build-desktop.sh:59-63`; the tests below recompile the same
+`src/tools/ed25519.c` for the host because a Windows machine cannot execute
+the Linux ELF. The two builds are the same source and the shipped one was
+checked to be byte-identical to a fresh build of that source (section 7).
+
+The seed file is written with `chmod 0600` by `keygen`. On Windows the
+filesystem has no POSIX mode bits, so that call is cosmetic there; keep
+`build/sign/repo.key` out of any shared folder and set NTFS permissions on
+it instead of trusting the mode.
+
 ---
 
 ## 4. Publisher workflow
@@ -147,7 +180,99 @@ tools/sign-index.py verify --pub stage/etc/mystic/repo.pub \
 `sign` writes `<in>.sig` (64 raw bytes) next to the file. `--pub` is not
 decoration: it makes the signer read the public half that will be
 distributed and **refuse to sign** if the seed does not match it, which is
-the failure mode where an image silently trusts a key nobody has.
+the failure mode where an image silently trusts a key nobody has. Both
+halves of that behaviour, on a fresh key:
+
+```
+$ tools/sign-index.py keygen --seed .work/sign/k.key --pub .work/sign/k.pub
+seed      : .work/sign/k.key (mode 0600, keep it off any shared machine)
+public key: .work/sign/k.pub (32 raw bytes)
+public hex: fc5818b4fc0cc73c01f82b26345b906715850d7d29a52224d826aed2bba22835
+fingerprint: sha256 0e6cd7b05d3a9fd8daea0574d705578fe98af43f2f6840e0121848d18aeecccb
+[exit 0]
+
+$ tools/sign-index.py sign --seed .work/sign/k.key \
+                           --in build/repo/index.tsv --sig .work/sign/k.sig \
+                           --pub .work/sign/k.pub
+signed    : build/repo/index.tsv (1269 bytes)
+signature : .work/sign/k.sig (64 raw bytes)
+fingerprint: sha256 0e6cd7b05d3a9fd8daea0574d705578fe98af43f2f6840e0121848d18aeecccb
+
+$ tools/sign-index.py verify --pub .work/sign/k.pub \
+                             --in build/repo/index.tsv --sig .work/sign/k.sig
+ok: signature verifies over 1269 bytes of build/repo/index.tsv
+[exit 0]
+
+$ tools/sign-index.py sign --seed .work/sign/k.key \
+                           --in build/repo/index.tsv \
+                           --pub stage/etc/mystic/repo.pub
+stage/etc/mystic/repo.pub does not match the seed - refusing to sign with
+  a key whose public half is not the one being distributed
+  seed gives: fc5818b4...22835
+  stage/etc/mystic/repo.pub has:    ede5d32a...ba41f
+[exit 1]
+```
+
+Signing the real repository index in this tree (the seed from
+`build/sign/repo.key`, the key shipped in `stage/etc/mystic/repo.pub`) is
+exactly:
+
+```sh
+tools/sign-index.py sign --seed build/sign/repo.key \
+                         --in  build/repo/index.tsv \
+                         --pub stage/etc/mystic/repo.pub
+# signed    : build/repo/index.tsv (1269 bytes)
+# signature : build/repo/index.tsv.sig (64 raw bytes)
+# fingerprint: sha256 ce177b2cc56f3cfd4c3458a7e7201eece66b45b01a1a888b9a6f1e4cbcf90096
+
+tools/sign-index.py verify --pub stage/etc/mystic/repo.pub \
+                           --in  build/repo/index.tsv
+# ok: signature verifies over 1269 bytes of build/repo/index.tsv
+```
+
+`build/repo/index.tsv.sig` is not optional metadata; it is a required
+release asset. Ed25519 is deterministic, so signing the same bytes twice
+produces the same 64 bytes - that is why the signature already sitting in
+`build/repo` is reproduced byte-for-byte by the command above.
+
+### Publishing the repository release
+
+The package repository is the GitHub release tagged `repo-v1` (the same
+base URL `stage/usr/bin/pkg` uses by default: `.../releases/download/
+repo-v1`). A release is complete only when **both** `index.tsv` and
+`index.tsv.sig` are uploaded, plus `index.pub` for humans and every
+tarball named in the index:
+
+```sh
+# 1. build the index exactly the way the mirror will serve it
+tools/serve-repo.sh --index        # packs stage bundles and signs index.tsv
+# or, when the vlc bundle was produced separately:
+#   python tools/fetch-vlc.py        # adds the vlc row and re-signs
+
+# 2. verify before uploading - this is what pkg will do
+tools/sign-index.py verify --pub stage/etc/mystic/repo.pub \
+                           --in  build/repo/index.tsv
+
+# 3. publish every asset, signature included
+gh release upload repo-v1 build/repo/index.tsv \
+                          build/repo/index.tsv.sig \
+                          build/repo/index.pub \
+                          build/repo/*.tar.gz --clobber
+
+# 4. prove the release carries the signature, from the URL pkg uses
+curl -fsSL https://github.com/wishyoulive/mystic-os/releases/download/repo-v1/index.tsv.sig \
+     -o /tmp/index.tsv.sig
+curl -fsSL https://github.com/wishyoulive/mystic-os/releases/download/repo-v1/index.tsv \
+     -o /tmp/index.tsv
+tools/sign-index.py verify --pub stage/etc/mystic/repo.pub \
+                           --in /tmp/index.tsv --sig /tmp/index.tsv.sig
+```
+
+Never upload an index without its `.sig`: `pkg` will refuse the whole
+release (`the repository publishes no signature ... an unsigned index is
+refused`), so the failure is loud rather than silent, but the mirror is
+then unusable until the signature is uploaded. Upload the pair together,
+and re-run step 4 after any `--clobber` that replaces `index.tsv`.
 
 `tools/serve-repo.sh` builds the index, signs it with
 `$REPO_KEY` (default `build/sign/repo.key`) against `$REPO_PUB`
@@ -180,10 +305,14 @@ be distributed with the OS rather than fetched.
 6. Only then move the pair into place, and re-verify the pair in its final
    location before reporting the package count.
 
-`ensure_index` re-verifies a **cached** index on every use, so a file in
-`/tmp` that cannot be authenticated is treated as absent and refetched.
+`ensure_index` (`stage/usr/bin/pkg:758-774`) re-verifies a **cached** index
+on every use, so a file in `/tmp` that cannot be authenticated is treated
+as absent and refetched. It also calls `prepare_cache` **before** the
+cached index is read (`:764`), so the ownership check cannot be skipped by
+a read-only command such as `pkg list`: a cache directory an unprivileged
+user can write is refused even when a valid signed index is already in it.
 
-`cmd_install` then:
+`cmd_install` (`:1047`) then:
 
 1. Takes the row from the verified index; the sha256 column must be 64 hex
    characters and the file name must be a bare file name (no `/`, no
@@ -192,12 +321,14 @@ be distributed with the OS rather than fetched.
    matches the signed value. A cached file that does not match is deleted
    and downloaded again.
 3. After the download, `sha256sum` must equal the signed value or the file
-   is deleted and the install dies — it is never unpacked.
-4. `tar_members_ok` — list the archive and refuse absolute members and
-   `..` path components before extracting anything, because `tar` extracts
-   as root and would happily write outside the install directory.
-5. Unpack into `$APPS/.<name>.new.$$`, then swap it in, so a failed upgrade
-   leaves the working installation alone.
+   is deleted and the install dies — it is never unpacked (`:1150-1178`).
+4. `tar_scan` — list the archive and refuse absolute members and `..`
+   path components before extracting anything, because `tar` extracts as
+   root and would happily write outside the install directory (`:473-600`).
+5. Unpack into a fresh `$APPS/.<name>.new.$$`, check every member the
+   archive listed actually landed (busybox tar stops at the first member
+   it cannot create, so tar's exit status is not a completion test), then
+   swap it in, so a failed upgrade leaves the working installation alone.
 
 The user-visible refusals are specific, e.g.:
 
@@ -213,7 +344,10 @@ pkg: index in /tmp/pkg/index.tsv is left untouched
 ```
 
 ```
-pkg: checksum mismatch for demo.tar.gz (signed index says 584e4395..., download is 6635227c...) - refusing to unpack
+pkg: sha256 mismatch for g2048.tar.gz
+pkg:   signed index says: ead803a53539a4d24cb5ae6a934776a9a003341910a53a466666340703d02ee1
+pkg:   the download is:   9dda598c1dea6c16bf839b39302b81ab70bb16f010c08c397ca46065a4a0aefc
+pkg: the file does not match the signed index - deleted, nothing was installed
 ```
 
 ```
@@ -230,28 +364,29 @@ install. There is no `--insecure` flag.
 ### The Store's copy of the index is not authenticated yet
 
 `pkg` writes its verified index to `/tmp/pkg/index.tsv` and also copies it
-to `/run/mystic/repo.index` (`stage/usr/bin/pkg:319-321`). The Store window
+to `/run/mystic/repo.index` (`stage/usr/bin/pkg:752-754`). The Store window
 does not read `pkg`'s copy: it reads `/run/mystic/repo.index`
-(`src/apps/store.c:163`, opened at `:741` and `:755`), and the desktop
-overwrites that file with a plain, unverified
+(`STORE_REPO_INDEX` in `src/apps/store.c`, opened in `store_index_reload`),
+and the desktop overwrites that file with a plain, unverified
 `wget -q -T 10 -O /run/mystic/repo.index http://10.0.2.2:8000/index.tsv`
-on first run (`src/main.c:1854-1857`) and on every Refresh
-(`src/main.c:1865-1868`). Nothing on that path checks a signature.
+on first run and on every Refresh (both commands in `src/main.c`, search
+for `/run/mystic/repo.index`). Nothing on that path checks a signature.
 
 Consequence: the Store's *list* - names, versions, sizes, descriptions,
 the installed/update hints - is attacker-chosen on an untrusted network.
 Installing is still gated: the Store writes only the chosen *name* to
-`/run/mystic/install.request` (`src/apps/store.c:1590`), the desktop
-validates it (`src/main.c:404-422`) and `pkg install` re-fetches and
-re-verifies the signed index before it looks the name up, refusing one
-that is not there (`stage/usr/bin/pkg:325-336`, `:421`). So the worst
-case today is a misleading row or a denied install, not code execution -
-but it is a hole in this story and it is listed in section 8.
+`/run/mystic/install.request` (`store_install_request` in
+`src/apps/store.c`), the desktop validates it (`take_request` in
+`src/main.c`) and `pkg install` re-fetches and re-verifies the signed
+index before it looks the name up (`stage/usr/bin/pkg:1047-1062`),
+refusing one that is not there. So the worst case today is a misleading
+row or a denied install, not code execution - but it is a hole in this
+story and it is listed in section 8.
 
 The fix belongs in `src/main.c`, which this worker does not own. Either:
 
-1. replace both `wget` commands (`src/main.c:1854-1857` and
-   `:1865-1868`) with
+1. replace both `wget` commands (search `src/main.c` for
+   `/run/mystic/repo.index`) with
    `execl("/bin/sh", "sh", "-c", "pkg update", (char *)NULL);` so `pkg`
    is the only writer of `/run/mystic/repo.index`; or
 2. leave the fetch in `main.c` but have the Store read
@@ -319,8 +454,209 @@ independently written implementations to pass.
 
 ## 7. The proof
 
-Real transcript from `.work/sign/proof.sh` (a fresh random keypair each
-run, so the hex differs run to run — the pass/fail lines do not).
+### Against the real repository, with the key the image ships
+
+Everything below was run on the working tree, not on a fixture. The files
+are the real ones: `build/repo/index.tsv` (1269 bytes, 9 packages),
+`build/repo/index.tsv.sig`, and `stage/etc/mystic/repo.pub` (sha256
+`ce177b2c...90096`). Two things are host-only, and neither changes what
+`pkg` decides: the network is a local HTTP server reached through a
+behavioural model of the busybox `wget` applet (so `pkg`'s own control
+flow and all its checks ran unmodified), and the verifier is the Windows
+build of `src/tools/ed25519.c` because Windows cannot execute the Linux
+ELF. `stage/usr/bin/ed25519-verify` is byte-identical to a fresh build of
+that same source (last block in this section).
+
+**Sign the real index and verify it.** The signature that was already in
+`build/repo/index.tsv.sig` is reproduced byte-for-byte, because Ed25519 is
+deterministic:
+
+```
+$ cp build/repo/index.tsv.sig .work/sign/sig.before
+$ tools/sign-index.py sign --seed build/sign/repo.key \
+                           --in  build/repo/index.tsv \
+                           --pub stage/etc/mystic/repo.pub
+signed    : build/repo/index.tsv (1269 bytes)
+signature : build/repo/index.tsv.sig (64 raw bytes)
+public hex: ede5d32a05be2b79f9535f8945e35e90e2d21f143ec9326babcf424ee4cba41f
+fingerprint: sha256 ce177b2cc56f3cfd4c3458a7e7201eece66b45b01a1a888b9a6f1e4cbcf90096
+[exit 0]
+$ cmp build/repo/index.tsv.sig .work/sign/sig.before \
+      && echo "the same 64 bytes"
+the same 64 bytes
+
+$ tools/sign-index.py verify --pub stage/etc/mystic/repo.pub \
+                             --in  build/repo/index.tsv
+ok: signature verifies over 1269 bytes of build/repo/index.tsv
+key fingerprint: sha256 ce177b2cc56f3cfd4c3458a7e7201eece66b45b01a1a888b9a6f1e4cbcf90096
+[exit 0]
+
+$ ed25519-verify stage/etc/mystic/repo.pub \
+                  build/repo/index.tsv build/repo/index.tsv.sig
+[exit 0, silent]
+```
+
+**Flip exactly one byte of the index.** Byte 500 is the `g` of
+`clock.tar.gz` in the first row, so the result is still a syntactically
+perfect TSV (`clock.tar.fz` is a legal bare file name) - only the
+signature notices:
+
+```
+$ (flip byte 500 of a copy of build/repo/index.tsv)
+byte 500: 0x67 -> 0x66
+
+$ ed25519-verify stage/etc/mystic/repo.pub \
+                  .work/sign/tampered.tsv build/repo/index.tsv.sig
+invalid
+[exit 1]
+
+$ cp <tampered index> build/repo/index.tsv       # what a hostile mirror does
+$ pkg update
+fetching index from http://127.0.0.1:8807/index.tsv
+  index download: 1 KB downloaded 1 KB/s 1s
+  index download: 1 KB in 2s
+fetching signature from http://127.0.0.1:8807/index.tsv.sig
+  signature download: 64 B downloaded 64 B/s 1s
+  signature download: 64 B in 2s
+pkg: SIGNATURE VERIFICATION FAILED for <repo>/.work/sign/cache/index.tsv.part
+pkg:   key       : <repo>/stage/etc/mystic/repo.pub
+pkg:   fingerprint: sha256 ce177b2cc56f3cfd4c3458a7e7201eece66b45b01a1a888b9a6f1e4cbcf90096
+pkg:   signature : <repo>/.work/sign/cache/index.tsv.sig.part
+pkg: the index was altered in transit, or it was signed with a key this
+pkg: image does not trust. Either way it is not used.
+[exit 1]
+```
+
+The previously verified index in the cache was **not** replaced: it is
+still byte-identical to the original signed file. With no cache at all,
+the same tampered repository cannot be installed from:
+
+```
+$ rm -rf <cache>; pkg install clock
+...
+pkg: SIGNATURE VERIFICATION FAILED for <repo>/.work/sign/cache/index.tsv.part
+pkg:   key       : <repo>/stage/etc/mystic/repo.pub
+pkg:   fingerprint: sha256 ce177b2cc56f3cfd4c3458a7e7201eece66b45b01a1a888b9a6f1e4cbcf90096
+pkg:   signature : <repo>/.work/sign/cache/index.tsv.sig.part
+pkg: the index was altered in transit, or it was signed with a key this
+pkg: image does not trust. Either way it is not used.
+pkg: the index from http://127.0.0.1:8807 was NOT installed; any previously verified
+pkg: index in <repo>/.work/sign/cache/index.tsv is left untouched
+pkg: cannot read the index from http://127.0.0.1:8807
+[exit 1]
+$ ls -d <apps>/clock
+ls: cannot access ...: No such file or directory
+```
+
+With the original index restored, the same command succeeds and the
+tarball passes the sha256 gate:
+
+```
+$ pkg install clock
+...
+9 packages (signature ok, key sha256 ce177b2cc56f3cfd4c3458a7e7201eece66b45b01a1a888b9a6f1e4cbcf90096)
+installing clock 1.0 (clock.tar.gz, 74 KB) from http://127.0.0.1:8807
+...
+size ok: 76053 bytes, the signed index says 76053
+checksum ok: sha256 ed001ffca06e6ee9cba434a67ba7548195f76f2246a2ac6eed87a260c453ec0e
+...
+installed clock 1.0 to <apps>/clock (exec: bin, 131 KB on disk)
+[exit 0]
+```
+
+**Flip exactly one byte of a tarball** (`g2048.tar.gz`, offset 5000),
+leaving the index and its signature untouched:
+
+```
+$ (flip byte 5000 of build/repo/g2048.tar.gz)
+g2048.tar.gz byte 5000: 0x6c -> 0x93
+$ pkg install g2048
+installing g2048 1.0 (g2048.tar.gz, 77 KB) from http://127.0.0.1:8807
+  space ok: ...
+  downloading g2048.tar.gz: 77 KB / 77 KB (99%)
+  downloading g2048.tar.gz: 77 KB of 77 KB in 2s
+pkg: sha256 mismatch for g2048.tar.gz
+pkg:   signed index says: ead803a53539a4d24cb5ae6a934776a9a003341910a53a466666340703d02ee1
+pkg:   the download is:   9dda598c1dea6c16bf839b39302b81ab70bb16f010c08c397ca46065a4a0aefc
+pkg: the file does not match the signed index - deleted, nothing was installed
+[exit 1]
+$ ls <cache>/g2048.tar.gz* <apps>/g2048
+ls: cannot access ...: No such file or directory
+```
+
+The downloaded file is deleted, not kept for a retry: a byte stream that
+is not the one the signed index describes never reaches `tar`.
+
+The cache is not trusted either. Corrupting the already-verified
+`g2048.tar.gz` in `/tmp/pkg` and installing again re-checks it against the
+signed index instead of unpacking it:
+
+```
+$ (flip one byte of <cache>/g2048.tar.gz)
+$ pkg install g2048
+...
+pkg: the cached g2048.tar.gz does not match the signed index - downloading it again
+...
+checksum ok: sha256 ead803a53539a4d24cb5ae6a934776a9a003341910a53a466666340703d02ee1
+installed g2048 1.0 to <apps>/g2048 (exec: bin, 135 KB on disk)
+[exit 0]
+```
+
+### The shipped verifier and the trust anchor
+
+`tools/build-desktop.sh` compiles `src/tools/ed25519.c` and installs it as
+`/usr/bin/ed25519-verify`. The built initramfs (parsed from the cpio) has:
+
+```
+etc/mystic/repo.pub                mode=0644 uid=0 gid=0 bytes=32
+usr/bin/ed25519-verify             mode=0755 uid=0 gid=0 bytes=37784
+usr/bin/pkg                        mode=0755 uid=0 gid=0 bytes=58120
+```
+
+so the key is root-owned and the only permission on it is root's write
+bit; the verifier is root-owned and executable. A fresh build of the
+source is byte-identical to the binary in `stage/`:
+
+```
+$ zig cc -target x86_64-linux-musl -Os -static -Wall -Wextra \
+      -Wno-unused-parameter -o .work/sign/ed25519-verify.linux src/tools/ed25519.c
+$ cmp .work/sign/ed25519-verify.linux stage/usr/bin/ed25519-verify
+identical
+$ zig cc -target x86_64-linux-musl -Os -static -Isrc -Wall -Wextra \
+      -Wno-unused-parameter -c src/tools/ed25519.c -o .work/sign/x.o
+silent, exit 0
+$ file stage/usr/bin/ed25519-verify
+ELF 64-bit LSB executable, x86-64, statically linked, stripped
+```
+
+A 63-byte signature is not quietly accepted either:
+
+```
+$ ed25519-verify stage/etc/mystic/repo.pub build/repo/index.tsv short.sig
+ed25519-verify: short.sig: signature must be exactly 64 bytes
+[exit 2]        <-- pkg treats any non-zero exit as a refusal
+```
+
+### Cross-check between the two implementations
+
+`.work/sign/crosscheck.py` generated 25 random keys x 3 messages and 25
+uniformly random 64-byte signatures, and required the C verifier to accept
+every real signature and reject every one-bit flip, wrong-key and random
+signature:
+
+```
+$ python .work/sign/crosscheck.py
+crosscheck: 277 checks, 0 failures
+```
+
+---
+
+### Fixture test: a separate keypair
+
+The older transcript below is from `.work/sign/proof.sh`, which generates
+a fresh random keypair on every run (so the hex differs run to run - the
+pass/fail lines do not). It is kept because it exercises the case where
+the trusted key is *not* the development key in the tree.
 
 ### Generate a keypair
 
@@ -435,30 +771,48 @@ low-order `R`), so the property is enforced by a test rather than
 asserted in prose, and `.work/sign/crosscheck.py` feeds the same three
 encodings to both implementations and requires both to reject them.
 
-### Test coverage actually run
+### Test coverage actually run for this revision
 
-* `.work/sign/pkgtest.sh` — **22 checks, 0 failures** against the real
-  `stage/usr/bin/pkg`: signed index accepted; one flipped bit refused and
-  the cached index left intact; missing signature refused; foreign key
-  refused; verified install works; corrupt tarball refused and nothing
-  unpacked; `../` member refused; absolute-path member refused; missing
-  key refused; missing verifier refused.
-* `.work/sign/crosscheck.py` — **0 failures** in every run (the check count varies with how many random messages happen to be empty; each run does well over 250) comparing
-  `src/tools/ed25519.c` with `tools/sign-index.py` over random keys and
-  messages: valid signatures accepted, one-bit signature flips rejected,
-  one-bit message flips rejected, wrong key rejected, uniformly random
-  64-byte signatures rejected.
-* `tools/serve-repo.sh --index` — the real publisher path: it packed the
-  eight app bundles, signed the 1112-byte index with the development
-  key, wrote `index.pub`, and `pkg` then listed all eight rows
-  (`8 packages (signature ok, ...)`) and installed one of them with a
-  matching sha256.
-* `ed25519-verify --selftest` — RFC 8032 vectors 1-3 plus a corrupted
-  signature each, a corrupted message for the two non-empty vectors, a
-  non-canonical `S` each, and the three forged encodings (`y = p` key,
-  identity key, low-order `R`): `selftest: ok`.
-* `python tools/sign-index.py selftest` — the same vectors through the
-  Python implementation: `selftest: ok`.
+All of these ran against `stage/usr/bin/pkg` as shipped (only `wget` and
+the verifier were host shims; the script itself is unmodified) and the
+real `build/repo` files:
+
+| check | result |
+|---|---|
+| `sign-index.py sign` over the real 1269-byte index, then `cmp` with the `.sig` already in `build/repo` | exit 0, signature byte-identical |
+| `sign-index.py verify` and the C verifier over the real index | exit 0, fingerprint `ce177b2c...90096` |
+| one byte flipped in the index, C verifier | `invalid`, exit 1 |
+| one byte flipped in the index, `pkg update` | `SIGNATURE VERIFICATION FAILED`, exit 1, cached index untouched |
+| one byte flipped in the index, `pkg install clock` with no cache | refusal, exit 1, no app directory created |
+| genuine index, `pkg install clock` | `size ok`, `checksum ok`, exit 0, app installed |
+| one byte flipped in `g2048.tar.gz`, `pkg install g2048` | `sha256 mismatch`, both hashes printed, file deleted, no app directory, exit 1 |
+| one byte flipped in the **cached** `g2048.tar.gz` | `cached ... does not match the signed index - downloading it again`, re-download passes the checksum, install succeeds |
+| index signed by a different key | `SIGNATURE VERIFICATION FAILED` (trusted key's fingerprint printed), exit 1 |
+| `index.tsv.sig` missing (HTTP 404) | `refusing the unsigned index`, exit 1 |
+| `MYSTIC_VERIFY` pointing at nothing | `no Ed25519 verifier found ... refused by design`, exit 1 |
+| `MYSTIC_REPO_PUB` pointing at nothing | `no repository public key ... not used`, exit 1 |
+| 63-byte signature file | verifier exit 2, `signature must be exactly 64 bytes` |
+| cached index tampered behind `pkg`'s back, server good | `cannot be authenticated - fetching it again`, then `pkg list` succeeds from a re-verified index |
+| `pkg list` with no cache directory | fetch + verify + list, exit 0 |
+| 25 random keys x 3 messages + 25 random signatures cross-checked C vs Python | `crosscheck: 277 checks, 0 failures` |
+| `sign-index.py selftest` (3 RFC 8032 vectors + 3 negative cases each) | `selftest: ok` |
+| C `--selftest` (RFC vectors, corrupted sig/message, non-canonical `S`, forged encodings) | `selftest: ok` |
+| `sh -n stage/usr/bin/pkg` | silent |
+| cpio built from `stage/` | `etc/mystic/repo.pub` 0644 root:root, `usr/bin/ed25519-verify` 0755 root:root |
+
+`.work/sign/verify.sh` runs all of the rows above and prints a pass/fail
+line for each (it needs `.work/sign/serve.sh` on `127.0.0.1:8807`, which
+serves the real `build/repo` files):
+
+```
+$ sh .work/sign/verify.sh
+...
+verify: 45 checks passed, 0 failed
+```
+
+The older `.work/sign/pkgtest.sh` fixture harness (22 checks) still exists
+and covers the same refusal paths against a synthetic repository; it was
+not needed for the verdict above, which uses the real index and key.
 
 `--selftest` is compiled into the shipped binary, so the target system can
 be checked with one command:
@@ -478,15 +832,15 @@ selftest: ok
 | Signing key stolen | Attacker publishes packages every image trusts | Rotate the key, ship a new image. No revocation path exists in this format. |
 | Replay of an old signed index | User installs an older package with a real vulnerability | Not mitigated: no expiry/timestamp. |
 | Mirror blocks or delays | Installs fail | Expected; availability is not a security property here. |
-| Cache directory pre-created by uid 1000 | Index swapped between check and read | `prepare_cache` refuses a foreign-owned cache; `/tmp/pkg` is root-owned 0755. |
-| `tar` extracting as root | Files written outside the install dir | `tar_members_ok` rejects absolute and `..` members before extraction. |
-| Store "Available" list is unauthenticated | Names, versions, sizes and descriptions shown in the Store are attacker-chosen over plain HTTP; installs are still gated because `pkg` re-verifies before looking up the name | **Not mitigated yet**: `src/main.c:1854-1857` and `:1865-1868` write `/run/mystic/repo.index` with plain `wget`. Make `pkg update` the only writer, or have the Store verify before reading (see section 5). |
+| Cache directory pre-created by uid 1000 | Index swapped between check and read | `prepare_cache` refuses a foreign-owned cache and is called by `ensure_index` before any cached index is read (`stage/usr/bin/pkg:764`); `/tmp/pkg` is root-owned 0755. |
+| `tar` extracting as root | Files written outside the install dir | `tar_scan` rejects absolute members and `..` components before extraction, and `unpack_archive` verifies every member afterwards. |
+| Store "Available" list is unauthenticated | Names, versions, sizes and descriptions shown in the Store are attacker-chosen over plain HTTP; installs are still gated because `pkg` re-verifies before looking up the name | **Not mitigated yet**: `src/main.c` writes `/run/mystic/repo.index` with a plain `wget` (search for the path). Make `pkg update` the only writer, or have the Store verify before reading (see section 5). |
 
 ---
 
 ## 9. Host and CI notes
 
-`pkg` can be exercised outside the image with three environment variables,
+`pkg` can be exercised outside the image with five environment variables,
 which exist for testing and are **not** a security boundary (anyone who can
 set them can edit the script):
 

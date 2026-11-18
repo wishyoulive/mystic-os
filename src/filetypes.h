@@ -138,6 +138,7 @@ typedef enum {
 #define FT_APP_WEB      "web"        /* the browser                    */
 #define FT_APP_TERMINAL "terminal"   /* the shell window               */
 #define FT_APP_SETTINGS "settings"   /* the Settings app               */
+#define FT_APP_VLC      "vlc"        /* the video player (VLC bundle)  */
 #define FT_APP_NONE     ""
 
 /* One row. `ext` is lowercase and carries no dot; a compound

@@ -7,6 +7,7 @@
  *  file turns them into a grid of cells we can draw.
  * ============================================================ */
 #include "mystic.h"
+#include "clipboard.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -55,10 +56,32 @@
  * after a text-scale change. */
 #define TERM_FONT_SIZE 12.0f
 
+/* @term-grid-a-begin (types; the host grid harness in .work/i18n compiles this text) */
 typedef struct {
     u32 ch;
+    /* A combining mark (Unicode width 0) that sits on this cell's glyph. One
+     * slot is enough for the marks that occur in practice; a second one on the
+     * same base replaces the first rather than running past the cell. */
+    u32 mark;
     u8  fg, bg, bold;
+    /* Unicode cell span of ch: 0 = one cell, 1 = the first cell of a two-cell
+     * glyph (a CJK ideograph, an emoji), 2 = the second cell of one. The grid
+     * has to carry this because the cursor, a `ls` column and a prompt all
+     * count CELLS, and a wide glyph that occupied one cell pushed everything
+     * after it one column to the left. */
+    u8  span;
+    /* 1 when this cell is the first glyph of a row that the *automatic* wrap
+     * produced, 0 when the row really starts here (a newline, CR, a clear).
+     * Text selection has to know which rows are one logical line: without
+     * this, copying a wrapped command would put a newline in the middle of
+     * it. Only the cell at column 0 of a wrapped row carries it. */
+    u8  soft;
 } Cell;
+
+/* The Unicode tables and the UTF-8 walk live in src/font.c, beside the face
+ * list, and are shared through src/i18n.h - see also docs/ACCESSIBILITY.md. */
+#include "i18n.h"
+
 
 #define HIST_ROWS 600      /* lines of scrollback per terminal */
 
@@ -106,7 +129,21 @@ struct Term {
      * what will be drawn, so term_resize_px() re-measures from the font. */
     float cell_cw, cell_ch;
     float cell_scale;
+
+    /* Text selection. A line here is an ABSOLUTE line: 0 is the oldest line
+     * in the scrollback and hist_count is the top row of the live screen, so
+     * the highlight follows the text when the view scrolls and a selection
+     * can span lines that have already scrolled into the history. The two
+     * ends are stored unordered; sel_range() orders them. */
+    int sel_active;      /* 1 when a range exists */
+    int sel_kind;        /* 0 character, 1 word, 2 whole line */
+    int sel_al, sel_ac;  /* the anchor cell: where the drag began */
+    int sel_a0, sel_a1;  /* the anchor's word [a0,a1], inclusive */
+    int sel_ml, sel_mc;  /* the moving cell: where the pointer is now */
 };
+
+
+/* @term-grid-a-end */
 
 /* ---------------------------------------------------------- palette */
 static const u32 PALETTE[16] = {
@@ -135,34 +172,75 @@ static void cell_floor(float *cw, float *ch) {
     *ch = (*ch > 8.0f) ? *ch : 8.0f;
 }
 
+/* @utf8-fit-begin  (the host harness in .work/i18n compiles exactly this text) */
 /* Trim a label so it fits a width, with ".." where it had to be cut: the
  * scrolled-back pill is text in a pill that may itself have been narrowed to
- * the window, so the string has to be fitted, not clipped by the surface. */
+ * the window, so the string has to be fitted, not clipped by the surface.
+ *
+ * Every cut lands on a codepoint boundary. The old loop shortened the string by
+ * one BYTE at a time, so a Cyrillic or Japanese label could be cut inside a
+ * character: font_draw() then read the bare lead byte and swallowed the dots
+ * after it as one codepoint, which turned ".." into a stray glyph. */
 static void fit_label(Font *f, const char *src, char *out, size_t cap, float maxw) {
-    snprintf(out, cap, "%s", src);
-    if (maxw <= 0.0f) { out[0] = 0; return; }
+    if (cap == 0) return;
+    out[0] = 0;
+    if (!src || maxw <= 0.0f) return;
+    size_t len = strlen(src);
+    if (len > cap - 3) len = font_utf8_boundary(src, cap - 3);
+    memcpy(out, src, len);
+    out[len] = 0;
     if (font_width(f, out) <= maxw) return;
-    size_t n = strlen(src);
-    while (n > 0) {
-        n--;
-        snprintf(out, cap, "%.*s..", (int)n, src);
+    while (len > 0) {
+        len = font_utf8_prev(src, len);
+        snprintf(out, cap, "%.*s..", (int)len, src);
         if (font_width(f, out) <= maxw) return;
     }
     out[0] = 0;
 }
 
+/* @utf8-fit-end */
+
+/* @term-grid-b-begin */
 /* ---------------------------------------------------------- screen */
 static Cell *cell_at(Term *t, int x, int y) {
     if (x < 0 || x >= t->cols || y < 0 || y >= t->rows) return NULL;
     return &t->grid[(size_t)y * t->cols + x];
 }
 
+/* One cell, blanked. Every path that erases cells goes through here so the
+ * span and the mark can never be left behind on an empty cell - an orphaned
+ * wide-glyph span would make term_draw() skip the cell for ever. */
+static void cell_blank(Cell *c, u8 fg, u8 bg) {
+    c->ch = ' ';
+    c->mark = 0;
+    c->fg = fg;
+    c->bg = bg;
+    c->bold = 0;
+    c->span = 0;
+    c->soft = 0;
+}
+
 static void clear_cells(Term *t, int x0, int y0, int x1, int y1) {
-    for (int y = y0; y <= y1; y++)
+    for (int y = y0; y <= y1; y++) {
+        /* A two-cell glyph straddling the edge of the cleared span has to go as
+         * a whole: blanking only its tail leaves the head painting over the
+         * cleared cell, and blanking only its head leaves a tail no draw ever
+         * paints. One extra cell at the boundary is what every terminal does. */
+        if (x0 > 0) {
+            Cell *c = cell_at(t, x0, y);
+            Cell *h = cell_at(t, x0 - 1, y);
+            if (c && h && c->span == 2 && h->span == 1) cell_blank(h, t->fg, t->bg);
+        }
+        if (x1 + 1 < t->cols) {
+            Cell *c = cell_at(t, x1, y);
+            Cell *n = cell_at(t, x1 + 1, y);
+            if (c && n && c->span == 1 && n->span == 2) cell_blank(n, t->fg, t->bg);
+        }
         for (int x = x0; x <= x1; x++) {
             Cell *c = cell_at(t, x, y);
-            if (c) { c->ch = ' '; c->fg = t->fg; c->bg = t->bg; c->bold = 0; }
+            if (c) cell_blank(c, t->fg, t->bg);
         }
+    }
 }
 
 static void hist_push(Term *t, const Cell *row) {
@@ -176,12 +254,7 @@ static void scroll_up(Term *t) {
     hist_push(t, t->grid);
     memmove(t->grid, t->grid + t->cols, (size_t)(t->rows - 1) * t->cols * sizeof(Cell));
     Cell *last = t->grid + (size_t)(t->rows - 1) * t->cols;
-    for (int x = 0; x < t->cols; x++) {
-        last[x].ch = ' ';
-        last[x].fg = t->fg;
-        last[x].bg = t->bg;
-        last[x].bold = 0;
-    }
+    for (int x = 0; x < t->cols; x++) cell_blank(&last[x], t->fg, t->bg);
 }
 
 static void newline(Term *t) {
@@ -215,19 +288,96 @@ static void cursor_move(Term *t, int dx, int dy) {
     t->wrap = 0;
 }
 
+/* Detach a wide glyph from a cell that is about to be overwritten. A two-cell
+ * glyph is stored as a head (span 1) and a tail (span 2); writing over either
+ * half has to release the other one, or the grid keeps a head with no tail (the
+ * head paints over whatever replaced it) or a tail with no head (a cell that
+ * term_draw() skips and nothing ever paints). */
+static void unspan(Term *t, int x, int y) {
+    Cell *c = cell_at(t, x, y);
+    if (!c || c->span == 0) return;
+    if (c->span == 2) {
+        Cell *h = cell_at(t, x - 1, y);
+        if (h && h->span == 1) { cell_blank(h, t->fg, t->bg); }
+        c->span = 0;
+    } else {
+        Cell *n = cell_at(t, x + 1, y);
+        if (n && n->span == 2) n->span = 0;
+        c->span = 0;
+    }
+}
+
+/* Put one codepoint at the cursor, using the width the character really has:
+ *
+ *   1 cell    ordinary text: the cursor advances one column.
+ *   2 cells   a CJK ideograph, a Hangul syllable or an emoji: it owns the next
+ *             cell as well (span 1 + span 2) and the cursor advances two, which
+ *             is what makes `ls`, prompt redraws and every column-aligned
+ *             program line up in a CJK locale. At the last column the pair
+ *             starts on the next line, as xterm does, because a two-cell glyph
+ *             cannot be split.
+ *   0 cells   a combining mark: it decorates the cell before the cursor and
+ *             consumes nothing, so "е" + U+0301 stays one column wide.
+ *
+ * Before this, every codepoint took exactly one cell and the grid had no idea
+ * that a CJK glyph paints two: the glyph was drawn at its natural width (about
+ * two cells in a CJK face) and overflowed into the next character. */
 static void put_char(Term *t, u32 ch) {
+    int w = font_cell_width(ch);
+
+    if (w == 0) {
+        int x = t->wrap ? t->cols - 1 : t->cx - 1;
+        Cell *c = cell_at(t, x, t->cy);
+        if (c && c->span != 2) { c->mark = ch; t->dirty = 1; }
+        else if (c && c->span == 2) {
+            Cell *h = cell_at(t, x - 1, t->cy);
+            if (h) { h->mark = ch; t->dirty = 1; }
+        }
+        return;
+    }
+
     /* A glyph written into the last column parks the cursor there and wraps
-     * on the next glyph rather than running past the end of the row. */
-    if (t->wrap) { t->cx = 0; newline(t); }
+     * on the next glyph rather than running past the end of the row. A row
+     * entered this way is a soft wrap: the text on it continues the line
+     * above, which is what selection needs to know. */
+    int soft = 0;
+    if (t->wrap) { t->cx = 0; newline(t); soft = 1; }
+    if (w == 2) {
+        if (t->cols < 2) w = 1;                  /* a one-column terminal */
+        else if (t->cx + 1 >= t->cols) {          /* no room: start a new row */
+            t->cx = 0;
+            newline(t);
+            soft = 1;
+        }
+    }
+
+    unspan(t, t->cx, t->cy);
+    if (w == 2) unspan(t, t->cx + 1, t->cy);
+
     Cell *c = cell_at(t, t->cx, t->cy);
     if (c) {
         c->ch = ch;
+        c->mark = 0;
         c->fg = t->fg;
         c->bg = t->bg;
         c->bold = t->bold;
+        c->span = (w == 2) ? 1 : 0;
+        c->soft = (u8)soft;
     }
-    if (t->cx + 1 < t->cols) t->cx++;
-    else                     t->wrap = 1;
+    if (w == 2) {
+        Cell *tail = cell_at(t, t->cx + 1, t->cy);
+        if (tail) {
+            tail->ch = ' ';
+            tail->mark = 0;
+            tail->fg = t->fg;
+            tail->bg = t->bg;
+            tail->bold = t->bold;
+            tail->span = 2;
+            tail->soft = 0;
+        }
+    }
+    if (t->cx + w < t->cols) t->cx += w;
+    else                     { t->cx = t->cols - 1; t->wrap = 1; }
     t->dirty = 1;
 }
 
@@ -244,6 +394,7 @@ static void screen_reset(Term *t) {
     t->u8_need = 0;
     t->u8_min = 0;
     t->scroll = 0;
+    t->sel_active = 0;
     clear_cells(t, 0, 0, t->cols - 1, t->rows - 1);
     t->dirty = 1;
 }
@@ -255,6 +406,8 @@ void term_clear_screen(Term *t) {
     if (!t) return;
     screen_reset(t);
 }
+
+/* @term-grid-b-end */
 
 /* ---------------------------------------------------------- parser */
 
@@ -602,6 +755,14 @@ Term *term_create(int cols, int rows, const char *shell) {
     if (!t->grid || !t->hist) { free(t->grid); free(t->hist); free(t); return NULL; }
     clear_cells(t, 0, 0, cols - 1, rows - 1);
 
+#ifdef TERM_HOST_TEST
+    /* A host test has no pty to fork and no termios to set. The grid, the
+     * parser and the selection are the same objects; term_host_feed() below
+     * hands the parser the bytes a shell would have written. */
+    (void)shell;
+    t->pid = -1;
+    return t;
+#else
     struct winsize ws = { 0 };
     ws.ws_col = (unsigned short)cols;
     ws.ws_row = (unsigned short)rows;
@@ -628,6 +789,7 @@ Term *term_create(int cols, int rows, const char *shell) {
      * to the waitpid probe + kill(2). */
     t->pidfd = (int)syscall(SYS_pidfd_open, (long)pid, 0L);
     return t;
+#endif
 }
 
 int term_fd(Term *t) { return t ? t->fd : -1; }
@@ -640,6 +802,11 @@ int term_rows(Term *t) { return t ? t->rows : 0; }
  * compositor: at 64 KiB per frame the desktop still paints, and the rest of
  * the output is read on the next frame. */
 int term_pump(Term *t) {
+#ifdef TERM_HOST_TEST
+    /* No pty: the harness feeds the parser directly (term_host_feed). */
+    (void)t;
+    return 0;
+#else
     if (!t || !t->alive) return 0;
     char buf[2048];
     long budget = 65536;
@@ -669,7 +836,20 @@ int term_pump(Term *t) {
     }
     t->dirty = t->dirty || total > 0;
     return total;
+#endif
 }
+
+#ifdef TERM_HOST_TEST
+/* Feed the escape parser the bytes a shell would have written to the pty.
+ * This is the same feed_byte() the desktop calls from term_pump(), so a host
+ * test exercises the real decoder, the real grid and the real wrap flags. */
+int term_host_feed(Term *t, const char *buf, int n) {
+    if (!t || !buf || n < 0) return 0;
+    for (int i = 0; i < n; i++) feed_byte(t, (unsigned char)buf[i]);
+    t->dirty = 1;
+    return n;
+}
+#endif
 
 /* Resize the screen: a new grid and a new scrollback ring of the new width,
  * then tell the shell. The grid is cols wide everywhere in this file (cell_at,
@@ -692,6 +872,17 @@ int term_pump(Term *t) {
  * the pty's foreground process group, and programs read the new size back with
  * TIOCGWINSZ. Without it the shell keeps formatting for the old width - 'ls'
  * still wraps at the old column count while the window shows the new one. */
+/* After a resize has copied a row of `cc` cells, a two-cell glyph may have been
+ * cut in half by the new edge: the head survived and its tail did not. The head
+ * would then paint over the cell that no longer exists. Blank it - one cell lost
+ * at the fold is what every terminal does, and it keeps the grid consistent. */
+static void fix_row_edge(Cell *row, int cc) {
+    if (cc <= 0) return;
+    Cell *last = &row[cc - 1];
+    if (last->span == 1) { last->ch = ' '; last->mark = 0; last->span = 0; }
+    if (row[0].span == 2) { row[0].ch = ' '; row[0].mark = 0; row[0].span = 0; }
+}
+
 void term_resize(Term *t, int cols, int rows) {
     if (!t) return;
     if (cols < 10) cols = 10;
@@ -707,16 +898,20 @@ void term_resize(Term *t, int cols, int rows) {
     int cc = cols < t->cols ? cols : t->cols;   /* columns that survive */
     int cr = rows < t->rows ? rows : t->rows;   /* rows that survive */
 
-    for (int y = 0; y < cr; y++)
+    for (int y = 0; y < cr; y++) {
         memcpy(grid + (size_t)y * cols, t->grid + (size_t)y * t->cols,
                (size_t)cc * sizeof(Cell));
+        fix_row_edge(grid + (size_t)y * cols, cc);
+    }
     for (int y = 0; y < rows; y++) {
         for (int x = (y < cr ? cc : 0); x < cols; x++) {
             Cell *c = &grid[(size_t)y * cols + x];
             c->ch = ' ';
+            c->mark = 0;
             c->fg = t->fg;
             c->bg = t->bg;
             c->bold = 0;
+            c->span = 0;
         }
     }
 
@@ -728,12 +923,15 @@ void term_resize(Term *t, int cols, int rows) {
             int src = (t->hist_head - t->hist_count + i + HIST_ROWS * 2) % HIST_ROWS;
             memcpy(hist + (size_t)i * cols, t->hist + (size_t)src * t->cols,
                    (size_t)cc * sizeof(Cell));
+            fix_row_edge(hist + (size_t)i * cols, cc);
             for (int x = cc; x < cols; x++) {
                 Cell *c = &hist[(size_t)i * cols + x];
                 c->ch = ' ';
+                c->mark = 0;
                 c->fg = t->fg;
                 c->bg = t->bg;
                 c->bold = 0;
+                c->span = 0;
             }
         }
         t->hist_head = t->hist_count % HIST_ROWS;
@@ -745,6 +943,10 @@ void term_resize(Term *t, int cols, int rows) {
     t->hist = hist;
     t->cols = cols;
     t->rows = rows;
+    /* Absolute line numbers do not survive a rebuild: the history ring is
+     * re-strided and rows move. A selection that kept its numbers would
+     * highlight text the user never picked, so it is dropped, not guessed. */
+    t->sel_active = 0;
     if (!t->hist) t->hist_count = 0;   /* no ring: nothing may index it */
 
     if (t->cx < 0) t->cx = 0;
@@ -840,6 +1042,9 @@ static int wait_for_room(Term *t, int *waits) {
  * desktop. Only a genuinely dead pty ends the loop early. */
 void term_key(Term *t, const char *bytes, int n) {
     if (!t || !t->alive || !bytes || n <= 0 || t->fd < 0) return;
+    /* Typing ends a selection, the way it does in every terminal: the text
+     * the highlight covered is about to change under it. */
+    if (t->sel_active) { t->sel_active = 0; t->dirty = 1; }
 
     int sent = 0;
     int waits = 0;
@@ -950,6 +1155,277 @@ void term_destroy(Term *t) {
     free(t);
 }
 
+/* Re-encode one codepoint for font_draw (1, 2, 3 or 4 bytes). A surrogate or
+ * something above U+10FFFF cannot come out of feed_byte, but render U+FFFD if
+ * it ever does. Returns the byte count. */
+static int cp_encode(u32 ch, char *utf) {
+    int n = 0;
+    if (ch > 0x10FFFFu || (ch >= 0xD800u && ch <= 0xDFFFu)) ch = 0xFFFDu;
+    if (ch < 0x80) {
+        utf[n++] = (char)ch;
+    } else if (ch < 0x800) {
+        utf[n++] = (char)(0xC0 | (ch >> 6));
+        utf[n++] = (char)(0x80 | (ch & 0x3F));
+    } else if (ch < 0x10000) {
+        utf[n++] = (char)(0xE0 | (ch >> 12));
+        utf[n++] = (char)(0x80 | ((ch >> 6) & 0x3F));
+        utf[n++] = (char)(0x80 | (ch & 0x3F));
+    } else {
+        utf[n++] = (char)(0xF0 | (ch >> 18));
+        utf[n++] = (char)(0x80 | ((ch >> 12) & 0x3F));
+        utf[n++] = (char)(0x80 | ((ch >> 6) & 0x3F));
+        utf[n++] = (char)(0x80 | (ch & 0x3F));
+    }
+    utf[n] = 0;
+    return n;
+}
+
+/* ============================================================
+ *  Text selection
+ *
+ *  The mouse handlers live in the desktop (src/main.c): it owns the
+ *  window's pixels, so it is the only place that knows which cell a
+ *  pointer position names. This file owns the model - which cells are
+ *  selected, what they spell, and how the highlight is painted - because
+ *  it owns the grid.
+ *
+ *  A row is addressed in the VIEWPORT here (0 = the top row currently on
+ *  screen) and converted to an absolute line immediately, so scrolling
+ *  moves the highlight with the text instead of leaving it on a screen
+ *  row.
+ * ============================================================ */
+
+/* The absolute line the given viewport row shows right now. */
+static int sel_line_of_row(const Term *t, int row) {
+    int line = t->hist_count - t->scroll + row;
+    if (line < 0) line = 0;
+    return line;
+}
+
+/* One cell by absolute line and column, or NULL when that line is not held
+ * any more (scrolled out of the history ring). */
+static Cell *sel_cell(Term *t, int line, int col) {
+    if (!t || line < 0 || col < 0 || col >= t->cols) return NULL;
+    if (line < t->hist_count) {
+        int idx = (t->hist_head - t->hist_count + line + HIST_ROWS * 2) % HIST_ROWS;
+        return &t->hist[(size_t)idx * t->cols + col];
+    }
+    int gy = line - t->hist_count;
+    if (gy >= t->rows) return NULL;
+    return &t->grid[(size_t)gy * t->cols + col];
+}
+
+static int sel_word_ch(u32 ch) {
+    if (ch == 0 || ch == ' ') return 0;
+    if (ch == '_' || ch == '\'') return 1;
+    if (ch < 0x80) return (ch >= '0' && ch <= '9') ||
+                          (ch >= 'a' && ch <= 'z') ||
+                          (ch >= 'A' && ch <= 'Z');
+    return 1;                       /* anything non-ASCII is a word letter */
+}
+
+/* The word under (line,col), as an inclusive cell range. A cell that is not
+ * a word character is its own one-cell word, which is what a double click
+ * on punctuation should select. */
+static void sel_word_at(Term *t, int line, int col, int *w0, int *w1) {
+    Cell *c = sel_cell(t, line, col);
+    *w0 = *w1 = col;
+    if (!c || !sel_word_ch(c->ch)) return;
+    int a = col, b = col;
+    while (a > 0) {
+        Cell *p = sel_cell(t, line, a - 1);
+        if (!p || !sel_word_ch(p->ch)) break;
+        a--;
+    }
+    while (b + 1 < t->cols) {
+        Cell *p = sel_cell(t, line, b + 1);
+        if (!p || !sel_word_ch(p->ch)) break;
+        b++;
+    }
+    *w0 = a;
+    *w1 = b;
+}
+
+/* Order the two endpoints into a range. Word and line selections keep their
+ * unit: dragging from a double-clicked word takes whole words with it, and a
+ * triple-clicked line takes whole lines. */
+static void sel_range(const Term *t, int *l0, int *c0, int *l1, int *c1) {
+    int al = t->sel_al, ac = t->sel_ac;
+    int ml = t->sel_ml, mc = t->sel_mc;
+    if (t->sel_kind == 2) {
+        if (ml >= al) { *l0 = al; *c0 = 0; *l1 = ml; *c1 = t->cols - 1; }
+        else          { *l0 = ml; *c0 = 0; *l1 = al; *c1 = t->cols - 1; }
+        return;
+    }
+    if (t->sel_kind == 1) {
+        int w0 = 0, w1 = 0;
+        sel_word_at((Term *)t, ml, mc, &w0, &w1);
+        if (ml > al || (ml == al && mc >= t->sel_a1)) {
+            *l0 = al; *c0 = t->sel_a0; *l1 = ml; *c1 = w1;
+        } else {
+            *l0 = ml; *c0 = w0; *l1 = al; *c1 = t->sel_a1;
+        }
+        return;
+    }
+    if (ml > al || (ml == al && mc >= ac)) { *l0 = al; *c0 = ac; *l1 = ml; *c1 = mc; }
+    else                                   { *l0 = ml; *c0 = mc; *l1 = al; *c1 = ac; }
+}
+
+static int sel_has_cell(int l0, int c0, int l1, int c1, int line, int col) {
+    if (line < l0 || line > l1) return 0;
+    if (line == l0 && col < c0) return 0;
+    if (line == l1 && col > c1) return 0;
+    return 1;
+}
+
+/* Start a selection at a viewport cell. kind: 0 character, 1 word, 2 line. */
+void term_sel_begin(Term *t, int col, int row, int kind) {
+    if (!t) return;
+    if (col < 0) col = 0;
+    if (col >= t->cols) col = t->cols - 1;
+    if (row < 0) row = 0;
+    if (row >= t->rows) row = t->rows - 1;
+    int line = sel_line_of_row(t, row);
+    t->sel_active = 1;
+    t->sel_kind = kind;
+    t->sel_al = line;
+    t->sel_ac = col;
+    t->sel_ml = line;
+    t->sel_mc = col;
+    t->sel_a0 = col;
+    t->sel_a1 = col;
+    if (kind == 1) sel_word_at(t, line, col, &t->sel_a0, &t->sel_a1);
+    else if (kind == 2) { t->sel_a0 = 0; t->sel_a1 = t->cols - 1; }
+    t->dirty = 1;
+}
+
+/* Move the free end (drag), keeping the unit the selection was started in. */
+void term_sel_extend(Term *t, int col, int row) {
+    if (!t || !t->sel_active) return;
+    if (col < 0) col = 0;
+    if (col >= t->cols) col = t->cols - 1;
+    if (row < 0) row = 0;
+    if (row >= t->rows) row = t->rows - 1;
+    t->sel_ml = sel_line_of_row(t, row);
+    t->sel_mc = col;
+    t->dirty = 1;
+}
+
+void term_sel_clear(Term *t) {
+    if (!t || !t->sel_active) return;
+    t->sel_active = 0;
+    t->dirty = 1;
+}
+
+int term_sel_active(Term *t) { return t && t->sel_active; }
+
+/* Select every line the terminal still holds: the scrollback and the live
+ * screen. Trailing blank lines are dropped when the text is built. */
+void term_sel_all(Term *t) {
+    if (!t) return;
+    t->sel_active = 1;
+    t->sel_kind = 2;
+    t->sel_al = 0;
+    t->sel_ac = 0;
+    t->sel_a0 = 0;
+    t->sel_a1 = t->cols - 1;
+    t->sel_ml = t->hist_count + t->rows - 1;
+    t->sel_mc = t->cols - 1;
+    t->dirty = 1;
+}
+
+/* Build the selected text. Lines the automatic wrap produced are joined
+ * without a newline, trailing blanks on each logical line are dropped, and
+ * trailing empty lines are not part of the copy. Returns a malloc'ed UTF-8
+ * string (caller frees) and sets *out_len, or NULL when there is nothing to
+ * copy. */
+char *term_sel_text(Term *t, int *out_len) {
+    if (out_len) *out_len = 0;
+    if (!t || !t->sel_active) return NULL;
+    int l0, c0, l1, c1;
+    sel_range(t, &l0, &c0, &l1, &c1);
+    int maxline = t->hist_count + t->rows - 1;
+    if (l0 < 0) l0 = 0;
+    if (l1 > maxline) l1 = maxline;
+    if (l1 < l0) return NULL;
+
+    /* Worst case: one codepoint per cell, four bytes each, plus newlines. */
+    size_t cap = (size_t)(l1 - l0 + 1) * ((size_t)t->cols * 4u + 1u) + 2u;
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    size_t o = 0;
+    int started = 0;
+
+    for (int line = l0; line <= l1; line++) {
+        Cell *head = sel_cell(t, line, 0);
+        int soft = head && head->soft;
+        int a = (line == l0) ? c0 : 0;
+        int b = (line == l1) ? c1 : t->cols - 1;
+        if (a < 0) a = 0;
+        if (b >= t->cols) b = t->cols - 1;
+
+        /* The line's last cell that is really text. A single selected cell
+         * is kept even when it is a space, or selecting one space would copy
+         * nothing at all. */
+        int last = b;
+        if (b > a) {
+            while (last >= a) {
+                Cell *c = sel_cell(t, line, last);
+                if (c && c->ch && c->ch != ' ') break;
+                last--;
+            }
+        }
+        if (last < a) {
+            /* An empty visual line inside the selection is a real line break;
+             * one at the very end is not text. */
+            if (started) {
+                if (o + 1 < cap) out[o++] = '\n';
+            }
+            continue;
+        }
+        if (started) {
+            if (!soft && o + 1 < cap) out[o++] = '\n';
+        }
+        started = 1;
+        for (int col = a; col <= last; col++) {
+            Cell *c = sel_cell(t, line, col);
+            if (!c) continue;
+            if (c->span == 2) continue;       /* tail of a two-cell glyph */
+            u32 ch = c->ch ? c->ch : ' ';
+            char u[8];
+            int n = cp_encode(ch, u);
+            if (o + (size_t)n + 1 >= cap) { free(out); return NULL; }
+            memcpy(out + o, u, (size_t)n);
+            o += (size_t)n;
+            if (c->mark) {
+                int mn = cp_encode(c->mark, u);
+                if (o + (size_t)mn + 1 < cap) {
+                    memcpy(out + o, u, (size_t)mn);
+                    o += (size_t)mn;
+                }
+            }
+        }
+    }
+    while (o > 0 && out[o - 1] == '\n') o--;
+    out[o] = 0;
+    if (o == 0) { free(out); return NULL; }
+    if (out_len) *out_len = (int)o;
+    return out;
+}
+
+/* Put the selection on the system clipboard. Returns a CLIP_* code; *copied
+ * is the byte count of the text that was sent. */
+int term_sel_copy(Term *t, int *copied) {
+    if (copied) *copied = 0;
+    int n = 0;
+    char *txt = term_sel_text(t, &n);
+    if (!txt) return CLIP_ERR_EMPTY;
+    int rc = clip_set_text(txt);
+    if (copied) *copied = n;
+    free(txt);
+    return rc;
+}
+
 /* Draw the grid into a rectangle. Caller owns the frame. */
 void term_draw(Term *t, Surface *s, int x, int y, int w, int h,
                Font *fr, float cw, float ch) {
@@ -978,6 +1454,11 @@ void term_draw(Term *t, Surface *s, int x, int y, int w, int h,
 
     int first_line = t->hist_count - t->scroll;   /* line index shown at the top */
 
+    /* The selection is resolved once per paint: every cell then asks a
+     * question with no arithmetic in it. */
+    int sl0 = 0, sc0 = 0, sl1 = 0, sc1 = 0;
+    if (t->sel_active) sel_range(t, &sl0, &sc0, &sl1, &sc1);
+
     for (int ry = 0; ry < rows; ry++) {
         for (int rx = 0; rx < cols; rx++) {
             int line = first_line + ry;
@@ -991,36 +1472,34 @@ void term_draw(Term *t, Surface *s, int x, int y, int w, int h,
                 if (gy < t->rows) c = cell_at(t, rx, gy);
             }
             if (!c) continue;
+            /* The second cell of a two-cell glyph is painted by its head, which
+             * is one column to the left and draws a glyph about two cells wide.
+             * Painting it again here would double-blend the overlap. */
+            if (c->span == 2) continue;
             float px = x + rx * cw;
             float py = y + ry * ch;
-            u32 bg = cell_bg(c);
-            if (bg != PALETTE[0]) surf_fill(s, (int)px, (int)py, (int)cw + 1, (int)ch + 1, bg);
+            int inv = t->sel_active && sel_has_cell(sl0, sc0, sl1, sc1, line, rx);
+            u32 bg = inv ? cell_fg(c) : cell_bg(c);
+            u32 fg = inv ? cell_bg(c) : cell_fg(c);
+            /* An inverted cell whose foreground and background are the same
+             * colour would vanish, so a selected blank block falls back to the
+             * palette's selection grey. */
+            if (inv && bg == fg) bg = PALETTE[8];
+            float cellw = (c->span == 1) ? cw * 2.0f : cw;
+            if (bg != PALETTE[0])
+                surf_fill(s, (int)px, (int)py, (int)cellw + 1, (int)ch + 1, bg);
             if (c->ch && c->ch != ' ') {
-                /* Re-encode the codepoint we decoded in feed_byte. 1, 2, 3 and
-                 * 4 byte forms; a cell can never hold a surrogate or
-                 * something above U+10FFFF, but render U+FFFD if it does. */
                 char utf[8];
-                int n = 0;
-                u32 ch2 = c->ch;
-                if (ch2 > 0x10FFFFu || (ch2 >= 0xD800u && ch2 <= 0xDFFFu))
-                    ch2 = 0xFFFDu;
-                if (ch2 < 0x80) {
-                    utf[n++] = (char)ch2;
-                } else if (ch2 < 0x800) {
-                    utf[n++] = (char)(0xC0 | (ch2 >> 6));
-                    utf[n++] = (char)(0x80 | (ch2 & 0x3F));
-                } else if (ch2 < 0x10000) {
-                    utf[n++] = (char)(0xE0 | (ch2 >> 12));
-                    utf[n++] = (char)(0x80 | ((ch2 >> 6) & 0x3F));
-                    utf[n++] = (char)(0x80 | (ch2 & 0x3F));
-                } else {
-                    utf[n++] = (char)(0xF0 | (ch2 >> 18));
-                    utf[n++] = (char)(0x80 | ((ch2 >> 12) & 0x3F));
-                    utf[n++] = (char)(0x80 | ((ch2 >> 6) & 0x3F));
-                    utf[n++] = (char)(0x80 | (ch2 & 0x3F));
+                cp_encode(c->ch, utf);
+                font_draw(s, fr, px + 1, py + 1, utf, fg);
+                /* A combining mark was stored on this cell by put_char(): it is
+                 * drawn at the same pen, after the base, and its own advance is
+                 * zero, so the column does not move. */
+                if (c->mark) {
+                    char mk[8];
+                    cp_encode(c->mark, mk);
+                    font_draw(s, fr, px + 1, py + 1, mk, fg);
                 }
-                utf[n] = 0;
-                font_draw(s, fr, px + 1, py + 1, utf, cell_fg(c));
             }
         }
     }

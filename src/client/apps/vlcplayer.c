@@ -131,13 +131,25 @@
  *  i420_rgb converters refuse non-integer ratios; a nearest-neighbour
  *  scale here is ~30 lines and has no extra dependency.
  *
- *  Audio: libVLC's default audio output is left alone when a sound device
- *  exists. When /dev/snd has no PCM node (the image has no driver and
- *  QEMU has no sound card) the player passes --aout=dummy once at
- *  libvlc_new() time and says so once - it never retries a missing device
- *  per frame or per media. Volume still goes through
- *  libvlc_audio_set_volume(), which is VLC's software volume, and the
- *  status says "no output" rather than pretending to be audible.
+ *  Audio: libVLC's default audio output is left alone only when BOTH of
+ *  the two things it needs exist: a PCM node under /dev/snd (the sandbox
+ *  binds /dev/snd when the manifest says 'audio = yes'), and an ALSA
+ *  output plugin in the bundle. The shipped closure has audio output
+ *  plugins replaced by libadummy only - fetch-vlc.py's profile does not
+ *  include libalsa_plugin.so - so on a machine WITH a sound card the
+ *  honest answer is still "decoded, not played". The player tests both
+ *  at startup, passes --aout=dummy once (never per frame or per media)
+ *  when either is missing, and says which one in one line on stderr and
+ *  permanently in the status bar. Volume still goes through
+ *  libvlc_audio_set_volume(), which is VLC's software volume.
+ *
+ *  Hardware decoding is refused with --avcodec-hw=none (and the same option
+ *  on the media). A vmem picture lives in system memory; a D3D11VA/VAAPI
+ *  frame lives in the GPU, so hardware decode could never hand us a picture.
+ *  VLC 3 still *probes* the hardware output formats before the software one,
+ *  which on the Windows proof host left the vmem surface at a padded
+ *  320x194 for a 320x176 file - vp_visible_size() asks libVLC for the real
+ *  size and vp_blit() crops to it, so the padding is never presented.
  *
  *  Keys: space play/pause, Left/Right seek -/+10 s, Up/Down volume,
  *        s stop, f fit/fill scaling, q or Esc quit, click toggles play.
@@ -286,6 +298,7 @@ typedef struct VpApi {
     const char *(*version)(void);
 
     libvlc_media_t *(*media_new_path)(libvlc_instance_t *, const char *);
+    void (*media_add_option)(libvlc_media_t *, const char *);
     void (*media_release)(libvlc_media_t *);
     VpTime (*media_get_duration)(libvlc_media_t *);
     unsigned (*media_tracks_get)(libvlc_media_t *, VpTrack ***);
@@ -305,6 +318,9 @@ typedef struct VpApi {
 
     int (*audio_set_volume)(libvlc_media_player_t *, int);
     int (*audio_get_volume)(libvlc_media_player_t *);
+
+    int (*video_get_size)(libvlc_media_player_t *, unsigned,
+                          unsigned *, unsigned *);
 
     void (*video_set_callbacks)(libvlc_media_player_t *, VpLockCb, VpUnlockCb,
                                 VpDisplayCb, void *);
@@ -372,6 +388,7 @@ static int vp_bind(VpApi *a, VpLibHandle h, char *missing, size_t mn) {
     VP_FN(errmsg,                 "libvlc_errmsg");
     VP_FN(version,                "libvlc_get_version");
     VP_FN(media_new_path,         "libvlc_media_new_path");
+    VP_FN(media_add_option,       "libvlc_media_add_option");
     VP_FN(media_release,          "libvlc_media_release");
     VP_FN(media_get_duration,     "libvlc_media_get_duration");
     VP_FN(media_tracks_get,       "libvlc_media_tracks_get");
@@ -389,6 +406,7 @@ static int vp_bind(VpApi *a, VpLibHandle h, char *missing, size_t mn) {
     VP_FN(player_is_playing,      "libvlc_media_player_is_playing");
     VP_FN(audio_set_volume,       "libvlc_audio_set_volume");
     VP_FN(audio_get_volume,       "libvlc_audio_get_volume");
+    VP_FN(video_get_size,         "libvlc_video_get_size");
     VP_FN(video_set_callbacks,    "libvlc_video_set_callbacks");
     VP_FN(video_set_format_callbacks, "libvlc_video_set_format_callbacks");
 #undef VP_FN
@@ -414,6 +432,7 @@ typedef struct VpVmem {
     int       maxw, maxh;
 
     int       w, h;            /* dimensions VLC asked for, after setup() */
+    int       visw, vish;      /* visible picture inside those, from VLC */
     int       pitch;           /* bytes per row VLC writes */
     int       too_big;         /* decoder output did not fit the surface */
 
@@ -503,6 +522,10 @@ static unsigned vp_cb_setup(void **opaque, char *chroma, unsigned *width,
     VpVmem *v = (VpVmem *)*opaque;
     unsigned w = *width, h = *height;
 
+#if defined(VP_TRACE)
+    fprintf(stderr, "vlcplayer: vmem setup %u asks for %ux%u (chroma %.4s)\n",
+            v ? v->setups : 0u, w, h, chroma);
+#endif
     if (!v || !v->fb) return 0;
     if (w < 2 || h < 2 || w > (unsigned)v->maxw || h > (unsigned)v->maxh) {
         v->too_big = 1;
@@ -519,6 +542,11 @@ static unsigned vp_cb_setup(void **opaque, char *chroma, unsigned *width,
     v->w = (int)w;
     v->h = (int)h;
     v->pitch = (int)pitches[0];
+    /* a new format invalidates the visible rectangle the previous one had:
+     * VLC asks again for each candidate it probes, and a stale crop from the
+     * hardware attempt would be wrong for the software format that wins. */
+    v->visw = 0;
+    v->vish = 0;
     v->setups++;
     pthread_mutex_unlock(&v->m);
     return 1;
@@ -526,6 +554,31 @@ static unsigned vp_cb_setup(void **opaque, char *chroma, unsigned *width,
 
 static void vp_cb_cleanup(void *opaque) {
     (void)opaque;
+}
+
+/* The visible rectangle inside the vmem surface. vmem.c uses
+ * video_format_ApplyRotation(vd->fmt) and hands us i_width/i_height, and it
+ * then sets i_visible_width = i_width - so the two agree for a plain frame.
+ * They do NOT always agree: a hardware-tried decoder (or a file whose coded
+ * size is padded to a macroblock edge) reaches vmem with the padded height,
+ * e.g. 320x194 for a 320x176 H.264 file. libvlc_video_get_size() is the
+ * number VLC itself would show in its own UI, so the blit is cropped to it
+ * instead of presenting padding rows as picture. 0 keeps the surface size. */
+static void vp_visible_size(VpPlayer *p, VpVmem *v) {
+    unsigned w = 0, h = 0;
+    int visw = 0, vish = 0;
+
+    if (!p || !p->mp || !p->api.video_get_size) return;
+    if (p->api.video_get_size(p->mp, 0, &w, &h) == 0 && w >= 2 && h >= 2) {
+        visw = (int)w;
+        vish = (int)h;
+    }
+    pthread_mutex_lock(&v->m);
+    if (visw > 0 && vish > 0 && visw <= v->w && vish <= v->h) {
+        v->visw = visw;
+        v->vish = vish;
+    }
+    pthread_mutex_unlock(&v->m);
 }
 
 static unsigned vp_frame_count(VpVmem *v) {
@@ -573,6 +626,8 @@ static int vp_blit(VpVmem *v, uint32_t *dst, int dw, int dh, int dstride,
     }
     sw = v->w;
     sh = v->h;
+    if (v->visw >= 2 && v->visw <= sw) sw = v->visw;
+    if (v->vish >= 2 && v->vish <= sh) sh = v->vish;
     spitch = v->pitch;
     src = v->fb;
     v->busy = 1;               /* VLC's lock waits while we read fb */
@@ -662,9 +717,12 @@ static int vp_player_open(VpPlayer *p, VpVmem *v, const char *libpath,
     }
 
     /* Only options that exist in libVLC 3. --no-video-title-show keeps its
-     * OSD out of our surface; --aout=dummy is added exactly once, and only
-     * when the machine has no PCM node to write to. */
+     * OSD out of our surface. --avcodec-hw=none is not a preference: vmem
+     * pictures are system memory, so a hardware decoder's GPU frame could
+     * never be handed to us. --aout=dummy is added exactly once, and only
+     * when there is no PCM node or no ALSA plugin to write through. */
     args[nargs++] = "--no-video-title-show";
+    args[nargs++] = "--avcodec-hw=none";
     if (no_audio) args[nargs++] = "--aout=dummy";
 
     p->vlc = p->api.new_instance(nargs, args);
@@ -688,6 +746,23 @@ static int vp_player_open(VpPlayer *p, VpVmem *v, const char *libpath,
         p->lib = NULL;
         return -1;
     }
+
+    /* Hardware decoding is impossible with vmem: its pictures are system
+     * memory, and a DXVA/VAAPI frame is a GPU surface that vmem.c's
+     * picture_CopyPixels() cannot copy into planes[0]. The instance option
+     * above refuses it - on the proof host VLC's log changes from "Using
+     * D3D11VA ... for hardware decoding" to "looking for hw decoder module
+     * matching \"none\" / no hw decoder modules matched". This per-media
+     * copy of the same rule keeps it attached to the media even if the
+     * instance is reused.
+     *
+     * What it does NOT do is stop VLC 3 from probing the two hardware output
+     * formats first: vmem setup() is still called three times on a GPU host,
+     * with chroma DX11 and DXA9 before I420, and the third call is the one
+     * that sticks (at a padded 320x194 for a 320x176 file). That is why
+     * vp_visible_size() exists and why vp_blit() crops: the padding is VLC's,
+     * not the file's. */
+    p->api.media_add_option(p->media, ":avcodec-hw=none");
 
     p->mp = p->api.player_new_from_media(p->media);
     if (!p->mp) {
@@ -811,6 +886,7 @@ typedef struct VpApp {
     int    fit;              /* 1 = letterbox, 0 = stretch */
     int    vol;
     int    audio_device;     /* /dev/snd/pcm* exists */
+    int    audio_plugin;     /* an ALSA output plugin exists for libVLC */
     int    no_audio_once;    /* we already said it */
     int    queried_codec;
     long   codec_try_at;
@@ -948,6 +1024,33 @@ static void find_libvlc(char *out, size_t n) {
         return;
     }
     snprintf(out, n, "libvlc.so.5");
+}
+
+/* Does libVLC have an audio output it can actually open? Two things are
+ * needed and they are independent: a PCM node (audio_device_present()) and
+ * the plugin that opens it. VLC 3 on Linux reaches ALSA only through
+ * vlc/plugins/audio_output/libalsa_plugin.so, and the shipped closure in
+ * this repository replaces the audio outputs with libadummy only (see
+ * tools/fetch-vlc.py's plugin profile). Saying "default output" when the
+ * plugin is absent would be a lie the user hears as silence, so the bundle
+ * check is explicit - and a system install is accepted too, because a
+ * distribution's own vlc package really does ship it (Alpine keeps the file
+ * in vlc-3.0.23-r4.apk; that package is not in this bundle's closure). */
+static int audio_plugin_present(void) {
+    static const char *const rel =
+        "lib/vlc/plugins/audio_output/libalsa_plugin.so";
+    char dir[PATH_MAX], probe[PATH_MAX];
+
+    if (bundle_dir(dir, sizeof(dir)) && dir[0]) {
+        snprintf(probe, sizeof(probe), "%s/%s", dir, rel);
+        if (access(probe, R_OK) == 0) return 1;
+    }
+    if (access("/usr/lib/vlc/plugins/audio_output/libalsa_plugin.so", R_OK) == 0)
+        return 1;
+    if (access("/usr/lib/x86_64-linux-gnu/vlc/plugins/audio_output/"
+               "libalsa_plugin.so", R_OK) == 0)
+        return 1;
+    return 0;
 }
 
 /* Is libVLC actually on this disk? The no-argument card must not say "not
@@ -1133,13 +1236,16 @@ static void draw_overlay(Surface *s, VpApp *a, Font *fs, Font *fb) {
         y += lh;
     }
 
+    const char *audio_txt;
+    int audio_ok = a->audio_device && a->audio_plugin;
+    if (audio_ok)              audio_txt = "default output (ALSA)";
+    else if (!a->audio_device) audio_txt = "none (no /dev/snd PCM node)";
+    else                       audio_txt = "decoded, not played (no ALSA plugin in this bundle)";
     snprintf(line, sizeof(line), "scale %s   audio %s   libVLC %s",
-             a->fit ? "fit" : "fill",
-             a->audio_device ? "default output"
-                             : "none (no /dev/snd PCM node)",
+             a->fit ? "fit" : "fill", audio_txt,
              a->libver[0] ? a->libver : "unreported");
     draw_clipped(s, fs, pad, y, s->w - pad * 2, line,
-                 a->audio_device ? RGB(150, 165, 180) : RGB(235, 185, 120));
+                 audio_ok ? RGB(150, 165, 180) : RGB(235, 185, 120));
     y += lh;
 
     draw_clipped(s, fs, pad, y, s->w - pad * 2,
@@ -1194,6 +1300,11 @@ static void refresh(VpApp *a) {
     if (!a->player_ok) return;
     VpApi *api = &a->pl.api;
 
+    /* Ask VLC for the visible size before the status line reads it, so the
+     * bar and the blit can never disagree about how much of the surface is
+     * picture. */
+    vp_visible_size(&a->pl, &a->vmem);
+
     a->last_state = api->player_get_state(a->pl.mp);
     a->pos = api->player_get_time(a->pl.mp);
     a->len = api->player_get_length(a->pl.mp);
@@ -1204,8 +1315,8 @@ static void refresh(VpApp *a) {
     if (v >= 0) a->vol = v;
 
     pthread_mutex_lock(&a->vmem.m);
-    a->vw = a->vmem.w;
-    a->vh = a->vmem.h;
+    a->vw = a->vmem.visw > 0 ? a->vmem.visw : a->vmem.w;
+    a->vh = a->vmem.vish > 0 ? a->vmem.vish : a->vmem.h;
     pthread_mutex_unlock(&a->vmem.m);
 
     if (!a->queried_codec && a->last_state >= 3) {
@@ -1334,9 +1445,15 @@ int main(int argc, char **argv) {
     }
 
     a.audio_device = audio_device_present();
-    if (!a.audio_device && !a.no_audio_once) {
-        fprintf(stderr, "vlcplayer: no /dev/snd PCM node - libVLC will use "
-                        "--aout=dummy (decoding audio, not playing it)\n");
+    a.audio_plugin = audio_plugin_present();
+    if ((!a.audio_device || !a.audio_plugin) && !a.no_audio_once) {
+        if (!a.audio_device)
+            fprintf(stderr, "vlcplayer: no /dev/snd PCM node - libVLC will use "
+                            "--aout=dummy (decoding audio, not playing it)\n");
+        else
+            fprintf(stderr, "vlcplayer: /dev/snd has a PCM node but this bundle "
+                            "has no ALSA output plugin (libalsa_plugin.so); "
+                            "passing --aout=dummy once\n");
         a.no_audio_once = 1;
     }
 
@@ -1347,11 +1464,22 @@ int main(int argc, char **argv) {
     if (a.have_file) {
         char lib[PATH_MAX], err[512];
         find_libvlc(lib, sizeof(lib));
-        if (vp_vmem_init(&a.vmem, VP_MAXW, VP_MAXH) != 0) {
+        /* Readable before libVLC is asked. libVLC 3 answers a missing path by
+         * ending the media with libvlc_errmsg() empty, which would leave the
+         * window saying "no picture decoded" - true, and useless. The kernel's
+         * own errno says which file and why, and inside this jail the common
+         * cause is that the window server did not bind the file (it is not in
+         * the same directory the app was started with), so the path in the
+         * message is the one that failed. */
+        if (access(a.path, R_OK) != 0) {
+            snprintf(a.err, sizeof(a.err), "cannot open %s: %s", a.path,
+                     strerror(errno));
+        } else if (vp_vmem_init(&a.vmem, VP_MAXW, VP_MAXH) != 0) {
             snprintf(a.err, sizeof(a.err), "out of memory for a %dx%d frame surface",
                      VP_MAXW, VP_MAXH);
         } else if (vp_player_open(&a.pl, &a.vmem, lib, a.path,
-                                  !a.audio_device, err, sizeof(err)) != 0) {
+                                  !(a.audio_device && a.audio_plugin),
+                                  err, sizeof(err)) != 0) {
             explain_open_error(a.err, sizeof(a.err), err);
         } else {
             a.player_ok = 1;

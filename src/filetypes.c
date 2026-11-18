@@ -74,11 +74,11 @@ static const FileType FT_TABLE[] = {
     { "ppm",      "PPM image",          FT_KIND_IMAGE,      FT_ICON_IMAGE,      FT_APP_VIEWER   },
 
     /* ---- video ------------------------------------------------------- */
-    { "mp4",      "MP4 video",          FT_KIND_VIDEO,      FT_ICON_VIDEO,      FT_APP_VIEWER   },
-    { "mkv",      "Matroska video",     FT_KIND_VIDEO,      FT_ICON_VIDEO,      FT_APP_VIEWER   },
-    { "webm",     "WebM video",         FT_KIND_VIDEO,      FT_ICON_VIDEO,      FT_APP_VIEWER   },
-    { "avi",      "AVI video",          FT_KIND_VIDEO,      FT_ICON_VIDEO,      FT_APP_VIEWER   },
-    { "mov",      "QuickTime video",    FT_KIND_VIDEO,      FT_ICON_VIDEO,      FT_APP_VIEWER   },
+    { "mp4",      "MP4 video",          FT_KIND_VIDEO,      FT_ICON_VIDEO,      FT_APP_VLC      },
+    { "mkv",      "Matroska video",     FT_KIND_VIDEO,      FT_ICON_VIDEO,      FT_APP_VLC      },
+    { "webm",     "WebM video",         FT_KIND_VIDEO,      FT_ICON_VIDEO,      FT_APP_VLC      },
+    { "avi",      "AVI video",          FT_KIND_VIDEO,      FT_ICON_VIDEO,      FT_APP_VLC      },
+    { "mov",      "QuickTime video",    FT_KIND_VIDEO,      FT_ICON_VIDEO,      FT_APP_VLC      },
 
     /* ---- audio ------------------------------------------------------- */
     { "mp3",      "MP3 audio",          FT_KIND_AUDIO,      FT_ICON_AUDIO,      FT_APP_VIEWER   },

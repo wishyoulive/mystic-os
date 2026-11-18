@@ -117,6 +117,105 @@ static void free_shm(WmClient *c) {
 }
 
 /* ---------------------------------------------------------- start */
+
+/* ------------------------------------------------------------- media sample
+ *
+ * The image carries one real, short H.264 clip at
+ * /usr/share/mystic/media/clip.mp4 (320x176, 2.8 s, encoded with libx264
+ * through VLC itself; the generator and the proof are in docs/MULTIMEDIA.md).
+ * It exists so the
+ * owner can open a video on a machine that has never had one, without
+ * downloading anything.
+ *
+ * It cannot simply be staged at /root/media in the initramfs: on every normal
+ * boot stage/init mounts the data disk on /root, which hides whatever the
+ * initramfs put there, and a fresh disk is empty. So the window server - the
+ * first process that runs as root after the disk is mounted - puts one copy
+ * in place. It never overwrites: a file the user already has at that path is
+ * theirs. A partial copy is removed, so a full disk at boot retries next time
+ * instead of leaving a truncated MP4 that VLC cannot demux.
+ */
+static void provision_media(void) {
+    static const char *const names[] = { "clip.mp4" };
+    char src[256], dst[256], tmp[256];
+    unsigned char buf[65536];
+
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        struct stat st;
+        long long src_size;
+        snprintf(src, sizeof(src), "/usr/share/mystic/media/%s", names[i]);
+        snprintf(dst, sizeof(dst), "/root/media/%s", names[i]);
+        snprintf(tmp, sizeof(tmp), "%s.part", dst);
+
+        if (stat(src, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0)
+            continue;                       /* this image has no sample */
+        /* Saved now: the stat() of the destination below may fail, and POSIX
+         * leaves the buffer undefined after a failure - reading st_size from
+         * it would then compare the copy against garbage. */
+        src_size = (long long)st.st_size;
+        if (stat(dst, &st) == 0)
+            continue;                       /* already provisioned or user's */
+
+        mkdir("/root", 0755);
+        if (mkdir("/root/media", 0755) != 0 && errno != EEXIST) {
+            fprintf(stderr, "wms: media: cannot create /root/media: %s\n",
+                    strerror(errno));
+            continue;
+        }
+        remove(tmp);
+        int in = open(src, O_RDONLY);
+        if (in < 0) {
+            fprintf(stderr, "wms: media: cannot read %.120s: %s\n", src, strerror(errno));
+            continue;
+        }
+        int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (out < 0) {
+            fprintf(stderr, "wms: media: cannot create %.120s: %s\n", tmp, strerror(errno));
+            close(in);
+            continue;
+        }
+        long long copied = 0;
+        int failed = 0;
+        for (;;) {
+            ssize_t r = read(in, buf, sizeof(buf));
+            if (r == 0) break;
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                failed = 1;
+                fprintf(stderr, "wms: media: read %.120s failed: %s\n", src, strerror(errno));
+                break;
+            }
+            ssize_t off = 0;
+            while (off < r) {
+                ssize_t w = write(out, buf + off, (size_t)(r - off));
+                if (w < 0) {
+                    if (errno == EINTR) continue;
+                    failed = 1;
+                    fprintf(stderr, "wms: media: write %.120s failed: %s\n",
+                            tmp, strerror(errno));
+                    break;
+                }
+                off += w;
+            }
+            if (failed) break;
+            copied += r;
+        }
+        close(in);
+        if (close(out) != 0) failed = 1;
+        if (failed || copied != src_size) {
+            remove(tmp);                     /* retry on the next boot */
+            continue;
+        }
+        if (rename(tmp, dst) != 0) {
+            fprintf(stderr, "wms: media: rename %.120s failed: %s\n", dst, strerror(errno));
+            remove(tmp);
+            continue;
+        }
+        fprintf(stderr, "wms: media: %s (%lld bytes) from %s\n",
+                dst, copied, src);
+    }
+}
+
 int wms_start(void) {
     char dir[64];
     snprintf(dir, sizeof(dir), "%s", WM_SOCKET);
@@ -146,6 +245,9 @@ int wms_start(void) {
     chmod(WM_SOCKET, 0666);
     fcntl(listen_fd, F_SETFL, fcntl(listen_fd, F_GETFL, 0) | O_NONBLOCK);
     fprintf(stderr, "wms: listening on %s\n", WM_SOCKET);
+
+    /* the one file the owner can open before installing anything */
+    provision_media();
     return 0;
 }
 
@@ -850,6 +952,18 @@ static void sandbox_child(const char *exe, const char *id, int net, int audio,
     /* the bundle's own tree, if the app needs more than its payload */
     setenv("MYSTIC_BUNDLE", "/app", 1);
     setenv("LD_LIBRARY_PATH", "/app/usr/lib:/app/lib", 1);
+    /* libVLC's module bank searches <dir of the vlc libs>/vlc/plugins (which
+     * inside the jail would be /app/libexec/vlc/plugins, because config
+     * GetLibDir() follows the program, not the dlopen()ed library) and then
+     * every directory in VLC_PLUGIN_PATH. The bundle keeps its plugins in
+     * lib/vlc/plugins, so without this line the player would find libvlc and
+     * then discover no demuxers, no codecs and no video output at all - a
+     * black window with "no suitable interface module". */
+    setenv("VLC_PLUGIN_PATH", "/app/lib/vlc/plugins", 1);
+    /* VLC and every other library that keeps state writes under these; /tmp
+     * is the jail's own writable tmpfs (mode 0777, created above). */
+    setenv("XDG_CACHE_HOME", "/tmp/.cache", 1);
+    setenv("XDG_CONFIG_HOME", "/tmp/.config", 1);
 }
 
 static int wms_launch_arg(const WmApp *app, WmClient *cl, int slot, const char *arg) {

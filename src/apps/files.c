@@ -148,7 +148,9 @@
  *  close); a directory opens instead.
  * ============================================================ */
 #include "mystic.h"
+#include "clipboard.h"
 #include "filetypes.h"
+#include "i18n.h"      /* font_cell_width / UTF-8 helpers, shared with font.c */
 
 #ifndef OPEN_REQ
 #define OPEN_REQ "/run/mystic/open.request"
@@ -465,6 +467,12 @@ typedef struct {
     int    show_hidden;           /* dotfiles in the listing */
     int    w, h;
     int    px, py;                /* last pointer position reported to us */
+    /* Keyboard focus. The list owns the keys by default; Tab hands them to the
+     * two navigation buttons and then to the header action, so everything a
+     * mouse can reach has a key path and the focused control wears a visible
+     * ring (draw_focus()). 0 = list, 1 = back, 2 = up, 3 = header action. */
+    int    focus;
+    int    kb;                    /* a key moved the focus: show the list ring */
     double last_click_t;          /* CLOCK_MONOTONIC of the last row click */
     int    last_click_idx;
     int    last_click_x, last_click_y;
@@ -502,6 +510,15 @@ static int iceil(float v) {
     return (v > (float)i) ? i + 1 : i;
 }
 
+/* Shorten a buffer that snprintf() filled so it ends on a character boundary.
+ * A name longer than the field it was copied into used to leave half a
+ * codepoint at the end, which the font then drew as one replacement glyph. */
+static void cut_utf8(char *s) {
+    if (!s) return;
+    size_t n = strlen(s), k = font_utf8_boundary(s, n);
+    if (k < n) s[k] = 0;
+}
+
 
 static double mono_now(void) {
     struct timespec ts;
@@ -524,6 +541,7 @@ static void statusf(Files *f, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(f->status, sizeof(f->status), fmt, ap);
     va_end(ap);
+    cut_utf8(f->status);
 }
 
 /* Report the last syscall failure with the real string the kernel returned. */
@@ -633,27 +651,41 @@ static void fmt_mtime(long long mtime, char *out, size_t n) {
         snprintf(out, n, "--");
 }
 
+/* @utf8-fit-begin  (the host harness in .work/i18n compiles exactly this text) */
 /* draw inside maxw pixels, ending in ".." when it has to be cut.
  * The half-pixel tolerance matters: a column width is computed as
  * (x0 + width) - x0, which in floating point can come out a few
  * thousandths of a pixel smaller than the width it started from - enough
- * to chop the last letter off a label that fits perfectly. */
+ * to chop the last letter off a label that fits perfectly.
+ *
+ * IMPORTANT: every cut lands on a CODEPOINT boundary. The loop used to
+ * shorten the string one byte at a time, so a Cyrillic or Japanese name cut
+ * mid-character left a bare lead byte before the dots; font_draw() then read
+ * that byte plus the first '.' as one 2-byte sequence, drew a wrong glyph and
+ * ate the dots, and the rest of the line shifted with it. font_utf8_prev()
+ * steps back whole characters, so the string handed to the font is always
+ * valid UTF-8. */
 static void text_fit(char *buf, size_t cap, Font *f, const char *text, float maxw) {
-    if (cap == 0) return;
+    if (cap < 4) { if (cap) buf[0] = 0; return; }
     buf[0] = 0;
     if (!f || !text || !text[0] || maxw < 4.0f) return;
     size_t len = strlen(text);
-    if (len >= cap - 3) len = cap - 3;
+    if (len >= cap - 3) len = font_utf8_boundary(text, cap - 3);
     memcpy(buf, text, len);
     buf[len] = 0;
     if (font_width(f, buf) <= maxw + 0.5f) return;
     float budget = maxw - font_width(f, "..");
     size_t cut = len;
-    while (cut > 0 && font_width(f, buf) > budget) buf[--cut] = 0;
+    while (cut > 0 && font_width(f, buf) > budget) {
+        cut = font_utf8_prev(buf, cut);
+        buf[cut] = 0;
+    }
     if (cut == 0) { buf[0] = 0; return; }
     memcpy(buf + cut, "..", 3);
     buf[cut + 2] = 0;
 }
+
+/* @utf8-fit-end */
 
 static void draw_clipped(Surface *s, Font *f, float x, float y, float maxw,
                          const char *text, u32 color) {
@@ -825,6 +857,74 @@ static int list_row_at(const Layout *L, int cy) {
 }
 
 /* ------------------------------------------------------------
+ *  Keyboard focus: who owns the keys, and where the ring goes
+ *
+ *  Every control a mouse can hit already had a key path, but not one
+ *  a user could SEE: Tab moved nothing, so the only thing a keyboard
+ *  user could tell was where the list cursor was. The focus now walks
+ *  list -> back -> up -> header action, and the control holding it is
+ *  drawn with a ring (draw_focus()).
+ * ------------------------------------------------------------ */
+#define FOCUS_LIST   0
+#define FOCUS_BACK   1
+#define FOCUS_UP     2
+#define FOCUS_ACTION 3
+
+/* The rectangle the ring is drawn around, app-local. Returns 0 when the
+ * control is not on screen in this layout (the path band is dropped in a very
+ * short window). */
+static int focus_rect(const Files *f, const Layout *L, int which,
+                      int *rx, int *ry, int *rw, int *rh) {
+    if (which == FOCUS_BACK || which == FOCUS_UP) {
+        if (!nav_rect(L, which == FOCUS_BACK ? 0 : 1, rx, ry, rw, rh)) return 0;
+        *ry += L->header_h;          /* nav_rect() is relative to the path band */
+        return 1;
+    }
+    if (which == FOCUS_ACTION) return act_rect(L, rx, ry, rw, rh);
+    /* the list: the ring is the selected row, which is where Enter acts */
+    if (!row_rect(L, f->sel - f->scroll, ry, rh)) return 0;
+    *rx = L->row_xpad;
+    *rw = f->w - 2 * L->row_xpad;
+    return 1;
+}
+
+/* Is this control present? The path band (and with it back/up) is the first
+ * thing a short window gives up, so Tab has to skip what is not there. */
+static int focus_exists(const Layout *L, int which) {
+    if (which == FOCUS_BACK || which == FOCUS_UP) return L->path_h > 0 && L->nav_sz > 0;
+    if (which == FOCUS_ACTION) return L->act_w > 0 && L->act_h > 0;
+    return 1;
+}
+
+static int focus_next(const Layout *L, int from, int step) {
+    for (int i = 0; i < 4; i++) {
+        from = (from + step + 4) % 4;
+        if (focus_exists(L, from)) return from;
+    }
+    return FOCUS_LIST;
+}
+
+/* The visible focus indicator: two device pixels of the theme's accent drawn
+ * just outside the focused control. A colour change alone is not enough for a
+ * user who cannot see the palette; the accent is the brightest colour in every
+ * shipped theme (docs/THEMES.md measures it against the body colour), so the
+ * ring is the highest-contrast mark the app can make. The list keeps its
+ * selection pill and only gains the ring once a key has moved the focus, so a
+ * mouse user's screen does not change. */
+static void draw_focus(Surface *s, int x, int y, const Files *f,
+                       const Layout *L, const Theme *th) {
+    if (f->focus == FOCUS_LIST && !f->kb) return;
+    int rx, ry, rw, rh;
+    if (!focus_rect(f, L, f->focus, &rx, &ry, &rw, &rh)) return;
+    if (rw <= 0 || rh <= 0) return;
+    float pad = (float)L->rule;
+    gfx_rrect_aa(s, (float)(x + rx) - pad, (float)(y + ry) - pad,
+                 (float)rw + 2.0f * pad, (float)rh + 2.0f * pad,
+                 (float)L->radius + pad, 0u,
+                 color_alpha(th->accent, 0.90f), 2.0f);
+}
+
+/* ------------------------------------------------------------
  *  Two coordinate spaces, and the rule that keeps them apart
  *
  *  AppVT.draw() gets the app's ORIGIN on the compositor's surface
@@ -877,9 +977,18 @@ static int crumb_build(const Files *f, const Layout *L, Crumb *out, int *dots) {
     float total = 0.0f;
     for (int k = 0; k < n; k++) {
         char lab[NAME_LEN];
-        int len = all[k].ll;
-        if (len >= (int)sizeof(lab)) len = (int)sizeof(lab) - 1;
-        if (len > 0) memcpy(lab, f->path + all[k].ls, (size_t)len);
+        size_t len = (size_t)all[k].ll;
+        if (len >= sizeof(lab)) {
+            /* A segment longer than the buffer has to be cut on a character
+             * boundary: a byte cut split a Cyrillic or Japanese folder name
+             * and the breadcrumb drew a replacement glyph for the half of it
+             * that survived. */
+            memcpy(lab, f->path + all[k].ls, sizeof(lab) - 1);
+            lab[sizeof(lab) - 1] = 0;
+            len = font_utf8_boundary(lab, sizeof(lab) - 1);
+        } else {
+            memcpy(lab, f->path + all[k].ls, len);
+        }
         lab[len] = 0;
         wid[k] = font_width(L->f.body, len ? lab : "/");
         total += wid[k];
@@ -1604,6 +1713,7 @@ static void preview_open(Files *f, int row) {
 
     overlays_close(f);
     snprintf(f->dlg_title, sizeof(f->dlg_title), "%s", e->name);
+    cut_utf8(f->dlg_title);
     snprintf(f->dlg_msg, sizeof(f->dlg_msg), "%d bytes%s", (int)got,
              e->size > (long long)got ? " (first 4096 shown)" : "");
     f->dlg = DLG_PREVIEW;
@@ -1893,6 +2003,35 @@ static void ti_key(Files *f, const char *bytes, int n) {
         }
         if (c == 0x1B) { ti_cancel(f); return; }
         if (c == '\n' || c == '\r') { ti_commit(f); return; }
+        if (c == 0x16) {
+            /* Ctrl+V in the name field: the clipboard's text, inserted at the
+             * caret. Clipboard.c is linked into this desktop, so Files reads
+             * it directly - no socket, no jail. Line breaks and NULs are not
+             * name bytes and are dropped. */
+            ClipEntry *e = clip_get_current(CLIP_TYPE_TEXT);
+            if (!e || e->type != CLIP_TYPE_TEXT || !e->text) {
+                clip_entry_free(e);
+                statusf(f, "paste: the clipboard holds no text");
+                continue;
+            }
+            int put = 0;
+            for (uint32_t k = 0; k < e->text_len; k++) {
+                unsigned char ch = (unsigned char)e->text[k];
+                if (ch < 0x20 || ch == 0x7F) continue;
+                if (f->ti.len >= NAME_LEN - 1) break;
+                memmove(f->ti.buf + f->ti.caret + 1, f->ti.buf + f->ti.caret,
+                        (size_t)(f->ti.len - f->ti.caret + 1));
+                f->ti.buf[f->ti.caret] = (char)ch;
+                f->ti.caret++;
+                f->ti.len++;
+                put++;
+            }
+            char msg[96];
+            snprintf(msg, sizeof(msg), "pasted %d byte%s", put, put == 1 ? "" : "s");
+            statusf(f, "%s", msg);
+            clip_entry_free(e);
+            continue;
+        }
         if (c == '\b' || c == 0x7F) {
             if (f->ti.caret > 0 && f->ti.len > 0) {
                 memmove(f->ti.buf + f->ti.caret - 1, f->ti.buf + f->ti.caret,
@@ -2196,7 +2335,9 @@ static void props_open(Files *f, int row) {
     overlays_close(f);
     f->prop_scroll = 0;
     snprintf(f->dlg_title, sizeof(f->dlg_title), "%s", f->ent[row].name);
+    cut_utf8(f->dlg_title);
     snprintf(f->dlg_msg, sizeof(f->dlg_msg), "%s", full);
+    cut_utf8(f->dlg_msg);
     f->dlg = DLG_PROPS;
 }
 
@@ -3175,6 +3316,7 @@ static void files_draw(App *a, Surface *s, int x, int y, int w, int h, const The
     draw_path(f, s, x, y, w, &L, th);
     draw_list(f, s, x, y, w, &L, th);
     draw_footer(f, s, x, y, w, &L, th);
+    draw_focus(s, x, y, f, &L, th);
 
     if (f->menu.open) draw_menu(s, x, y, &f->menu, th);
     if (f->sub.open)  draw_menu(s, x, y, &f->sub, th);
@@ -3190,6 +3332,9 @@ static void files_click(App *a, int cx, int cy, int buttons) {
     if (cx < 0 || cy < 0 || (f->w > 0 && cx >= f->w) || (f->h > 0 && cy >= f->h)) return;
     f->px = cx;
     f->py = cy;
+    /* a click puts the keyboard focus back where it landed: the list, or the
+     * button that was pressed */
+    f->focus = FOCUS_LIST;
 
     int right  = (buttons & BTN_RIGHT) != 0;
     int middle = (buttons & BTN_MIDDLE) != 0;
@@ -3404,6 +3549,7 @@ static void files_key(App *a, const char *bytes, int n) {
             else if (fin == 'D') nav_up(f);
             else if (fin == 'H') cursor_home(f, 0);
             else if (fin == 'F') cursor_home(f, 1);
+            else if (fin == 'Z') { f->kb = 1; f->focus = focus_next(&L, f->focus, -1); }
             else if (fin == '~' && have_arg) {
                 if (arg == 5) cursor_move(f, -page);
                 else if (arg == 6) cursor_move(f, page);
@@ -3415,8 +3561,19 @@ static void files_key(App *a, const char *bytes, int n) {
             continue;
         }
         if (c == 0x1B) {
-            if (f->mark_mode) { f->mark_mode = 0; statusf(f, "range mode off"); }
+            if (f->focus != FOCUS_LIST) { f->focus = FOCUS_LIST; }
+            else if (f->mark_mode) { f->mark_mode = 0; statusf(f, "range mode off"); }
             else if (f->nmarked > 0) { marks_reset(f); statusf(f, "selection cleared"); }
+            continue;
+        }
+
+        /* Tab walks the controls. It has to be handled before the switch on
+         * characters: a Tab byte is 0x09 and used to do nothing at all, which
+         * left the two navigation buttons and the header action reachable only
+         * with a mouse. */
+        if (c == 0x09) {
+            f->kb = 1;
+            f->focus = focus_next(&L, f->focus, +1);
             continue;
         }
 
@@ -3424,10 +3581,22 @@ static void files_key(App *a, const char *bytes, int n) {
             case 'j': cursor_move(f, 1); break;
             case 'k': cursor_move(f, -1); break;
             case '\n':
-            case '\r': open_selected(f); break;
+            case '\r':
+                /* Enter activates whatever holds the focus */
+                if (f->focus == FOCUS_BACK)        nav_back(f);
+                else if (f->focus == FOCUS_UP)     nav_up(f);
+                else if (f->focus == FOCUS_ACTION) ti_open_mkdir(f);
+                else                               open_selected(f);
+                break;
             case '\b':
             case 0x7F: nav_up(f); break;
             case ' ': {
+                if (f->focus != FOCUS_LIST) {
+                    if (f->focus == FOCUS_BACK)        nav_back(f);
+                    else if (f->focus == FOCUS_UP)     nav_up(f);
+                    else if (f->focus == FOCUS_ACTION) ti_open_mkdir(f);
+                    break;
+                }
                 mark_toggle(f, f->sel);
                 statusf(f, "%d selected", f->nmarked);
                 break;

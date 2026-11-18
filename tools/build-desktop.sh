@@ -52,6 +52,16 @@ cp "$OUT" stage/usr/bin/mystic-desktop
 chmod +x stage/usr/bin/mystic-desktop
 cp assets/fonts/*.ttf assets/fonts/LICENSE.txt stage/usr/share/fonts/ 2>/dev/null || true
 
+# ---- the clipboard daemon ------------------------------------------
+# The owner could not copy or paste anything because the service existed
+# but nothing ever started it. It is its own process so the history
+# survives the desktop being restarted.
+echo "==> compiling mystic-clipboardd"
+"$ZIG" cc -target x86_64-linux-musl -Os -static -fno-sanitize=all -Isrc     -Wall -Wextra -Wno-unused-parameter     -o build/mystic-clipboardd src/clipboardd.c src/clipboard.c
+cp build/mystic-clipboardd stage/usr/bin/mystic-clipboardd
+chmod +x stage/usr/bin/mystic-clipboardd
+
+
 # ---- the repository signature verifier ------------------------------
 # pkg will not read a package index it cannot authenticate, so this
 # binary ships in the image. It is static, has no dependencies, and

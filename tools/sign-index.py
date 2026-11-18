@@ -243,13 +243,31 @@ def read_seed(path):
 
 
 def write_bytes(path, data, mode=None):
+    """Write path atomically: a crash leaves the old file, not half a signature.
+
+    `pkg` refuses an index whose .sig does not verify, so a truncated write
+    during publish would take the mirror down until someone noticed. The
+    temporary file is in the same directory (os.replace is atomic there) and
+    never ends in .sig, so nothing can mistake it for the real thing.
+    """
     parent = os.path.dirname(os.path.abspath(path))
     if parent and not os.path.isdir(parent):
         os.makedirs(parent, exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(data)
-    if mode is not None:
-        os.chmod(path, mode)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
