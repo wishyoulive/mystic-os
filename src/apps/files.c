@@ -68,6 +68,18 @@
  *         PageUp/PageDn  one page      Backspace  parent
  *         s              cycle sort    r          rescan
  *         b              back in history  h       home ("/")
+ *         Ctrl+O         the desktop's Open dialog   (src/filepick.h)
+ *         Ctrl+S         the desktop's Save-as dialog
+ *
+ *  CTRL+O / CTRL+S open the one open/save dialog the desktop owns. Files
+ *  writes /run/mystic/filepick.request and polls the answer in
+ *  /run/mystic/filepick.result, exactly as a sandboxed app does, so the
+ *  dialog exists once and every app sees the same behaviour. A chosen
+ *  path is shown in the status line; Ctrl+O also reveals the file (its
+ *  directory becomes the listing and the file becomes the cursor). Files
+ *  consumes its own answer; a Save-as path is named but no document is
+ *  written, because Files does not edit files - the app that asked for a
+ *  save path is the one that writes it.
  *  MOUSE  a click selects a row; a second click on the same row within
  *         450 ms (measured with CLOCK_MONOTONIC) opens it; the header
  *         action, Back, Up and every breadcrumb segment are clickable.
@@ -151,6 +163,7 @@
 #include "mystic.h"
 #include "clipboard.h"
 #include "filetypes.h"
+#include "filepick.h"  /* the desktop's open/save dialog, protocol + state */
 #include "i18n.h"      /* font_cell_width / UTF-8 helpers, shared with font.c */
 
 #ifndef OPEN_REQ
@@ -503,6 +516,12 @@ typedef struct {
     int       preview_len, preview_binary, preview_scroll;
     Undo      undo[UNDO_MAX];
     int       undo_n;
+
+    /* The open/save dialog: the token of the request we are waiting on
+     * ("" = none) and which dialog it was. The desktop owns the dialog;
+     * this is only the exchange. */
+    char      pick_token[FILEPICK_TOKEN_MAX + 1];
+    int       pick_mode;
 } Files;
 
 /* A box that must *contain* a string rounds up: rounding a text width down by
@@ -1274,6 +1293,100 @@ static void rescan(Files *f) {
 /* Set a sort mode by name, keeping the cursor on the same entry. Used by
  * 's', the toolbar's sort button and the Sort by submenu, so all three go
  * through one implementation. */
+/* ------------------------------------------------------------
+ *  The open/save dialog
+ *
+ *  Ctrl+O / Ctrl+S ask the desktop for its one dialog (src/filepick.h)
+ *  through the same request file a sandboxed app writes: the desktop
+ *  draws it and answers with a token, Files only reads the answer. The
+ *  token is what keeps a stale answer from a previous dialog out of this
+ *  one; filepick_result_take() refuses any other token.
+ *
+ *  What consumes a chosen path: this app. Ctrl+O reveals the file - its
+ *  directory becomes the listing, the file becomes the cursor and the
+ *  status line names it. Ctrl+S names the chosen path in the status line
+ *  and writes nothing: Files does not edit documents, so the app that
+ *  asked for a save path is the one that writes it.
+ * ------------------------------------------------------------ */
+static void pick_start(Files *f, int mode) {
+    char req[FILEPICK_PATH_MAX], res[FILEPICK_PATH_MAX], err[192];
+    filepick_paths(req, sizeof(req), res, sizeof(res));
+
+    char suggest[NAME_LEN];
+    suggest[0] = 0;
+    if (mode == FILEPICK_SAVE && f->count > 0 && f->sel >= 0 && f->sel < f->count)
+        snprintf(suggest, sizeof(suggest), "%s", f->ent[f->sel].name);
+
+    if (filepick_request(req, mode, "*", f->path, suggest,
+                         f->pick_token, sizeof(f->pick_token),
+                         err, sizeof(err)) != 0) {
+        f->pick_token[0] = 0;
+        statusf(f, "file picker: %s", err);
+        return;
+    }
+    f->pick_mode = mode;
+    statusf(f, "%s dialog opened", mode == FILEPICK_SAVE ? "Save as" : "Open");
+}
+
+/* Show `path` in the listing: its directory, and its name as the cursor.
+ * Returns 1 when the entry is really there after the rescan - a file that
+ * vanished in between is simply absent, never invented. */
+static int reveal_path(Files *f, const char *path) {
+    char dir[PATH_LEN], base[NAME_LEN];
+    int n = snprintf(dir, sizeof(dir), "%s", path);
+    if (n < 0 || n >= (int)sizeof(dir)) return 0;
+    char *slash = strrchr(dir, '/');
+    if (!slash) return 0;
+    snprintf(base, sizeof(base), "%s", slash + 1);
+    if (slash == dir) dir[1] = 0;
+    else *slash = 0;
+    if (!dir[0]) snprintf(dir, sizeof(dir), "%s", "/");
+
+    if (strcmp(f->path, dir) != 0) nav_to(f, dir, 1);
+    else rescan(f);
+
+    for (int i = 0; i < f->count; i++) {
+        if (strcmp(f->ent[i].name, base) != 0) continue;
+        f->sel = i;
+        f->scroll = i;
+        f->anchor = i;
+        f->last_click_idx = -1;
+        marks_reset(f);
+        mark_set(f, i, 1);
+        return 1;
+    }
+    return 0;
+}
+
+/* Collect the answer, once. Nothing here runs unless a dialog was asked
+ * for, so the steady state costs one empty token. */
+static void pick_poll(Files *f) {
+    if (!f->pick_token[0]) return;
+    char req[FILEPICK_PATH_MAX], res[FILEPICK_PATH_MAX];
+    char path[FILEPICK_PATH_MAX];
+    filepick_paths(req, sizeof(req), res, sizeof(res));
+
+    FpEvent ev = filepick_result_take(res, f->pick_token, path, sizeof(path));
+    if (ev == FILEPICK_NONE) return;            /* still open, or not ours */
+    remove(res);                                /* this token's answer, read once */
+    f->pick_token[0] = 0;
+
+    if (ev == FILEPICK_CANCEL) {
+        statusf(f, "%s dialog cancelled",
+                f->pick_mode == FILEPICK_SAVE ? "Save as" : "Open");
+        return;
+    }
+    if (f->pick_mode == FILEPICK_SAVE) {
+        statusf(f, "save as %s", path);
+        return;
+    }
+    /* reveal_path() navigates, and a navigation clears the status line, so
+     * the message is set AFTER it - the path the dialog returned is the
+     * thing the user must be able to read afterwards. */
+    if (reveal_path(f, path)) statusf(f, "open %s", path);
+    else                      statusf(f, "open %s - no longer in %s", path, f->path);
+}
+
 static void sort_set(Files *f, int mode) {
     char keep[NAME_LEN];
     keep[0] = 0;
@@ -3311,6 +3424,11 @@ static void files_draw(App *a, Surface *s, int x, int y, int w, int h, const The
     f->w = w;
     f->h = h;
 
+    /* the dialog's answer, on the frame the desktop closed it. This is
+     * one empty token in the steady state; it only reads the disk while a
+     * request of ours is outstanding. */
+    pick_poll(f);
+
     Layout L;
     if (!layout_build(&L, w, h)) return;
 
@@ -3631,6 +3749,11 @@ static void files_key(App *a, const char *bytes, int n) {
             case 0x18: do_cut(f, f->sel); break;
             case 0x16: do_paste(f, f->sel); break;
             case 0x1A: undo_delete(f); break;
+            /* Ctrl+O / Ctrl+S: the desktop's own open/save dialog. input.c
+             * delivers Ctrl+letter as the control byte, and neither chord
+             * is in the shortcut table, so it arrives here. */
+            case 0x0F: pick_start(f, FILEPICK_OPEN); break;
+            case 0x13: pick_start(f, FILEPICK_SAVE); break;
             default: break;
         }
     }

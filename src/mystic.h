@@ -345,13 +345,14 @@ void   disp_bench_report(int src_w, int src_h, int dst_w, int dst_h);
 /* ------------------------------------------------------------
  * Input (evdev)
  * ------------------------------------------------------------ */
-/* Gestures are produced by input_poll(); there is no separate call, and no
+/* Gestures are produced by input_poll(); there is no separate call and no
  * open() of an input device here. The parser reads evdev protocol B:
  * ABS_MT_SLOT / ABS_MT_TRACKING_ID / ABS_MT_POSITION_X / ABS_MT_POSITION_Y,
- * and accepts BTN_TOOL_FINGER..BTN_TOOL_QUINT plus BTN_TOOL_DOUBLE_TAP /
- * TRIPLE_TAP (all of which are EV_KEY codes) from a device that reports no
- * slots at all. Positions arrive in the device's own units and are delivered
- * as pixels, the same convention ABS_X already had in src/input.c. */
+ * plus the slot-less contact counters BTN_TOOL_FINGER, BTN_TOOL_DOUBLETAP,
+ * BTN_TOOL_TRIPLETAP and BTN_TOOL_QUINTTAP - those are the exact names in
+ * <linux/input.h>; there is no BTN_TOOL_QUINT in the UAPI. Positions arrive
+ * in the device's own units and are delivered as pixels, the same
+ * convention ABS_X already had in src/input.c. */
 int  input_open(Input *in);
 int  input_poll(Input *in);        /* fills Input for this frame; returns 1 if anything happened */
 void input_frame(Input *in);       /* clear per-frame fields */

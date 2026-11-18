@@ -22,6 +22,7 @@
 
 #include "mystic.h"
 #include "filetypes.h"
+#include "filepick.h"
 #include "ipc.h"
 #include "wallpaper.h"
 #include "shortcuts.h"
@@ -1379,6 +1380,868 @@ static void text_fit(Font *f, const char *src, char *dst, size_t dstsz, float av
 }
 /* MYSTIC_TEXT_FIT_END */
 
+/* ============================================================
+ *  THE FILE PICKER - the desktop's own open/save dialog.
+ *
+ *  src/filepick.h owns the protocol and the state machine (scan,
+ *  filter, sort, navigate, type, save, the one overwrite question,
+ *  cancel). This block is the part that needs the screen and the
+ *  process: the request watcher, the geometry, the painter, the hit
+ *  test and the wheel.
+ *
+ *  It is modal in the strongest sense the desktop has. While it is up
+ *  the main loop hands it every key and every typed byte BEFORE the
+ *  shortcut table and before any window, handle_click() asks it first,
+ *  and the painter runs last - above the launcher, the menu and every
+ *  window. The lock screen still wins: a locked desktop must not show
+ *  anybody's files.
+ *
+ *  Two doors in. An app in this process (Files, Settings) writes
+ *  /run/mystic/filepick.request. A sandboxed app cannot write there -
+ *  its jail's /run is root-owned - so it writes /tmp/filepick.request
+ *  inside the jail, which is the same file as
+ *  /run/mystic/jail/<id>/tmp/filepick.request out here; the answer goes
+ *  back the same way. Both use the same reader, the same state machine
+ *  and the same token check.
+ *
+ *  The dialog can never be lost: the panel is clamped inside the
+ *  display, and Esc always closes it (the overwrite question first, so
+ *  one Escape cannot destroy a file).
+ * ============================================================ */
+static FilePick filepick;                            /* at most one dialog */
+static char     filepick_result_path[FILEPICK_PATH_MAX];
+
+/* One client id becomes two path components here. A client chooses its
+ * own HELLO id, so anything that could climb out of /run/mystic/jail is
+ * refused before it is used to build a path. Same rule as the clipboard
+ * bridge, for the same reason. */
+static int fp_id_ok(const char *id) {
+    if (!id || !id[0] || strlen(id) >= 32) return 0;
+    for (const char *p = id; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                 (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        if (!ok) return 0;
+    }
+    return strstr(id, "..") == NULL;
+}
+
+/* A second request while the dialog is up gets the only answer the
+ * protocol has for "no path": cancel. The reason is real and it is said
+ * on stderr and in the status line, not silently swallowed. */
+static void fp_answer_busy(const char *req, const char *res) {
+    FilePick tmp;
+    char err[200];
+    if (filepick_read_request(req, &tmp, err, sizeof(err)) != 0) {
+        fprintf(stderr, "filepick: bad request %.120s: %s\n", req, err);
+        remove(req);
+        return;
+    }
+    if (filepick_write_result(res, tmp.token, FILEPICK_CANCEL, NULL,
+                              err, sizeof(err)) != 0)
+        fprintf(stderr, "filepick: cannot answer %.120s: %s\n", res, err);
+    else
+        fprintf(stderr, "filepick: token %s answered cancel - one dialog at a time\n",
+                tmp.token);
+    set_status("File picker is already open - that request was cancelled");
+    remove(req);
+}
+
+/* Take a request if there is one. Returns 1 when a dialog was opened. */
+static int fp_take_request(const char *req, const char *res) {
+    struct stat st;
+    if (stat(req, &st) != 0) return 0;
+    if (!S_ISREG(st.st_mode)) {
+        /* Leave it alone (it is somebody else's file) but say it once, not
+         * once a frame for the rest of the session. */
+        static char warned[FILEPICK_PATH_MAX];
+        if (strcmp(warned, req) != 0) {
+            snprintf(warned, sizeof(warned), "%s", req);
+            fprintf(stderr, "filepick: refusing %s: not a regular file\n", req);
+            set_status("File picker: %s is not a request file", req);
+        }
+        return 0;
+    }
+    if (filepick.active) { fp_answer_busy(req, res); return 0; }
+
+    FilePick tmp;
+    char err[200];
+    if (filepick_read_request(req, &tmp, err, sizeof(err)) != 0) {
+        fprintf(stderr, "filepick: refusing %.120s: %s\n", req, err);
+        set_status("File picker: %s", err);
+        remove(req);
+        return 0;
+    }
+    if (remove(req) != 0)
+        fprintf(stderr, "filepick: cannot remove %.120s: %s\n", req, strerror(errno));
+    filepick = tmp;
+    snprintf(filepick_result_path, sizeof(filepick_result_path), "%s", res);
+
+    /* the dialog wins over every other overlay: they are all transient */
+    launcher_open = 0;
+    menu_open = 0;
+    help_open = 0;
+    drag_win = -1;
+    resize_win = -1;
+    dirty = 1;
+    fprintf(stderr, "filepick: %s dialog, token %s, in %s (filter %s)\n",
+            filepick.mode == FILEPICK_SAVE ? "save" : "open",
+            filepick.token, filepick.dir, filepick.filter);
+    return 1;
+}
+
+/* Watch both doors, once a frame. A locked desktop watches neither. */
+static void filepick_service(void) {
+    if (locked) return;
+    if (fp_take_request(FILEPICK_REQUEST, FILEPICK_RESULT)) return;
+    for (int i = 0; i < WM_MAX_CLIENTS; i++) {
+        WmClient *cl = &clients[i];
+        if (!cl->used || !fp_id_ok(cl->id)) continue;
+        char req[192], res[192];
+        snprintf(req, sizeof(req),
+                 "/run/mystic/jail/%s/tmp/filepick.request", cl->id);
+        snprintf(res, sizeof(res),
+                 "/run/mystic/jail/%s/tmp/filepick.result", cl->id);
+        if (fp_take_request(req, res)) return;
+    }
+}
+
+/* End the dialog: write the answer where the requester is waiting, say
+ * what happened, and drop the state. Nothing is written if the answer
+ * cannot be written - except that the dialog still closes, because an
+ * undismissable dialog is worse than a lost answer, and the reason is on
+ * screen and on stderr. */
+static void filepick_finish(FpEvent ev) {
+    if (!filepick.active) return;
+    char path[FILEPICK_PATH_MAX + FILEPICK_NAME_MAX + 2];
+    char err[200];
+    int chosen = (ev == FILEPICK_CHOSEN);
+    path[0] = 0;
+    if (chosen) filepick_target(&filepick, path, sizeof(path));
+
+    if (filepick_write_result(filepick_result_path, filepick.token, ev,
+                              chosen ? path : NULL, err, sizeof(err)) != 0) {
+        fprintf(stderr, "filepick: cannot answer token %s: %s\n",
+                filepick.token, err);
+        set_status("File picker: %s", err);
+    } else if (chosen) {
+        set_status("%s %s", filepick.mode == FILEPICK_SAVE ? "Save as" : "Open",
+                   path);
+        fprintf(stderr, "filepick: token %s -> %s\n", filepick.token, path);
+    } else {
+        set_status("File picker cancelled");
+        fprintf(stderr, "filepick: token %s cancelled\n", filepick.token);
+    }
+    memset(&filepick, 0, sizeof(filepick));
+    filepick_result_path[0] = 0;
+    dirty = 1;
+}
+
+/* MYSTIC_FILEPICK_DRAW_BEGIN
+ * The block below is the picker's whole painter and layout. A host
+ * harness extracts this exact text and links it against the real
+ * src/gfx.c, src/font.c and src/ui.c, so the picture it renders is the
+ * picture this desktop draws. Keep it self-contained: no desktop state
+ * except the one `filepick` the harness declares, and the pointer
+ * position, which is passed in.
+ *
+ * ------------------------------------------------------------ geometry
+ *
+ * One layout, built from the fonts and the screen, and used by the
+ * painter and the hit test alike - so a row is clickable exactly where it
+ * was drawn and no widget can be painted outside the panel. Every number
+ * here is a function of font_height()/ui_px(), never a hardcoded pixel
+ * size that a text scale could outgrow.
+ */
+#define FP_CRUMBS 16
+
+typedef struct {
+    Font *title, *body, *small;
+
+    int px, py, pw, ph;        /* the panel, clamped inside the display */
+    int pad, gap, radius;
+
+    int title_y, title_h;
+    int filter_r;              /* right edge of the filter label */
+
+    int crumb_y, crumb_h;
+    int crumb_n;
+    int crumb_ell;             /* 1 = leading crumbs were trimmed */
+    int crumb_cut[FP_CRUMBS];  /* path prefix length this crumb jumps to */
+    int crumb_s0[FP_CRUMBS];   /* where this crumb's label starts in the path */
+    int crumb_x0[FP_CRUMBS], crumb_x1[FP_CRUMBS];
+
+    int list_y, list_bot, row_h, rows;
+    int size_r, size_w, name_x, name_w;
+
+    int name_y, name_h, name_lab_w;   /* save mode: the Name field */
+
+    int foot_y, foot_h;
+    int ok_x, ok_y, ok_w, ok_h, cancel_x;
+    int fact_r;                /* right edge of the footer facts */
+
+    int ov_x, ov_y, ov_w, ov_h;       /* the overwrite question */
+    int ov_ok_x, ov_ok_w, ov_cancel_x, ov_cancel_w, ov_btn_y, ov_btn_h;
+} FpGeom;
+
+static int fp_line(Font *f) {
+    if (!f) return 1;
+    int h = (int)(font_height(f) + 0.5f);
+    return h < 1 ? 1 : h;
+}
+
+/* Split the current directory into clickable prefixes. For the absolute
+ * path "/root/x" that is three crumbs - "/", "/root", "/root/x" - each
+ * with the prefix it jumps to (cut) and where its own label starts (s0).
+ * A relative path (only a host test uses one) has no "/" crumb: its
+ * first label is its first component. */
+static int fp_crumb_cuts(const char *dir, int *cut, int *s0, int max) {
+    int n = 0;
+    if (max < 1) return 0;
+    int abs = dir[0] == '/';
+    const char *comp = abs ? dir + 1 : dir;
+    if (abs) { cut[0] = 1; s0[0] = 0; n = 1; }
+
+    for (size_t i = abs ? 1 : 0; ; i++) {
+        if (dir[i] != '/' && dir[i] != 0) continue;
+        if (i > (size_t)(comp - dir)) {
+            if (n >= max) break;
+            cut[n] = (int)i;
+            s0[n] = (int)(comp - dir);
+            n++;
+        }
+        if (!dir[i]) break;
+        comp = dir + i + 1;
+    }
+    return n;
+}
+
+static void fp_geom(int sw, int sh, FpGeom *g) {
+    memset(g, 0, sizeof(*g));
+    g->title = font_get(FONT_SEMIBOLD, 15);
+    g->body  = font_get(FONT_REGULAR, 11);
+    g->small = font_get(FONT_MEDIUM, 9);
+    /* Air that also respects the panel it has to fit in: on a 320x240
+     * canvas at the largest text scale the scaled 16/8 units alone would
+     * be taller than the screen, so the padding shrinks with the height
+     * instead of pushing the buttons off the bottom. */
+    g->pad = ui_px(16);
+    if (g->pad > sh / 24) g->pad = sh / 24;
+    if (g->pad < 4) g->pad = 4;
+    g->gap = ui_px(8);
+    if (g->gap > sh / 48) g->gap = sh / 48;
+    if (g->gap < 2) g->gap = 2;
+    g->radius = ui_px(10);
+    if (!g->title || !g->body || !g->small) return;
+
+    int margin = ui_px(24);
+    if (margin > sw / 8) margin = sw / 8;
+    if (margin > sh / 8) margin = sh / 8;
+    if (margin < 2) margin = 2;
+
+    g->row_h = fp_line(g->body) + ui_px(4);
+    if (g->row_h < ui_px(18)) g->row_h = ui_px(18);
+    g->title_h = fp_line(g->title) + ui_px(2);
+    g->crumb_h = fp_line(g->small) + ui_px(6);
+    g->name_h  = fp_line(g->body) + ui_px(10);
+    g->foot_h  = fp_line(g->small) + ui_px(8);
+    if (g->foot_h < g->row_h) g->foot_h = g->row_h;   /* the buttons live here */
+    if (g->foot_h < fp_line(g->body) + ui_px(6)) g->foot_h = fp_line(g->body) + ui_px(6);
+
+    int pw = sw - 2 * margin;
+    int maxw = ui_px(430);                 /* ~600 px at the shipped scale */
+    if (pw > maxw) pw = maxw;
+    if (pw < ui_px(280)) pw = sw - 2 * margin;
+    if (pw < 96) pw = sw;                       /* a tiny screen still gets one */
+    if (pw > sw) pw = sw;
+
+    int chrome = g->pad + g->title_h + g->gap + g->crumb_h + g->gap +
+                 g->gap + g->foot_h + g->pad;
+    if (filepick.mode == FILEPICK_SAVE) chrome += g->name_h + g->gap;
+    int rows = (sh - 2 * margin - chrome) / g->row_h;
+    if (rows < 1) {
+        /* Too short for the full chrome: the breadcrumb is the one band a
+         * file dialog can do without (the path is still in the title when
+         * the list has no room for it, see the painter). Dropping it is
+         * what lets the smallest supported canvas (320x240) still show a
+         * row, the Name field and the buttons inside the panel. */
+        g->crumb_h = 0;
+        chrome = g->pad + g->title_h + g->gap + g->gap + g->foot_h + g->pad;
+        if (filepick.mode == FILEPICK_SAVE) chrome += g->name_h + g->gap;
+        rows = (sh - 2 * margin - chrome) / g->row_h;
+    }
+    if (rows > 14) rows = 14;
+    if (rows < 1) rows = 1;
+    int ph = chrome + rows * g->row_h;
+    if (ph > sh) ph = sh;
+
+    g->pw = pw;
+    g->ph = ph;
+    g->rows = rows;
+    g->px = (sw - pw) / 2;
+    g->py = (sh - ph) / 2;
+    if (g->px < 0) g->px = 0;
+    if (g->py < 0) g->py = 0;
+    if (g->px + g->pw > sw) g->px = sw - g->pw;
+    if (g->py + g->ph > sh) g->py = sh - g->ph;
+
+    g->title_y = g->py + g->pad;
+    g->filter_r = g->px + g->pw - g->pad;
+
+    g->crumb_y = g->title_y + g->title_h + g->gap;
+    g->list_y = g->crumb_y + g->crumb_h + g->gap;
+
+    /* The bottom bands are anchored to the panel's bottom edge and the list
+     * takes what is left. Anchoring them (rather than stacking from the
+     * list down) is what keeps the Name field and the buttons inside the
+     * panel when the panel was clamped to a short display. */
+    g->foot_y = g->py + g->ph - g->pad - g->foot_h;
+    int bottom = g->foot_y - g->gap;
+    if (filepick.mode == FILEPICK_SAVE) {
+        g->name_y = bottom - g->name_h;
+        bottom = g->name_y - g->gap;
+    }
+    g->list_bot = bottom;
+    rows = (g->list_bot - g->list_y) / g->row_h;
+    if (rows < 1) {
+        rows = 1;
+        if (g->list_bot < g->list_y + g->row_h)
+            g->list_bot = g->list_y + g->row_h;   /* below 320x240 only */
+    } else {
+        g->list_bot = g->list_y + rows * g->row_h;
+    }
+    g->rows = rows;
+
+    /* footer: facts on the left, buttons on the right, all on one band */
+    const char *ok_label = filepick.mode == FILEPICK_SAVE ? "Save" : "Open";
+    g->ok_w = (int)font_width(g->small, ok_label) + 2 * ui_px(10);
+    int cw = (int)font_width(g->small, "Cancel") + 2 * ui_px(10);
+    g->ok_h = fp_line(g->small) + ui_px(8);
+    if (g->ok_h < g->row_h - ui_px(4)) g->ok_h = g->row_h - ui_px(4);
+    g->ok_y = g->foot_y + (g->foot_h - g->ok_h) / 2;
+    g->ok_x = g->px + g->pw - g->pad - g->ok_w;
+    g->cancel_x = g->ok_x - g->gap - cw;
+    g->fact_r = g->cancel_x - g->gap;
+    if (g->fact_r < g->px + g->pad) g->fact_r = g->px + g->pad;
+
+    /* the list columns own their widths; the size column is measured from
+     * the widest real figure the formatter can produce */
+    int szw = (int)font_width(g->small, "999.9 GB") + ui_px(4);
+    g->size_w = szw;
+    g->size_r = g->px + g->pw - g->pad;
+    g->name_x = g->px + g->pad;
+    g->name_w = g->size_r - szw - g->gap - g->name_x;
+    if (g->name_w < ui_px(40)) g->name_w = ui_px(40);
+
+    if (filepick.mode == FILEPICK_SAVE) {
+        g->name_lab_w = (int)font_width(g->small, "Name") + g->gap;
+        g->name_x = g->px + g->pad + g->name_lab_w;
+        g->name_w = g->size_r - g->name_x;
+        if (g->name_w < ui_px(60)) g->name_w = ui_px(60);
+    }
+
+    /* breadcrumbs, oldest first, trimmed from the left when they do not
+     * fit: the tail (where you are) is the part that must stay readable */
+    int cut[FP_CRUMBS], cstart[FP_CRUMBS];
+    int nc = fp_crumb_cuts(filepick.dir, cut, cstart, FP_CRUMBS);
+    const char *sep = "\xE2\x80\xBA";              /* U+203A, ">" */
+    int sepw = (int)(font_width(g->small, sep) + 2.0f * font_width(g->small, " "));
+    int avail = g->size_r - g->name_x;
+    int first = 0;
+    for (;;) {
+        int total = 0;
+        for (int i = first; i < nc; i++) {
+            int len = cut[i] - cstart[i];
+            char lab[FILEPICK_PATH_MAX];
+            if (len < 0) len = 0;
+            if (len > (int)sizeof(lab) - 1) len = (int)sizeof(lab) - 1;
+            memcpy(lab, filepick.dir + cstart[i], (size_t)len);
+            lab[len] = 0;
+            total += (int)font_width(g->small, lab);
+            if (i + 1 < nc) total += sepw;
+        }
+        if (first > 0) total += (int)font_width(g->small, "\xE2\x80\xA6 ");
+        if (total <= avail || first + 2 >= nc) break;
+        first++;
+    }
+    int x = g->name_x;
+    g->crumb_ell = first > 0 ? 1 : 0;
+    if (g->crumb_ell)
+        x += (int)font_width(g->small, "\xE2\x80\xA6 ");
+    for (int i = first; i < nc && g->crumb_n < FP_CRUMBS; i++) {
+        int len = cut[i] - cstart[i];
+        char lab[FILEPICK_PATH_MAX];
+        if (len < 0) len = 0;
+        if (len > (int)sizeof(lab) - 1) len = (int)sizeof(lab) - 1;
+        memcpy(lab, filepick.dir + cstart[i], (size_t)len);
+        lab[len] = 0;
+        int w = (int)font_width(g->small, lab);
+        g->crumb_cut[g->crumb_n] = cut[i];
+        g->crumb_s0[g->crumb_n] = cstart[i];
+        g->crumb_x0[g->crumb_n] = x;
+        g->crumb_x1[g->crumb_n] = x + w;
+        g->crumb_n++;
+        x += w;
+        if (i + 1 < nc) x += sepw;
+    }
+
+    /* the overwrite question: a box over the list, never off the panel */
+    g->ov_w = g->pw - 2 * g->pad;
+    if (g->ov_w > ui_px(400)) g->ov_w = ui_px(400);
+    if (g->ov_w < ui_px(160)) g->ov_w = ui_px(160);
+    int lh = fp_line(g->small);
+    g->ov_h = g->pad + fp_line(g->title) + g->gap + 2 * lh + g->gap + g->row_h + g->pad;
+    g->ov_x = g->px + (g->pw - g->ov_w) / 2;
+    g->ov_y = g->list_y + ((g->list_bot - g->list_y) - g->ov_h) / 2;
+    if (g->ov_y < g->list_y) g->ov_y = g->list_y;
+    if (g->ov_y + g->ov_h > g->list_bot) g->ov_y = g->list_bot - g->ov_h;
+    if (g->ov_y < g->py) g->ov_y = g->py;
+    g->ov_btn_h = fp_line(g->small) + ui_px(8);
+    g->ov_btn_y = g->ov_y + g->ov_h - g->pad - g->ov_btn_h;
+    g->ov_ok_w = (int)font_width(g->small, "Replace") + 2 * ui_px(10);
+    int ovcw = (int)font_width(g->small, "Cancel") + 2 * ui_px(10);
+    g->ov_ok_x = g->ov_x + g->ov_w - g->pad - g->ov_ok_w;
+    g->ov_cancel_x = g->ov_ok_x - g->gap - ovcw;
+    g->ov_cancel_w = ovcw;
+}
+
+/* ------------------------------------------------------------ drawing */
+/* Fit `src` into `maxw` by putting the ellipsis at the END (names) or at
+ * the START (paths, where the tail is what you are looking at). Both
+ * measure with font_width(), so a cut cannot overflow its column. */
+static void fp_fit_head(Font *f, const char *src, char *dst, size_t cap, float maxw) {
+    if (!dst || cap < 4) return;
+    dst[0] = 0;
+    if (!f || !src) return;
+    text_fit(f, src, dst, cap, maxw);
+}
+
+static void fp_fit_tail(Font *f, const char *src, char *dst, size_t cap, float maxw) {
+    if (!dst || cap < 4) return;
+    dst[0] = 0;
+    if (!f || !src) return;
+    if (font_width(f, src) <= maxw) { snprintf(dst, cap, "%s", src); return; }
+    const char *ell = "\xE2\x80\xA6";
+    if (font_width(f, ell) <= 0.0f) ell = "...";
+    size_t elen = strlen(ell);
+    size_t n = strlen(src);
+    size_t start = n;
+    float room = maxw - font_width(f, ell);
+    if (room <= 0.0f || cap <= elen + 1) return;
+    float w = 0.0f;
+    while (start > 0) {
+        /* step back one UTF-8 codepoint */
+        size_t s = start - 1;
+        while (s > 0 && ((unsigned char)src[s] & 0xC0) == 0x80) s--;
+        char one[5];
+        size_t len = start - s;
+        if (len > 4) len = 1;
+        memcpy(one, src + s, len);
+        one[len] = 0;
+        float adv = font_width(f, one);
+        if (w + adv > room) break;
+        w += adv;
+        start = s;
+    }
+    if (start == n) return;                     /* not even one glyph fit */
+    snprintf(dst, cap, "%s%s", ell, src + start);
+}
+
+static void fp_size_text(long long size, char *out, size_t n) {
+    if (size < 0) { snprintf(out, n, "%s", "--"); return; }
+    if (size < 1024) snprintf(out, n, "%lld B", size);
+    else if (size < 1024LL * 1024) snprintf(out, n, "%.0f KB", (double)size / 1024.0);
+    else if (size < 1024LL * 1024 * 1024)
+        snprintf(out, n, "%.1f MB", (double)size / (1024.0 * 1024.0));
+    else snprintf(out, n, "%.1f GB", (double)size / (1024.0 * 1024.0 * 1024.0));
+}
+
+static void fp_rule(Surface *s, int x0, int x1, int y, u32 c) {
+    if (x1 <= x0) return;
+    surf_blend(s, x0, y, x1 - x0, 1, c);
+}
+
+static void fp_button(Surface *s, int x, int y, int w, int h, int primary,
+                      const char *label, Font *f, const Theme *th) {
+    if (!f || w <= 0 || h <= 0) return;
+    gfx_rrect_aa(s, (float)x, (float)y, (float)w, (float)h, (float)ui_px(6),
+                 primary ? color_alpha(th->accent, 0.30f)
+                         : color_alpha(th->text, 0.07f),
+                 primary ? color_alpha(th->accent, 0.85f)
+                         : color_alpha(th->panel_border, 0.85f), 1.0f);
+    float tw = font_width(f, label);
+    font_draw(s, f, (float)x + ((float)w - tw) * 0.5f,
+              (float)y + (float)((h - fp_line(f)) / 2), label,
+              primary ? th->text : color_alpha(th->text, 0.88f));
+}
+
+/* The Name field, with the text scrolled so the caret stays inside and the
+ * caret placed at the pen font_width() gives for the text before it. */
+static void fp_name_field(Surface *s, const FpGeom *g, const Theme *th) {
+    Font *f = g->body;
+    if (!f) return;
+    int bx = g->name_x, by = g->name_y;
+    int bw = g->name_w, bh = g->name_h;
+    if (bw <= 0 || bh <= 0) return;
+    u32 border = filepick.name_focus ? color_alpha(th->accent, 0.90f)
+                                     : color_alpha(th->panel_border, 0.85f);
+    gfx_rrect_aa(s, (float)bx, (float)by, (float)bw, (float)bh,
+                 (float)ui_px(5), th->window_bg, border, 1.0f);
+
+    float room = (float)bw - (float)ui_px(10);
+    if (room < 1.0f) room = 1.0f;
+    int start = 0;
+    char tmp[FILEPICK_NAME_MAX + 1];
+    for (;;) {
+        int len = filepick.name_len - start;
+        if (len <= 0) break;
+        if (len >= (int)sizeof(tmp)) len = (int)sizeof(tmp) - 1;
+        memcpy(tmp, filepick.name + start, (size_t)len);
+        tmp[len] = 0;
+        if (font_width(f, tmp) <= room) break;
+        start++;
+    }
+    int vis = filepick.name_len - start;
+    if (vis < 0) vis = 0;
+    if (vis >= (int)sizeof(tmp)) vis = (int)sizeof(tmp) - 1;
+    memcpy(tmp, filepick.name + start, (size_t)vis);
+    tmp[vis] = 0;
+    float tx = (float)bx + (float)ui_px(5);
+    float ty = (float)by + (float)((bh - fp_line(f)) / 2);
+    font_draw(s, f, tx, ty, tmp, filepick.name_len ? th->text : th->text_dim);
+
+    if (filepick.name_focus) {
+        int caret = filepick.name_len - start;
+        if (caret < 0) caret = 0;
+        if (caret > vis) caret = vis;
+        memcpy(tmp, filepick.name + start, (size_t)caret);
+        tmp[caret] = 0;
+        float cx = tx + font_width(f, tmp);
+        float ch = (float)fp_line(f);
+        gfx_line(s, cx, (float)by + 3.0f, cx, (float)by + 3.0f + ch, 1.4f, th->accent);
+    }
+}
+
+static void filepick_draw(Surface *s, const Theme *th, int ptr_x, int ptr_y) {
+    if (!filepick.active || !s || !s->px) return;
+    FpGeom g;
+    fp_geom(s->w, s->h, &g);
+    if (!g.pw) return;
+    filepick.rows = g.rows;
+
+    /* dim the whole frame: the dialog is the only thing that matters */
+    surf_blend(s, 0, 0, s->w, s->h, 0x66000000u);
+
+    gfx_shadow(s, (float)g.px, (float)g.py, (float)g.pw, (float)g.ph,
+               (float)g.radius, (float)ui_px(10), 0.55f);
+    gfx_rrect_aa(s, (float)g.px, (float)g.py, (float)g.pw, (float)g.ph,
+                 (float)g.radius, th->window_bg,
+                 color_alpha(th->panel_border, 0.95f), 1.0f);
+
+    /* header */
+    font_draw(s, g.title, (float)(g.px + g.pad), (float)g.title_y,
+              filepick.mode == FILEPICK_SAVE ? "Save as" : "Open", th->text);
+    {
+        /* Right of the title: the path when the breadcrumb band had to be
+         * dropped for height (a 320x240 canvas), otherwise what is
+         * narrowing the list - the typed query first (it is the active
+         * constraint), then the filter. */
+        char ftxt[FILEPICK_FILTER_MAX + 64];
+        const char *ft = !strcmp(filepick.filter, "*") ? "all files"
+                                                       : filepick.filter;
+        if (g.crumb_h <= 0)
+            snprintf(ftxt, sizeof(ftxt), "%s", filepick.dir);
+        else if (filepick.typed_len > 0)
+            snprintf(ftxt, sizeof(ftxt), "\"%s\"  \xC2\xB7  %s",
+                     filepick.typed, ft);
+        else
+            snprintf(ftxt, sizeof(ftxt), "%s", ft);
+        char shown[FILEPICK_FILTER_MAX + 72];
+        float hroom = (float)(g.filter_r - (g.px + g.pw / 2));
+        if (g.crumb_h <= 0) fp_fit_tail(g.small, ftxt, shown, sizeof(shown), hroom);
+        else                fp_fit_head(g.small, ftxt, shown, sizeof(shown), hroom);
+        font_draw(s, g.small,
+                  (float)g.filter_r - font_width(g.small, shown),
+                  (float)(g.title_y + (g.title_h - fp_line(g.small)) / 2),
+                  shown, color_alpha(th->text, 0.50f));
+    }
+
+    /* breadcrumb */
+    if (g.crumb_h > 0) {
+        int yc = g.crumb_y + (g.crumb_h - fp_line(g.small)) / 2;
+        if (g.crumb_n == 0) {
+            char shown[FILEPICK_PATH_MAX];
+            fp_fit_tail(g.small, filepick.dir, shown, sizeof(shown),
+                        (float)(g.size_r - g.name_x));
+            font_draw(s, g.small, (float)g.name_x, (float)yc, shown, th->text_dim);
+        }
+        if (g.crumb_ell)
+            font_draw(s, g.small, (float)g.name_x, (float)yc,
+                      "\xE2\x80\xA6 ", color_alpha(th->text, 0.62f));
+        for (int i = 0; i < g.crumb_n; i++) {
+            int len = g.crumb_cut[i] - g.crumb_s0[i];
+            char lab[FILEPICK_PATH_MAX];
+            if (len < 0) len = 0;
+            if (len > (int)sizeof(lab) - 1) len = (int)sizeof(lab) - 1;
+            memcpy(lab, filepick.dir + g.crumb_s0[i], (size_t)len);
+            lab[len] = 0;
+            int last = (i == g.crumb_n - 1);
+            u32 c = last ? th->text : color_alpha(th->text, 0.62f);
+            font_draw(s, g.small, (float)g.crumb_x0[i], (float)yc, lab, c);
+            if (!last) {
+                /* the separator sits centred in the gap the layout reserved */
+                const char *sep = "\xE2\x80\xBA";
+                float gap = font_width(g.small, sep) + 2.0f * font_width(g.small, " ");
+                font_draw(s, g.small,
+                          (float)g.crumb_x1[i] + (gap - font_width(g.small, sep)) * 0.5f,
+                          (float)yc, sep, color_alpha(th->text, 0.40f));
+            }
+        }
+    }
+
+    fp_rule(s, g.px + g.pad, g.px + g.pw - g.pad,
+            g.list_y - ui_px(4), color_alpha(th->panel_border, 0.70f));
+
+    /* the list */
+    if (filepick.nvis == 0) {
+        const char *msg = filepick.err ? filepick.notice
+                        : (filepick.typed_len ? "no name matches that filter"
+                                              : "this folder is empty");
+        char shown[FILEPICK_NOTICE_MAX];
+        fp_fit_head(g.body, msg, shown, sizeof(shown),
+                    (float)(g.size_r - g.name_x));
+        font_draw(s, g.body, (float)g.name_x,
+                  (float)(g.list_y + (g.row_h - fp_line(g.body)) / 2),
+                  shown, filepick.err ? th->accent : th->text_dim);
+    } else {
+        for (int i = 0; i < g.rows; i++) {
+            int idx = filepick.scroll + i;
+            if (idx >= filepick.nvis) break;
+            int ry = g.list_y + i * g.row_h;
+            if (ry + g.row_h > g.list_bot) break;
+            const FilePickEntry *e = &filepick.ent[filepick.vis[idx]];
+            int sel = (idx == filepick.sel);
+            int hov = ptr_x >= g.px && ptr_x < g.px + g.pw &&
+                      ptr_y >= ry && ptr_y < ry + g.row_h &&
+                      ptr_y >= g.list_y && ptr_y < g.list_bot;
+            int rx = g.px + ui_px(6);
+            int rw = g.pw - 2 * ui_px(6);
+            if (sel || hov)
+                gfx_rrect_aa(s, (float)rx, (float)ry + 1.0f, (float)rw,
+                             (float)(g.row_h - 2), (float)ui_px(4),
+                             color_alpha(th->accent, sel ? 0.22f : 0.08f), 0, 0);
+
+            char name[FILEPICK_NAME_MAX + 2];
+            snprintf(name, sizeof(name), "%s%s", e->name, e->is_dir ? "/" : "");
+            char shown[FILEPICK_NAME_MAX + 4];
+            fp_fit_head(g.body, name, shown, sizeof(shown), (float)g.name_w);
+            font_draw(s, g.body, (float)g.name_x,
+                      (float)(ry + (g.row_h - fp_line(g.body)) / 2), shown,
+                      sel ? th->text
+                          : (e->is_dir ? th->text : color_alpha(th->text, 0.86f)));
+
+            if (!e->is_dir) {
+                char sz[32], ssz[40];
+                fp_size_text(e->size, sz, sizeof(sz));
+                fp_fit_head(g.small, sz, ssz, sizeof(ssz), (float)g.size_w);
+                font_draw(s, g.small,
+                          (float)g.size_r - font_width(g.small, ssz),
+                          (float)(ry + (g.row_h - fp_line(g.small)) / 2), ssz,
+                          color_alpha(th->text, sel ? 0.80f : 0.48f));
+            }
+        }
+    }
+
+    /* the save name field */
+    if (filepick.mode == FILEPICK_SAVE) {
+        int yc = g.name_y + (g.name_h - fp_line(g.small)) / 2;
+        font_draw(s, g.small, (float)(g.px + g.pad), (float)yc, "Name",
+                  color_alpha(th->text, 0.60f));
+        fp_name_field(s, &g, th);
+    }
+
+    fp_rule(s, g.px + g.pad, g.px + g.pw - g.pad,
+            g.foot_y - ui_px(4), color_alpha(th->panel_border, 0.70f));
+
+    /* footer: the real count - or, when there is something to say (an
+     * errno, "type a file name", "already exists"), that instead. A
+     * reason outranks a figure: the rows already show what exists. */
+    {
+        char fact[FILEPICK_NOTICE_MAX + 32];
+        int is_msg = filepick.notice[0] != 0;
+        if (is_msg) {
+            snprintf(fact, sizeof(fact), "%s", filepick.notice);
+        } else if (filepick.typed_len > 0) {
+            snprintf(fact, sizeof(fact), "%d of %d entries", filepick.nvis,
+                     filepick.n);
+        } else if (filepick.truncated) {
+            snprintf(fact, sizeof(fact), "showing %d of more than %d entries",
+                     filepick.nvis, FILEPICK_MAX_ENTRIES);
+        } else {
+            snprintf(fact, sizeof(fact), "%d entr%s", filepick.nvis,
+                     filepick.nvis == 1 ? "y" : "ies");
+        }
+        char shown[FILEPICK_NOTICE_MAX + 32];
+        float room = (float)(g.fact_r - (g.px + g.pad));
+        if (room < 0) room = 0;
+        /* a message keeps its END - that is where strerror's sentence is */
+        if (is_msg) fp_fit_tail(g.small, fact, shown, sizeof(shown), room);
+        else        fp_fit_head(g.small, fact, shown, sizeof(shown), room);
+        float fy = (float)(g.foot_y + (g.foot_h - fp_line(g.small)) / 2);
+        font_draw(s, g.small, (float)(g.px + g.pad), fy, shown,
+                  is_msg ? th->accent : color_alpha(th->text, 0.55f));
+
+        /* the keys this modal actually answers, right-aligned before the
+         * buttons - drawn only when it fits beside the fact, so the two
+         * can never be painted over each other */
+        const char *hint = filepick.mode == FILEPICK_SAVE
+            ? "Tab name  \xC2\xB7  Enter save  \xC2\xB7  Esc cancel"
+            : "Enter open  \xC2\xB7  Esc cancel";
+        float hw = font_width(g.small, hint);
+        float fw = font_width(g.small, shown);
+        if (hw + fw + (float)g.gap <= room)
+            font_draw(s, g.small, (float)g.fact_r - hw, fy, hint,
+                      color_alpha(th->text, 0.38f));
+    }
+    fp_button(s, g.ok_x, g.ok_y, g.ok_w, g.ok_h, 1,
+              filepick.mode == FILEPICK_SAVE ? "Save" : "Open", g.small, th);
+    fp_button(s, g.cancel_x, g.ok_y,
+              g.ok_x - g.gap - g.cancel_x, g.ok_h, 0, "Cancel", g.small, th);
+
+    /* the one overwrite question, over the list */
+    if (filepick.overwrite) {
+        gfx_shadow(s, (float)g.ov_x, (float)g.ov_y, (float)g.ov_w, (float)g.ov_h,
+                   (float)ui_px(8), (float)ui_px(8), 0.45f);
+        gfx_rrect_aa(s, (float)g.ov_x, (float)g.ov_y, (float)g.ov_w,
+                     (float)g.ov_h, (float)ui_px(8),
+                     color_alpha(th->window_bg, 0.99f),
+                     color_alpha(th->accent, 0.85f), 1.0f);
+        int tx = g.ov_x + g.pad;
+        int room = g.ov_w - 2 * g.pad;
+        char line[FILEPICK_NAME_MAX + 48], shown[FILEPICK_NAME_MAX + 48];
+        snprintf(line, sizeof(line), "Replace \"%s\"?", filepick.overwrite_name);
+        fp_fit_head(g.title, line, shown, sizeof(shown), (float)room);
+        font_draw(s, g.title, (float)tx,
+                  (float)(g.ov_y + g.pad), shown, th->text);
+
+        char path[FILEPICK_PATH_MAX + FILEPICK_NAME_MAX + 2];
+        fp_join(filepick.dir, filepick.overwrite_name, path, sizeof(path));
+        fp_fit_tail(g.small, path, shown, sizeof(shown), (float)room);
+        font_draw(s, g.small, (float)tx,
+                  (float)(g.ov_y + g.pad + fp_line(g.title) + g.gap), shown,
+                  color_alpha(th->text, 0.62f));
+
+        const char *what = "Enter replaces it  \xC2\xB7  Esc keeps the old file";
+        fp_fit_head(g.small, what, shown, sizeof(shown), (float)room);
+        font_draw(s, g.small, (float)tx,
+                  (float)(g.ov_y + g.pad + fp_line(g.title) + g.gap + fp_line(g.small)),
+                  shown, color_alpha(th->text, 0.48f));
+
+        fp_button(s, g.ov_ok_x, g.ov_btn_y, g.ov_ok_w, g.ov_btn_h, 1,
+                  "Replace", g.small, th);
+        fp_button(s, g.ov_cancel_x, g.ov_btn_y, g.ov_cancel_w, g.ov_btn_h, 0,
+                  "Cancel", g.small, th);
+    }
+}
+
+/* MYSTIC_FILEPICK_DRAW_END */
+
+/* ------------------------------------------------------------ clicks */
+/* One press inside the dialog. Returns 1: the dialog consumed it. */
+static int filepick_click(int mx, int my, int buttons) {
+    if (!filepick.active) return 0;
+    FpGeom g;
+    fp_geom(screen.w, screen.h, &g);
+    if (!g.pw) return 1;
+    filepick.rows = g.rows;
+    if (!(buttons & 1)) return 1;              /* only the left button acts */
+
+    /* the overwrite question is modal over the dialog */
+    if (filepick.overwrite) {
+        int in_ok = mx >= g.ov_ok_x && mx < g.ov_ok_x + g.ov_ok_w &&
+                    my >= g.ov_btn_y && my < g.ov_btn_y + g.ov_btn_h;
+        int in_no = mx >= g.ov_cancel_x && mx < g.ov_cancel_x + g.ov_cancel_w &&
+                    my >= g.ov_btn_y && my < g.ov_btn_y + g.ov_btn_h;
+        if (in_ok) {
+            FpEvent ev = filepick_enter(&filepick);     /* the same Enter */
+            if (ev != FILEPICK_NONE) filepick_finish(ev);
+        } else if (in_no) {
+            filepick.overwrite = 0;
+            filepick.notice[0] = 0;
+            dirty = 1;
+        } else if (mx < g.ov_x || mx >= g.ov_x + g.ov_w ||
+                   my < g.ov_y || my >= g.ov_y + g.ov_h) {
+            filepick.overwrite = 0;                    /* clicked away: dismissed */
+            filepick.notice[0] = 0;
+            dirty = 1;
+        }
+        return 1;
+    }
+
+    if (mx < g.px || mx >= g.px + g.pw || my < g.py || my >= g.py + g.ph)
+        return 1;                                       /* outside: nothing */
+
+    /* Cancel, then the primary button */
+    if (my >= g.ok_y && my < g.ok_y + g.ok_h) {
+        if (mx >= g.ok_x && mx < g.ok_x + g.ok_w) {
+            FpEvent ev = filepick_enter(&filepick);
+            if (ev != FILEPICK_NONE) filepick_finish(ev);
+            return 1;
+        }
+        if (mx >= g.cancel_x && mx < g.ok_x - g.gap) {
+            filepick_finish(FILEPICK_CANCEL);
+            return 1;
+        }
+    }
+
+    /* the breadcrumb: jump to that ancestor */
+    if (my >= g.crumb_y && my < g.crumb_y + g.crumb_h) {
+        for (int i = 0; i < g.crumb_n; i++) {
+            if (mx < g.crumb_x0[i] || mx >= g.crumb_x1[i]) continue;
+            char to[FILEPICK_PATH_MAX];
+            int cut = g.crumb_cut[i];
+            if (cut < 1) cut = 1;
+            if (cut > (int)sizeof(to) - 1) cut = (int)sizeof(to) - 1;
+            memcpy(to, filepick.dir, (size_t)cut);
+            to[cut] = 0;
+            if (!to[0]) snprintf(to, sizeof(to), "%s", "/");
+            fp_goto(&filepick, to);
+            dirty = 1;
+            return 1;
+        }
+        return 1;
+    }
+
+    /* the Name field */
+    if (filepick.mode == FILEPICK_SAVE &&
+        mx >= g.name_x && mx < g.name_x + g.name_w &&
+        my >= g.name_y && my < g.name_y + g.name_h) {
+        filepick.name_focus = 1;
+        dirty = 1;
+        return 1;
+    }
+    filepick.name_focus = 0;
+
+    /* a row */
+    if (my >= g.list_y && my < g.list_bot) {
+        int vis = (my - g.list_y) / g.row_h;
+        int idx = filepick.scroll + vis;
+        if (vis < 0 || vis >= g.rows || idx >= filepick.nvis) return 1;
+        if (idx == filepick.sel) {
+            /* a second click on the selected row opens it, like Files */
+            FpEvent ev = filepick_open_selected(&filepick);
+            if (ev != FILEPICK_NONE) filepick_finish(ev);
+        } else {
+            filepick.sel = idx;
+            fp_clamp_scroll(&filepick);
+        }
+        dirty = 1;
+        return 1;
+    }
+    dirty = 1;
+    return 1;
+}
+
 static void draw_desktop(Surface *s, const Theme *th) {
     int W = s->w;
     (void)(s->h);
@@ -1731,6 +2594,10 @@ static void draw_desktop(Surface *s, const Theme *th) {
     /* the shortcut panel is above every window, and the lock screen is
      * above everything - it is a security boundary, not a decoration */
     if (help_open) shortcuts_draw_panel(s, th, topbar_h(), help_page);
+    /* the file picker is the desktop's modal dialog: above the launcher,
+     * the menu, the shortcut panel and every window, and below the lock
+     * screen - a locked desktop must not show the user's files */
+    if (filepick.active) filepick_draw(s, th, input.mouse_x, input.mouse_y);
     if (locked) draw_lock_screen(s, th);
 }
 
@@ -2410,6 +3277,9 @@ static void launcher_fit_tail(Font *f, const char *src, char *dst, size_t cap,
         p = q;
         if (font_width(f, p) + ew <= avail) break;
     }
+    /* not even the last codepoint fits beside the marker: draw the marker
+     * alone rather than overflow the field */
+    if (font_width(f, p) + ew > avail) { snprintf(dst, cap, "%s", ell); return; }
     snprintf(dst, cap, "%s%s", ell, p);
 }
 
@@ -4482,6 +5352,19 @@ static const ShortcutActions SHORTCUTS = { shortcut_action, NULL };
         static int handle_click(void) {
     int mx = input.mouse_x, my = input.mouse_y;
 
+    /* The file picker is the topmost thing on screen and a modal: it
+     * answers the press before the taskbar, before the start button and
+     * before any window. It never reports "not handled", so a click meant
+     * for the dialog cannot land behind it. */
+    if (filepick.active) {
+        int click_buttons = input.buttons;
+        if (input.shift) click_buttons |= 0x100;
+        if (input.ctrl)  click_buttons |= 0x200;
+        if (input.alt)   click_buttons |= 0x400;
+        filepick_click(mx, my, click_buttons);
+        return 1;
+    }
+
     /* A new press ends any drag that was extending something: the press
      * below either starts a new selection on a terminal or nothing at all. */
     term_sel_win = -1;
@@ -5107,6 +5990,19 @@ static void text_scale_store(float abs) {
 }
 
 static void gestures_apply(void) {
+    /* The file picker is modal for the trackpad too: a two-finger scroll
+     * moves its list, and a swipe or a tap must not rearrange windows or
+     * open the shortcut panel over the dialog. */
+    if (filepick.active) {
+        if (input.gesture == GESTURE_SCROLL && input.gesture_dy) {
+            int lines = input.gesture_dy / ui_px(24);
+            if (lines) {
+                filepick_wheel(&filepick, -lines);
+                dirty = 1;
+            }
+        }
+        return;
+    }
     int modal = launcher_open || help_open || menu_open;
 
     if (input.gesture_release) {
@@ -5452,6 +6348,35 @@ int main(int argc, char **argv) {
             input.text[0] = 0;
         }
 
+        /* The file picker owns the keyboard completely while it is up.
+         * This runs BEFORE the shortcut table (whose Esc row is SC_ALWAYS)
+         * and before any window, because a dialog is modal: no chord, no
+         * Super tap and no text may reach the desktop behind it. The keys
+         * arrive as the same bytes an app gets, so the state machine in
+         * src/filepick.h parses arrows, Home/End, PageUp/PageDown, Esc,
+         * Enter, Backspace, Tab and printable text exactly as the harness
+         * drives it. */
+        if (filepick.active && !locked) {
+            FpEvent ev = FILEPICK_NONE;
+            for (int ki = 0; ki < input.nkeys && ev == FILEPICK_NONE; ki++) {
+                char kb[64];
+                int kn = 0;
+                int m = (input.shift ? 1 : 0) | (input.alt ? 2 : 0) |
+                        (input.ctrl ? 4 : 0);
+                key_bytes_for(input.keys[ki], kb, &kn, m);
+                if (kn) ev = filepick_key(&filepick, kb, kn);
+            }
+            if (ev == FILEPICK_NONE && input.text_len > 0)
+                ev = filepick_key(&filepick, input.text, input.text_len);
+            input.nkeys = 0;
+            input.text_len = 0;
+            input.text[0] = 0;
+            super_down = 0;
+            super_lone = 0;
+            if (ev != FILEPICK_NONE) filepick_finish(ev);
+            dirty = 1;
+        }
+
         /* Every key pressed this frame, in order. Handling only the last one
          * collapsed fast bursts: five arrow presses registered as one. */
         for (int ki = 0; ki < input.nkeys; ki++) {
@@ -5642,7 +6567,8 @@ int main(int argc, char **argv) {
             /* a modal overlay owns the keyboard: nothing typed while the
              * launcher or the shortcut panel is up may reach the window
              * behind it */
-            Window *top = (launcher_open || help_open || menu_open) ? NULL : win_focused();
+            Window *top = (launcher_open || help_open || menu_open ||
+                           filepick.active) ? NULL : win_focused();
             if (top && input.text_len) {
                 if (top->term) {
                     term_scroll(top->term, -(term_scroll_offset(top->term)));
@@ -5659,7 +6585,12 @@ int main(int argc, char **argv) {
         }
 
         /* mouse */
-        if (input.wheel) {
+        if (filepick.active && input.wheel) {
+            /* the wheel over a dialog scrolls its list, never the window
+             * behind it */
+            filepick_wheel(&filepick, input.wheel);
+            dirty = 1;
+        } else if (input.wheel) {
             /* The wheel goes to whatever the pointer is over - any window,
              * not just terminals, and not only the focused one. */
             Window *under = window_under_pointer();
@@ -5794,6 +6725,11 @@ int main(int argc, char **argv) {
 
         /* the sandboxed apps' clipboard requests, if any arrived */
         clip_bridge_poll();
+
+        /* the open/save dialog: an app in this process writes
+         * /run/mystic/filepick.request, a sandboxed one writes the same
+         * file inside its jail's /tmp, and this answers either. */
+        filepick_service();
 
         /* A client that exited leaves its slot free; the window that was bound
          * to that slot must close with it, or the next client to take the slot

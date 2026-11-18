@@ -79,9 +79,133 @@ load_modules() {
     else
         echo "sound: no /proc/asound - kernel sound support not loaded"
     fi
-    for m in unused; do
-        :
+    load_hw_modules
+}
+
+# ------------------------------------------------------------
+# Webcam and USB microphone.
+#
+#  linux-virt ships no kernel/drivers/media and no kernel/sound/usb,
+#  so on the default image there is nothing to load and the only honest
+#  thing to say is that the hardware cannot work. linux-lts (./image.sh
+#  --hw) carries both trees; what is in the image is checked on the
+#  filesystem, not assumed, and every node reported below is read back
+#  from /dev or /sys afterwards.
+#
+#  MYSTIC_HWROOT is empty on a real boot, so every path below is absolute.
+#  It exists so tools-style hosts (a Windows build box) can point this code
+#  at a fake /dev,/sys,/proc tree and check the logic without a boot.
+# ------------------------------------------------------------
+is_dev() { [ -c "$1" ]; }
+
+load_hw_modules() {
+    HWROOT=${MYSTIC_HWROOT:-}
+    HW_TREE=0
+    [ -d "$HWROOT/lib/modules/$KV/kernel/drivers/media" ] && HW_TREE=1
+
+    if [ "$HW_TREE" = "1" ]; then
+        # Order matters only in that usbcore has to exist before usbhid;
+        # modprobe resolves the rest from modules.dep, which depmod wrote.
+        for m in usbcore usb-common xhci-hcd xhci-pci ehci-hcd ehci-pci \
+                 ohci-hcd ohci-pci uhci-hcd usbhid hid hid-generic \
+                 mc videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc \
+                 videobuf2-memops uvcvideo \
+                 snd snd-pcm snd-timer snd-hwdep snd-rawmidi snd-seq-device \
+                 snd-usbmidi-lib snd-usb-audio; do
+            modprobe "$m" 2>/dev/null
+        done
+        # A module that is in the tree but refuses to load is worth a line,
+        # and the reason has to be modprobe's own, not this script's guess.
+        mkdir -p "$HWROOT/tmp" 2>/dev/null
+        for m in uvcvideo snd-usb-audio; do
+            # /proc/modules spells a module with underscores (snd_usb_audio),
+            # modprobe takes either spelling: accept both or this reports a
+            # reload that never happened.
+            mu=$(echo "$m" | tr '-' '_')
+            if ! grep -q "^$m \|^$mu " "$HWROOT/proc/modules" 2>/dev/null; then
+                if modprobe "$m" 2>"$HWROOT/tmp/hw-modprobe.err"; then
+                    echo "hw: $m loaded on retry"
+                else
+                    echo "hw: modprobe $m failed: $(head -1 "$HWROOT/tmp/hw-modprobe.err" 2>/dev/null)"
+                fi
+            fi
+        done
+        # What is actually loaded now, for the report below. /proc/modules is
+        # the kernel's own answer, so a failed modprobe cannot be reported as
+        # a working driver.
+        HW_UVCLOADED=0
+        if grep -q '^uvcvideo ' "$HWROOT/proc/modules" 2>/dev/null; then HW_UVCLOADED=1; fi
+    else
+        HW_UVCLOADED=0
+    fi
+    hw_devices
+}
+
+# The device side: what appeared, what a jailed app may open, and - when
+# nothing appeared - which of the possible reasons it is.
+hw_devices() {
+    HWROOT=${MYSTIC_HWROOT:-}
+    if [ "$HW_TREE" = "1" ]; then
+        echo "hw: kernel = lts (drivers/media + sound/usb present)"
+    else
+        echo "hw: kernel = virt (no drivers/media and no sound/usb in this kernel)"
+    fi
+
+    # USB bus, straight from sysfs: one entry per root hub, one per device.
+    buses=$(ls -d "$HWROOT"/sys/bus/usb/devices/usb* 2>/dev/null | wc -l)
+    devs=$(ls -d "$HWROOT"/sys/bus/usb/devices/*-* 2>/dev/null | wc -l)
+    echo "hw: usb $buses bus(es), $devs device(s)"
+
+    # Cameras (V4L2 video nodes).
+    cam=0
+    for node in "$HWROOT"/dev/video*; do
+        is_dev "$node" || continue
+        cam=$((cam + 1))
+        name=$(cat "$HWROOT/sys/class/video4linux/$(basename "$node")/name" 2>/dev/null)
+        oldmode=$(ls -ld "$node" 2>/dev/null | cut -d' ' -f1)
+        if chmod 0666 "$node" 2>/dev/null; then
+            echo "hw: camera open to apps: $node ${name:+($name) }(was $oldmode)"
+        else
+            echo "hw: cannot chmod $node (was $oldmode)"
+        fi
     done
+    [ "$cam" = "0" ] && echo "hw: no /dev/video* node"
+
+    # Capture PCM nodes are reported, not opened. Playback nodes are 0666 so
+    # the Clock can beep; opening a microphone to every jailed app is a
+    # privacy decision, so this prints what exists and leaves the mode alone.
+    cap=0
+    for node in "$HWROOT"/dev/snd/pcmC*D*c; do
+        is_dev "$node" || continue
+        cap=$((cap + 1))
+        echo "hw: capture pcm: $node (mode $(ls -ld "$node" 2>/dev/null | cut -d' ' -f1), root-only for now)"
+    done
+    [ "$cap" = "0" ] && echo "hw: no /dev/snd/pcmC*D*c capture node"
+
+    # Raw USB device nodes (what a libusb app would open).
+    usbdev=0
+    for node in "$HWROOT"/dev/bus/usb/*/*; do
+        is_dev "$node" || continue
+        usbdev=$((usbdev + 1))
+        chmod 0666 "$node" 2>/dev/null
+    done
+    [ "$usbdev" != "0" ] && echo "hw: $usbdev raw usb device node(s) open to apps"
+
+    # One honest line of cause when there is nothing to open.
+    if [ "$cam" = "0" ] && [ "$cap" = "0" ]; then
+        if [ "$HW_TREE" != "1" ]; then
+            echo "hw: no webcam and no USB microphone: linux-virt has no V4L2 and no snd-usb-audio module"
+            echo "hw: this is a kernel limit, not a missing device - boot the linux-lts image (./image.sh --hw)"
+        elif [ "${HW_UVCLOADED:-0}" != "1" ]; then
+            echo "hw: no webcam and no USB microphone: the modules are in the image but uvcvideo did not load"
+            echo "hw:   the modprobe reason is printed above"
+        elif [ "$buses" = "0" ]; then
+            echo "hw: no webcam and no USB microphone: uvcvideo loaded, but the kernel has no USB bus"
+        else
+            echo "hw: no webcam and no USB microphone: uvcvideo is loaded and $buses usb bus(es) exist,"
+            echo "hw:   but no UVC camera and no USB audio device is attached to them"
+        fi
+    fi
 }
 
 setup_net() {
@@ -660,6 +784,32 @@ probe() {
     for d in /sys/class/input/event*; do
         [ -e "$d/device/name" ] && echo "  $(cat "$d/device/name")"
     done
+
+    # Webcam and microphone: the same facts load_hw_modules printed, but
+    # inside the probe block so `./image.sh --hw probe` shows them too.
+    echo "cameras  :"
+    n=0
+    for node in /dev/video*; do
+        [ -c "$node" ] || continue
+        n=$((n + 1))
+        echo "  $node: $(cat "/sys/class/video4linux/$(basename "$node")/name" 2>/dev/null)"
+        # The USB identity the driver bound to, straight out of sysfs.
+        devlink=$(readlink -f "/sys/class/video4linux/$(basename "$node")/device" 2>/dev/null)
+        [ -n "$devlink" ] && echo "    device: $devlink"
+    done
+    [ "$n" = "0" ] && echo "  none"
+    echo "  v4l2 modules: $(awk '$1 ~ /^(videodev|uvcvideo|mc)$/ || $1 ~ /^videobuf2_/ {printf "%s ", $1}' /proc/modules)"
+
+    echo "capture  :"
+    n=0
+    for node in /dev/snd/pcmC*D*c; do
+        [ -c "$node" ] || continue
+        n=$((n + 1))
+        echo "  $node"
+    done
+    [ "$n" = "0" ] && echo "  none"
+    echo "  usb audio modules: $(awk '$1 ~ /^(snd_usb_audio|snd_usbmidi_lib)$/ {printf "%s ", $1}' /proc/modules)"
+    echo "  usb bus: $(ls -d /sys/bus/usb/devices/usb* 2>/dev/null | wc -l) bus(es), $(ls -d /sys/bus/usb/devices/*-* 2>/dev/null | wc -l) device(s)"
 
     if [ -d /root ] && mountpoint -q /root 2>/dev/null; then
         n=$(cat /root/boots.txt 2>/dev/null || echo 0)

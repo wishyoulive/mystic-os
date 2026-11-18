@@ -130,7 +130,7 @@ capability is on the record.
 `.work/gestures/` (host harnesses, not shipped):
 
 * `harness.c` `#include`s the shipping `src/input.c` and feeds real
-  `<linux/input.h>` packets through `handle_event()`: 102 checks covering a
+  `<linux/input.h>` packets through `handle_event()`: 108 checks covering a
   40 px two-finger scroll, a 100→160 px pinch, three-finger swipes up and
   left, two-finger taps (together and finger-by-finger), 3 px of jitter, the
   plain-mouse fallback, `BTN_TOOL_*` consumption and per-finger deltas.
