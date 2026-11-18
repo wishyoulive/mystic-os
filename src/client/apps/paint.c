@@ -656,7 +656,7 @@ static int png_read_file(const char *path, u32 *dst, int dw, int dh,
             snprintf(err, esz, "%s: CRC mismatch in the %.4s chunk", path, (const char *)type);
             goto done;
         }
-        int revieweral = type[0] >= 'A' && type[0] <= 'Z';
+        int general = type[0] >= 'A' && type[0] <= 'Z';
         if (!memcmp(type, "IHDR", 4)) {
             if (clen != 13) { snprintf(err, esz, "IHDR is %u bytes, not 13", clen); goto done; }
             W = (int)be32(data);
@@ -697,8 +697,8 @@ static int png_read_file(const char *path, u32 *dst, int dw, int dh,
             if (bytes_add(&idat, data, clen) < 0) { snprintf(err, esz, "out of memory collecting IDAT"); goto done; }
         } else if (!memcmp(type, "IEND", 4)) {
             have_iend = 1;
-        } else if (revieweral) {
-            snprintf(err, esz, "revieweral chunk %.4s is not supported", (const char *)type);
+        } else if (general) {
+            snprintf(err, esz, "general chunk %.4s is not supported", (const char *)type);
             goto done;
         }
         p += 12u + clen;

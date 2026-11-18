@@ -1533,8 +1533,18 @@ static int sandbox_prepare(const SbxPlan *p, char *err, size_t errn) {
     for (int i = 0; i < p->nstep; i++) {
         const SbxStep *s = &p->step[i];
         if (s->where != SBX_PARENT) continue;
-        if (strncmp(s->dst, anchor, al) != 0 ||
-            (s->dst[al] != 0 && s->dst[al] != '/')) {
+        /* One parent step legitimately points elsewhere: the appdata chown,
+         * which targets /root/appdata/<id>. Everything else must be inside
+         * the jail anchor. This check refused every launch until it allowed
+         * that one case - the plan was right, the guard was too strict. */
+        if (s->op == SBX_CHOWN) {
+            if (strncmp(s->dst, "/root/appdata/", 14) != 0) {
+                snprintf(err, errn, "sandbox step %d: refusing to chown outside appdata: %.80s",
+                         i + 1, s->dst);
+                return -1;
+            }
+        } else if (strncmp(s->dst, anchor, al) != 0 ||
+                   (s->dst[al] != 0 && s->dst[al] != '/')) {
             snprintf(err, errn, "sandbox step %d points outside %s", i + 1, anchor);
             return -1;
         }
@@ -1598,10 +1608,14 @@ static int sbx_step_child(const SbxPlan *p, const SbxStep *s, char *err, size_t 
         int want_dir = stat(s->src, &st) == 0 && S_ISDIR(st.st_mode);
         if (sbx_walk(p->jail, s->dst, want_dir, s->mode, tgt, sizeof(tgt), err, errn) != 0)
             return -1;
-        unsigned long flags = MS_BIND | (s->ro ? MS_RDONLY : 0);
-        if (mount(s->src, tgt, NULL, flags, NULL) != 0) {
-            snprintf(err, errn, "mount %s%s on %s: %s", s->ro ? "--bind,ro " : "--bind ",
-                     s->src, tgt, strerror(errno));
+        if (mount(s->src, tgt, NULL, MS_BIND, NULL) != 0) {
+            snprintf(err, errn, "mount --bind %s on %s: %s", s->src, tgt, strerror(errno));
+            return -1;
+        }
+        if (s->ro &&
+            mount(NULL, tgt, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) != 0) {
+            /* second pass: MS_RDONLY on the initial bind is ignored */
+            snprintf(err, errn, "remount,ro %s: %s", tgt, strerror(errno));
             return -1;
         }
         return 0;
@@ -1615,8 +1629,15 @@ static int sbx_step_child(const SbxPlan *p, const SbxStep *s, char *err, size_t 
         return 0;
     case SBX_PROC_RO:
         if (sbx_walk(p->jail, s->dst, 1, 0755, tgt, sizeof(tgt), err, errn) != 0) return -1;
-        if (mount("/proc", tgt, NULL, MS_BIND | MS_RDONLY, NULL) != 0) {
-            snprintf(err, errn, "mount --bind,ro /proc %s: %s", tgt, strerror(errno));
+        if (mount("/proc", tgt, NULL, MS_BIND, NULL) != 0) {
+            snprintf(err, errn, "mount --bind /proc %s: %s", tgt, strerror(errno));
+            return -1;
+        }
+        /* A read-only flag on the initial bind is IGNORED by Linux; read-only
+         * requires a second, remount pass. Without this an app with procs=yes
+         * that was promised a read-only /proc actually got a writable one. */
+        if (mount(NULL, tgt, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) != 0) {
+            snprintf(err, errn, "remount,ro /proc %s: %s", tgt, strerror(errno));
             return -1;
         }
         return 0;

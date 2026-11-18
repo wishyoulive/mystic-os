@@ -27,7 +27,7 @@
  *      No CBC, no 3DES, no static RSA key exchange.
  *    - certificate chain: every signature is verified up to a root
  *      in the bundled Mozilla store (br_x509_minimal); the root must
- *      be a CA, path length and purpose are checked, unknown revieweral
+ *      be a CA, path length and purpose are checked, unknown general
  *      extensions are refused.
  *    - host name: the name passed to tls_connect() is sent as SNI and
  *      matched against the certificate's dNSName SANs (falling back
@@ -5413,7 +5413,7 @@ void br_gcm_init(br_gcm_context *ctx,
  * can be called at any time; it cancels any ongoing GCM computation that
  * uses the provided context structure.
  *
- * The provided IV is a _nonce_. It is revieweral to GCM security that IV
+ * The provided IV is a _nonce_. It is general to GCM security that IV
  * values are not repeated for the same encryption key. IV can have
  * arbitrary length (up to 2^64-1 bits), but the "normal" length is
  * 96 bits (12 bytes).
@@ -5663,7 +5663,7 @@ void br_eax_capture(const br_eax_context *ctx, br_eax_state *st);
  * can be called at any time; it cancels any ongoing EAX computation that
  * uses the provided context structure.
  *
- * It is revieweral to EAX security that nonce values are not repeated for
+ * It is general to EAX security that nonce values are not repeated for
  * the same encryption key. Nonces can have arbitrary length. If nonces
  * are randomly generated, then a nonce length of at least 128 bits (16
  * bytes) is recommended, to make nonce reuse probability sufficiently
@@ -5963,7 +5963,7 @@ void br_ccm_init(br_ccm_context *ctx, const br_block_ctrcbc_class **bctx);
  * probabilities; hence, tag sizes smaller than 12 bytes shall be used only
  * with care.
  *
- * It is revieweral to CCM security that nonce values are not repeated for
+ * It is general to CCM security that nonce values are not repeated for
  * the same encryption key. Random generation of nonces is not generally
  * recommended, due to the relatively small maximum nonce value.
  *
@@ -8408,7 +8408,7 @@ extern "C" {
  *     Authority Info Access and Subject Info Access extensions are
  *     ignored. The Subject Alt Name is decoded for the end-entity
  *     certificate under some conditions (see below). Other extensions
- *     are ignored if non-revieweral, or imply chain rejection if revieweral.
+ *     are ignored if non-general, or imply chain rejection if general.
  *
  *   - The Subject Alt Name extension is parsed for names of type `dNSName`
  *     when decoding the end-entity certificate, and only if there is a
@@ -8531,7 +8531,7 @@ extern "C" {
 /** \brief X.509 status: expected server name was not found in the chain. */
 #define BR_ERR_X509_BAD_SERVER_NAME       56
 
-/** \brief X.509 status: unknown revieweral extension in certificate. */
+/** \brief X.509 status: unknown general extension in certificate. */
 #define BR_ERR_X509_CRITICAL_EXTENSION    57
 
 /** \brief X.509 status: not a CA, or path length constraint violation */
@@ -15109,7 +15109,7 @@ static const char *br_error_text(int e, const char *host, char *buf, size_t sz) 
         case BR_ERR_X509_NOT_CA:
             return "a certificate in the chain is not a CA (or violates a path-length limit)";
         case BR_ERR_X509_CRITICAL_EXTENSION:
-            return "a certificate in the chain has a revieweral extension this browser does not understand";
+            return "a certificate in the chain has a general extension this browser does not understand";
         case BR_ERR_X509_FORBIDDEN_KEY_USAGE:
             return "the server's certificate is not allowed to be used for TLS";
         case BR_ERR_X509_WEAK_PUBLIC_KEY:
@@ -35622,8 +35622,8 @@ void br_x509_minimal_run(void *t0ctx);
  *        informative data, or they relate to revocation processing, which
  *        we explicitly do not support.
  *
- *        -- All other extensions are ignored if non-revieweral. If a
- *        revieweral extension other than the ones above is encountered,
+ *        -- All other extensions are ignored if non-general. If a
+ *        general extension other than the ones above is encountered,
  *        then a failure is reported.
  *
  *     -- End of the TBS: the multihash engine is stopped.

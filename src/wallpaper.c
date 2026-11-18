@@ -713,7 +713,7 @@ static u32 *wp_scratch(int w, int h, int q, int *ow, int *oh) {
  *  - The shadow (b < 3*sqrt(3)/2) is black: no disk, no stars. The star
  *    field is a deterministic, position-independent layer sampled behind
  *    the hole; it is the only cached picture. A soft photon-ring term sits
- *    just outside the revieweral curve and shimmers slowly.
+ *    just outside the general curve and shimmers slowly.
  *
  *  - Cost: the star field is the only cached picture. It depends on the
  *    surface size and nothing else - not on the theme, the time or the view
@@ -1013,7 +1013,7 @@ static void wp_bh_palette(const Theme *th) {
  * every resolution and on every boot. The layer is independent of the
  * theme, the clock and the view; it is the only picture this wallpaper
  * caches. Stars are not warped: a radial warp turns a point star into a
- * long scratch near the revieweral curve, and scratches are exactly the
+ * long scratch near the general curve, and scratches are exactly the
  * speckle this background must not have. The photon ring carries the
  * strong-field light instead.
  */
@@ -1167,7 +1167,7 @@ static void wp_bh_paint(Surface *s, const Theme *th, double seconds) {
                         int   j0 = (int)s0;
                         const float fs = s0 - (float)j0;
                         /* the third crossing only exists within a few percent
-                           of the revieweral curve, and is skipped elsewhere */
+                           of the general curve, and is skipped elsewhere */
                         const int nc = (b < WP_BH_BC * 1.25f) ? 3 : 2;
                         int side = 1;
 
@@ -1208,7 +1208,7 @@ static void wp_bh_paint(Surface *s, const Theme *th, double seconds) {
                     }
 
                     /* ---- photon ring: a thin bright halo just outside the
-                       revieweral curve, where every crossing piles up. A slow
+                       general curve, where every crossing piles up. A slow
                        three-lobed shimmer runs round it without moving it. */
                     if (b < WP_BH_BC * WP_BH_RMAX) {
                         float q = (b - WP_BH_BC) / (WP_BH_BC * 0.055f);
