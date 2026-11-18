@@ -1356,10 +1356,12 @@ typedef struct {
     int         in_title;
     int         skip;            /* inside <script>/<style>       */
     int         in_style;        /* collecting a <style> body     */
+    const CssSheet *sheet;       /* the page's cascade            */
     char       *css;             /* where that text is collected  */
     size_t      css_cap;
     size_t     *css_len;
     int         level;           /* 0 body, 1..6 heading          */
+    int         css_size;        /* px from CSS, 0 = use the level */
     int         prev_level;      /* level of the last atom emitted; its
                                   * AF_BREAK decides the gap below it */
     int         in_link;         /* link index, -1 when outside   */
@@ -1371,6 +1373,8 @@ typedef struct {
     int         overflow;        /* a cap was hit                 */
 } Html;
 
+static int level_for_px(int px);   /* defined with the other style helpers */
+
 static void html_atom(Html *h, const char *text, long len, int flags, int link) {
     Doc *d = h->d;
     if (len <= 0) return;
@@ -1379,7 +1383,8 @@ static void html_atom(Html *h, const char *text, long len, int flags, int link) 
     Atom *a = &d->atom[d->natom++];
     memcpy(a->text, text, (size_t)len);
     a->text[len] = 0;
-    a->level = (u8)h->level;
+    /* A page's own font-size wins over the tag's default level. */
+    a->level = (u8)(h->css_size ? level_for_px(h->css_size) : h->level);
     a->flags = (u8)flags;
     int gap = 0;
     if (flags & AF_BREAK) {
@@ -1612,7 +1617,18 @@ static void html_tag(Html *h, const Tag *t) {
             return;
         }
         if (!strcmp(n, "li")) { html_break(h, GAP_LI_D); return; }
-        if (!strcmp(n, "p")) { html_break(h, GAP_BLOCK_D); return; }
+        if (!strcmp(n, "p")) {
+            /* CSS decides the space above a paragraph and its text size.
+             * The size is mapped onto the renderer's level table (24/20/17/
+             * 15/13/12 px), which is how a heading can be any size a page
+             * asks for rather than only the six HTML defaults. */
+            CssStyle cs = css_for(h->sheet, "p", NULL, NULL, NULL);
+            int gap = GAP_BLOCK_D;
+            if (cs.set & CSS_SET_MARGIN_TOP) gap = cs.margin_top;
+            h->css_size = (cs.set & CSS_SET_FONT_SIZE) ? cs.font_size : 0;
+            html_break(h, gap);
+            return;
+        }
         if (!strcmp(n, "td") || !strcmp(n, "th")) { html_end_word(h, 0); h->pending_space = 1; return; }
         if (is_block_tag(n)) { html_break(h, GAP_BLOCK_D); return; }
     }
@@ -1678,7 +1694,8 @@ static void html_tag(Html *h, const Tag *t) {
  * (possibly empty). Returns the number of links found. */
 static int html_build(Doc *d, const char *s, long n, const Url *base,
                       int latin1, char *title, size_t title_cap,
-                      char *css, size_t css_cap, size_t *css_len) {
+                      char *css, size_t css_cap, size_t *css_len,
+                      const CssSheet *sheet) {
     d->natom = 0;
     d->nseg = 0;
     d->nline = 0;
@@ -1696,6 +1713,7 @@ static int html_build(Doc *d, const char *s, long n, const Url *base,
     h.title_cap = title_cap;
     h.latin1 = latin1;
     h.in_link = -1;
+    h.sheet = sheet;
     h.css = css;
     h.css_cap = css_cap;
     h.css_len = css_len;
@@ -1883,6 +1901,18 @@ static int line_at(const Doc *d, u32 y) {
  *  font_width() of the same Lato faces that draw the glyphs, so a
  *  line that fits here fits on screen.
  * ============================================================ */
+/* Map an absolute CSS font-size onto the renderer's level table. The table
+ * is what every measurement and every glyph uses, so a page asking for 30px
+ * headings gets them through the same code path as <h1>. */
+static int level_for_px(int px) {
+    if (px >= 22) return 1;      /* 24 */
+    if (px >= 19) return 2;      /* 20 */
+    if (px >= 16) return 3;      /* 17 */
+    if (px >= 14) return 4;      /* 15 */
+    if (px >= 13) return 5;      /* 13 */
+    return 0;                    /* 12 */
+}
+
 static int style_size(int level) {
     static const int sizes[7] = { 12, 24, 20, 17, 15, 13, 12 };
     if (level < 0 || level > 6) level = 0;
@@ -2845,11 +2875,22 @@ static void web_load(Web *w) {
     snprintf(w->charset, sizeof(w->charset), "%s", f.charset);
 
     char title[WEB_TITLE_MAX];
-    w->css_ready = 0;
+    /* nothing to parse yet: the sheet is filled by css_apply() and the
+     * parser reads it through the same struct, so block tags can ask for
+     * their size and margin as they are met */
+    /* Two passes, because <style> lives in <head> and the block tags in
+     * <body> need to know their size and margin as they are met. The first
+     * pass collects the stylesheet only; the sheet is then parsed and the
+     * second pass lays out with it. */
+    memset(&w->sheet, 0, sizeof(w->sheet));
     size_t css_len = 0;
-    html_build(&w->doc, f.body, f.body_len, &w->cur, f.latin1, title, sizeof(title),
-               w->css_raw, sizeof(w->css_raw), &css_len);
+    Doc scratch;
+    html_build(&scratch, f.body, f.body_len, &w->cur, f.latin1, title, sizeof(title),
+               w->css_raw, sizeof(w->css_raw), &css_len, NULL);
+    if (css_len) css_parse(w->css_raw, css_len, &w->sheet);
     css_apply(w);
+    html_build(&w->doc, f.body, f.body_len, &w->cur, f.latin1, title, sizeof(title),
+               w->css_raw, sizeof(w->css_raw), &css_len, &w->sheet);
     snprintf(w->title, sizeof(w->title), "%s", title);
 
     w->scroll = 0;
