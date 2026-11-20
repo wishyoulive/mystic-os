@@ -569,7 +569,7 @@ static void collect_lib_dirs(const char *base, int depth, char *out, size_t cap)
 
 static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
                         int mute_audio, char *err, size_t esz) {
-    char exe[512], libdir[640], size[64];
+    char exe[512], libdir[640], size[64], loader[600];
     char *argv[32];
     int in[2] = {-1, -1}, out[2] = {-1, -1}, errp[2] = {-1, -1};
     int n = 0;
@@ -585,6 +585,8 @@ static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
     }
     collect_lib_dirs(bundle, 0, libdir, sizeof libdir);
     if (!libdir[0]) snprintf(libdir, sizeof(libdir), "%s/usr/lib:%s/lib", bundle, bundle);
+    snprintf(loader, sizeof(loader), "%s/lib/ld-musl-x86_64.so.1", bundle);
+    if (access(loader, X_OK) != 0)
     snprintf(size, sizeof(size), "--window-size=%dx%d", page_w, page_h);
 
     if (pipe(in) != 0 || pipe(out) != 0 || pipe(errp) != 0) {
@@ -665,8 +667,13 @@ static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
             p4[b > 0 ? b : 0] = 0;
             fprintf(stderr, "engineview: exec %s fd3=%s fd4=%s\n", exe, p3, p4);
         }
+        /* The binary is exec'd directly: chromium re-execs
+         * /proc/self/exe for its child processes, so starting it through
+         * the loader would make every child restart the loader with no
+         * arguments ("GPU process launch failed"). The package rewrites
+         * PT_INTERP to /app/ld-musl-x86_64.so.1, which exists in the jail. */
         execv(exe, argv);
-        fprintf(stderr, "engineview: execv %s: %s\n", exe, strerror(errno));
+        fprintf(stderr, "engineview: execv %s: %s\n", loader, strerror(errno));
         _exit(127);
     }
 
@@ -1091,6 +1098,12 @@ static int engine_pump(Page *p, Engine *e, Rx *rx, long *last_rx_ms) {
         }
         if (n == 0) {
             e->alive = 0;
+            /* Drain what the child wrote before it died: without
+             * this the reason it exited is lost, because the exit is
+             * observed before the frame loop ever reads the pipe. */
+            engine_note_stderr(e);
+            if (e->stderr_len)
+                fprintf(stderr, "engine: %s\n", engine_last_stderr(e));
             snprintf(p->state, sizeof(p->state), "engine exited");
             return frames;
         }
@@ -1390,7 +1403,9 @@ int main(int argc, char **argv) {
         snprintf(p.state, sizeof(p.state), "no engine");
     } else {
         char loader[560];
-        snprintf(loader, sizeof(loader), "%s/ld-musl-x86_64.so.1", bundle);
+        snprintf(loader, sizeof(loader), "%s/lib/ld-musl-x86_64.so.1", bundle);
+        if (access(loader, R_OK) != 0)
+            snprintf(loader, sizeof(loader), "%s/ld-musl-x86_64.so.1", bundle);
         if (access(loader, R_OK) != 0) {
             snprintf(err, sizeof(err),
                      "the bundle has no %s, and the jail has no /lib: the "

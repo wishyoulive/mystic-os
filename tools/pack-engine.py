@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import io
 import hashlib
 import os
 import sys
@@ -24,6 +25,39 @@ import time
 # where a file of that name exists, so the whole closure bin/ tree is dropped:
 # nothing in it is needed to run the engine, which lives under usr/lib.
 SKIP_AT_ROOT = {"chromium", "manifest", ".pkg-name", ".pkg-version", "bin"}
+
+
+def retarget_interp(blob):
+    """Point the engine's PT_INTERP at the bundle root as the jail mounts it.
+
+    Chromium re-execs /proc/self/exe for its child processes (zygote, GPU,
+    network). Starting it through the loader would make /proc/self/exe the
+    loader, so every child restarts the loader with no arguments and dies -
+    which is exactly "GPU process launch failed: error_code=1002". Executing the
+    binary directly keeps /proc/self/exe the browser, and then its interpreter
+    must exist inside the jail, where /lib is not mounted. The bundle is at
+    /app, so the loader ships at the bundle root and the string becomes /app/...,
+    the same length as /lib/... and writable in place.
+    """
+    import struct
+    data = bytearray(blob)
+    if data[:4] != b"\x7fELF" or data[4] != 2:
+        return blob, None
+    phoff = struct.unpack_from("<Q", data, 0x20)[0]
+    phentsize = struct.unpack_from("<H", data, 0x36)[0]
+    phnum = struct.unpack_from("<H", data, 0x38)[0]
+    for i in range(phnum):
+        off = phoff + i * phentsize
+        if struct.unpack_from("<I", data, off)[0] != 3:
+            continue
+        start = struct.unpack_from("<Q", data, off + 0x08)[0]
+        size = struct.unpack_from("<Q", data, off + 0x20)[0]
+        cur = bytes(data[start:start + size]).split(b"\x00")[0]
+        if cur.startswith(b"/lib/"):
+            data[start:start + 5] = b"/app/"
+            return bytes(data), cur.decode()
+        return blob, cur.decode()
+    return blob, None
 
 
 def main():
@@ -70,11 +104,24 @@ def main():
             if not name or name.split("/")[0] in SKIP_AT_ROOT:
                 skipped += 1
                 continue
+            if ti.isreg() and name == "usr/lib/chromium/chromium-headless-shell":
+                blob, old_interp = retarget_interp(src.extractfile(ti).read())
+                ti.size = len(blob)
+                dst.addfile(ti, io.BytesIO(blob))
+                print("interp: %s -> /app%s" % (old_interp, old_interp[4:]))
+                n_files += 1
+                continue
             dst.addfile(ti, src.extractfile(ti) if ti.isreg() else None)
             if ti.issym() or ti.islnk():
                 n_links += 1
             else:
                 n_files += 1
+
+        loader_src = os.path.join(here, "stage", "lib", "ld-musl-x86_64.so.1")
+        if not os.path.exists(loader_src):
+            sys.exit("missing %s (the image ships it)" % loader_src)
+        add_path("ld-musl-x86_64.so.1", loader_src)
+        n_files += 1
 
         for extra, text in ((".pkg-name", "engine\n"),
                             (".pkg-version", args.version + "\n")):

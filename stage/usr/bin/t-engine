@@ -1,0 +1,11 @@
+#!/bin/sh
+# Diagnostic: run the installed engine through the bundle's own loader with the
+# same library path the viewer builds (every directory holding a shared object).
+B=/root/apps/engine
+LP="$B/usr/lib:$B/lib"
+for d in "$B"/usr/lib/*/; do LP="$LP:$d"; done
+echo "libdir: $LP"
+export LD_LIBRARY_PATH="$LP"
+exec "$B/lib/ld-musl-x86_64.so.1" --library-path "$LP" \
+     "$B/usr/lib/chromium/chromium-headless-shell" --headless --no-sandbox \
+     --dump-dom about:blank
