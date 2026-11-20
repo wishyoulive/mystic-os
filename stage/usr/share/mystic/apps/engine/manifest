@@ -1,0 +1,8 @@
+name = Browser Engine
+desc = Chromium 156 rendering through the DevTools protocol
+exec = bin
+version = 156.0.8078.79
+network = host
+bundle = engine
+placeholder = yes
+procs = yes

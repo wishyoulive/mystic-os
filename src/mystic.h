@@ -116,6 +116,12 @@ typedef enum {
 typedef struct {
     int   mouse_x, mouse_y;
     int   mouse_dx, mouse_dy;
+    /* An absolute pointing device reports in its own units: a USB tablet uses
+     * 0..32767 and a touchscreen uses its panel's pixel grid. Both must be
+     * mapped to this screen, and the driver that reports the range is the only
+     * one that knows it, so it is read once at open and scaled here. */
+    int   abs_max_x, abs_max_y;
+    int   scr_w, scr_h;
     int   buttons;          /* bit0 left, bit1 right, bit2 middle */
     int   clicked, released;
     int   clicked2;         /* a second press within 350ms and 6px */
@@ -354,6 +360,7 @@ void   disp_bench_report(int src_w, int src_h, int dst_w, int dst_h);
  * in the device's own units and are delivered as pixels, the same
  * convention ABS_X already had in src/input.c. */
 int  input_open(Input *in);
+void input_set_screen(Input *in, int w, int h);
 int  input_poll(Input *in);        /* fills Input for this frame; returns 1 if anything happened */
 void input_frame(Input *in);       /* clear per-frame fields */
 

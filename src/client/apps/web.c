@@ -92,7 +92,13 @@
  * pulled in only where the socket layer exists, so the host test builds
  * stay socket-free. */
 #include "../tls.c"
-#include "../../img.c"
+/* img.c is NOT included here: tools/mkapp.sh links src/img.c into every
+ * external app, so a second copy in this translation unit defines
+ * img_sniff()/img_format_name()/img_decode()/img_scale_fit() twice and the
+ * app stops linking (measured: ld.lld "duplicate symbol: img_sniff, defined
+ * at web.c and at img.c"). img.h above is the API; the implementation comes
+ * from the link line. A host harness that includes this file must provide
+ * img.c itself, which is what the harnesses in .work/w2 do. */
 #include "../../css.c"
 #endif
 
@@ -351,6 +357,15 @@ typedef struct {
     char url[WEB_PATH_MAX];
 } Link;
 
+/* The atom range a <label> owns. A click on the label's own text belongs to
+ * the control inside it, which is what makes `<label>User <input></label>`
+ * focus the field when the word is clicked - the behaviour every form on
+ * the web relies on. The control is found by its atom index, so a label that
+ * wraps two controls resolves to the first one, as a browser does. */
+typedef struct {
+    u16 atom_start, atom_end;         /* [start, end) in Doc.atom      */
+} Label;
+
 /* Every stylesheet the document references, in document order: either a
  * <style> element's text (an offset into the collected buffer) or an
  * external <link rel=stylesheet> still to be fetched. The browser walks
@@ -390,6 +405,7 @@ typedef struct {
  * rather than pretending the method was honoured. */
 #define WEB_MAX_CTLS     48
 #define WEB_MAX_FORMS    8
+#define WEB_MAX_LABELS   32
 #define WEB_CTL_TEXT     96
 /* One textarea wraps its content into this many visual rows. The value
  * buffer is WEB_CTL_TEXT bytes, so this can never be the limit that
@@ -530,6 +546,8 @@ typedef struct {
     int   nctl;
     Form  form[WEB_MAX_FORMS];
     int   nform;
+    Label label[WEB_MAX_LABELS];
+    int   nlabel;
     u32  doc_h;
     int  truncated;                  /* a cap was hit; say so in the footer */
     PageImg img[WEB_MAX_IMGS];
@@ -1712,41 +1730,72 @@ static int parse_tag(const char *s, long n, long *used, Tag *t) {
                        s[i] != '\n' && s[i] != '>') i++;
                 vl = i - vs;
             }
-            if (!strcmp(an, "href") && vl < (long)sizeof(t->href)) {
-                memcpy(t->href, s + vs, (size_t)vl);
-                t->href[vl] = 0;
-            } else if (!strcmp(an, "alt") && vl < (long)sizeof(t->alt)) {
-                memcpy(t->alt, s + vs, (size_t)vl);
-                t->alt[vl] = 0;
-            } else if (!strcmp(an, "src") && vl < (long)sizeof(t->src)) {
-                memcpy(t->src, s + vs, (size_t)vl);
-                t->src[vl] = 0;
-            } else if (!strcmp(an, "class") && vl < (long)sizeof(t->cls)) {
-                memcpy(t->cls, s + vs, (size_t)vl);
-                t->cls[vl] = 0;
-            } else if (!strcmp(an, "id") && vl < (long)sizeof(t->id)) {
-                memcpy(t->id, s + vs, (size_t)vl);
-                t->id[vl] = 0;
-            } else if (!strcmp(an, "rel") && vl < (long)sizeof(t->rel)) {
-                memcpy(t->rel, s + vs, (size_t)vl);
-                t->rel[vl] = 0;
-            } else if (!strcmp(an, "media") && vl < (long)sizeof(t->media)) {
-                memcpy(t->media, s + vs, (size_t)vl);
-                t->media[vl] = 0;
-            } else if (!strcmp(an, "style") && vl < (long)sizeof(t->style)) {
+            /* An attribute value is HTML text: decode its character
+             * references once, here. Without this `value="a&amp;b"`
+             * submitted the six literal characters and
+             * `action="/s?a=1&amp;b=2"` requested "&amp;" as part of
+             * the query, which no server expects. A bare '&' that is not
+             * a reference is copied as it is. */
+            char aval[WEB_PATH_MAX];
+            const char *vp = s + vs;
+            long vlen = vl;
+            if (vl > 0) {
+                long o = 0;
+                for (long k = 0; k < vl; ) {
+                    if (s[vs + k] == '&') {
+                        char dec[8];
+                        long used = 0, outlen = 0;
+                        if (entity_decode(s + vs + k, vl - k, dec, sizeof dec,
+                                          &used, &outlen)) {
+                            for (long m = 0;
+                                 m < outlen && o < (long)sizeof aval - 1; m++)
+                                aval[o++] = dec[m];
+                            k += used;
+                            continue;
+                        }
+                    }
+                    if (o < (long)sizeof aval - 1) aval[o++] = s[vs + k];
+                    k++;
+                }
+                aval[o] = 0;
+                vp = aval;
+                vlen = o;
+            }
+            if (!strcmp(an, "href") && vlen < (long)sizeof(t->href)) {
+                memcpy(t->href, vp, (size_t)vlen);
+                t->href[vlen] = 0;
+            } else if (!strcmp(an, "alt") && vlen < (long)sizeof(t->alt)) {
+                memcpy(t->alt, vp, (size_t)vlen);
+                t->alt[vlen] = 0;
+            } else if (!strcmp(an, "src") && vlen < (long)sizeof(t->src)) {
+                memcpy(t->src, vp, (size_t)vlen);
+                t->src[vlen] = 0;
+            } else if (!strcmp(an, "class") && vlen < (long)sizeof(t->cls)) {
+                memcpy(t->cls, vp, (size_t)vlen);
+                t->cls[vlen] = 0;
+            } else if (!strcmp(an, "id") && vlen < (long)sizeof(t->id)) {
+                memcpy(t->id, vp, (size_t)vlen);
+                t->id[vlen] = 0;
+            } else if (!strcmp(an, "rel") && vlen < (long)sizeof(t->rel)) {
+                memcpy(t->rel, vp, (size_t)vlen);
+                t->rel[vlen] = 0;
+            } else if (!strcmp(an, "media") && vlen < (long)sizeof(t->media)) {
+                memcpy(t->media, vp, (size_t)vlen);
+                t->media[vlen] = 0;
+            } else if (!strcmp(an, "style") && vlen < (long)sizeof(t->style)) {
                 /* The inline style is applied to the element's resolved
                  * style in html_elem_push(), as the author's last word. */
-                memcpy(t->style, s + vs, (size_t)vl);
-                t->style[vl] = 0;
+                memcpy(t->style, vp, (size_t)vlen);
+                t->style[vlen] = 0;
             } else if (!strcmp(an, "align")) {
-                if (ci_eq(s + vs, vl, "center")) t->align = 1;
-                else if (ci_eq(s + vs, vl, "right")) t->align = 2;
-                else if (ci_eq(s + vs, vl, "justify")) t->align = 3;
+                if (ci_eq(vp, vlen, "center")) t->align = 1;
+                else if (ci_eq(vp, vlen, "right")) t->align = 2;
+                else if (ci_eq(vp, vlen, "justify")) t->align = 3;
             } else if (!strcmp(an, "colspan") || !strcmp(an, "rowspan")) {
                 int v = 0;
-                for (long k = 0; k < vl && k < 4; k++) {
-                    if (s[vs + k] < '0' || s[vs + k] > '9') { v = 0; break; }
-                    v = v * 10 + (s[vs + k] - '0');
+                for (long k = 0; k < vlen && k < 4; k++) {
+                    if (vp[k] < '0' || vp[k] > '9') { v = 0; break; }
+                    v = v * 10 + (vp[k] - '0');
                 }
                 if (v < 1) v = 1;
                 if (v > WEB_MAX_TCOLS) v = WEB_MAX_TCOLS;
@@ -1755,38 +1804,38 @@ static int parse_tag(const char *s, long n, long *used, Tag *t) {
                 /* <table border> is HTML's presentational hint for a
                  * framed grid: border="0" means none, anything else
                  * (including the bare attribute) means on. */
-                t->border = (vl == 1 && s[vs] == '0') ? 0 : 1;
-            } else if (!strcmp(an, "action") && vl < (long)sizeof(t->action)) {
-                memcpy(t->action, s + vs, (size_t)vl);
-                t->action[vl] = 0;
-            } else if (!strcmp(an, "method") && vl < (long)sizeof(t->method)) {
-                memcpy(t->method, s + vs, (size_t)vl);
-                t->method[vl] = 0;
-            } else if (!strcmp(an, "type") && vl < (long)sizeof(t->type)) {
-                memcpy(t->type, s + vs, (size_t)vl);
-                t->type[vl] = 0;
-            } else if (!strcmp(an, "name") && vl < (long)sizeof(t->fname)) {
-                memcpy(t->fname, s + vs, (size_t)vl);
-                t->fname[vl] = 0;
-            } else if (!strcmp(an, "value") && vl < (long)sizeof(t->value)) {
-                memcpy(t->value, s + vs, (size_t)vl);
-                t->value[vl] = 0;
+                t->border = (vlen == 1 && vp[0] == '0') ? 0 : 1;
+            } else if (!strcmp(an, "action") && vlen < (long)sizeof(t->action)) {
+                memcpy(t->action, vp, (size_t)vlen);
+                t->action[vlen] = 0;
+            } else if (!strcmp(an, "method") && vlen < (long)sizeof(t->method)) {
+                memcpy(t->method, vp, (size_t)vlen);
+                t->method[vlen] = 0;
+            } else if (!strcmp(an, "type") && vlen < (long)sizeof(t->type)) {
+                memcpy(t->type, vp, (size_t)vlen);
+                t->type[vlen] = 0;
+            } else if (!strcmp(an, "name") && vlen < (long)sizeof(t->fname)) {
+                memcpy(t->fname, vp, (size_t)vlen);
+                t->fname[vlen] = 0;
+            } else if (!strcmp(an, "value") && vlen < (long)sizeof(t->value)) {
+                memcpy(t->value, vp, (size_t)vlen);
+                t->value[vlen] = 0;
             } else if (!strcmp(an, "placeholder") &&
-                       vl < (long)sizeof(t->placeholder)) {
-                memcpy(t->placeholder, s + vs, (size_t)vl);
-                t->placeholder[vl] = 0;
+                       vlen < (long)sizeof(t->placeholder)) {
+                memcpy(t->placeholder, vp, (size_t)vlen);
+                t->placeholder[vlen] = 0;
             } else if (!strcmp(an, "size")) {
                 int v = 0;
-                for (long k = 0; k < vl && k < 4; k++) {
-                    if (s[vs + k] < '0' || s[vs + k] > '9') { v = 0; break; }
-                    v = v * 10 + (s[vs + k] - '0');
+                for (long k = 0; k < vlen && k < 4; k++) {
+                    if (vp[k] < '0' || vp[k] > '9') { v = 0; break; }
+                    v = v * 10 + (vp[k] - '0');
                 }
                 t->size = v;
             } else if (!strcmp(an, "rows") || !strcmp(an, "cols")) {
                 int v = 0;
-                for (long k = 0; k < vl && k < 4; k++) {
-                    if (s[vs + k] < '0' || s[vs + k] > '9') { v = 0; break; }
-                    v = v * 10 + (s[vs + k] - '0');
+                for (long k = 0; k < vlen && k < 4; k++) {
+                    if (vp[k] < '0' || vp[k] > '9') { v = 0; break; }
+                    v = v * 10 + (vp[k] - '0');
                 }
                 if (an[0] == 'r') t->rows = v; else t->cols = v;
             }
@@ -1814,6 +1863,11 @@ typedef struct {
     int  block;                  /* index into Doc.block, -1 if capped */
     int  elem;                   /* index into Html.elem, -1 if capped */
     int  ordinal;                /* li counter, for ol/ul elements     */
+    /* The TCell this element opened, or -1. A cell closed by an implicit
+     * end tag is stamped through this: the table level it belonged to has
+     * already been popped when the block closes, so looking it up there
+     * would find the enclosing table instead. */
+    int  cell;
 } HtmlOpen;
 
 typedef struct {
@@ -1880,7 +1934,13 @@ typedef struct {
     int         ctl_opt_active;  /* this <option> writes into the label  */
     int         form;            /* the <form> open here, -1 none        */
     int         form_depth;      /* open <form> elements (nesting is
-                                  * ignored for state, as HTML says)    */
+                                  * ignored for state)                   */
+    /* ---- <label> ----
+     * A label's atom range is recorded so a click on its text can reach the
+     * control inside it. Labels do not nest in HTML, but keeping a depth
+     * makes an accidental nest harmless: only the outermost range is kept. */
+    int         label_atom;      /* first atom of the open <label>, -1   */
+    int         label_depth;
 } Html;
 
 static int level_for_px(int px);   /* defined with the other style helpers */
@@ -2030,8 +2090,13 @@ static void ctl_ws(Html *h, char c) {
     if (ctl->kind == CTL_TEXTAREA) {
         /* HTML drops the single newline directly after <textarea>; without
          * this the first line of every textarea is blank. */
-        if (c == '\n' && !ctl->value[0]) return;
-        char b = (c == '\t') ? ' ' : c;
+        if ((c == '\n' || c == '\r') && !ctl->value[0]) return;
+        /* The HTML input stream normalises CRLF and CR to LF before the
+         * tokenizer sees it; a textarea body that arrives from a Windows
+         * file must not keep a '\r' that would then be submitted as %0D
+         * and drawn as a glyph. html_text() has already skipped the '\n'
+         * of a CRLF pair, so the '\r' is the one to map. */
+        char b = (c == '\t') ? ' ' : (c == '\r' ? '\n' : c);
         str_append(ctl->value, sizeof ctl->value, &b, 1);
     } else if (ctl->kind == CTL_SELECT) {
         if (h->ctl_opt_active)
@@ -2043,23 +2108,6 @@ static void ctl_ws(Html *h, char c) {
 
 static void html_put(Html *h, const char *bytes, long len) {
     if (html_hidden(h)) return;              /* display:none subtree */
-
-    /* A <textarea> body, a <button>'s label and a <select>'s options are
-     * the control's text, not the page's: collect them here and emit no
-     * atoms, so the label is never laid out twice. */
-    {
-        Ctl *c = html_ctl(h);
-        if (c) {
-            if (c->kind == CTL_TEXTAREA)
-                str_append(c->value, sizeof c->value, bytes, len);
-            else if (c->kind == CTL_SELECT) {
-                if (h->ctl_opt_active)
-                    str_append_collapsed(c->label, sizeof c->label, bytes, len);
-            } else
-                str_append_collapsed(c->label, sizeof c->label, bytes, len);
-            return;
-        }
-    }
 
     /* A <textarea> body, a <button>'s label and a <select>'s options are
      * the control's text, not the page's: collect them here and emit no
@@ -2574,6 +2622,7 @@ static void html_elem_push(Html *h, const Tag *t, int make_block, int level) {
         o->block = bi;
         o->elem = ei;
         o->ordinal = 0;
+        o->cell = -1;
     } else if (bi >= 0) {
         /* No room to track it: the box is real but empty. */
         d->block[bi].atom_end = (u16)d->natom;
@@ -2617,6 +2666,15 @@ static void html_elem_close(Html *h, const char *tag, int is_block) {
             b->atom_end = (u16)h->d->natom;
             had_block = 1;
         }
+        /* A cell closed by an implicit end tag - a page that writes
+         * `<td>a<td>b`, or a </table> with the </td> left out - ends here
+         * instead of in html_table_cell_end(), and its TCell.atom_end would
+         * stay 0. Then the cell owns no atom at all: its words are laid as
+         * loose text and its column is measured empty. The cell index rides
+         * on the open element because html_table_end() has already dropped
+         * the table level by the time this runs. */
+        if (o->cell >= 0 && o->cell < h->d->ntcell)
+            h->d->tcell[o->cell].atom_end = (u16)h->d->natom;
         if (o->elem >= 0) h->nelem = o->elem;
     }
     /* An inline tag that the cascade turned into a block box still ends
@@ -2699,6 +2757,19 @@ static int tbl_current_table(Html *h) {
     return h->nts > 0 ? h->tstack[h->nts - 1].table : -1;
 }
 
+static void html_table_cell_end(Html *h);   /* the row and table ends use it */
+
+/* Shut the cell this table level has open, if any. Every way a cell can end
+ * - an explicit </td>, a new <td>/<th>, a new <tr>, a </table> - goes through
+ * here, because a cell that is never shut keeps atom_end = 0: its words are
+ * laid as loose text by the table and its column measures empty. HTML ends a
+ * cell at each of those tags, so a page that leaves </td> out of every row
+ * still gets one cell per <td>, each owning exactly its own words. */
+static void tbl_cell_shut(Html *h) {
+    if (h->tskip > 0 || h->nts <= 0) return;
+    if (h->tstack[h->nts - 1].cell >= 0) html_table_cell_end(h);
+}
+
 static void html_table_begin(Html *h, const Tag *t) {
     Doc *d = h->d;
     html_block_open(h, t, 0);
@@ -2736,6 +2807,7 @@ static void html_table_begin(Html *h, const Tag *t) {
 }
 
 static void html_table_end(Html *h) {
+    tbl_cell_shut(h);
     if (h->tskip > 0) h->tskip--;      /* a level that was never recorded */
     else if (h->nts > 0) h->nts--;
     h->table_block = -1;
@@ -2744,6 +2816,7 @@ static void html_table_end(Html *h) {
 
 static void html_table_row_begin(Html *h, const Tag *t) {
     Doc *d = h->d;
+    tbl_cell_shut(h);
     html_block_open(h, t, 0);
     int bi = html_block_cur(h);
     if (bi >= 0) {
@@ -2764,6 +2837,7 @@ static void html_table_row_begin(Html *h, const Tag *t) {
 }
 
 static void html_table_row_end(Html *h) {
+    tbl_cell_shut(h);
     /* A row of a table this parser could not record (deeper than the
      * stack) has no level of its own. Touching the top level here would
      * end the OUTER row and leave the next cell of the recorded table with
@@ -2778,6 +2852,9 @@ static void html_table_row_end(Html *h) {
 static void html_table_cell_begin(Html *h, const Tag *t) {
     Doc *d = h->d;
     const char *n = t->name;
+    /* <td> closes an open <td>: one cell per <td>, whatever the page
+     * omitted. */
+    tbl_cell_shut(h);
     html_end_word(h, 0);
     html_block_open(h, t, 0);
     int bi = html_block_cur(h);
@@ -2836,11 +2913,20 @@ static void html_table_cell_begin(Html *h, const Tag *t) {
 
     d->trow[ri].cell_end = (u16)d->ntcell;
     h->tstack[h->nts - 1].cell = ci;
+    /* The open element for this tag carries the cell too, so an implicit
+     * end (no </td>) can stamp the same atom_end the explicit one does. */
+    if (h->nopen > 0 && h->open[h->nopen - 1].block == bi)
+        h->open[h->nopen - 1].cell = ci;
 }
 
 static void html_table_cell_end(Html *h) {
     Doc *d = h->d;
     html_end_word(h, 0);
+    /* Which element this cell opened: a <th>'s box must be closed by </th>.
+     * html_elem_close() searches the open stack by tag, so closing a header
+     * cell with the word "td" found nothing and left its box open until the
+     * row ended - its atom range then covered the rest of the row. */
+    const char *etag = "td";
     /* Same rule as the row end: a cell of an unrecorded table must not
      * close the enclosing recorded cell, or that cell's atom range would
      * end at the first unrecorded cell - which dropped every word after it
@@ -2848,9 +2934,21 @@ static void html_table_cell_end(Html *h) {
     if (h->tskip == 0 && h->nts > 0) {
         int ci = h->tstack[h->nts - 1].cell;
         if (ci >= 0 && ci < d->ntcell) d->tcell[ci].atom_end = (u16)d->natom;
+        /* The open element that carried this cell no longer owns it. Without
+         * this the same cell was stamped a second time when html_elem_close()
+         * popped the element at the end of the row - and a header row's three
+         * <th> cells all ended at the row's last atom, so every cell claimed
+         * its neighbours' words (measured: cell ranges [3,6) [4,6) [5,6)
+         * instead of [3,4) [4,5) [5,6)). */
+        for (int i = h->nopen - 1; i >= 0; i--) {
+            if (h->open[i].cell != ci) continue;
+            etag = h->open[i].tag;
+            h->open[i].cell = -1;
+            break;
+        }
         h->tstack[h->nts - 1].cell = -1;
     }
-    html_block_close(h, "td");
+    html_block_close(h, etag);
     /* The next cell's text must not join this one's last word. */
     h->pending_space = 1;
 }
@@ -2889,6 +2987,22 @@ static int html_ctl_new(Html *h, const Tag *t, int kind, const CssStyle *cs) {
     snprintf(c->label, sizeof c->label, "%s", t->placeholder);
     snprintf(c->subval, sizeof c->subval, "%s", t->value);
     snprintf(c->name, sizeof c->name, "%s", t->fname);
+    /* A radio group is the radios of one form with one name. A `checked`
+     * attribute on a new member unchecks the group's earlier ones: checkedness
+     * is a group property, so a page that marks two radios checked submits
+     * only the last one, exactly as a browser does. The earlier member's
+     * default is cleared too, or a reset would restore both and break the
+     * invariant again. */
+    if (kind == CTL_RADIO && c->checked) {
+        for (int i = 0; i < ci; i++) {
+            Ctl *o = &d->ctl[i];
+            if (o->kind == CTL_RADIO && o->form == c->form &&
+                !strcmp(o->name, c->name)) {
+                o->checked = 0;
+                o->checked0 = 0;
+            }
+        }
+    }
     if (cs && (cs->set & CSS_SET_COLOR)) { c->set_color = 1; c->color = cs->color; }
     if (cs && (cs->set & CSS_SET_BACKGROUND)) {
         if (cs->background >> 24) { c->set_bg = 1; c->background = cs->background; }
@@ -3025,8 +3139,13 @@ static void html_tag(Html *h, const Tag *t) {
             if (h->in_link >= 0) {
                 char num[16];
                 int idx = h->in_link;
-                h->in_link = -1;
+                /* The link's LAST word is still pending here. Flush it
+                 * while in_link still names this link, or only the words
+                 * before it are clickable and a one-word link is dead
+                 * except for its [n] marker (measured: "help" carried
+                 * link=-1 while "[1]" carried 0). */
                 html_end_word(h, 0);
+                h->in_link = -1;
                 html_elem_close(h, "a", 0);
                 snprintf(num, sizeof(num), "[%d]", idx + 1);
                 html_atom_word(h, num, (long)strlen(num), idx, 1);
@@ -3066,6 +3185,29 @@ static void html_tag(Html *h, const Tag *t) {
         if (!strcmp(n, "form")) {
             html_form_end(h);
             html_block_close(h, "form");
+            return;
+        }
+        if (!strcmp(n, "label")) {
+            /* The label's atoms are its click target. Record the range now,
+             * while the atom count is the one the reader sees. */
+            if (h->label_depth > 0) {
+                h->label_depth--;
+                if (h->label_depth == 0 && h->label_atom >= 0) {
+                    if (h->d->nlabel < WEB_MAX_LABELS) {
+                        Label *lb = &h->d->label[h->d->nlabel++];
+                        lb->atom_start = (u16)h->label_atom;
+                        lb->atom_end = (u16)h->d->natom;
+                    } else {
+                        /* The footer already reports a cap; a page with more
+                         * than WEB_MAX_LABELS labels keeps the ones it
+                         * recorded and loses only the click target of the
+                         * rest. */
+                        h->d->truncated = 1;
+                    }
+                    h->label_atom = -1;
+                }
+            }
+            html_elem_close(h, "label", 0);
             return;
         }
         if (is_heading_tag(n)) {
@@ -3294,7 +3436,11 @@ static void html_tag(Html *h, const Tag *t) {
         Doc *d = h->d;
         html_block_open(h, t, 0);
         int bi = html_block_cur(h);
-        if (bi >= 0) {
+        /* Only a table the parser RECORDED has a lay_table() that could place
+         * this box. In a table past the nesting cap (tskip) there is no
+         * Table, so the caption stays an ordinary block and the page flow
+         * lays it where it stands - which keeps its words on the page. */
+        if (bi >= 0 && tbl_current_table(h) >= 0) {
             d->block[bi].in_table = 1;
             d->block[bi].is_caption = 1;
         }
@@ -3303,6 +3449,15 @@ static void html_tag(Html *h, const Tag *t) {
     if (is_block_tag(n)) {
         if (!strcmp(n, "form")) html_form_begin(h, t);
         html_block_open(h, t, 0);
+        return;
+    }
+    if (!strcmp(n, "label")) {
+        /* An ordinary inline box, plus the atom where its text starts. A
+         * click on that text focuses (or toggles) the control inside it. */
+        html_flush_before_inline(h);
+        html_elem_push(h, t, 0, 0);
+        if (h->label_depth == 0) h->label_atom = h->d->natom;
+        h->label_depth++;
         return;
     }
     if (is_void_tag(n)) return;
@@ -3332,6 +3487,7 @@ static int html_build(Doc *d, const char *s, long n, const Url *base,
     d->ntcell = 0;
     d->nctl = 0;
     d->nform = 0;
+    d->nlabel = 0;
     d->doc_h = 0;
     d->truncated = 0;
 
@@ -3341,6 +3497,7 @@ static int html_build(Doc *d, const char *s, long n, const Url *base,
     memset(&h, 0, sizeof(h));
     h.d = d;
     h.base = base;
+    h.label_atom = -1;
     h.title = title;
     h.title_cap = title_cap;
     h.latin1 = latin1;
@@ -4093,13 +4250,17 @@ static void lay_table_loose(Layout *L, int ti) {
     L->width = (float)(tblk->box_x1 - tblk->box_x0);
     L->pending_margin = 0;
 
-    /* One cursor answers "does a cell own this atom" for the whole range:
-     * TCell is in document order, so its atom_start values rise and a cell is
-     * only left behind once the atom index has passed its end. The filter is
-     * every cell in the document, not only this table's: an atom that some
-     * cell claims is never loose, whatever the table it sits in, so a page
-     * whose tags did not nest (a missing </td> leaves two cells claiming one
-     * range) is laid by its cells and not a second time here. */
+    /* A cell owns the atoms of its own content; a nested table owns the
+     * atoms of its grid, caption included (its own lay_table_loose() places
+     * them, and placing them here as well would print them twice). Those two
+     * tests decide every atom in this range; what is left over is text the
+     * table owns and no cell does - a caption's words, or text the parser met
+     * between rows - and that is what this pass lays.
+     *
+     * The cell cursor: TCell is in document order, so its atom_start values
+     * rise and a cell is only left behind once the atom index has passed its
+     * end. Filtering by TCell.row is what excludes the cells of a table
+     * nested inside one of these. */
     int ck = 0;
     for (int ai = (int)tblk->atom_start; ai < (int)tblk->atom_end; ai++) {
         while (L->nopen > base &&
@@ -4114,21 +4275,32 @@ static void lay_table_loose(Layout *L, int ti) {
             L->pending_margin = 0;
             lay_open_block(L, bi);
         }
-        while (ck < d->ntcell && (int)d->tcell[ck].atom_end <= ai) ck++;
-        if (ck < d->ntcell && (int)d->tcell[ck].atom_start <= ai)
-            continue;                             /* a cell's atom */
-        /* A nested table owns its own range, caption included: its own
-         * lay_table_loose() places those atoms, and placing them here as
-         * well would print them twice. */
         int nested = 0;
         for (int t = 0; t < d->ntable && !nested; t++) {
             if (t == ti) continue;
             int b = (int)d->table[t].block;
             if (b == 0xFFFF || b >= d->nblock) continue;
+            /* A table INSIDE this one, not the table this one sits in: an
+             * enclosing table's range contains every atom here and would
+             * make the whole pass a no-op. A descendant starts at or after
+             * this block and ends no later. */
+            if ((int)d->block[b].atom_start < (int)tblk->atom_start) continue;
+            if ((int)d->block[b].atom_end > (int)tblk->atom_end) continue;
             if (ai >= (int)d->block[b].atom_start &&
                 ai < (int)d->block[b].atom_end) nested = 1;
         }
         if (nested) continue;
+        while (ck < d->ntcell) {
+            TCell *c = &d->tcell[ck];
+            int t = (c->row < d->ntrow) ? (int)d->trow[c->row].table : -1;
+            if (t != ti || (int)c->atom_end <= ai) { ck++; continue; }
+            break;
+        }
+        if (ck < d->ntcell) {
+            TCell *c = &d->tcell[ck];
+            int t = (c->row < d->ntrow) ? (int)d->trow[c->row].table : -1;
+            if (t == ti && (int)c->atom_start <= ai) continue;  /* a cell's */
+        }
         lay_atom(L, ai);
     }
     while (L->nopen > base)
@@ -4145,28 +4317,36 @@ static void lay_table_loose(Layout *L, int ti) {
     L->width = (float)(tblk->box_x1 - tblk->box_x0);
 }
 
-static void lay_table(Layout *L, int ti) {
+/* The columns of one table, and what each asks for - measured, never laid.
+ *
+ * nat[c] is the widest line the column's cells can be set on one line and
+ * low[c] the narrowest they can be squeezed to, their longest word: CSS's
+ * max-content and min-content requests. Each atom is measured with
+ * m->text_w() on the atom itself, so the face that draws the glyphs is the
+ * face that decides the column - a 32 px cell, a bold <th> and a monospace
+ * token all measure differently. (The old code measured every cell with
+ * ctl_w(), which zeroes the atom, so all text was counted in the 12 px body
+ * face; and it skipped AF_BREAK atoms, which is the flag the first word of
+ * every cell carries, so that word was not counted at all.)
+ *
+ * A cell's padding is the padding its own box will really take, read from
+ * the cascade, not a constant.
+ *
+ * A cell that holds a table asks for that table's own grid, recursively, and
+ * the nested table's atoms are not measured here as text: they are its
+ * cells' words, and counting them again would ask for a column wide enough
+ * to hold the inner table's whole text run together on one line. Returns the
+ * column count; `depth` is a runaway guard, not a policy - the parser has
+ * already capped table nesting.
+ */
+static void table_caption_measure(Layout *L, int ti, int *cap_nat,
+                                int *cap_low);
+static int table_measure(Layout *L, int ti, int *nat, int *low,
+                         int *tab_nat, int *tab_low, int depth) {
     Doc *d = L->d;
-    if (ti < 0 || ti >= d->ntable) return;
     Table *tb = &d->table[ti];
-    if (tb->block == 0xFFFF || tb->block >= (u16)d->nblock) return;
-    Block *tblk = &d->block[tb->block];
+    for (int c = 0; c < WEB_MAX_TCOLS; c++) { nat[c] = 0; low[c] = 0; }
 
-    lay_flush(L);
-    /* The table's own top margin, and the tops of every box around it,
-     * are fixed by the same call the first line of any block uses. */
-    lay_anchor_boxes(L);
-
-    /* A <caption> - and any text the parser met between rows, which HTML
-     * foster-parents out of the table - is owned by the table and by no
-     * cell, and the page flow skips the table's whole atom range. Laying it
-     * here is the only place it can be laid at all. */
-    lay_table_loose(L, ti);
-
-    /* A table's own rows are the TRows whose TRow.table is this table.
-     * They are not necessarily contiguous: a table nested in a cell of
-     * this one appends its rows to the same array, in document order, so
-     * [row_start, row_end) is a window and TRow.table is the filter. */
     int nrows = (int)tb->row_end - (int)tb->row_start;
     int ncols = 0;
     for (int r = 0; r < nrows; r++) {
@@ -4180,11 +4360,8 @@ static void lay_table(Layout *L, int ti) {
     }
     if (ncols > WEB_MAX_TCOLS) ncols = WEB_MAX_TCOLS;
     if (ncols < 1) ncols = 1;
-    tb->ncols = (u8)ncols;
+    if (depth > WEB_MAX_TABLES) return ncols;      /* runaway guard */
 
-    /* 1. What each column asks for. */
-    int nat[WEB_MAX_TCOLS];
-    for (int c = 0; c < ncols; c++) nat[c] = 0;
     for (int r = 0; r < nrows; r++) {
         TRow *row = &d->trow[tb->row_start + r];
         if (row->table != (u16)ti) continue;
@@ -4195,74 +4372,317 @@ static void lay_table(Layout *L, int ti) {
             int span = c->colspan ? c->colspan : 1;
             if (col + span > ncols) span = ncols - col;
             if (span < 1) span = 1;
-            float w = 0.0f;
+
+            int pad = 2 * layout_gap(WEB_TABLE_INSET_D);
+            if (c->block != 0xFFFF && c->block < (u16)d->nblock) {
+                Block *cb = &d->block[c->block];
+                pad = layout_gap((int)cb->inset_left) +
+                      layout_gap((int)cb->inset_right);
+            }
+
+            /* A table inside this cell: its own grid is the request. */
+            int gr_nat = 0, gr_low = 0;
+            for (int t = 0; t < d->ntable; t++) {
+                if (t == ti) continue;
+                int b = (int)d->table[t].block;
+                if (b == 0xFFFF || b >= d->nblock) continue;
+                if (d->block[b].cell != (u16)k) continue;   /* not this cell */
+                int inat[WEB_MAX_TCOLS], ilow[WEB_MAX_TCOLS];
+                int in_nat = 0, in_low = 0;
+                table_measure(L, t, inat, ilow, &in_nat, &in_low, depth + 1);
+                int sn = 2 * layout_gap(WEB_TABLE_INSET_D) + in_nat;
+                int sl = 2 * layout_gap(WEB_TABLE_INSET_D) + in_low;
+                if (sn > gr_nat) gr_nat = sn;
+                if (sl > gr_low) gr_low = sl;
+            }
+
+            float line = 0.0f, widest_line = 0.0f, widest_word = 0.0f;
             int first = 1;
             for (int ai = c->atom_start; ai < c->atom_end; ai++) {
+                /* A nested table's atoms belong to its grid, measured above.
+                 * Only a table INSIDE this one: an enclosing table's range
+                 * contains every atom here, and treating it as the owner made
+                 * the inner grid measure nothing at all (measured: a table in
+                 * a cell asked for its 20 px minimum instead of its words). */
+                int owned = 0;
+                int me = (int)tb->block;
+                for (int t = 0; t < d->ntable && !owned; t++) {
+                    if (t == ti) continue;
+                    int b = (int)d->table[t].block;
+                    if (b == 0xFFFF || b >= d->nblock) continue;
+                    if (me != 0xFFFF && b < d->nblock)
+                        if (d->block[b].atom_start < d->block[me].atom_start ||
+                            d->block[b].atom_end > d->block[me].atom_end)
+                            continue;              /* an ancestor, not nested */
+                    if (ai >= (int)d->block[b].atom_start &&
+                        ai < (int)d->block[b].atom_end) owned = 1;
+                }
+                if (owned) continue;
+
                 const Atom *a = &d->atom[ai];
-                if (a->flags & (AF_BREAK | AF_HARD)) { first = 1; continue; }
-                if (a->flags & AF_ALT) continue;
+                if (a->flags & AF_ALT) continue;   /* the picture took its place */
+                int brk = (a->flags & (AF_BREAK | AF_HARD)) != 0;
+                if (brk) {
+                    if (line > widest_line) widest_line = line;
+                    line = 0.0f;
+                    first = 1;                     /* no space at a line start */
+                }
                 int len = (int)strlen(a->text);
-                if (!first && !(a->flags & AF_GLUE)) w += ctl_w(L, " ", 1);
+                float aw = 0.0f;
                 if (a->flags & AF_CTL && a->ctl >= 0 && a->ctl < d->nctl) {
                     int cw = 0, ch = 0;
                     ctl_size(L, &d->ctl[a->ctl], &cw, &ch);
-                    w += (float)cw;
-                } else if (a->flags & AF_IMAGE) {
-                    w += (float)layout_gap(48);
+                    aw = (float)cw;
+                } else if (a->flags & AF_IMAGE && a->img >= 0 &&
+                           a->img < d->nimg && d->img[a->img].pic.px) {
+                    int ww = 0, hh = 0;
+                    img_fit(&d->img[a->img], L->width, &ww, &hh);
+                    aw = (float)ww;
                 } else if (len > 0) {
-                    w += ctl_w(L, a->text, len);
+                    aw = L->m->text_w(L->m->ctx, a, a->text, len);
+                    if (L->m->overhang) aw += L->m->overhang(L->m->ctx, a);
+                } else {
+                    continue;
                 }
-                if (len > 0 || (a->flags & (AF_CTL | AF_IMAGE))) first = 0;
+                if (aw > widest_word) widest_word = aw;
+                if (!first && !(a->flags & AF_GLUE))
+                    line += L->m->text_w(L->m->ctx, a, " ", 1);
+                line += aw;
+                first = 0;
             }
-            /* The width this cell asks for: its longest line on one line,
-             * plus the padding its own box carries, measured from the atoms
-             * every time. Reading the previous pass's column width here
-             * made the grid depend on the window it was last laid out in:
-             * a 3-column table with one long cell measured 79/729/80 px at
-             * 900, then 142/603/143 at the same 900 after one 900->520->900
-             * resize. The numbers were drifting, not the content. */
-            int per = (int)(w / (float)span + 0.5f) +
-                      2 * layout_gap(WEB_TABLE_INSET_D);
-            for (int s = 0; s < span; s++)
+            if (line > widest_line) widest_line = line;
+            if ((float)gr_nat > widest_line) widest_line = (float)gr_nat;
+            if ((float)gr_low > widest_word) widest_word = (float)gr_low;
+
+            /* The cell's padding belongs to the CELL, not to each column it
+             * spans: adding it per column counted a colspan=3 header's 12 px
+             * of padding three times (measured: a 3-column spanned header
+             * wanted 261 px where its text plus one padding is 212). */
+            int per = (int)((widest_line + (float)pad) / (float)span + 0.999f);
+            int lw = (int)((widest_word + (float)pad) / (float)span + 0.999f);
+            for (int s = 0; s < span; s++) {
                 if (per > nat[col + s]) nat[col + s] = per;
+                if (lw > low[col + s]) low[col + s] = lw;
+            }
             col += span;
         }
     }
 
-    /* 2. Scale the requests to the column the table was given. A cell's
-     * own text never decides more than twice an equal share, or one long
-     * paragraph would squeeze every other column to the minimum. */
-    float avail = L->width - 2.0f * (float)layout_gap(WEB_TABLE_INSET_D);
-    int minw = layout_gap(WEB_COL_MIN_D);
-    if (minw < 8) minw = 8;
-    if (avail < (float)(ncols * minw)) avail = (float)(ncols * minw);
-    float fair = avail / (float)ncols;
-    int sum = 0;
+    /* Floors: no column is narrower than the shared minimum or its own
+     * longest word, and a column never asks for less than its floor. */
+    int floor_min = layout_gap(WEB_COL_MIN_D);
+    if (floor_min < 8) floor_min = 8;
+    int sn = 0, sl = 0;
     for (int c = 0; c < ncols; c++) {
-        if (nat[c] > (int)(fair * 2.0f)) nat[c] = (int)(fair * 2.0f);
-        if (nat[c] < minw) nat[c] = minw;
-        sum += nat[c];
+        if (low[c] < floor_min) low[c] = floor_min;
+        if (nat[c] < low[c]) nat[c] = low[c];
+        sn += nat[c];
+        sl += low[c];
     }
-    int used = 0;
-    for (int c = 0; c < ncols; c++) {
-        int w = (sum > 0) ? (int)(avail * (float)nat[c] / (float)sum + 0.5f)
-                          : (int)(avail / (float)ncols);
-        if (w < minw) w = minw;
-        tb->col_w[c] = (u16)(w > 30000 ? 30000 : w);
-        used += tb->col_w[c];
+    /* A caption widens the table only as far as its MIN-content: a caption
+     * made of words that fit wraps at the grid's own width (that is what a
+     * browser does), and only a word too wide for the grid pulls the table
+     * wider. Using the caption's max-content here made a sentence caption
+     * force a page-wide one-line table. Both are measured; cap_nat is
+     * deliberately not used to widen anything. */
+    int cap_nat = 0, cap_low = 0;
+    table_caption_measure(L, ti, &cap_nat, &cap_low);
+    (void)cap_nat;
+    *tab_nat = sn;
+    *tab_low = cap_low > sl ? cap_low : sl;
+    return ncols;
+}
+
+/* The widest line a table's own caption can be set on, and its longest word.
+ * CSS gives the caption its own box but counts its content towards the TABLE's
+ * width (CSS 2.1 17.4): a caption wider than the grid it labels widens the
+ * table instead of wrapping inside it. Measured in the atoms' own faces, like
+ * the cells. A caption that is not there leaves both values at 0. */
+static void table_caption_measure(Layout *L, int ti, int *cap_nat, int *cap_low) {
+    Doc *d = L->d;
+    Table *tb = &d->table[ti];
+    *cap_nat = 0;
+    *cap_low = 0;
+    for (int b = 0; b < d->nblock; b++) {
+        Block *blk = &d->block[b];
+        if (!blk->is_caption || blk->parent != tb->block) continue;
+        float line = 0.0f, widest_line = 0.0f, widest_word = 0.0f;
+        int first = 1;
+        for (int ai = blk->atom_start; ai < blk->atom_end; ai++) {
+            const Atom *a = &d->atom[ai];
+            if (a->flags & AF_ALT) continue;
+            if (a->flags & (AF_BREAK | AF_HARD)) {
+                if (line > widest_line) widest_line = line;
+                line = 0.0f;
+                first = 1;
+            }
+            int len = (int)strlen(a->text);
+            if (len <= 0) continue;
+            float aw = L->m->text_w(L->m->ctx, a, a->text, len);
+            if (L->m->overhang) aw += L->m->overhang(L->m->ctx, a);
+            if (aw > widest_word) widest_word = aw;
+            if (!first && !(a->flags & AF_GLUE))
+                line += L->m->text_w(L->m->ctx, a, " ", 1);
+            line += aw;
+            first = 0;
+        }
+        if (line > widest_line) widest_line = line;
+        /* The caption's own box has no padding: the table's grid inset does
+         * not apply to it. */
+        int n = (int)(widest_line + 0.999f);
+        int w = (int)(widest_word + 0.999f);
+        if (n > *cap_nat) *cap_nat = n;
+        if (w > *cap_low) *cap_low = w;
     }
-    /* The rounding must not leave a gap at the table's right edge. */
-    int diff = (int)avail - used;
-    for (int c = 0; diff != 0 && c < ncols * 2; c++) {
-        int k = c % ncols;
-        if (diff > 0) { tb->col_w[k] = (u16)(tb->col_w[k] + 1); diff--; }
-        else if (tb->col_w[k] > (u16)minw) { tb->col_w[k] = (u16)(tb->col_w[k] - 1); diff++; }
+}
+
+static void lay_table(Layout *L, int ti) {
+    Doc *d = L->d;
+    if (ti < 0 || ti >= d->ntable) return;
+    Table *tb = &d->table[ti];
+    if (tb->block == 0xFFFF || tb->block >= (u16)d->nblock) return;
+    Block *tblk = &d->block[tb->block];
+
+    lay_flush(L);
+    /* The table's own top margin, and the tops of every box around it,
+     * are fixed by the same call the first line of any block uses. */
+    lay_anchor_boxes(L);
+
+    /* A table's own rows are the TRows whose TRow.table is this table.
+     * They are not necessarily contiguous: a table nested in a cell of
+     * this one appends its rows to the same array, in document order, so
+     * [row_start, row_end) is a window and TRow.table is the filter. */
+    int nrows = (int)tb->row_end - (int)tb->row_start;
+
+    /* 1. What each column asks for, measured from the content: the widest
+     * line its cells can be set on (nat) and their longest word (low), which
+     * are CSS's max-content and min-content requests. table_measure() does
+     * the measuring, recursively for a cell that holds a table. */
+    int nat[WEB_MAX_TCOLS];
+    int low[WEB_MAX_TCOLS];
+    int sum_nat = 0, sum_low = 0;
+    int ncols = table_measure(L, ti, nat, low, &sum_nat, &sum_low, 0);
+    tb->ncols = (u8)ncols;
+    /* What the COLUMNS need, which is not the table's minimum: sum_low also
+     * carries the caption's longest word, and that widens the box without
+     * being a column's floor. Using the table minimum here sent a caption-
+     * widened grid down the "nothing fits" branch (measured: a 207 px grid
+     * with two 24 px floors came out 48 px wide and left 159 px unassigned). */
+    int sum_col_low = 0;
+    for (int c = 0; c < ncols; c++) sum_col_low += low[c];
+    /* 2. Give the columns their widths.
+     *
+     * CSS's auto table layout, in the form this renderer can be honest
+     * about:
+     *   - a column may not be narrower than its longest word (min-content),
+     *     so a word is never split just because the table shares the page;
+     *   - the table shrink-wraps: it is as wide as the sum of what its
+     *     cells ask for, and only as wide as the page when they ask for more
+     *     (so three one-letter cells make a small table, not a page-wide
+     *     one);
+     *   - what is left over after the floors is shared in proportion to how
+     *     much more each column asked for.
+     * If even the floors do not fit the page, the floors are scaled to fit and
+     * the word that cannot fit is broken by fit_prefix() in lay_atom(), which
+     * is the one place that knows how to break one; the row still gets the
+     * height of what was really drawn. */
+    int inset_x = layout_gap(WEB_TABLE_INSET_D);
+    int avail = (int)L->width - 2 * inset_x;
+    /* A table that asked for a width (``width: 100%`` on a Wikipedia table,
+     * or a px width) gets it: the author's width wins over shrink-to-fit, and
+     * the columns share the whole box. Otherwise the table is as wide as its
+     * content asks, never wider than the page. */
+    int fixed_w = (tblk->width > 0 || tblk->width_pct > 0);
+    int grid_w = (fixed_w || sum_nat >= avail) ? avail : sum_nat;
+    if (grid_w < sum_low) {
+        /* The longest words do not fit: keep them if the table is allowed to
+         * use the whole column, otherwise cut with a common ceiling below. */
+        grid_w = sum_low < avail ? sum_low : avail;
     }
-    float x = L->x + (float)layout_gap(WEB_TABLE_INSET_D);
+    if (grid_w < 1) grid_w = 1;
+
+    /* Allocation. Two shapes, and both end with the columns summing to
+     * grid_w EXACTLY - a table whose columns do not fill its box leaves a gap
+     * at the right edge that no rule can hide. (Measured on the previous
+     * revision, which read the TABLE minimum here: a single-word caption
+     * widened the grid to 219 px and the two columns came out 47+47 = 94,
+     * leaving 125 px of empty box.) */
+    if (grid_w <= sum_col_low) {
+        /* The floors do not all fit. Cut with a common ceiling rather than
+         * proportionally: a narrow column keeps its word whole and only the
+         * columns asking for more than the page are cut. (Measured on this
+         * file's harness: a 160-character <pre> beside a one-word cell gave
+         * 821/56 px with proportional floors and "RIGHT" split over two
+         * lines; with the ceiling it is 818/59 px and RIGHT is one line.)
+         * The cut column's own word is then broken by fit_prefix(), the only
+         * place that knows how; a white-space:pre line is never broken, it
+         * overflows and the painter clips it to the cell. */
+        int lo = 1, hi = 0;
+        for (int c = 0; c < ncols; c++) if (low[c] > hi) hi = low[c];
+        while (lo < hi) {
+            int mid = (lo + hi + 1) / 2, s2 = 0;
+            for (int c = 0; c < ncols; c++) s2 += (low[c] < mid ? low[c] : mid);
+            if (s2 <= grid_w) lo = mid; else hi = mid - 1;
+        }
+        int cap = lo, used = 0;
+        for (int c = 0; c < ncols; c++) {
+            int w = low[c] < cap ? low[c] : cap;
+            if (w < 1) w = 1;
+            tb->col_w[c] = (u16)(w > 30000 ? 30000 : w);
+            used += tb->col_w[c];
+        }
+        /* The ceiling's own rounding: one pixel at a time to a cut column. */
+        for (int c = 0, guard = 0; used < grid_w && guard < ncols * 4; guard++) {
+            if (low[c % ncols] <= cap) { c++; continue; }
+            tb->col_w[c % ncols] = (u16)(tb->col_w[c % ncols] + 1);
+            used++;
+        }
+    } else {
+        /* Floors first, then the spare shared by weight: how much more each
+         * column asked for than its floor, falling back to its request when
+         * no column asked for more, then to equal shares. A caption that
+         * widened the grid therefore lands its extra on the columns in the
+         * same proportion instead of lying unassigned. */
+        int spare = grid_w - sum_col_low;
+        int w[WEB_MAX_TCOLS], wsum = 0;
+        for (int c = 0; c < ncols; c++) {
+            w[c] = nat[c] - low[c];
+            if (w[c] < 0) w[c] = 0;
+            wsum += w[c];
+        }
+        if (wsum <= 0) {
+            for (int c = 0; c < ncols; c++) { w[c] = nat[c]; wsum += w[c]; }
+        }
+        if (wsum <= 0) {
+            for (int c = 0; c < ncols; c++) { w[c] = 1; wsum++; }
+        }
+        int handed = 0;
+        for (int c = 0; c < ncols; c++) {
+            int add = (c == ncols - 1) ? spare - handed
+                                       : (int)((long long)spare * w[c] / wsum);
+            handed += add;
+            int cw = low[c] + add;
+            if (cw < 1) cw = 1;
+            tb->col_w[c] = (u16)(cw > 30000 ? 30000 : cw);
+        }
+    }
+    float x = L->x + (float)inset_x;
     for (int c = 0; c < ncols; c++) {
         tb->col_x[c] = (u16)(x + 0.5f);
         x += (float)tb->col_w[c];
     }
+    /* The table is its grid: a table narrower than the page ends at its last
+     * column, so its background and border hug the content instead of
+     * stretching to a page edge with nothing in it. */
+    if (ncols > 0 && (int)(x + 0.5f) < (int)tblk->box_x1)
+        tblk->box_x1 = (u16)(x + 0.5f + (float)inset_x);
+    /* A <caption> - and any text the parser met between rows, which HTML
+     * foster-parents out of the table - is owned by the table and by no cell,
+     * and the page flow skips the table's whole atom range. Laying it here is
+     * the only place it can be laid at all, and it comes AFTER the columns so
+     * the caption's own box is the table's real width (a shrink-wrapped table
+     * has a narrow one) and its centring lands over the grid. */
+    lay_table_loose(L, ti);
 
     /* 3. Lay the rows. Every cell starts at its row's top; the row is as
      * tall as its tallest cell, which is what makes the columns line up. */
@@ -4318,6 +4738,20 @@ static void lay_table(Layout *L, int ti) {
         if (row_bot < row_top + (u32)minh) row_bot = row_top + (u32)minh;
         row->y0 = row_top;
         row->y1 = row_bot;
+        /* A cell's box is the ROW's band, not its own text's height: that is
+         * what makes `td { background }` fill the row beside a taller
+         * neighbour, and what the painter clips to. Measured before this: an
+         * empty cell's box was 6 px inside a 30 px row, a one-line cell 30 px
+         * inside a 54 px one. */
+        for (int k = row->cell_start; k < row->cell_end; k++) {
+            TCell *c = &d->tcell[k];
+            if (c->row != (u16)(tb->row_start + r)) continue;
+            if (c->y1 < row_bot) c->y1 = row_bot;
+            if (c->block != 0xFFFF && c->block < (u16)d->nblock) {
+                Block *cb = &d->block[c->block];
+                if (cb->box_y1 < row_bot) cb->box_y1 = row_bot;
+            }
+        }
         L->y = row_bot;
         L->x = tblk->box_x0;
         L->width = (float)(tblk->box_x1 - tblk->box_x0);
@@ -4535,6 +4969,12 @@ typedef struct {
      * hands it to the loader. */
     int  focus_ctl;
     int  caret;
+    /* The caret and focus the textarea painter last scrolled to. A wheel
+     * notch moves the rows without touching the caret, so the painter
+     * must not drag the view back to the caret on the next frame; typing
+     * or clicking changes `caret`, and then the caret wins again. */
+    int  ctl_caret_seen;
+    int  ctl_focus_seen;
     /* The control the current press started on, or -1. A press is the one
      * moment a checkbox toggles or a button submits; motion with the
      * button still down is a drag, and must not activate the control a
@@ -5123,6 +5563,32 @@ static int ctl_hend(Font *f, const char *shown, int len, int start, int iw) {
     return best;
 }
 
+/* A password is masked one '*' per CHARACTER, not per byte: "café" is four
+ * dots, not five. The value stays a byte string, so the painter maps its
+ * byte caret into the mask and a click maps back. Without the mapping a
+ * click after the fourth dot of a five-byte password put the caret inside
+ * the 'é' and the next character split it. */
+static int ctl_char_count(const char *s, int bytes) {
+    int n = 0;
+    for (int i = 0; i < bytes && s[i]; ) {
+        int gl = utf8_len((unsigned char)s[i]);
+        if (gl < 1) gl = 1;
+        i += gl;
+        n++;
+    }
+    return n;
+}
+
+static int ctl_byte_of_char(const char *s, int chars) {
+    int i = 0;
+    while (chars-- > 0 && s[i]) {
+        int gl = utf8_len((unsigned char)s[i]);
+        if (gl < 1) gl = 1;
+        i += gl;
+    }
+    return i;
+}
+
 /* One form control, drawn where its Seg was placed. The box is a real
  * rectangle in the page: a text field shows its value (or its
  * placeholder, dimmed), a password shows one dot per byte without ever
@@ -5215,6 +5681,12 @@ static void draw_ctl(Surface *v, Web *w, int ci, int x, int y, int cw, int ch) {
     if (c->kind == CTL_BUTTON) {
         iw = cw - 2 * pad;
         if (iw < 1) iw = 1;
+        /* The caption sits in the middle of the box, the way a button's
+         * label does. Drawing it at the left padding left 4 px on one
+         * side and 24 px on the other in a 62 px button (measured). */
+        float lw = font_width(f, shown);
+        if (lw < (float)iw)
+            ix += (int)(((float)iw - lw) * 0.5f);
     } else if (!c->value[0]) {
         tcol = color_alpha(fg, 0.45f);          /* the placeholder */
     }
@@ -5231,13 +5703,22 @@ static void draw_ctl(Surface *v, Web *w, int ci, int x, int y, int cw, int ch) {
         int nr = ctl_rows(f, shown, iw, rows, WEB_CTL_ROWS);
         int at = w->caret;
         if (focused) {
-            int cr = ctl_row_of(rows, nr, at);
-            int top = c->scroll;
-            if (cr < top) top = cr;
-            if (cr >= top + maxrows) top = cr - maxrows + 1;
-            if (top > nr - 1) top = nr - 1;
-            if (top < 0) top = 0;
-            c->scroll = (u16)top;
+            /* Only follow the caret when it (or the focus) moved. A wheel
+             * notch scrolled the rows without moving the caret;
+             * re-keeping the caret every frame undid that scroll on the
+             * next paint (measured: wheel to row 0, repaint snapped back
+             * to row 2). */
+            if (w->caret != w->ctl_caret_seen || w->focus_ctl != w->ctl_focus_seen) {
+                int cr = ctl_row_of(rows, nr, at);
+                int top = c->scroll;
+                if (cr < top) top = cr;
+                if (cr >= top + maxrows) top = cr - maxrows + 1;
+                if (top > nr - 1) top = nr - 1;
+                if (top < 0) top = 0;
+                c->scroll = (u16)top;
+            }
+            w->ctl_caret_seen = w->caret;
+            w->ctl_focus_seen = w->focus_ctl;
         }
         int top = c->scroll;
         if (top > nr - 1) top = nr - 1;
@@ -5253,34 +5734,40 @@ static void draw_ctl(Surface *v, Web *w, int ci, int x, int y, int cw, int ch) {
             draw_fit(v, f, (float)ix, ty + (float)(row * lh), (float)iw,
                      line, tcol);
         }
-        if (focused) {
+        if (focused && w->caret_on) {
             int cr = ctl_row_of(rows, nr, at);
             int row = cr - top;
-            if (row < 0) row = 0;
-            if (row >= maxrows) row = maxrows - 1;
-            int off = at - (int)rows[cr].off;
-            if (off < 0) off = 0;
-            if (off > (int)rows[cr].len) off = (int)rows[cr].len;
-            char pre[WEB_CTL_TEXT + 1];
-            int m = (int)rows[cr].len;
-            if (m > off) m = off;
-            memcpy(pre, shown + rows[cr].off, (size_t)m);
-            pre[m] = 0;
-            int cxp = ix + (int)(font_width(f, pre) + 0.5f);
-            if (cxp > x + cw - 2) cxp = x + cw - 2;
-            if (cxp < ix) cxp = ix;
-            surf_blend(v, cxp, (int)ty + row * lh, 1, lh, C_ACCENT);
+            /* A caret scrolled out of the visible rows is not drawn at the
+             * edge in place of the caret that is off screen: it is simply
+             * not visible, exactly as in a browser. */
+            if (row >= 0 && row < maxrows) {
+                int off = at - (int)rows[cr].off;
+                if (off < 0) off = 0;
+                if (off > (int)rows[cr].len) off = (int)rows[cr].len;
+                char pre[WEB_CTL_TEXT + 1];
+                int m = (int)rows[cr].len;
+                if (m > off) m = off;
+                memcpy(pre, shown + rows[cr].off, (size_t)m);
+                pre[m] = 0;
+                int cxp = ix + (int)(font_width(f, pre) + 0.5f);
+                if (cxp > x + cw - 2) cxp = x + cw - 2;
+                if (cxp < ix) cxp = ix;
+                surf_blend(v, cxp, (int)ty + row * lh, 1, lh, C_ACCENT);
+            }
         }
         return;
     }
 
     /* A focused text field scrolls its own value sideways so the caret is
      * always visible; unfocused, it shows the start of the value the way a
-     * browser does. */
+     * browser does. A password's caret indexes its value's bytes, so it is
+     * mapped into the mask, which has one character per dot. */
     int start = 0;
     int end = (int)strlen(shown);
+    int cat = w->caret;
+    if (c->kind == CTL_PASSWORD) cat = ctl_char_count(c->value, w->caret);
     if (focused && (c->kind == CTL_TEXT || c->kind == CTL_PASSWORD)) {
-        start = ctl_hoff(f, shown, end, w->caret, iw);
+        start = ctl_hoff(f, shown, end, cat, iw);
         end = ctl_hend(f, shown, end, start, iw);
         char vis[WEB_CTL_TEXT + 1];
         int m = end - start;
@@ -5299,8 +5786,9 @@ static void draw_ctl(Surface *v, Web *w, int ci, int x, int y, int cw, int ch) {
      * so drawing the bar here put it after the first glyph of the label.
      * Checkbox/radio/sELECT returned above, and a textarea has its own
      * caret block. */
-    if (focused && (c->kind == CTL_TEXT || c->kind == CTL_PASSWORD)) {
-        size_t at = (size_t)w->caret;
+    if (focused && w->caret_on &&
+        (c->kind == CTL_TEXT || c->kind == CTL_PASSWORD)) {
+        size_t at = (size_t)cat;
         size_t vl = strlen(shown);
         if (at > vl) at = vl;
         if (at < (size_t)start) start = (int)at;
@@ -5365,13 +5853,19 @@ static void draw_table_grid(Surface *v, Web *w) {
             for (int r = 0; r < nr; r++) {
                 TRow *row = &d->trow[tb->row_start + r];
                 if (row->table != (u16)i) continue;
-                int covered = 0, col = 0;
-                for (int k = row->cell_start; k < row->cell_end && col <= c; k++) {
+                /* `xcol` is this cell's column counter. It used to be called
+                 * `col`, which shadowed the rule colour above: the separator
+                 * was then drawn with 1, 2, 3 ... as its ARGB value, alpha 0,
+                 * so a border=1 table painted its frame and its row rules and
+                 * no column separator at all (measured: 3 painted pixels at
+                 * x=299 and x=591 where the frame has 60). */
+                int covered = 0, xcol = 0;
+                for (int k = row->cell_start; k < row->cell_end && xcol <= c; k++) {
                     TCell *cell = &d->tcell[k];
                     if (cell->row != (u16)(tb->row_start + r)) continue;
                     int span = cell->colspan ? cell->colspan : 1;
-                    if (col < c && col + span > c) { covered = 1; break; }
-                    col += span;
+                    if (xcol < c && xcol + span > c) { covered = 1; break; }
+                    xcol += span;
                 }
                 if (covered) continue;
                 int y0 = (int)row->y0 - w->scroll;
@@ -6035,6 +6529,11 @@ static void render(Web *w) {
 static void web_clear_page(Web *w) {
     w->focus_ctl = -1;
     w->caret = 0;
+    /* No control was painted for this page yet, so the first focused one
+     * must scroll its textarea to the caret rather than trust a position
+     * remembered from the previous page. */
+    w->ctl_caret_seen = -1;
+    w->ctl_focus_seen = -1;
     w->doc.natom = 0;
     w->doc.nseg = 0;
     w->doc.nline = 0;
@@ -6592,6 +7091,44 @@ static int ctl_at(Web *w, int lx, int ly) {
     return -1;
 }
 
+/* The control whose <label> owns the atom under a point, or -1. The label's
+ * own words are ordinary text, so ctl_at() cannot see the control from them;
+ * this second walk is what makes a click on "User" focus the field it names.
+ * The first control inside the label wins, which is also what a browser
+ * does when a (technically invalid) label wraps two controls. */
+static int label_ctl_at(Web *w, int lx, int ly) {
+    Doc *d = &w->doc;
+    if (d->nlabel <= 0) return -1;
+    int l, sg, off;
+    web_pos_at(w, lx, ly, &l, &sg, &off);
+    if (l < 0 || l >= d->nline) return -1;
+    /* web_pos_at() clamps to the nearest line and segment, which is right
+     * for a text selection but wrong here: a click below the last line must
+     * not focus a control because the page happens to end with a label. */
+    Line *ln = &d->line[l];
+    int y = ly + w->scroll;
+    if (y < (int)ln->y || y >= (int)ln->y + (int)ln->h) return -1;
+    if (sg < 0 || sg >= d->nseg) return -1;
+    Seg *s = &d->seg[sg];
+    if (lx < (int)s->x || lx >= (int)s->x + (int)s->w) return -1;
+    int atom = s->atom;
+    /* An interactive descendant (a link, or a control, which ctl_at()
+     * already tried) wins over the label: clicking "help" in
+     * `<label>See <a href=...>help</a> <input></label>` follows the link,
+     * exactly as a browser does. */
+    if (d->atom[atom].link >= 0) return -1;
+    for (int j = 0; j < d->nlabel; j++) {
+        Label *lb = &d->label[j];
+        if (atom < lb->atom_start || atom >= lb->atom_end) continue;
+        for (int i = 0; i < d->nctl; i++) {
+            Ctl *c = &d->ctl[i];
+            if (c->atom >= lb->atom_start && c->atom < lb->atom_end)
+                return i;
+        }
+    }
+    return -1;
+}
+
 /* What a control shows, which is not always its value: a password
  * shows dots, an empty field shows its placeholder. Both the painter
  * and the caret calculation need exactly this string. */
@@ -6603,7 +7140,8 @@ static void ctl_shown(const Ctl *c, char *out, size_t cap) {
     if (c->kind == CTL_BUTTON) {
         snprintf(out, cap, "%s", c->label[0] ? c->label : "Button");
     } else if (c->kind == CTL_PASSWORD) {
-        size_t n = strlen(c->value);
+        /* One dot per character, not per byte: see ctl_char_count(). */
+        size_t n = (size_t)ctl_char_count(c->value, (int)strlen(c->value));
         if (n >= cap) n = cap - 1;
         for (size_t k = 0; k < n; k++) out[k] = '*';
         out[n] = 0;
@@ -7029,10 +7567,155 @@ static void ctl_caret_from_click(Web *w, int ci, int lx, int ly) {
          * map the click against the text the painter actually drew. */
         int start = (int)c->hoff;
         if (start < 0 || start > len) start = 0;
-        w->caret = start + ctl_off_at_x(f, shown + start, len - start, lx - ix);
+        int at = start + ctl_off_at_x(f, shown + start, len - start, lx - ix);
+        if (c->kind == CTL_PASSWORD) {
+            /* `at` is an index into the mask; the caret is a byte index
+             * into the value, so stop on a character boundary. */
+            w->caret = ctl_byte_of_char(c->value, at);
+        } else {
+            w->caret = at;
+        }
     }
     if (w->caret < 0) w->caret = 0;
-    if (c->kind != CTL_PASSWORD && w->caret > len) w->caret = len;
+    int vlen = (int)strlen(c->value);
+    if (c->kind == CTL_PASSWORD) {
+        if (w->caret > vlen) w->caret = vlen;
+    } else if (w->caret > len) {
+        w->caret = len;
+    }
+}
+
+/* The byte boundary before/after one whole UTF-8 character. Moving the
+ * caret by one byte could leave it inside a multi-byte sequence, and the
+ * next character typed then split it (measured: "café", one arrow-left,
+ * "X" produced 63 61 66 C3 58 A9 - not UTF-8 at all). */
+static int ctl_prev_char(const char *s, int caret) {
+    if (caret <= 0) return 0;
+    int k = caret - 1;
+    while (k > 0 && ((unsigned char)s[k] & 0xC0) == 0x80) k--;
+    return k;
+}
+
+static int ctl_next_char(const char *s, int caret) {
+    int len = (int)strlen(s);
+    if (caret < 0) return 0;
+    if (caret >= len) return len;
+    int gl = utf8_len((unsigned char)s[caret]);
+    if (gl < 1) gl = 1;
+    caret += gl;
+    return caret > len ? len : caret;
+}
+
+/* Home/End: the start or the end of the caret's line. In a textarea that is
+ * the visual row it is on, not the whole value - which is what a browser
+ * does and what the wrapping makes useful. */
+static void ctl_line_edge(Web *w, int ci, int end) {
+    Ctl *c = &w->doc.ctl[ci];
+    if (c->kind == CTL_TEXTAREA) {
+        Font *f = field_font();
+        if (f) {
+            const int pad = ui_px(3);
+            int iw = (int)c->w - 2 * pad;
+            if (iw < 1) iw = 1;
+            CtlRow rows[WEB_CTL_ROWS];
+            int nr = ctl_rows(f, c->value, iw, rows, WEB_CTL_ROWS);
+            int r = ctl_row_of(rows, nr, w->caret);
+            w->caret = (int)rows[r].off + (end ? (int)rows[r].len : 0);
+        }
+    } else {
+        w->caret = end ? (int)strlen(c->value) : 0;
+    }
+    w->caret_on = 1;
+    w->dirty = 1;
+}
+
+/* Up/Down inside a textarea move one visual row, keeping the pixel column
+ * as far as the target row allows. Returns 1 when the caret moved. */
+static int ctl_move_row(Web *w, int ci, int dir) {
+    Ctl *c = &w->doc.ctl[ci];
+    Font *f = field_font();
+    if (!f || c->kind != CTL_TEXTAREA) return 0;
+    const int pad = ui_px(3);
+    int iw = (int)c->w - 2 * pad;
+    if (iw < 1) iw = 1;
+    CtlRow rows[WEB_CTL_ROWS];
+    int nr = ctl_rows(f, c->value, iw, rows, WEB_CTL_ROWS);
+    int r = ctl_row_of(rows, nr, w->caret);
+    int to = r + dir;
+    if (to < 0 || to >= nr) return 0;
+    int off = w->caret - (int)rows[r].off;
+    if (off < 0) off = 0;
+    if (off > (int)rows[r].len) off = (int)rows[r].len;
+    char pre[WEB_CTL_TEXT + 1];
+    if (off > (int)sizeof pre - 1) off = (int)sizeof pre - 1;
+    memcpy(pre, c->value + rows[r].off, (size_t)off);
+    pre[off] = 0;
+    int dx = (int)(font_width(f, pre) + 0.5f);
+    w->caret = (int)rows[to].off +
+               ctl_off_at_x(f, c->value + rows[to].off, (int)rows[to].len, dx);
+    w->caret_on = 1;
+    w->dirty = 1;
+    return 1;
+}
+
+/* The next control Tab reaches, then the first one. A hidden field has no
+ * box and cannot take the keyboard, so it is skipped; every other control
+ * is focusable, exactly as the click path treats it. */
+static int ctl_next_focus(const Web *w, int from) {
+    for (int i = from + 1; i < w->doc.nctl; i++)
+        if (w->doc.ctl[i].kind != CTL_HIDDEN) return i;
+    return -1;
+}
+
+static int ctl_first_focus(const Web *w) {
+    for (int i = 0; i < w->doc.nctl; i++)
+        if (w->doc.ctl[i].kind != CTL_HIDDEN) return i;
+    return -1;
+}
+
+/* Give the keyboard to a control, with the caret at the end of its text -
+ * where Tab leaves it. */
+static void ctl_focus_set(Web *w, int ci) {
+    if (ci < 0 || ci >= w->doc.nctl) return;
+    Ctl *c = &w->doc.ctl[ci];
+    w->edit_focus = 0;
+    w->focus_ctl = ci;
+    w->caret = (c->kind == CTL_TEXT || c->kind == CTL_PASSWORD ||
+                c->kind == CTL_TEXTAREA) ? (int)strlen(c->value) : 0;
+    w->caret_on = 1;
+    w->press_ctl = -1;
+    w->sel = 0;
+    w->sel_drag = 0;
+    w->link_hit = -1;
+    w->dirty = 1;
+}
+
+/* Check one radio and uncheck the rest of its group (the same form owner and
+ * the same name). A click never unchecks a radio: it only moves the group's
+ * choice, which is why a group submits at most one value. */
+static void ctl_radio_check(Web *w, int ci) {
+    if (ci < 0 || ci >= w->doc.nctl) return;
+    Ctl *c = &w->doc.ctl[ci];
+    if (c->kind != CTL_RADIO) return;
+    c->checked = 1;
+    for (int i = 0; i < w->doc.nctl; i++) {
+        Ctl *o = &w->doc.ctl[i];
+        if (i != ci && o->kind == CTL_RADIO && o->form == c->form &&
+            !strcmp(o->name, c->name))
+            o->checked = 0;
+    }
+    w->dirty = 1;
+}
+
+/* Activate a button exactly as a click does: reset, submit, or say why not.
+ * Shared with Enter/Space on a focused button so the keyboard cannot mean
+ * something different from the mouse. */
+static void ctl_activate(Web *w, int ci) {
+    if (ci < 0 || ci >= w->doc.nctl) return;
+    Ctl *c = &w->doc.ctl[ci];
+    if (c->is_reset) form_reset(w, c->form);
+    else if (c->submits) form_submit(w, c->form, ci);
+    else web_note(w, "a button without type=submit has no action");
 }
 
 /* The wheel over a textarea scrolls its rows first; at either end it
@@ -7121,12 +7804,29 @@ static void handle_key(Web *w, int key, int mods) {
         return;
     }
     /* Arrow keys move the caret inside a focused field; everywhere else
-     * they scroll, which is the switch below. */
+     * they scroll, which is the switch below. The moves stop on UTF-8
+     * boundaries, and in a textarea Home/End are the edge of the visual
+     * row and Up/Down cross rows rather than scrolling the page. */
     if (w->focus_ctl >= 0 && w->focus_ctl < w->doc.nctl) {
         Ctl *c = &w->doc.ctl[w->focus_ctl];
-        int len = (int)strlen(c->value);
-        if (key == K_LEFT)  { if (w->caret > 0) w->caret--; w->caret_on = 1; w->dirty = 1; return; }
-        if (key == K_RIGHT) { if (w->caret < len) w->caret++; w->caret_on = 1; w->dirty = 1; return; }
+        int textish = (c->kind == CTL_TEXT || c->kind == CTL_PASSWORD ||
+                       c->kind == CTL_TEXTAREA);
+        if (textish) {
+            if (key == K_LEFT) {
+                w->caret = ctl_prev_char(c->value, w->caret);
+                w->caret_on = 1; w->dirty = 1; return;
+            }
+            if (key == K_RIGHT) {
+                w->caret = ctl_next_char(c->value, w->caret);
+                w->caret_on = 1; w->dirty = 1; return;
+            }
+            if (key == K_HOME) { ctl_line_edge(w, w->focus_ctl, 0); return; }
+            if (key == K_END)  { ctl_line_edge(w, w->focus_ctl, 1); return; }
+        }
+        if (c->kind == CTL_TEXTAREA && (key == K_UP || key == K_DOWN)) {
+            ctl_move_row(w, w->focus_ctl, key == K_UP ? -1 : 1);
+            return;             /* the caret owns the arrows here */
+        }
     }
 
     /* scroll_to() clamps to max_scroll, which is 0 when there is nothing
@@ -7147,34 +7847,75 @@ static int handle_text(Web *w, const char *t) {
     for (int i = 0; t[i]; i++) {
         unsigned char c = (unsigned char)t[i];
 
-        if (c == '\t') {                            /* Tab: focus the bar */
-            w->edit_focus = !w->edit_focus;
-            if (w->edit_focus) w->focus_ctl = -1;
-            w->caret_on = 1;
-            w->dirty = 1;
+        if (c == '\t') {
+            /* Tab walks the page's controls in document order and only then
+             * hands the keyboard to the address bar; a Tab from the bar comes
+             * back into the page. A page with no controls keeps the old
+             * toggle, so the bar is still reachable there. */
+            int next = -1;
+            if (w->focus_ctl >= 0 && !w->edit_focus)
+                next = ctl_next_focus(w, w->focus_ctl);
+            else if (w->edit_focus)
+                next = ctl_first_focus(w);
+            if (next >= 0) {
+                ctl_focus_set(w, next);
+            } else {
+                w->edit_focus = 1;
+                w->focus_ctl = -1;
+                w->caret_on = 1;
+                w->dirty = 1;
+            }
             continue;
         }
         /* A focused control owns the keyboard until the reader clicks or
-         * tabs away. Enter submits a form field (and is a real newline in
-         * a textarea), Tab goes to the address bar, and a printable
-         * character is inserted at the caret. */
-        if (w->focus_ctl >= 0 && !w->edit_focus) {
+         * tabs away. Enter submits a text field and activates a button (and
+         * is a real newline in a textarea); Space toggles a checkbox or a
+         * radio and activates a button; a printable character is inserted at
+         * the caret. */
+        if (w->focus_ctl >= 0 && w->focus_ctl < w->doc.nctl && !w->edit_focus) {
             Ctl *fc = &w->doc.ctl[w->focus_ctl];
             if (c == '\n' || c == '\r') {
                 if (fc->kind == CTL_TEXTAREA) {
                     ctl_insert(w, w->focus_ctl, "\n", 1);
+                    w->caret_on = 1;
                     w->dirty = 1;
+                } else if (fc->kind == CTL_BUTTON) {
+                    ctl_activate(w, w->focus_ctl);
                 } else {
                     form_submit_field(w, w->focus_ctl);
                 }
                 continue;
             }
-            if (c == '\b' || c == 0x7F) { ctl_backspace(w, w->focus_ctl); continue; }
-            if (c == 0x1B) { w->focus_ctl = -1; continue; }
+            if (c == '\b' || c == 0x7F) {
+                ctl_backspace(w, w->focus_ctl);
+                w->caret_on = 1;
+                continue;
+            }
+            if (c == 0x1B) {
+                w->focus_ctl = -1;
+                w->dirty = 1;
+                continue;
+            }
+            if (c == ' ') {
+                if (fc->kind == CTL_CHECKBOX) {
+                    fc->checked = (u8)!fc->checked;
+                    w->dirty = 1;
+                    continue;
+                }
+                if (fc->kind == CTL_RADIO) {
+                    ctl_radio_check(w, w->focus_ctl);
+                    continue;
+                }
+                if (fc->kind == CTL_BUTTON) {
+                    ctl_activate(w, w->focus_ctl);
+                    continue;
+                }
+            }
             char one[2];
             one[0] = (char)c;
             one[1] = 0;
             ctl_insert(w, w->focus_ctl, one, 1);
+            w->caret_on = 1;
             continue;
         }
         if (w->edit_focus) {
@@ -7273,6 +8014,11 @@ static void handle_mouse(Web *w, int x, int y, int buttons) {
      * never activates anything again, and a drag that began on the page
      * keeps selecting instead of stealing the keyboard. */
     int ci = ctl_at(w, lx, ly);
+    int via_label = 0;
+    if (ci < 0) {
+        ci = label_ctl_at(w, lx, ly);
+        via_label = (ci >= 0);
+    }
     int holding = (prev & 1) && w->press_ctl >= 0 && w->press_ctl == ci;
     if (ci >= 0 && (!(prev & 1) || holding)) {
         Ctl *c = &w->doc.ctl[ci];
@@ -7285,17 +8031,23 @@ static void handle_mouse(Web *w, int x, int y, int buttons) {
         if (!(prev & 1)) {
             w->press_ctl = ci;
             w->caret = (int)strlen(c->value);
-            if (c->kind == CTL_CHECKBOX || c->kind == CTL_RADIO) {
+            if (c->kind == CTL_CHECKBOX) {
                 c->checked = (u8)!c->checked;
+            } else if (c->kind == CTL_RADIO) {
+                ctl_radio_check(w, ci);
             } else if (c->kind == CTL_BUTTON) {
-                if (c->is_reset) form_reset(w, c->form);
-                else if (c->submits) form_submit(w, c->form, ci);
-                else web_note(w, "a button without type=submit has no action");
+                ctl_activate(w, ci);
+            } else if (via_label) {
+                /* The click was on the label's text, not in the box, so there
+                 * is no column to map: put the caret at the end, as a browser
+                 * does when a label focuses a field. */
+                w->caret = (int)strlen(c->value);
             } else {
                 ctl_caret_from_click(w, ci, lx, ly);
             }
-        } else if (c->kind == CTL_TEXT || c->kind == CTL_PASSWORD ||
-                   c->kind == CTL_TEXTAREA) {
+        } else if (!via_label &&
+                   (c->kind == CTL_TEXT || c->kind == CTL_PASSWORD ||
+                    c->kind == CTL_TEXTAREA)) {
             ctl_caret_from_click(w, ci, lx, ly);
         }
         w->sel = 0;
@@ -7402,6 +8154,8 @@ int main(int argc, char **argv) {
     w->caret_on = 1;
     w->focus_ctl = -1;
     w->press_ctl = -1;
+    w->ctl_caret_seen = -1;
+    w->ctl_focus_seen = -1;
     w->dirty = 1;
 
     /* 'web http://example.com' from a terminal starts on that page. It also

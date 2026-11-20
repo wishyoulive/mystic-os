@@ -21,6 +21,7 @@
 #include <sys/un.h>
 
 #include "mystic.h"
+#include "wmgeom.h"
 #include "filetypes.h"
 #include "filepick.h"
 #include "ipc.h"
@@ -209,6 +210,13 @@ static int    drag_ox, drag_oy;   /* where the drag began, so Esc can put it bac
 static unsigned drag_gen;         /* generation of the window being dragged   */
 static int    resize_win = -1;
 static int    resize_ow, resize_oh; /* the size before the resize handle grabbed */
+/* Which edges the pointer grabbed: bit 1 west, 2 east, 4 north, 8 south. A
+ * corner is two bits, so one code path moves the origin and the size together.
+ * The press point is kept because a resize follows the pointer's delta, not its
+ * absolute position: with only the origin stored, grabbing the left edge would
+ * jump the window the moment the pointer moved a pixel. */
+static int    resize_edge, resize_ox, resize_oy, resize_px, resize_py;
+static int    debug_input;        /* MYSTIC_DEBUG_INPUT: log press coordinates */
 static unsigned resize_gen;       /* generation of the window being resized   */
 
 /* Desktop context menu (right click on empty wallpaper). It is a modal for
@@ -3960,6 +3968,8 @@ static void cancel_drag(void) {
 static void cancel_resize(void) {
     if (resize_win >= 0 && wins[resize_win].used && wins[resize_win].gen == resize_gen) {
         Window *w = &wins[resize_win];
+        w->x = resize_ox;
+        w->y = resize_oy;
         w->w = resize_ow;
         w->h = resize_oh;
         window_resized(w);
@@ -5459,9 +5469,17 @@ static const ShortcutActions SHORTCUTS = { shortcut_action, NULL };
         if (mx < w->x || mx >= w->x + w->w || my < w->y || my >= w->y + w->h) continue;
         if (!hit || win_rank(w) > win_rank(hit)) hit = w;
     }
+    if (!hit && debug_input)
+        fprintf(stderr, "input: press at %d,%d hit no window\n", mx, my);
     if (hit) {
         win_focus(hit);
         int tb = title_h();
+        /* MYSTIC_DEBUG_INPUT=1 logs every press in window coordinates. A
+         * pointer that lands somewhere unexpected is otherwise invisible: the
+         * compositor draws one cursor bitmap and records no hit test. */
+        if (debug_input)
+            fprintf(stderr, "input: press at %d,%d window (%d,%d) size %dx%d\n",
+                    mx, my, mx - hit->x, my - hit->y, hit->w, hit->h);
         int lx = mx - hit->x, ly = my - hit->y;
         /* F12: red closes, yellow minimises - only on the dots themselves.
          * The band is derived from the same centre the dots are drawn on, so
@@ -5487,13 +5505,36 @@ int dot_y = traffic_y(tb);
             hit->hidden = 1;
             return 1;
         }
-        /* bottom-right corner resizes */
-        if (lx >= hit->w - ui_px(13) && ly >= hit->h - ui_px(13)) {
-            resize_win = (int)(hit - wins);
-            resize_gen = hit->gen;          /* F9: remember which window, not just the slot */
-            resize_ow = hit->w;
-            resize_oh = hit->h;
-            return 1;
+        /* Every edge resizes, and a corner is two edges at once: a 6 px band
+         * along each side and a 16 px square at the corners, both in UI pixels
+         * so the target grows with the text scale. The bottom-right square keeps
+         * the old size, because that is the handle people already learned. */
+        {
+            const int band = ui_px(6), corner = ui_px(16);
+            int e = 0;
+            int wband = (lx < band) ? 1 : ((lx >= hit->w - band) ? 2 : 0);
+            int hband = (ly < band) ? 4 : ((ly >= hit->h - band) ? 8 : 0);
+            if (lx < corner && ly < corner)                 { wband = 1; hband = 4; }
+            else if (lx >= hit->w - corner && ly < corner)  { wband = 2; hband = 4; }
+            else if (lx < corner && ly >= hit->h - corner)  { wband = 1; hband = 8; }
+            else if (lx >= hit->w - corner && ly >= hit->h - corner) { wband = 2; hband = 8; }
+            e = wband | hband;
+            if (e) {
+                resize_win = (int)(hit - wins);
+                resize_gen = hit->gen;      /* F9: which window, not just the slot */
+                resize_ow = hit->w;
+                resize_oh = hit->h;
+                resize_ox = hit->x;
+                resize_oy = hit->y;
+                /* screen coordinates: the drag delta is compared with the
+                 * pointer's own position every frame, so storing the press in
+                 * window coordinates made a resize overshoot by the window's
+                 * own offset (measured: 262 px of travel for a 150 px drag). */
+                resize_px = mx;
+                resize_py = my;
+                resize_edge = e;
+                return 1;
+            }
         }
         /* double-click on the title bar toggles maximise */
         if (ly < tb && input.clicked2) {
@@ -6131,6 +6172,8 @@ int main(int argc, char **argv) {
     ensure_clipd();
 
     install_fatal_handlers();
+    debug_input = getenv("MYSTIC_DEBUG_INPUT") != NULL ||
+                  access("/run/mystic/debug-input", F_OK) == 0;
     if (disp_open(&disp, "/dev/fb0") < 0) return 1;
     /* Ask the device what it can do before anything asks for a mode. */
     disp_scan_modes(&disp);
@@ -6235,6 +6278,7 @@ int main(int argc, char **argv) {
     theme_runtime_apply();
 
     if (input_open(&input) < 0) fprintf(stderr, "no input devices\n");
+    input_set_screen(&input, screen.w, screen.h);
 
     if (wms_start() < 0) fprintf(stderr, "window server failed to start\n");
     bundle_count = wms_scan_apps(bundles, WM_MAX_APPS);
@@ -6692,15 +6736,17 @@ int main(int argc, char **argv) {
             /* F9: the window closed and the slot was reused - not our window */
             if (!w->used || w->gen != resize_gen) { resize_win = -1; }
             else {
-                int nw = input.mouse_x - w->x + 1;
-                int nh = input.mouse_y - w->y + 1;
-                /* Minimums that leave a client app room to draw. Both the
-                 * width and the height are the desktop's own minimum module:
-                 * the resize clamps, the initial size and a snapped window
-                 * read the same functions, so they cannot disagree. */
-                if (nw < ui_win_min_w()) nw = ui_win_min_w();
-                if (nh < ui_win_min_h()) nh = ui_win_min_h();
-                if (nw != w->w || nh != w->h) {
+                WmRect r0 = { resize_ox, resize_oy, resize_ow, resize_oh };
+                WmRect r;
+                wm_resize_apply(&r0, resize_edge,
+                                input.mouse_x - resize_px,
+                                input.mouse_y - resize_py,
+                                ui_win_min_w(), ui_win_min_h(),
+                                topbar_h(), &r);
+                int nx = r.x, ny = r.y, nw = r.w, nh = r.h;
+                if (nw != w->w || nh != w->h || nx != w->x || ny != w->y) {
+                    w->x = nx;
+                    w->y = ny;
                     w->w = nw;
                     w->h = nh;
                     window_resized(w);

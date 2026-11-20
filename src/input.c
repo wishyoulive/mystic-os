@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <linux/input.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <time.h>
@@ -399,6 +400,94 @@ static void mt_packet(Input *in) {
     in->gesture_fingers = mt.fingers;
 }
 
+void input_set_screen(Input *in, int w, int h) {
+    in->scr_w = w;
+    in->scr_h = h;
+}
+
+/* ---- scripted input -------------------------------------------------------
+ *
+ * MYSTIC_INPUT_TEST=<file> replays a text script instead of reading evdev:
+ *
+ *     abs 690 470     move the pointer to a screen position
+ *     press           left button down
+ *     release         left button up
+ *     wheel 3         three notches up (negative scrolls down)
+ *     key a           a key press and release, same names evdev uses
+ *     wait 3          three frames with nothing happening
+ *
+ * One line is consumed per poll, so the compositor sees a sequence of frames
+ * exactly as it would from a device. This exists because a synthetic pointer
+ * driven through the hypervisor's PS/2 model drops and reorders events, which
+ * makes a resize or a drag untestable; with a script the same interaction can
+ * be reproduced deterministically, on any machine, in CI.
+ */
+static FILE *test_script;
+static int   test_eof;
+static int   test_wait;          /* frames still to skip before the next line */
+
+static void test_open(void) {
+    /* init starts the desktop, so an environment variable set in a shell is not
+     * visible here; the path is also read from a file the image can carry. */
+    const char *path = getenv("MYSTIC_INPUT_TEST");
+    if (!path || !*path) {
+        static const char marker[] = "/run/mystic/input-script";
+        if (access(marker, R_OK) == 0) path = marker;
+        else return;
+    }
+    test_script = fopen(path, "r");
+    if (!test_script) {
+        fprintf(stderr, "input: MYSTIC_INPUT_TEST %s: %s\n", path, strerror(errno));
+        return;
+    }
+    fprintf(stderr, "input: scripted device %s\n", path);
+}
+
+static void test_step(Input *in) {
+    char line[192];
+    if (!test_script || test_eof) return;
+    if (test_wait > 0) { test_wait--; return; }
+    if (!fgets(line, sizeof line, test_script)) { test_eof = 1; return; }
+    char what[24];
+    int a = 0, b = 0;
+    if (sscanf(line, "%23s %d %d", what, &a, &b) < 1) return;
+    fprintf(stderr, "script: %s", line);
+    if (!strcmp(what, "abs")) {
+        in->mouse_x = a; in->mouse_y = b;
+        in->mouse_dx += a; in->mouse_dy += b;
+    } else if (!strcmp(what, "press")) {
+        if (!(in->buttons & 1)) in->clicked = 1;
+        in->buttons |= 1;
+    } else if (!strcmp(what, "release")) {
+        if (in->buttons & 1) in->released = 1;
+        in->buttons &= ~1;
+    } else if (!strcmp(what, "rpress")) {
+        if (!(in->buttons & 2)) in->clicked = 1;
+        in->buttons |= 2;
+    } else if (!strcmp(what, "rrelease")) {
+        if (in->buttons & 2) in->released = 1;
+        in->buttons &= ~2;
+    } else if (!strcmp(what, "wheel")) {
+        in->wheel += a;
+    } else if (!strcmp(what, "text")) {
+        const char *t = strchr(line, ' ');
+        if (!t) return;
+        t++;
+        size_t n = strlen(t);
+        while (n && (t[n-1] == 10 || t[n-1] == 13)) n--;
+        if (n > sizeof(in->text) - 1) n = sizeof(in->text) - 1;
+        memcpy(in->text, t, n);
+        in->text_len = (int)n;
+    } else if (!strcmp(what, "enter")) {
+        in->key = 28;                 /* KEY_ENTER */
+        in->keys[0] = 28;
+        in->nkeys = 1;
+    } else if (!strcmp(what, "wait")) {
+        /* a is a count of frames */
+        test_wait = a;
+    }
+}
+
 int input_open(Input *in) {
     memset(in, 0, sizeof(*in));
     in->mouse_x = 640;
@@ -429,6 +518,18 @@ int input_open(Input *in) {
 
         if (is_mouse && nmouse < MAX_POINTERS) {
             mouse_fd[nmouse++] = fd;
+            /* The kernel reports the axis range for the device itself; a
+             * tablet says 0..32767, a touchscreen says its panel size. */
+            if (in->abs_max_x == 0 && has_bit(fd, EV_ABS, ABS_X)) {
+                struct input_absinfo ai;
+                if (ioctl(fd, EVIOCGABS(ABS_X), &ai) >= 0 && ai.maximum > 0)
+                    in->abs_max_x = ai.maximum;
+            }
+            if (in->abs_max_y == 0 && has_bit(fd, EV_ABS, ABS_Y)) {
+                struct input_absinfo ai;
+                if (ioctl(fd, EVIOCGABS(ABS_Y), &ai) >= 0 && ai.maximum > 0)
+                    in->abs_max_y = ai.maximum;
+            }
             if (!strcmp(mouse_name, "none"))
                 snprintf(mouse_name, sizeof(mouse_name), "%s", name);
             fprintf(stderr, "input: pointer  %s (%s)\n", path, name);
@@ -661,8 +762,15 @@ static void handle_event(Input *in, int fd, struct input_event *ev,
             else if (ev->code == REL_WHEEL_HI_RES) { wheel_hi += ev->value; wheel_have_hi = 1; }
             break;
         case EV_ABS:
-            if (ev->code == ABS_X) in->mouse_x = ev->value;
-            else if (ev->code == ABS_Y) in->mouse_y = ev->value;
+            if (ev->code == ABS_X) {
+                in->mouse_x = (in->abs_max_x > 0 && in->scr_w > 0)
+                            ? ev->value * in->scr_w / in->abs_max_x : ev->value;
+                if (in->mouse_x >= in->scr_w && in->scr_w > 0) in->mouse_x = in->scr_w - 1;
+            } else if (ev->code == ABS_Y) {
+                in->mouse_y = (in->abs_max_y > 0 && in->scr_h > 0)
+                            ? ev->value * in->scr_h / in->abs_max_y : ev->value;
+                if (in->mouse_y >= in->scr_h && in->scr_h > 0) in->mouse_y = in->scr_h - 1;
+            }
             else if (mt_accept(fd)) {
                 /* Protocol B. A value is stored, not acted on: the packet is
                  * not complete until SYN_REPORT, and acting per event would
@@ -777,8 +885,12 @@ static void handle_event(Input *in, int fd, struct input_event *ev,
 
 int input_poll(Input *in) {
     static int shift = 0, ctrl = 0;
+    static int opened;
     int any = 0;
     struct input_event ev;
+
+    if (!opened) { opened = 1; test_open(); }
+    if (test_script && !test_eof) { test_step(in); any = 1; }
 
     for (int i = 0; i < nmouse; i++) {
         ssize_t got;
