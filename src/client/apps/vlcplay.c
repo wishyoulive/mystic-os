@@ -48,6 +48,15 @@
  *  three colour bytes are therefore already in the right order, and
  *  surf_blit() copies u32 values without touching a channel.
  *
+ *  The OTHER half of the vmem contract is alignment, and it is not advisory:
+ *  libvlc_media_player.h says "The planes must be aligned on 32-bytes
+ *  boundaries". musl's malloc returns 16-byte alignment, so calloc() cannot
+ *  promise it. surf_init() over-allocates by 31 bytes and rounds the plane
+ *  pointer up inside that block; main() rounds the decode width down to a
+ *  multiple of 8 pixels, so pitch = w*4 is a multiple of 32 and every row
+ *  starts aligned too. surf_init() refuses to hand libVLC a misaligned plane,
+ *  and the proof prints (fb & 31) and pitch % 32 from the real buffer.
+ *
  *  WHY THE PICTURE IS SCALED TO THE BODY, AND WHY THE LETTERBOX IS OURS
  *  ------------------------------------------------------------------
  *  vmem with the simple format API gives the display exactly the size we
@@ -107,8 +116,10 @@
  *       is missing (an older server, or a direct chroot start)
  *    4. /root/apps/vlc/lib/libvlc.so.5      the installed package on the
  *       real rootfs - reachable when the app runs outside a jail
- *    5. <dir of this executable>/../lib/libvlc.so.5   a bundle started
- *       directly (the tile's exec is bin/..., the closure is lib/...)
+ *    5. <dir of this executable>/../lib/libvlc.so.5   a bundle run directly
+ *       from the rootfs: this file sits in <bundle>/libexec/, so ../lib is
+ *       <bundle>/lib. (Not a manifest exec path - wmsrv rejects exec values
+ *       containing '/' - this is the launcher case described under BUILD.)
  *    6. libvlc.so.5                         the loader's own search:
  *       LD_LIBRARY_PATH (wmsrv sets /app/usr/lib:/app/lib inside the
  *       jail) and the system search path
@@ -136,6 +147,14 @@
  *             src/client/apps/vlcplay.c src/client/mystic_client.c \
  *             src/gfx.c src/font.c src/ui.c -lm -pthread -ldl
  *
+ *  The SAME file builds the static launcher the manifest's `exec` needs, with
+ *  no libVLC and no SDK sources at all (section 0 describes what it does):
+ *
+ *      zig cc -target x86_64-linux-musl -Os -static -DVLCPLAY_BOOT \
+ *             -Isrc -Isrc/client -o bin src/client/apps/vlcplay.c
+ *
+ *  Both are compile-checked with the plain -c form and -Wall -Wextra.
+ *
  *  MSYS_NO_PATHCONV=1 is not decoration. Built from git-bash on Windows
  *  without it, MSYS rewrites the absolute -dynamic-linker argument into a
  *  Windows path, and the ELF's PT_INTERP then names a file that exists on no
@@ -153,23 +172,36 @@
  *  built from binds - the payload at /bin/app, the bundle at /app, the
  *  socket, fonts, /dev nodes - and nothing else; there is no /lib in it. A
  *  dynamic payload's PT_INTERP is absolute, so that exec fails before main()
- *  runs. The vlc package solves this with a static launcher, and vlcplay has
- *  to ride it:
+ *  runs. The package therefore needs a STATIC launcher as its `bin`, and this
+ *  file builds that launcher: see section 0 with -DVLCPLAY_BOOT. The intended
+ *  installed shape is
  *
  *      bin                      STATIC launcher (manifest exec = bin)
- *      libexec/vlcplay          this file, DYNAMIC
+ *                               built from this file with -DVLCPLAY_BOOT
+ *      libexec/vlcplay          this file, DYNAMIC (section BUILD above)
  *      lib/ld-musl-x86_64.so.1  the loader; the launcher execs it with
  *                               --library-path /app/lib and the player path
  *      lib/libvlc.so.5          the package's soname symlink
  *      lib/libvlccore.so.9      ditto
  *      lib/vlc/plugins/...      demuxers, decoders, the vmem output
  *
+ *  That is the shape docs/MULTIMEDIA.md describes and the shape pkg's tar
+ *  unpacker supports (symlink members included). It is NOT what
+ *  build/repo/vlc.tar.gz contained when this revision was written: that tar's
+ *  `bin` was a dynamic ELF with PT_INTERP /lib/ld-musl-x86_64.so.1 and it had
+ *  no libexec/ member at all, so the tile could not start. That is a packaging
+ *  bug outside this file - the two build commands are in section 0 and in
+ *  BUILD above, and the launcher's path logic is tested in .work/p1/boottest.c.
+ *
  *  Outside the jail - on the real rootfs, where /lib/ld-musl-x86_64.so.1
  *  exists, or with the closure reached through RUNPATH - the dynamic binary
  *  starts directly. Both entry paths end in the same main().
  *
- *  Keys: space play/pause, Left/Right seek 5 s, Up/Down volume, q or Esc
- *  quit, a click on the picture toggles playback.
+ *  Keys: space play/pause (on an ended file: restart), Left/Right seek 5 s,
+ *  Up/Down volume, q or Esc quit, a click on the picture toggles playback
+ *  (and restarts an ended file). Both restart paths are measured in
+ *  .work/p1/restart.c: set_time(0)+play() leaves VLC Ended, stop()+play()
+ *  returns it to Playing with the clock and the decoded frames advancing.
  * ============================================================ */
 
 #include "../vlcmin.h"           /* src/client/vlcmin.h - the ABI slice */
@@ -216,6 +248,210 @@
 #define KEY_LEFT  105
 #define KEY_RIGHT 106
 #define KEY_DOWN  108
+
+/* ============================================================
+ *  0. THE LAUNCHER BUILD (-DVLCPLAY_BOOT): THE STATIC `bin`
+ *
+ *  The manifest's `exec` is a bare file name and wmsrv execs it inside a
+ *  jail whose only contents are binds: the payload at /bin/app, the bundle
+ *  at /app, the socket, fonts, /dev nodes and the app's own /tmp and /root.
+ *  There is NO /lib in that jail (src/wmsrv.c's sbx plan, and
+ *  docs/MULTIMEDIA.md says the same), and a dynamic binary's PT_INTERP is an
+ *  absolute path, so the kernel cannot start one there. The same file built
+ *  with -DVLCPLAY_BOOT is a static launcher that provides the missing step:
+ *
+ *      /app/lib/ld-musl-x86_64.so.1 --library-path /app/lib \
+ *          /app/libexec/vlcplay <args...>
+ *
+ *  It resolves the bundle root from MYSTIC_BUNDLE (wmsrv sets /app), then
+ *  from /proc/self/exe (<bundle>/bin/<name> -> <bundle>), checks that the
+ *  loader and the player are really there, exports LD_LIBRARY_PATH and
+ *  VLC_PLUGIN_PATH when the caller did not, and execs. If anything is
+ *  missing it says which path, on stderr, and exits 127 - a tile that dies
+ *  silently is the failure this build exists to prevent.
+ *
+ *  Two build commands, both from this one file:
+ *
+ *      # static launcher, the manifest's exec
+ *      zig cc -target x86_64-linux-musl -Os -static -DVLCPLAY_BOOT \
+ *             -Isrc -Isrc/client -o bin src/client/apps/vlcplay.c
+ *
+ *      # the dynamic player, libexec/vlcplay (section BUILD below)
+ * ============================================================ */
+#if defined(VLCPLAY_BOOT)
+
+#define BOOT_LOADER_REL "lib/ld-musl-x86_64.so.1"
+#define BOOT_PLAYER_REL "libexec/vlcplay"
+
+typedef struct {
+    char root[512];
+    char libdir[640];
+    char loader[704];
+    char player[704];
+} BootPlan;
+
+/* Why a root could not be used, so the caller can say something true. The
+ * too-long and bad-env cases are NOT "unset": a 600-byte MYSTIC_BUNDLE used
+ * to produce the sentence "MYSTIC_BUNDLE is unset", which was false. */
+enum {
+    BOOT_ROOT_TOO_LONG = -2,
+    BOOT_ROOT_BAD_ENV  = -1,
+    BOOT_ROOT_NONE     =  0,
+    BOOT_ROOT_OK       =  1
+};
+
+/* Pure string work, no syscalls, so the host harness can test every layout:
+ *
+ *   1. $MYSTIC_BUNDLE                      wmsrv exports /app in the jail
+ *   2. <...>/bin/<name>  -> <...>          the installed bundle layout
+ *   3. dirname(<exe>)                      anything else
+ *
+ *  Returns BOOT_ROOT_OK with a root in `out`, or one of the reasons above. */
+static int boot_pick_root(const char *env, const char *exe, char *out, size_t n) {
+    const char *slash, *prev = NULL, *q;
+    size_t rootlen;
+
+    if (!out || n < 2) return BOOT_ROOT_TOO_LONG;
+    out[0] = 0;
+    if (env && *env) {
+        if (env[0] != '/') return BOOT_ROOT_BAD_ENV;   /* relative: not a mount */
+        if (strlen(env) >= n) return BOOT_ROOT_TOO_LONG;
+        snprintf(out, n, "%s", env);
+        return BOOT_ROOT_OK;
+    }
+    if (!exe || !*exe) return BOOT_ROOT_NONE;
+    slash = strrchr(exe, '/');
+    if (!slash) return BOOT_ROOT_NONE;
+
+    /* <bundle>/bin/<name>: drop "/<name>" and the "/bin" before it */
+    for (q = exe; q < slash; q++)
+        if (*q == '/') prev = q;
+    if (prev && prev > exe && (size_t)(slash - prev) == 4 &&
+        memcmp(prev, "/bin", 4) == 0) {
+        rootlen = (size_t)(prev - exe);
+        if (rootlen >= n) return BOOT_ROOT_TOO_LONG;
+        memcpy(out, exe, rootlen);
+        out[rootlen] = 0;
+        return BOOT_ROOT_OK;
+    }
+
+    /* dirname(exe); "/bin/app" gives "/bin" */
+    rootlen = (size_t)(slash - exe);
+    if (rootlen == 0) {
+        out[0] = '/';
+        out[1] = 0;
+        return BOOT_ROOT_OK;
+    }
+    if (rootlen >= n) return BOOT_ROOT_TOO_LONG;
+    memcpy(out, exe, rootlen);
+    out[rootlen] = 0;
+    return BOOT_ROOT_OK;
+}
+
+/* root -> the three absolute paths the exec needs. 0 when they do not fit. */
+static int boot_plan(const char *root, BootPlan *p) {
+    if (!root || !*root || !p) return 0;
+    if ((size_t)snprintf(p->root, sizeof(p->root), "%s", root) >= sizeof(p->root))
+        return 0;
+    if ((size_t)snprintf(p->libdir, sizeof(p->libdir), "%s/lib", p->root) >=
+        sizeof(p->libdir))
+        return 0;
+    if ((size_t)snprintf(p->loader, sizeof(p->loader), "%s/%s", p->root,
+                         BOOT_LOADER_REL) >= sizeof(p->loader))
+        return 0;
+    if ((size_t)snprintf(p->player, sizeof(p->player), "%s/%s", p->root,
+                         BOOT_PLAYER_REL) >= sizeof(p->player))
+        return 0;
+    return 1;
+}
+
+#if !defined(_WIN32)
+int main(int argc, char **argv) {
+    char exe[512], root[512], plugins[704];
+    const char *env;
+    BootPlan plan;
+    char **args;
+    int extra, i, rc;
+    ssize_t n;
+
+    n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n < 0) exe[0] = 0; else exe[n] = 0;
+
+    env = getenv("MYSTIC_BUNDLE");
+    rc = boot_pick_root(env, exe, root, sizeof(root));
+    if (rc == BOOT_ROOT_BAD_ENV) {
+        fprintf(stderr, "vlcplay: MYSTIC_BUNDLE='%s' is not an absolute "
+                        "path, so it cannot name the bundle mount\n", env);
+        return 127;
+    }
+    if (rc == BOOT_ROOT_TOO_LONG) {
+        fprintf(stderr, "vlcplay: %s is too long for the %u-byte bundle-root "
+                        "buffer\n",
+                (env && *env) ? "MYSTIC_BUNDLE" : "the executable path",
+                (unsigned)sizeof(root));
+        return 127;
+    }
+    if (rc == BOOT_ROOT_NONE) {
+        fprintf(stderr, "vlcplay: cannot find the bundle root: MYSTIC_BUNDLE "
+                        "is unset and /proc/self/exe did not resolve\n");
+        return 127;
+    }
+    if (!boot_plan(root, &plan)) {
+        fprintf(stderr, "vlcplay: the bundle path under %s is too long\n", root);
+        return 127;
+    }
+    /* A server that does not export MYSTIC_BUNDLE leaves the executable at
+     * /bin/app, so the root derived from /proc/self/exe is /bin - which is
+     * not where a bundle lives. The bundle is mounted at /app by the sandbox
+     * either way, so fall back to it when the first guess has no loader. */
+    if (access(plan.loader, X_OK) != 0 && strcmp(plan.root, "/app") != 0) {
+        BootPlan alt;
+        if (boot_plan("/app", &alt) && access(alt.loader, X_OK) == 0) {
+            plan = alt;
+            snprintf(root, sizeof(root), "%s", plan.root);
+        }
+    }
+    if (access(plan.loader, X_OK) != 0) {
+        fprintf(stderr, "vlcplay: %s: %s - the bundle must carry the musl "
+                        "loader at %s\n", plan.loader, strerror(errno),
+                BOOT_LOADER_REL);
+        return 127;
+    }
+    if (access(plan.player, X_OK) != 0) {
+        fprintf(stderr, "vlcplay: %s: %s - the dynamic player must be at %s\n",
+                plan.player, strerror(errno), BOOT_PLAYER_REL);
+        return 127;
+    }
+
+    /* musl reads these when the loader starts, which is the very next exec,
+     * so setting them here works. The jail already exports both. */
+    setenv("LD_LIBRARY_PATH", plan.libdir, 0);
+    if (!getenv("VLC_PLUGIN_PATH")) {
+        snprintf(plugins, sizeof(plugins), "%s/vlc/plugins", plan.libdir);
+        if (access(plugins, R_OK) == 0) setenv("VLC_PLUGIN_PATH", plugins, 1);
+    }
+
+    extra = argc > 1 ? argc - 1 : 0;
+    args = (char **)calloc((size_t)extra + 5u, sizeof(char *));
+    if (!args) {
+        fprintf(stderr, "vlcplay: out of memory building the loader command\n");
+        return 127;
+    }
+    args[0] = plan.loader;
+    args[1] = (char *)"--library-path";
+    args[2] = plan.libdir;
+    args[3] = plan.player;
+    for (i = 0; i < extra; i++) args[4 + i] = argv[1 + i];
+    args[4 + extra] = NULL;
+
+    execv(plan.loader, args);
+    fprintf(stderr, "vlcplay: cannot exec %s: %s\n", plan.loader,
+            strerror(errno));
+    return 127;
+}
+#endif /* !_WIN32 */
+
+#else  /* !VLCPLAY_BOOT: the player itself, from section 1 down */
 
 /* ------------------------------------------------------------ layout */
 
@@ -294,7 +530,8 @@ typedef struct {
 typedef struct {
     pthread_mutex_t m;
     pthread_cond_t  cv;
-    uint32_t       *fb;        /* dec_w * dec_h, RV32 */
+    uint32_t       *fb;        /* dec_w * dec_h, RV32, 32-byte aligned */
+    void           *fb_raw;    /* what malloc returned; fb is aligned into it */
     int             w, h;      /* the dimensions libVLC was told to fill */
     int             pitch;     /* bytes per row */
     int             busy;      /* one side owns fb */
@@ -476,18 +713,51 @@ static int vlc_load(VlcPlayer *p) {
  *  2. The frame surface and the vmem callbacks
  * ============================================================ */
 
+/* VLC_MIN_PLANE_ALIGN is not a preference. libvlc_media_player.h, above
+ * libvlc_video_set_callbacks(): "The planes must be aligned on 32-bytes
+ * boundaries". musl's malloc returns 16-byte alignment, so calloc() does NOT
+ * satisfy it; the buffer is over-allocated by 31 bytes and the plane pointer
+ * is rounded up inside it. The pitch is a multiple of 32 as well (main()
+ * rounds the decode width down to a multiple of 8 pixels, 8*4 == 32 bytes),
+ * which is what makes every row start on a 32-byte boundary too. */
+#define VLC_MIN_PLANE_ALIGN 32u
+
+static void *surf_alloc_aligned(size_t bytes, uint32_t **aligned) {
+    unsigned char *raw = (unsigned char *)malloc(bytes + VLC_MIN_PLANE_ALIGN);
+    uintptr_t p;
+    if (!raw) return NULL;
+    p = ((uintptr_t)raw + (uintptr_t)VLC_MIN_PLANE_ALIGN - 1u) &
+        ~((uintptr_t)VLC_MIN_PLANE_ALIGN - 1u);
+    *aligned = (uint32_t *)p;
+    return raw;
+}
+
 static int surf_init(VlcSurface *s, int w, int h) {
+    size_t bytes;
     memset(s, 0, sizeof(*s));
     if (w < 2 || h < 2) return -1;
     s->w = w;
     s->h = h;
     s->pitch = w * 4;
-    s->fb = (uint32_t *)calloc((size_t)w * (size_t)h, sizeof(uint32_t));
-    if (!s->fb) return -1;
-    if (pthread_mutex_init(&s->m, NULL) != 0) { free(s->fb); s->fb = NULL; return -1; }
+    bytes = (size_t)w * (size_t)h * sizeof(uint32_t);
+    s->fb_raw = surf_alloc_aligned(bytes, &s->fb);
+    if (!s->fb_raw || !s->fb) { free(s->fb_raw); s->fb_raw = NULL; s->fb = NULL; return -1; }
+    /* Provable, not assumed: if this ever fails the ABI contract is broken
+     * before libVLC is told anything, and the app reports the allocation
+     * failure instead of handing vmem a misaligned plane. */
+    if (((uintptr_t)s->fb & (uintptr_t)(VLC_MIN_PLANE_ALIGN - 1u)) != 0 ||
+        (s->pitch % (int)VLC_MIN_PLANE_ALIGN) != 0) {
+        free(s->fb_raw);
+        s->fb_raw = NULL;
+        s->fb = NULL;
+        return -1;
+    }
+    memset(s->fb, 0, bytes);
+    if (pthread_mutex_init(&s->m, NULL) != 0) { free(s->fb_raw); s->fb_raw = NULL; s->fb = NULL; return -1; }
     if (pthread_cond_init(&s->cv, NULL) != 0) {
         pthread_mutex_destroy(&s->m);
-        free(s->fb);
+        free(s->fb_raw);
+        s->fb_raw = NULL;
         s->fb = NULL;
         return -1;
     }
@@ -498,7 +768,8 @@ static void surf_free(VlcSurface *s) {
     if (!s) return;
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->m);
-    free(s->fb);
+    free(s->fb_raw);              /* never free() s->fb: it is aligned inside */
+    s->fb_raw = NULL;
     s->fb = NULL;
 }
 
@@ -662,6 +933,20 @@ static void save_err(VlcPlayer *p, const char *what) {
              e && *e ? e : "libVLC gave no error text");
 }
 
+/* The same words the card uses, on stderr, so a headless run and the window
+ * never disagree. A library that loaded but lacks a symbol is NOT "not
+ * installed": vlc_bind() names the symbol in lib_detail, and the sentence
+ * here is the one the card draws (VLC_BAD_SYMBOL_MSG). Kept as a function so
+ * the host harness can capture and compare the bytes instead of trusting a
+ * second copy of the wording. */
+static void report_load_failure(const VlcPlayer *p, FILE *out) {
+    if (!p || !out || p->lib_ok) return;
+    fprintf(out, "vlcplay: %s\n",
+            p->symbol_missing ? VLC_BAD_SYMBOL_MSG : VLC_MISSING_MSG);
+    fprintf(out, "vlcplay: %s\n",
+            p->lib_detail[0] ? p->lib_detail : "libVLC could not be loaded");
+}
+
 /* Open the library, create the instance, and - if a path was given -
  * build the media and the player and start it. Returns 0 when the window
  * has something real to show (even if that something is "libVLC is
@@ -764,7 +1049,22 @@ static void vp_toggle_pause(VlcPlayer *p) {
     if (!p->mp) return;
     st = p->api.player_get_state(p->mp);
     if (st == libvlc_Ended || st == libvlc_Stopped || st == libvlc_Error) {
-        p->api.player_set_time(p->mp, 0);
+        /* Restart, measured rather than assumed. On an Ended player
+         * set_time(0) + play() returns 0 and leaves the state Ended with the
+         * clock at 0 - i.e. the key does nothing while claiming success. Only
+         * stop() clears the input so the next play() starts a new one. With
+         * the real libVLC 3.0.24 on the host:
+         *
+         *   set_time(0)+play(): 2 s WAV -> ended (time 0)
+         *                       320x176 MP4 -> ended (time 0)
+         *   stop()+play():      2 s WAV -> playing (1908 ms after 2 s)
+         *                       320x176 MP4 -> playing (1751 ms after 2 s)
+         *
+         * The card promises that space or a click starts the file again, so
+         * this branch has to keep that promise. A/B: .work/p1/restartprobe.c;
+         * regression test (space and click, both media): .work/p1/restart.c */
+        p->api.player_stop(p->mp);
+        p->last_err[0] = 0;          /* the previous failure is history now */
         if (p->api.player_play(p->mp) != 0) {
             save_err(p, "restart failed");
             return;
@@ -1580,11 +1880,7 @@ int main(int argc, char **argv) {
         mc_close(&a.c);
         return 1;
     }
-    if (!a.pl.lib_ok) {
-        fprintf(stderr, "vlcplay: %s\n", VLC_MISSING_MSG);
-        fprintf(stderr, "vlcplay: %s\n",
-                a.pl.lib_detail[0] ? a.pl.lib_detail : "libVLC could not be loaded");
-    }
+    report_load_failure(&a.pl, stderr);
 
     draw_all(&a);
     a.last_hud_ms = now_ms();
@@ -1676,3 +1972,5 @@ int main(int argc, char **argv) {
     return 0;
 }
 #endif /* !VLCPLAY_HOST_TEST */
+
+#endif /* !VLCPLAY_BOOT - end of the player build */

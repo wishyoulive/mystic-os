@@ -19,7 +19,11 @@ import sys
 import tarfile
 import time
 
-SKIP_AT_ROOT = {"chromium", "manifest", ".pkg-name", ".pkg-version"}
+# The bundle keeps its own payload at the root as a *file* named bin, and the
+# Chromium closure carries bin/sh (Alpine's yash). tar cannot create a directory
+# where a file of that name exists, so the whole closure bin/ tree is dropped:
+# nothing in it is needed to run the engine, which lives under usr/lib.
+SKIP_AT_ROOT = {"chromium", "manifest", ".pkg-name", ".pkg-version", "bin"}
 
 
 def main():
@@ -63,7 +67,7 @@ def main():
 
         for ti in src:
             name = ti.name.lstrip("./")
-            if not name or name in SKIP_AT_ROOT:
+            if not name or name.split("/")[0] in SKIP_AT_ROOT:
                 skipped += 1
                 continue
             dst.addfile(ti, src.extractfile(ti) if ti.isreg() else None)

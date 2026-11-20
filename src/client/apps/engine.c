@@ -82,7 +82,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <dirent.h>
 #include <string.h>
+#include <sys/stat.h>
 #ifndef EVP_SELFTEST
 /* The self-test at the bottom of this file runs on the host and only needs the
  * parsers, so the POSIX headers are not required to build it. */
@@ -482,6 +484,10 @@ static void engine_note_stderr(Engine *e) {
     ssize_t n;
     if (e->from_stderr < 0) return;
     while ((n = read(e->from_stderr, buf, sizeof(buf))) > 0) {
+        /* Also on the app's own stderr, which the OS writes to the serial
+         * console: an engine that dies before the first frame leaves its reason
+         * here even when nothing reaches the window. */
+        fprintf(stderr, "engine: %.*s", (int)n, buf);
         if ((size_t)n >= EVP_STDERR_KEEP) {
             memcpy(e->stderr_tail, buf + n - EVP_STDERR_KEEP, EVP_STDERR_KEEP);
             e->stderr_len = EVP_STDERR_KEEP;
@@ -517,6 +523,50 @@ static const char *engine_last_stderr(Engine *e) {
     return e->stderr_tail;
 }
 
+/* The engine's closure keeps libraries in subdirectories of the bundle -
+ * usr/lib/chromium for its own, usr/lib/pulseaudio for pulse's helpers - and
+ * the dynamic loader searches exactly the directories it is given, never their
+ * children. Walking the bundle once and listing every directory that holds a
+ * .so is what makes the child find all of them; with only <bundle>/usr/lib the
+ * engine exits immediately and the window says it never started. */
+static int dir_has_so(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) return 0;
+    struct dirent *ent;
+    int found = 0;
+    while (!found && (ent = readdir(d)) != NULL) {
+        const char *n = ent->d_name;
+        size_t len = strlen(n);
+        if (len > 3 && strstr(n, ".so")) found = 1;
+    }
+    closedir(d);
+    return found;
+}
+
+static void collect_lib_dirs(const char *base, int depth, char *out, size_t cap) {
+    if (depth > 3) return;
+    if (dir_has_so(base)) {
+        size_t used = strlen(out);
+        if (used + 1 < cap) {
+            if (used) snprintf(out + used, cap - used, ":");
+            snprintf(out + used + (used ? 1 : 0), cap - used - (used ? 1 : 0),
+                     "%s", base);
+        }
+    }
+    DIR *d = opendir(base);
+    if (!d) return;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        char child[512];
+        snprintf(child, sizeof child, "%s/%s", base, ent->d_name);
+        struct stat st;
+        if (stat(child, &st) == 0 && S_ISDIR(st.st_mode))
+            collect_lib_dirs(child, depth + 1, out, cap);
+    }
+    closedir(d);
+}
+
 static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
                         int mute_audio, char *err, size_t esz) {
     char exe[512], libdir[640], size[64];
@@ -533,7 +583,8 @@ static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
                 exe, strerror(errno));
         return -1;
     }
-    snprintf(libdir, sizeof(libdir), "%s/usr/lib:%s/lib", bundle, bundle);
+    collect_lib_dirs(bundle, 0, libdir, sizeof libdir);
+    if (!libdir[0]) snprintf(libdir, sizeof(libdir), "%s/usr/lib:%s/lib", bundle, bundle);
     snprintf(size, sizeof(size), "--window-size=%dx%d", page_w, page_h);
 
     if (pipe(in) != 0 || pipe(out) != 0 || pipe(errp) != 0) {
@@ -553,6 +604,10 @@ static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
          * the very descriptor the engine is about to read. */
         if (in[0] != 3) dup2(in[0], 3);
         if (out[1] != 4) dup2(out[1], 4);
+        /* The desktop's stderr is the serial console, and it is the only place
+         * a message survives if the engine dies before the frame loop drains the
+         * pipe, so a copy is kept for the diagnostics below. */
+        int console = dup(2);
         if (errp[1] != 2) dup2(errp[1], 2);
         if (in[0] != 3) close(in[0]);
         if (in[1] != 3 && in[1] != 4 && in[1] != 2) close(in[1]);
@@ -565,6 +620,8 @@ static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
         setenv("TMPDIR", "/tmp", 1);
 
         argv[n++] = exe;
+        argv[n++] = "--headless=new";          /* without it the shell prints
+                                               * usage and exits 0, silently */
         argv[n++] = "--remote-debugging-pipe";
         argv[n++] = "--no-sandbox";            /* the OS jail IS the sandbox */
         argv[n++] = "--disable-gpu";           /* no GPU: no GL, no DRI driver */
@@ -584,6 +641,30 @@ static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
         if (mute_audio) argv[n++] = "--mute-audio";
         argv[n++] = "about:blank";
         argv[n] = NULL;
+        if (console >= 0) {
+            char p3d[64], p4d[64];
+            ssize_t x = readlink("/proc/self/fd/3", p3d, sizeof p3d - 1);
+            ssize_t y = readlink("/proc/self/fd/4", p4d, sizeof p4d - 1);
+            p3d[x > 0 ? x : 0] = 0;
+            p4d[y > 0 ? y : 0] = 0;
+            dprintf(console, "engineview: exec %s fd3=%s fd4=%s\n",
+                    exe, p3d, p4d);
+        }
+        if (console >= 0) {
+            /* The child's stderr normally goes into the viewer's pipe, which is
+             * only drained once the frame loop runs; a child that dies during
+             * startup would leave no evidence at all. With the marker present it
+             * also goes to a file inside the jail, readable from the terminal. */
+            int lf = open("/tmp/engine-child.log",
+                          O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (lf >= 0) { dup2(lf, 2); if (lf != 2) close(lf); }
+            char p3[64], p4[64];
+            ssize_t a = readlink("/proc/self/fd/3", p3, sizeof p3 - 1);
+            ssize_t b = readlink("/proc/self/fd/4", p4, sizeof p4 - 1);
+            p3[a > 0 ? a : 0] = 0;
+            p4[b > 0 ? b : 0] = 0;
+            fprintf(stderr, "engineview: exec %s fd3=%s fd4=%s\n", exe, p3, p4);
+        }
         execv(exe, argv);
         fprintf(stderr, "engineview: execv %s: %s\n", exe, strerror(errno));
         _exit(127);

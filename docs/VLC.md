@@ -788,16 +788,38 @@ The window then shows the decoded frame with `ended 0:09 / 0:10`, `640x360`
 and `libVLC 3.0.23 Vetinari` in its footer. Screenshot:
 `docs/screenshots/video-vlc.png`.
 
+> **What this proves, and what it does not (note added by worker p1, which
+> owns `src/client/apps/vlcplay.c`).** The transcript above is a MANUAL start
+> from a terminal - the `LD_LIBRARY_PATH=/root/apps/vlc/lib /root/apps/vlc/bin`
+> line is the command that produced the screenshot. It proves decode + draw in
+> the running OS. It did not, at the time of writing, prove the launcher tile:
+> wmsrv execs the manifest's `exec` inside a chroot whose binds are the payload
+> at `/bin/app`, the bundle at `/app`, the socket, fonts and `/dev` nodes -
+> there is no `/lib` in it (`src/wmsrv.c` sbx plan), so a dynamic `bin` never
+> reached `main()` there.
+>
+> **That gap is now closed in the package** (see the bundle-shape update
+> below): `bin` is the STATIC launcher
+> (`/app/lib/ld-musl-x86_64.so.1 --library-path /app/lib /app/libexec/vlcplay`,
+> built from `src/client/apps/vlcplay.c` with `-DVLCPLAY_BOOT`) and the dynamic
+> player is at `libexec/vlcplay`. So this note is historical about the launch
+> path, not a statement about the current tarball; the measurements above are
+> still only the manual run.
+
 ### Three things had to be true before a frame appeared
 
 1. **The player must be dynamically linked.** A static musl binary's `dlopen()`
    is a stub: the app reported "Dynamic loading not supported" and showed the
-   install command instead of a window. The bundle therefore carries a dynamic
-   `bin` with `PT_INTERP /lib/ld-musl-x86_64.so.1`, `src/lib/ld-musl-x86_64.so.1`
-   is in the image, and the ELF interpreter string has to be corrected after
-   linking: zig prefixes `-dynamic-linker` with its own sysroot, so the built
-   binary pointed at `C:/Users/.../lib/ld-musl-x86_64.so.1` until the `PT_INTERP`
-   bytes were rewritten.
+   install command instead of a window. In the current package the dynamic
+   player is `libexec/vlcplay` (`PT_INTERP /lib/ld-musl-x86_64.so.1`), and
+   `bin` is the static launcher that execs it through the bundled loader - see
+   the update below. The interpreter string is written explicitly
+   (`-Wl,-dynamic-linker=/lib/ld-musl-x86_64.so.1`); the corruption this file
+   used to describe came from **MSYS rewriting the argument** when zig is
+   started from git-bash, not from zig's sysroot (a native invocation records
+   `/lib/...` unchanged, and `MSYS_NO_PATHCONV=1` or a Python `subprocess` call
+   does too), which is why `tools/fetch-vlc.py` passes the flag and
+   `check_elf()` now rejects any other interpreter outright.
 2. **The image builder must mark loaders executable.** A loader is executed by
    the kernel as the interpreter of every dynamic binary, and `tools/mkimage.py`
    gave anything outside `bin/` mode 0644 - which made `exec` of busybox fail
@@ -808,15 +830,58 @@ and `libVLC 3.0.23 Vetinari` in its footer. Screenshot:
    from an extracted tree silently dropped all of them, and the loader then
    failed with "libvlc.so.5: No such file or directory" even though the
    versioned file was present. `tools/pack-vlc.py` re-creates every `libX.so.N`,
-   `libX.so` alias from the versioned names: 337 links.
+   `libX.so` alias from the versioned names: 337 links for the earlier 64.3 MB
+   closure this section measured, 115 for the current 39.3 MB canonical build.
+
+> **Update (worker p1, `src/client/apps/vlcplay.c`): the bundle shape is now**
+> `bin` = a **static launcher** (27,648 bytes, no `PT_INTERP`, no `NEEDED`),
+> `libexec/vlcplay` = the dynamic player (`PT_INTERP /lib/ld-musl-x86_64.so.1`,
+> `NEEDED libc.so`, `RUNPATH $ORIGIN/../lib`), and
+> `lib/ld-musl-x86_64.so.1` = the 670,312-byte musl loader (its SONAME is
+> `libc.musl-x86_64.so.1`, which is what libvlc's closure asks for). The reason
+> is item 1 read against the sandbox: a dynamic `bin` cannot be the manifest's
+> `exec`, because wmsrv chroots the app into a jail whose binds are the payload,
+> the bundle at `/app`, the socket, fonts and `/dev` nodes - there is no `/lib`,
+> and `PT_INTERP` is absolute. The launcher execs
+> `/app/lib/ld-musl-x86_64.so.1 --library-path /app/lib /app/libexec/vlcplay`.
+> `src/apps/store.c` also needs `placeholder = no` in the installed manifest;
+> the package used to say `yes`, which keeps the Store offering the install.
+> `tools/pack-vlc.py` now emits both pieces (`--bin`, `--player`, `--loader`),
+> dedupes members, and drops modules whose `DT_NEEDED` the bundle cannot
+> satisfy (the inherited closure shipped `libpulse_plugin.so` and
+> `libjack_plugin.so` with neither libpulse nor libjack). **The canonical
+> builder was updated too**: `tools/fetch-vlc.py`'s `APP_SRC`/`BOOT_SRC` are
+> `src/client/apps/vlcplay.c`, it builds `bin` with `-DVLCPLAY_BOOT` and the
+> player at `libexec/vlcplay`, its `check_elf()` rejects any `PT_INTERP` other
+> than `/lib/ld-musl-x86_64.so.1`, and its default plugin profile now carries
+> `audio_output/libalsa_plugin.so` next to the dummy. A plain
+> `python tools/fetch-vlc.py` therefore produces this shape (39,274,007 bytes,
+> 289 members: 162 files, 115 soname links, 12 dirs, all `DT_NEEDED` resolved)
+> instead of reverting to the old app. The `pkg install` transcript above is the
+> earlier 64.3 MB package, so its 272 files / 337 links describe that run, not
+> this one. `tools/pack-vlc.py` remains the offline repack path when the closure
+> is already proven.
 
 ### Audio
 
 `libalsa_plugin.so` and `libasound.so.2` now ship in the bundle
-(`tools/pack-vlc.py --extras build/vlc.apk build/alsa.apk`), and the player's
-footer shows `vol 100` where it used to show `no audio output` - the ALSA output
-opened the OS's PCM device and libVLC reports a working volume.
-`docs/screenshots/video-vlc-audio.png`.
+(`tools/pack-vlc.py --extras build/vlc.apk build/alsa.apk`, and since the
+canonical-builder update below, the default `fetch-vlc.py` profile ships it
+directly), and the player's footer shows `vol 100` where it used to show
+`no audio output`. `docs/screenshots/video-vlc-audio.png`.
+
+> **Correction (worker p1): `vol 100` does not prove the PCM opened.** It is
+> `libvlc_audio_get_volume()`'s answer after a successful
+> `libvlc_audio_set_volume()`; the app prints `no audio output` only when the
+> setter returns < 0. A fallback sink that accepts a volume produces the same
+> `vol 100`. The screenshot's terminal line `ALSA lib...` is cut off by the
+> Player window, so it cannot settle it either - and alsa-lib prints such a line
+> when a PCM open *fails*. What would settle it: run with `-vvv` and read the
+> audio-output module line, or read
+> `/proc/asound/card0/pcm0p/sub0/status` while playing and require `RUNNING`.
+> Until then the honest sentence is "libVLC reports an audio output that accepts
+> a volume", not "the ALSA output opened the OS's PCM device".
+
 
 Why it was missing: the first closure was built with a filter that kept 27
 plugins, and `audio_output/` contained only `libadummy_plugin.so` - a sink that

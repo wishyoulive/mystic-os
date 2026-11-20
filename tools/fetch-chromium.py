@@ -35,6 +35,7 @@ SYSTEM_PACKAGES = {
     "alpine-keys", "apk-tools", "busybox", "busybox-binsh", "busybox-extras",
     "busybox-suid", "libc-utils", "musl", "musl-utils", "openrc", "yash",
     "scanelf", "ssl_client", "ca-certificates", "ca-certificates-bundle",
+    "yash-binsh",   # provides /bin/sh, which belongs to the base system
 }
 
 

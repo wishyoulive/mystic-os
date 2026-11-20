@@ -32,7 +32,7 @@ The package layout - one id everywhere (the directory, the manifest's
                                the same file says 'yes')
     bin                        static launcher (-DVP_BOOT=1): no PT_INTERP,
                                so it runs in a jail that has no /lib
-    libexec/vlcplayer          the player: DYNAMIC musl, PT_INTERP
+    libexec/vlcplay            the player: DYNAMIC musl, PT_INTERP
                                /lib/ld-musl-x86_64.so.1, RUNPATH $ORIGIN/../lib
     lib/ld-musl-x86_64.so.1    the musl loader from Alpine's musl apk (0755)
     lib/libvlc.so.5 ...        libVLC and its real closure
@@ -40,7 +40,7 @@ The package layout - one id everywhere (the directory, the manifest's
 
 The manifest's 'exec' must be a BARE FILE NAME. src/wmsrv.c (wms_launch_arg)
 rejects any exec containing '/' or '..' - 'unsafe exec' - so 'exec =
-libexec/vlcplayer' is not a layout this OS can launch, and nothing here may
+libexec/vlcplay' is not a layout this OS can launch, and nothing here may
 claim otherwise. 'exec = bin' names the static launcher at the bundle root;
 libexec/ is an internal path the launcher execs through the bundled loader.
 
@@ -51,7 +51,7 @@ kernel refuses to exec a dynamic ELF whose PT_INTERP does not exist. So the
 package's entry point is the static launcher; it replaces itself with the
 bundled loader:
 
-    lib/ld-musl-x86_64.so.1 --library-path <bundle>/lib         <bundle>/libexec/vlcplayer <args...>
+    lib/ld-musl-x86_64.so.1 --library-path <bundle>/lib         <bundle>/libexec/vlcplay <args...>
 
 musl's loader supports being run as a program and parses --library-path
 (ldso/dynlink.c, __dls3), and it resolves a DT_NEEDED of libc.so or
@@ -127,13 +127,13 @@ LOADER_IN_APK = "lib/ld-musl-x86_64.so.1"
 LOADER_IN_PKG = "lib/ld-musl-x86_64.so.1"
 
 APP_SRC = [
-    "src/client/apps/vlcplayer.c",
+    "src/client/apps/vlcplay.c",
     "src/client/mystic_client.c",
     "src/gfx.c",
     "src/font.c",
     "src/ui.c",
 ]
-BOOT_SRC = ["src/client/apps/vlcplayer.c"]
+BOOT_SRC = ["src/client/apps/vlcplay.c"]
 
 # libVLC is not a package name in Alpine: vlc-libs provides both shared
 # objects, so the roots are written the way the index writes them.
@@ -195,10 +195,14 @@ PLUGINS = {
         "packetizer/libpacketizer_mpegvideo_plugin.so",
         "packetizer/libpacketizer_vc1_plugin.so",
     ],
-    # The image has no sound device; this is what --aout=dummy resolves to.
-    # It adds 14 KB and no library, so "no sound" is a clean state instead
-    # of a failing ALSA probe per media.
-    "aout": ["audio_output/libadummy_plugin.so"],
+    # Audio outputs. alsa is the one that can open the emulated HDA PCM the
+    # image now carries; adummy stays as the honest fallback for an image
+    # without a sound device (it accepts a volume and discards samples, which
+    # is why "vol 100" alone must not be read as "a PCM opened").
+    "aout": [
+        "audio_output/libalsa_plugin.so",
+        "audio_output/libadummy_plugin.so",
+    ],
     "http": ["access/libhttp_plugin.so"],
     "subs": ["text_renderer/libfreetype_plugin.so"],
 }
@@ -553,6 +557,11 @@ def check_elf(path, kind, what):
             raise RuntimeError("%s has no PT_INTERP: a static musl binary cannot "
                                "dlopen libVLC (its dlopen is a stub that says "
                                "'Dynamic loading not supported')" % what)
+        if got["interp"] != "/lib/ld-musl-x86_64.so.1":
+            raise RuntimeError("%s has PT_INTERP %r, expected "
+                               "/lib/ld-musl-x86_64.so.1 (the loader the bundle "
+                               "ships and the launcher execs)"
+                               % (what, got["interp"]))
         if any("vlc" in n for n in got["needed"]):
             raise RuntimeError("%s is linked against libVLC (%s); it must load it "
                                "with dlopen so the package stays relocatable"
@@ -574,15 +583,19 @@ def build_player(stage, zig):
     """Compile the DYNAMIC player, the one that talks to libVLC.
 
     -dynamic is not optional: zig's musl target defaults to a static link,
-    and a static musl program's dlopen is a stub. RUNPATH $ORIGIN/../lib is
-    the third way to find the closure (the launcher passes --library-path,
-    wmsrv passes LD_LIBRARY_PATH), so a direct exec still works.
+    and a static musl program's dlopen is a stub. The interpreter is named
+    explicitly: the bundle ships it at lib/ld-musl-x86_64.so.1 and the jail
+    has no /lib, so the path the kernel records has to be the one the loader
+    is installed at, not whatever a host sysroot would suggest. RUNPATH
+    $ORIGIN/../lib is the third way to find the closure (the launcher passes
+    --library-path, wmsrv passes LD_LIBRARY_PATH), so a direct exec works.
     """
-    out = os.path.join(stage, "libexec", "vlcplayer")
+    out = os.path.join(stage, "libexec", "vlcplay")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     cmd = [zig, "cc", "-target", "x86_64-linux-musl", "-O2", "-dynamic",
            "-Wl,-rpath,$ORIGIN/../lib",
-           "-Isrc", "-Isrc/client", "-o", out] + APP_SRC + ["-lm", "-pthread"]
+           "-Wl,-dynamic-linker=/lib/ld-musl-x86_64.so.1",
+           "-Isrc", "-Isrc/client", "-o", out] + APP_SRC + ["-lm", "-pthread", "-ldl"]
     print("==> compiling the DYNAMIC player: %s" % out)
     r = subprocess.run(cmd)
     if r.returncode != 0:
@@ -595,11 +608,17 @@ def build_player(stage, zig):
 
 
 def build_boot(stage, zig):
-    """Compile the static launcher that becomes the package's exec = bin."""
+    """Compile the static launcher that becomes the package's exec = bin.
+
+    -DVLCPLAY_BOOT selects section 0 of src/client/apps/vlcplay.c: a static
+    program that execs <bundle>/lib/ld-musl-x86_64.so.1 with --library-path
+    and <bundle>/libexec/vlcplay. It pulls in no SDK objects and no libVLC,
+    which is why the source list below is one file.
+    """
     out = os.path.join(stage, "bin")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     cmd = [zig, "cc", "-target", "x86_64-linux-musl", "-Os", "-static", "-s",
-           "-DVP_BOOT=1", "-Isrc", "-Isrc/client", "-o", out] + BOOT_SRC
+           "-DVLCPLAY_BOOT", "-Isrc", "-Isrc/client", "-o", out] + BOOT_SRC
     print("==> compiling the static launcher: %s" % out)
     r = subprocess.run(cmd)
     if r.returncode != 0:
@@ -1133,7 +1152,7 @@ def build_stage(root, stage, profile, plugins, app_digest, zig, pkgs):
     entries = []
     entries.append(("manifest", "file", os.path.join(stage, "manifest"), 0o644, ""))
     entries.append(("bin", "file", boot, 0o755, ""))
-    entries.append(("libexec/vlcplayer", "file", player, 0o755, ""))
+    entries.append(("libexec/vlcplay", "file", player, 0o755, ""))
     # The loader is the only library that must be executable. Its mode in
     # the tar is what busybox tar restores as root, so 0755 has to be here.
     entries.append((LOADER_IN_PKG, "file", loader, 0o755, ""))
@@ -1166,7 +1185,7 @@ def build_stage(root, stage, profile, plugins, app_digest, zig, pkgs):
     # Fail before packing if a name the loader will ask for is not in lib/.
     closure_names = check_closure(
         libs, aliases,
-        [("libexec/vlcplayer", player)] +
+        [("libexec/vlcplay", player)] +
         [("plugin:" + rel, os.path.join(base, rel)) for rel in plist])
 
     # directories, so an empty lib/vlc tree still exists after unpack
@@ -1474,7 +1493,7 @@ def main():
           % (tarball, size / 1e6, usize / 1e6, ufiles + 1))
     print("    bin (launcher): %d bytes, static musl, no PT_INTERP"
           % info.get("boot_size", 0))
-    print("    libexec/vlcplayer: %d bytes, DYNAMIC musl, PT_INTERP %s"
+    print("    libexec/vlcplay: %d bytes, DYNAMIC musl, PT_INTERP %s"
           % (info.get("player_size", 0), info.get("player_interp", "?")))
     print("    player DT_NEEDED: %s   RUNPATH: %s"
           % (", ".join(info.get("player_needed", [])) or "(none)",
