@@ -188,7 +188,7 @@ EOF
 done
 
 # a couple of modules live directly under kernel/fs/ rather than in a subdir
-for rel in kernel/fs/mbcache.ko; do
+for rel in kernel/fs/mbcache.ko kernel/fs/jbd2/jbd2.ko; do
     src="$MODSRC/$rel.gz"
     [ -f "$src" ] || continue
     out="$DEST/$rel"

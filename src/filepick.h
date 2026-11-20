@@ -57,6 +57,17 @@
  *  directory differs, and filepick_paths() picks it from the
  *  environment the sandbox already exports.
  *
+ *  A HOSTILE LINK IN THE JAIL'S /tmp
+ *  The jail's /tmp belongs to the app, so any name in it - including
+ *  filepick.result and the writer's filepick.result.tmp - can be a
+ *  symbolic link. Writing through such a link as root would truncate
+ *  whatever it points at, so every write here opens with O_NOFOLLOW and
+ *  refuses a link with a real sentence ("<path>: ELOOP: <strerror> -
+ *  refusing to follow a symbolic link"); a read refuses one too,
+ *  and refuses a FIFO, which would otherwise block the desktop forever.
+ *  The reason comes back through err; nothing is retried without the
+ *  flag, and a reader never sees half a line either way.
+ *
  *  WHAT CONSUMES A CHOSEN PATH
  *  The desktop returns the path and does nothing else with it - it
  *  never opens, writes or copies the file on the requester's behalf.
@@ -776,11 +787,187 @@ static inline void fp_make_token(char *out, size_t cap) {
              (unsigned)(((unsigned long long)ts.tv_nsec / 1000ull) & 0xFFFFF));
 }
 
+/* 1 when the final component of `path` is a symbolic link, 0 when it is
+ * something else (including "nothing is there"), -1 when the question
+ * cannot be answered - errno then says why. lstat(2) does not follow the
+ * link, which is the whole point.
+ *
+ * The Windows branch exists only for the host harness: the shipping
+ * target is musl, where S_ISLNK is the answer, and Windows has no symlink
+ * bits in st_mode. There a link (or a junction) is a reparse point, and
+ * that attribute is what the harness plants at a path to prove the guard.
+ * (Creating a file symlink on Windows needs SeCreateSymbolicLinkPrivilege;
+ * a junction does not - see .work/w1/harness.c.) */
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+static inline int fp_path_is_symlink(const char *path) {
+    if (!path || !path[0]) { errno = ENOENT; return -1; }
+    DWORD a = GetFileAttributesA(path);
+    if (a == INVALID_FILE_ATTRIBUTES) {
+        DWORD e = GetLastError();
+        if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND ||
+            e == ERROR_INVALID_NAME)
+            return 0;                   /* nothing there, nothing to follow */
+        errno = EIO;                    /* not an errno value; say I/O error */
+        return -1;
+    }
+    return (a & FILE_ATTRIBUTE_REPARSE_POINT) ? 1 : 0;
+}
+#else
+static inline int fp_path_is_symlink(const char *path) {
+    struct stat st;
+    if (!path || !path[0]) { errno = ENOENT; return -1; }
+    if (lstat(path, &st) != 0) return errno == ENOENT ? 0 : -1;
+    return S_ISLNK(st.st_mode) ? 1 : 0;
+}
+#endif
+
+/* The one sentence a refused link produces, whether the pre-check or
+ * open(2)'s own ELOOP found it, so one cause reads as one answer. The
+ * literal "ELOOP" is in the text on purpose: the errno name is what the
+ * harness and a log grep look for, and strerror(ELOOP)'s own sentence
+ * does not contain it. */
+static inline int fp_refuse_link(const char *path, char *err, size_t esz) {
+    if (err && esz)
+        snprintf(err, esz, "%s: ELOOP: %s - refusing to follow a symbolic link",
+                 path, strerror(ELOOP));
+    errno = ELOOP;
+    return -1;
+}
+
+/* Refuse `path` when it is a link; report a real error when lstat itself
+ * fails. A missing path is fine: that is the normal case for a new file. */
+static inline int fp_refuse_link_at(const char *path, char *err, size_t esz) {
+    int r = fp_path_is_symlink(path);
+    if (r == 1) return fp_refuse_link(path, err, esz);
+    if (r < 0) {
+        int e = errno ? errno : EIO;
+        if (err && esz) snprintf(err, esz, "%s: %s", path, strerror(e));
+        errno = e;
+        return -1;
+    }
+    return 0;
+}
+
+/* The flags the writer opens its temp file with, as one constant so the
+ * build itself can prove O_NOFOLLOW is in the mask (assertions below).
+ * On musl the security-critical bit is O_NOFOLLOW: a link planted at the
+ * temp name fails ELOOP instead of being followed and truncated.
+ * O_CLOEXEC keeps the descriptor out of any child, O_NONBLOCK turns a
+ * FIFO planted at the name into ENXIO (or a regular-file check failure)
+ * instead of a desktop hung in open(2). Windows has none of the three in
+ * its CRT, and the product never runs there; the lstat-equivalent
+ * pre-check above is the harness's guard, and O_BINARY keeps the bytes
+ * written exactly as given. */
+#if defined(_WIN32)
+#  define FP_WRITE_OPEN_FLAGS (O_WRONLY | O_CREAT | O_TRUNC | O_BINARY)
+#  define FP_READ_OPEN_FLAGS  (O_RDONLY | O_BINARY)
+#else
+#  define FP_WRITE_OPEN_FLAGS \
+        (O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+#  define FP_READ_OPEN_FLAGS \
+        (O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+/* A libc that defined one of these as 0 would silently turn the guard
+ * off, so the shipping target must not build in that case. */
+_Static_assert((FP_WRITE_OPEN_FLAGS & O_NOFOLLOW) != 0,
+               "filepick: the writer must open with O_NOFOLLOW");
+_Static_assert((FP_WRITE_OPEN_FLAGS & O_CLOEXEC) != 0,
+               "filepick: the writer must open with O_CLOEXEC");
+_Static_assert((FP_READ_OPEN_FLAGS & O_NOFOLLOW) != 0,
+               "filepick: the reader must open with O_NOFOLLOW");
+#endif
+
+static inline int fp_write_open_flags(void) { return FP_WRITE_OPEN_FLAGS; }
+
+/* The flags the request/result readers use. Same reasoning as the writer:
+ * a link at an app-owned name must not be followed, and a FIFO there must
+ * not block the desktop. O_RDONLY does not stop O_TRUNC's class of damage,
+ * but a crafted target can still be used to feed the parser or to hang
+ * it, so the same refusal applies. */
+static inline int fp_read_open_flags(void) { return FP_READ_OPEN_FLAGS; }
+
+/* Open a request/result file only when it really is a regular file that
+ * is not a link, and hand back a stdio stream. NULL on any failure with
+ * err filled the way fp_write_atomic fills it. A missing file is reported
+ * as strerror(ENOENT), which is what callers already print. */
+static inline FILE *fp_read_regular(const char *path, char *err, size_t esz) {
+    if (err && esz) err[0] = 0;
+    if (!path || !path[0]) {
+        if (err && esz) snprintf(err, esz, "%s", "no path to read");
+        errno = ENOENT;
+        return NULL;
+    }
+    int r = fp_path_is_symlink(path);
+    if (r == 1) { fp_refuse_link(path, err, esz); return NULL; }
+    if (r < 0) {
+        int e = errno ? errno : EIO;
+        if (err && esz) snprintf(err, esz, "%s: %s", path, strerror(e));
+        errno = e;
+        return NULL;
+    }
+    int fd = open(path, fp_read_open_flags());
+    if (fd < 0) {
+        int e = errno;
+        if (e == ELOOP) { fp_refuse_link(path, err, esz); return NULL; }
+        if (err && esz) snprintf(err, esz, "%s: %s", path, strerror(e));
+        errno = e;
+        return NULL;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        int e = errno;
+        close(fd);
+        if (err && esz) snprintf(err, esz, "%s: %s", path, strerror(e));
+        errno = e;
+        return NULL;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        close(fd);
+        if (err && esz) snprintf(err, esz, "%s: not a regular file", path);
+        errno = EINVAL;
+        return NULL;
+    }
+    FILE *f = fdopen(fd, "r");
+    if (!f) {
+        int e = errno;
+        close(fd);
+        if (err && esz) snprintf(err, esz, "%s: %s", path, strerror(e));
+        errno = e;
+        return NULL;
+    }
+    return f;
+}
+
 /* Write a small file atomically: <path>.tmp then rename over <path>.
- * Returns 0 on success, -1 with errno kept and a sentence in err. */
+ * Returns 0 on success, -1 with errno kept and a sentence in err.
+ *
+ * SECURITY: <path> is inside a directory a sandboxed app may own (the
+ * picker answers at /run/mystic/jail/<id>/tmp/filepick.result), so the
+ * app can plant a symbolic link at <path> or <path>.tmp. Three layers
+ * stop a root desktop from following it:
+ *   1. fp_path_is_symlink() refuses a link at either name before any
+ *      open - the answer is the ELOOP sentence, not a retry;
+ *   2. open(2) itself carries O_NOFOLLOW, so a link planted after the
+ *      check still fails with ELOOP - this is the kernel-level guard;
+ *   3. O_NONBLOCK + fstat require the opened object to be a regular file,
+ *      so a FIFO cannot hang the desktop and a device cannot be written.
+ * After close the temp name is checked against the inode that was
+ * written; a mismatch is refused. That narrows the swap window but does
+ * not atomically close it - a swap after the lstat can still be renamed
+ * into place. It is not a write-through hole: rename(2) does not follow
+ * the final component, so the worst a later swap publishes is a link the
+ * app could have created itself, never a byte written through it. */
 static inline int fp_write_atomic(const char *path, const char *data, size_t len,
                                   char *err, size_t esz) {
     if (err && esz) err[0] = 0;
+    if (!path || !path[0]) {
+        if (err && esz) snprintf(err, esz, "%s", "no path to write");
+        errno = ENOENT;
+        return -1;
+    }
     char tmp[FILEPICK_PATH_MAX + FILEPICK_NAME_MAX + 8];
     int w = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
     if (w < 0 || (size_t)w >= sizeof(tmp)) {
@@ -788,9 +975,33 @@ static inline int fp_write_atomic(const char *path, const char *data, size_t len
         errno = ENAMETOOLONG;
         return -1;
     }
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    /* Rename replaces <path>, so a link there is never followed - but a
+     * link at an app-owned result name is itself the attack's footprint,
+     * and refusing it keeps the protocol's files regular by construction. */
+    if (fp_refuse_link_at(path, err, esz) != 0) return -1;
+    if (fp_refuse_link_at(tmp, err, esz) != 0) return -1;
+    int fd = open(tmp, fp_write_open_flags(), 0644);
     if (fd < 0) {
-        if (err && esz) snprintf(err, esz, "%s: %s", tmp, strerror(errno));
+        int e = errno;
+        if (e == ELOOP) return fp_refuse_link(tmp, err, esz);
+        if (err && esz) snprintf(err, esz, "%s: %s", tmp, strerror(e));
+        errno = e;
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        int e = errno;
+        close(fd);
+        unlink(tmp);
+        if (err && esz) snprintf(err, esz, "%s: %s", tmp, strerror(e));
+        errno = e;
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        close(fd);
+        unlink(tmp);
+        if (err && esz) snprintf(err, esz, "%s: not a regular file", tmp);
+        errno = EINVAL;
         return -1;
     }
     size_t off = 0;
@@ -814,6 +1025,28 @@ static inline int fp_write_atomic(const char *path, const char *data, size_t len
         errno = e;
         return -1;
     }
+#ifndef _WIN32
+    /* The app owns the directory, so it can unlink the temp file and put
+     * something else (a symlink, say) in its place between close() and
+     * rename(). This narrows that window: if the name is no longer the
+     * inode we wrote, nothing is published. It is NOT a security
+     * boundary - an lstat/rename race remains - but rename(2) does not
+     * follow the final component, so a swap can only publish a link,
+     * never write through one. The guard against following a link is
+     * O_NOFOLLOW at open(), above. (Windows st_ino is always 0 and its
+     * rename() has no atomic replace, so the check is POSIX-only.) */
+    struct stat after;
+    if (lstat(tmp, &after) != 0 ||
+        after.st_dev != st.st_dev || after.st_ino != st.st_ino) {
+        unlink(tmp);
+        if (err && esz)
+            snprintf(err, esz,
+                     "%s: changed while it was being written - refusing to publish it",
+                     tmp);
+        errno = EBUSY;
+        return -1;
+    }
+#endif
     if (rename(tmp, path) != 0) {
         int e = errno;
 #ifdef _WIN32
@@ -865,11 +1098,10 @@ static inline int filepick_request(const char *reqpath, int mode,
 static inline int filepick_read_request(const char *reqpath, FilePick *fp,
                                         char *err, size_t esz) {
     if (err && esz) err[0] = 0;
-    FILE *f = fopen(reqpath, "r");
-    if (!f) {
-        if (err && esz) snprintf(err, esz, "%s: %s", reqpath, strerror(errno));
-        return -1;
-    }
+    /* The desktop reads this through the jail: a link or a FIFO planted
+     * by the app is refused by fp_read_regular with the real sentence. */
+    FILE *f = fp_read_regular(reqpath, err, esz);
+    if (!f) return -1;
     char line[FILEPICK_PATH_MAX + FILEPICK_FILTER_MAX + 64];
     char token[FILEPICK_TOKEN_MAX + 8] = "";
     char mode[16] = "open", filter[FILEPICK_FILTER_MAX] = "*";
@@ -917,7 +1149,9 @@ static inline int filepick_write_result(const char *respath, const char *token,
 static inline FpEvent filepick_result_take(const char *respath, const char *token,
                                            char *path, size_t cap) {
     if (path && cap) path[0] = 0;
-    FILE *f = fopen(respath, "r");
+    /* Same guard as the writer: a link at the result name is not an answer.
+     * This function has no error channel by design, so refusal is silent. */
+    FILE *f = fp_read_regular(respath, NULL, 0);
     if (!f) return FILEPICK_NONE;
 
     char line[FILEPICK_PATH_MAX + FILEPICK_NAME_MAX + 64];
