@@ -9,7 +9,7 @@
  *  file too, so a caller can verify a wrapper's trailer without
  *  linking anything.
  *
- *  What is implemented (all of it exercised by .work/n4/)
+ *  What is implemented (all of it exercised by .work/v3/)
  *  ------------------------------------------------------
  *    - stored, fixed-Huffman and dynamic-Huffman blocks
  *      (RFC 1951 sections 3.2.3 .. 3.2.7)
@@ -168,7 +168,9 @@ void df_end_input(DfStream *s);
  *                call returns DF_OK, DF_NEED_INPUT, DF_NEED_OUTPUT or
  *                DF_DONE.  The caller may drop the whole buffer and must
  *                not hand the same bytes again.  On DF_ERR_NOMEM nothing
- *                was taken and it is 0.
+ *                was taken and it is 0; a call made after the stream is
+ *                already in a sticky error state also takes nothing and
+ *                returns 0.
  *  out/outcap    where to put uncompressed bytes; at most outcap are
  *                written per call.  NULL/0 is legal and is how a
  *                caller asks "how much output do you have for me?".

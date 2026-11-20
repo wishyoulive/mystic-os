@@ -766,3 +766,56 @@ Things this code deliberately does *not* do, and why:
 - It does not compute its own pitch: `pitch` is `stride * 4` from the window
   server's `OK` line, and `player_open` refuses a pitch that VLC's 32-byte
   recommendation or the row width would make unsafe.
+
+## It plays
+
+Verified in the running OS, not on a host: a 991,017-byte H.264/MP4 sample
+(`sample.mp4`, 10 s, 640x360) decoded by libVLC 3.0.23 and drawn in the Player
+window by `src/client/apps/vlcplay.c`.
+
+```
+pkg install vlc
+  installing vlc 3.0.23 (vlc.tar.gz, 64.3 MB) from the signed repository
+  size ok: 67455432 bytes, the signed index says 67455432
+  checksum ok: sha256 1da93bc0...
+  272 files, 337 links (soname links included)
+  installed vlc 3.0.23 to /root/apps/vlc (exec: bin, 99.1 MB on disk)
+
+LD_LIBRARY_PATH=/root/apps/vlc/lib /root/apps/vlc/bin /root/sample.mp4
+```
+
+The window then shows the decoded frame with `ended 0:09 / 0:10`, `640x360`
+and `libVLC 3.0.23 Vetinari` in its footer. Screenshot:
+`docs/screenshots/video-vlc.png`.
+
+### Three things had to be true before a frame appeared
+
+1. **The player must be dynamically linked.** A static musl binary's `dlopen()`
+   is a stub: the app reported "Dynamic loading not supported" and showed the
+   install command instead of a window. The bundle therefore carries a dynamic
+   `bin` with `PT_INTERP /lib/ld-musl-x86_64.so.1`, `src/lib/ld-musl-x86_64.so.1`
+   is in the image, and the ELF interpreter string has to be corrected after
+   linking: zig prefixes `-dynamic-linker` with its own sysroot, so the built
+   binary pointed at `C:/Users/.../lib/ld-musl-x86_64.so.1` until the `PT_INTERP`
+   bytes were rewritten.
+2. **The image builder must mark loaders executable.** A loader is executed by
+   the kernel as the interpreter of every dynamic binary, and `tools/mkimage.py`
+   gave anything outside `bin/` mode 0644 - which made `exec` of busybox fail
+   with `EACCES` and the kernel panic with "No working init found". Alpine's
+   busybox is dynamic, which is why adding a loader at mode 0644 broke the boot.
+3. **The package needs soname links.** `libvlc.so.5` is a symlink to
+   `libvlc.so.5.6.1`, and Windows cannot create symlinks. Rebuilding the package
+   from an extracted tree silently dropped all of them, and the loader then
+   failed with "libvlc.so.5: No such file or directory" even though the
+   versioned file was present. `tools/pack-vlc.py` re-creates every `libX.so.N`,
+   `libX.so` alias from the versioned names: 337 links.
+
+### Audio is not there yet, and the reason is measured
+
+The footer says `no audio output`. The package's `lib/vlc/plugins/audio_output/`
+contains exactly one plugin, `libadummy_plugin.so`, and the closure has no
+`libasound.so.2` at all: the ALSA output was never in the dependency set that
+was packaged. Video is unaffected - libVLC decoded and displayed without an
+audio device. Closing this needs `libalsa_plugin.so` plus `libasound` in the
+bundle and `/dev/snd/pcmC0D0p` reachable from the process (the OS already
+exposes it for the Clock's tone).

@@ -425,6 +425,19 @@ void input_set_screen(Input *in, int w, int h) {
 static FILE *test_script;
 static int   test_eof;
 static int   test_wait;          /* frames still to skip before the next line */
+static char  test_pending[512];  /* text that did not fit in one frame */
+static int   test_pending_len, test_pending_off;
+
+/* Hand the focused window as much of the pending text as one frame carries. */
+static void test_pump(Input *in) {
+    int room = (int)sizeof(in->text) - 1;
+    int left = test_pending_len - test_pending_off;
+    int n = left < room ? left : room;
+    if (n <= 0) return;
+    memcpy(in->text, test_pending + test_pending_off, (size_t)n);
+    in->text_len = n;
+    test_pending_off += n;
+}
 
 static void test_open(void) {
     /* init starts the desktop, so an environment variable set in a shell is not
@@ -447,6 +460,7 @@ static void test_step(Input *in) {
     char line[192];
     if (!test_script || test_eof) return;
     if (test_wait > 0) { test_wait--; return; }
+    if (test_pending_off < test_pending_len) { test_pump(in); return; }
     if (!fgets(line, sizeof line, test_script)) { test_eof = 1; return; }
     char what[24];
     int a = 0, b = 0;
@@ -475,11 +489,22 @@ static void test_step(Input *in) {
         t++;
         size_t n = strlen(t);
         while (n && (t[n-1] == 10 || t[n-1] == 13)) n--;
-        if (n > sizeof(in->text) - 1) n = sizeof(in->text) - 1;
-        memcpy(in->text, t, n);
-        in->text_len = (int)n;
+        /* A line can be longer than one frame's text queue (a shell command
+         * with a URL easily is), so the remainder is carried to the next
+         * frames instead of being cut. */
+        if (n >= sizeof(test_pending)) n = sizeof(test_pending) - 1;
+        memcpy(test_pending, t, n);
+        test_pending[n] = 0;
+        test_pending_len = (int)n;
+        test_pending_off = 0;
+        test_pump(in);
+        return;
     } else if (!strcmp(what, "enter")) {
-        in->key = 28;                 /* KEY_ENTER */
+        /* A window receives text, not keycodes: main.c delivers input.text to
+         * the focused terminal or app, so Enter has to be the byte itself. */
+        in->text[0] = 13;    /* carriage return */
+        in->text_len = 1;
+        in->key = 28;                 /* KEY_ENTER, for the shortcut table */
         in->keys[0] = 28;
         in->nkeys = 1;
     } else if (!strcmp(what, "wait")) {

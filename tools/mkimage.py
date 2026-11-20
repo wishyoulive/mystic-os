@@ -145,7 +145,12 @@ def main():
                 exec_dirs = ('bin/', 'sbin/', 'usr/bin/', 'usr/sbin/', 'usr/local/bin/')
                 # an app bundle's payload is called 'bin' and lives under
                 # usr/share/mystic/apps/<id>/ - it must be executable too
+                # A dynamic loader is executed by the kernel itself (it is the
+                # interpreter of every dynamic binary, busybox included), so a
+                # loader without +x makes exec fail with EACCES and the kernel
+                # reports "No working init found".
                 is_prog = (rel == 'init' or rel.startswith(exec_dirs)
+                           or rel.startswith('lib/ld-')
                            or rel.endswith('/bin')
                            # udhcpc execs its script directly, so it needs +x
                            or rel.endswith('.script')

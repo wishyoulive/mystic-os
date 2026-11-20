@@ -103,6 +103,7 @@ typedef void (*libvlc_video_display_cb)(void *opaque, void *picture);
     X(libvlc_media_player_get_length, player_get_length) \
     X(libvlc_media_player_get_state,  player_get_state) \
     X(libvlc_audio_set_volume,        audio_set_volume) \
+    X(libvlc_audio_get_volume,        audio_get_volume) \
     X(libvlc_video_get_size,          video_get_size) \
     X(libvlc_video_set_callbacks,     video_set_callbacks) \
     X(libvlc_video_set_format,        video_set_format)
@@ -148,10 +149,12 @@ void libvlc_media_player_set_time(libvlc_media_player_t *p_mi,
 libvlc_time_t libvlc_media_player_get_length(libvlc_media_player_t *p_mi);
 libvlc_state_t libvlc_media_player_get_state(libvlc_media_player_t *p_mi);
 
-/* :1807 - returns 0 when libVLC accepted the value (0..200) and -1 when
- * there is no audio output to set it on. The app does not use the getter:
- * the value it asked for and libVLC accepted is the value it shows. */
+/* :1807 and :1819 - set returns 0 when libVLC accepted the value and -1
+ * when there is no audio output; get returns the output's own volume, or
+ * -1 when there is no output. The app shows the getter's answer, because
+ * that is libVLC's answer. */
 int libvlc_audio_set_volume(libvlc_media_player_t *p_mi, int i_volume);
+int libvlc_audio_get_volume(libvlc_media_player_t *p_mi);
 
 /* :1112 - the video's own size in pixels, from the media's track info
  * (so it answers as soon as the track is parsed); 0 on success. */

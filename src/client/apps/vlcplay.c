@@ -1,3 +1,8 @@
+/* setenv(), clock_gettime() and usleep() are POSIX, and musl hides them
+ * under -std=c11 unless a feature-test macro asks for them. This must come
+ * before any system header, so it is the first line of the file. */
+#define _GNU_SOURCE 1
+
 /* ============================================================
  *  Mystic OS - apps (external) / vlcplay
  *
@@ -122,27 +127,46 @@
  *  both ways). A working binary must be DYNAMIC musl, because a static
  *  musl program's dlopen() is a stub that fails with "Dynamic loading
  *  not supported" - and when that happens this app shows that exact
- *  string plus the pkg line, so it is never a silent blank window.
+ *  string plus the pkg line, so it is never a silent blank window. (The
+ *  stub is not folklore: the string is in this file's own -static link.)
  *
- *      zig cc -target x86_64-linux-musl -Os -dynamic \
+ *      MSYS_NO_PATHCONV=1 zig cc -target x86_64-linux-musl -Os -dynamic \
  *             -Wl,-rpath,'$ORIGIN/../lib' -Wl,-dynamic-linker=/lib/ld-musl-x86_64.so.1 \
  *             -Isrc -Isrc/client -o vlcplay \
  *             src/client/apps/vlcplay.c src/client/mystic_client.c \
  *             src/gfx.c src/font.c src/ui.c -lm -pthread -ldl
  *
- *  (-dynamic is not optional: zig's musl target defaults to a static
- *  link. The dynamic link then carries PT_INTERP
- *  /lib/ld-musl-x86_64.so.1 and NEEDED libc.so, which is what makes
- *  dlopen() work at all. The rpath makes a direct exec find the closure
- *  next to the binary; inside the jail the loader and LD_LIBRARY_PATH do
- *  the same job.)
+ *  MSYS_NO_PATHCONV=1 is not decoration. Built from git-bash on Windows
+ *  without it, MSYS rewrites the absolute -dynamic-linker argument into a
+ *  Windows path, and the ELF's PT_INTERP then names a file that exists on no
+ *  Linux machine. Both results were read out of the program headers:
  *
- *  The bundle must carry the loader and the closure beside it:
+ *      with    MSYS_NO_PATHCONV=1: PT_INTERP /lib/ld-musl-x86_64.so.1
+ *      without                  : PT_INTERP C:/Users/<name>/.../lib/ld-musl-x86_64.so.1
  *
- *      bin/vlcplay                dynamic, PT_INTERP /lib/ld-musl-...
- *      lib/ld-musl-x86_64.so.1    the loader, if the jail has no /lib
- *      lib/libvlc.so.5 ...        libvlc + libvlccore (+ the rest)
- *      lib/vlc/plugins/...        demuxers, decoders, the vmem output
+ *  and in both cases NEEDED libc.so, RUNPATH $ORIGIN/../lib. (-dynamic is
+ *  not optional either: zig's musl target defaults to a static link.)
+ *
+ *  WHERE THIS BINARY CAN BE THE MANIFEST'S exec, AND WHERE IT CANNOT
+ *  -----------------------------------------------------------------
+ *  Not inside the wmsrv jail. src/wmsrv.c chroots each app into a directory
+ *  built from binds - the payload at /bin/app, the bundle at /app, the
+ *  socket, fonts, /dev nodes - and nothing else; there is no /lib in it. A
+ *  dynamic payload's PT_INTERP is absolute, so that exec fails before main()
+ *  runs. The vlc package solves this with a static launcher, and vlcplay has
+ *  to ride it:
+ *
+ *      bin                      STATIC launcher (manifest exec = bin)
+ *      libexec/vlcplay          this file, DYNAMIC
+ *      lib/ld-musl-x86_64.so.1  the loader; the launcher execs it with
+ *                               --library-path /app/lib and the player path
+ *      lib/libvlc.so.5          the package's soname symlink
+ *      lib/libvlccore.so.9      ditto
+ *      lib/vlc/plugins/...      demuxers, decoders, the vmem output
+ *
+ *  Outside the jail - on the real rootfs, where /lib/ld-musl-x86_64.so.1
+ *  exists, or with the closure reached through RUNPATH - the dynamic binary
+ *  starts directly. Both entry paths end in the same main().
  *
  *  Keys: space play/pause, Left/Right seek 5 s, Up/Down volume, q or Esc
  *  quit, a click on the picture toggles playback.
@@ -297,8 +321,8 @@ typedef struct {
     VlcSurface surf;
     int dec_w, dec_h;
     int vid_w, vid_h;          /* libvlc_video_get_size, 0 until known */
-    int vol;
-    int vol_known;             /* libVLC accepted a volume query */
+    int vol;                   /* what libVLC's getter last answered   */
+    int vol_known;             /* a getter answer, not a guess        */
     int audio_dead;            /* set_volume returned < 0: no output */
 } VlcPlayer;
 
@@ -584,22 +608,45 @@ static void fit_rect(int vw, int vh, int bw, int bh,
  *  3. The player lifecycle
  * ============================================================ */
 
-/* A fresh libvlc player reports the audio output's own idea of the volume
- * (0 on a device that has not been used yet). Ask for the normal 100% once
- * at play, and once more when the first picture arrives, because the audio
- * output may only exist by then. After that a failure is real: there is no
- * audio output. */
+/* The volume the footer shows is libVLC's own answer: the output's getter,
+ * re-read on every status tick, so a change made anywhere (including a
+ * stream that carries its own gain) is what appears. Measured with the real
+ * library (host VLC 3.0.24, live audio output): set_volume(100/50/20/200/0)
+ * returned 0 every time and get_volume() answered 100/50/20/200/0 once the
+ * output had applied it - the same numbers, so the getter is a usable
+ * source and the footer does not have to echo its own request. Two facts
+ * that shape the code below: the getter answers -1 while no audio output
+ * exists yet (libvlc_media_player.h documents that), and the output applies
+ * a set asynchronously, so a getter call immediately after set_volume()
+ * still reports the old value. Hence "vol n/a" until the first answer, and
+ * the key handler showing its request for one tick before the truth lands. */
+static void vp_refresh_volume(VlcPlayer *p) {
+    int got;
+    if (!p->mp || !p->api.audio_get_volume) return;
+    got = p->api.audio_get_volume(p->mp);
+    if (got < 0) return;              /* no output yet: no answer to show */
+    p->vol = got;
+    p->vol_known = 1;
+}
+
+/* A fresh libvlc player reports the audio output's own idea of the volume.
+ * On a device nobody has used that is 0 - silent video - and libVLC also
+ * remembers the volume it saved when a previous process exited. So ask for
+ * the nominal 100% once at play, and once more when playback has actually
+ * started, because the audio output may only exist by then. After that a
+ * failure is real: there is no audio output.
+ *
+ * The read-back here can still be the output's pre-set value for one
+ * moment (the output applies a set asynchronously - measured on the host:
+ * a previous process had saved 37, so the first getter answer after the
+ * set was 37 and the next status tick showed 100). That is why the footer
+ * is refreshed on every tick instead of being written once: what it shows
+ * is the output's answer, and the answer settles. */
 static void vp_start_volume(VlcPlayer *p, int final) {
     if (!p->mp || p->vol_init || p->audio_dead) return;
     if (p->api.audio_set_volume(p->mp, 100) >= 0) {
-        /* The setter's 0 is libVLC accepting the value; that accepted
-         * value is what the footer shows. The getter is not used: in the
-         * host proof (VLC 3.0.24) set_volume(100) returned 0 and
-         * get_volume() answered 5, and showing a second, contradicting
-         * number would be worse than the one libVLC accepted. */
-        p->vol = 100;
-        p->vol_known = 1;
         p->vol_init = 1;
+        vp_refresh_volume(p);         /* show what the output holds */
     } else if (final) {
         p->audio_dead = 1;
         p->vol_init = 1;
@@ -729,7 +776,17 @@ static void vp_toggle_pause(VlcPlayer *p) {
 
 static void vp_seek(VlcPlayer *p, int64_t delta_ms) {
     int64_t now, len, to;
+    libvlc_state_t st;
     if (!p->mp || !p->started) return;
+    /* Seeking a player that is not on a timeline is meaningless, and on
+     * VLC 3 it is worse than meaningless: set_time() is accepted for a
+     * media that never opened, and get_time() then reports the number we
+     * asked for, so the footer would show a position the file never
+     * played. Refuse instead of inventing a clock. */
+    st = p->api.player_get_state(p->mp);
+    if (st == libvlc_Ended || st == libvlc_Stopped || st == libvlc_Error ||
+        st == libvlc_NothingSpecial)
+        return;
     now = p->api.player_get_time(p->mp);
     len = p->api.player_get_length(p->mp);
     if (now < 0) now = 0;
@@ -752,6 +809,12 @@ static void vp_volume(VlcPlayer *p, int delta) {
         p->audio_dead = 1;
         return;
     }
+    /* Show the new value at once so held/repeated keys accumulate from it,
+     * then let the next status tick replace it with the output's own answer
+     * (vp_refresh_volume). Measured on the host: the output applies a
+     * volume change asynchronously, so an immediate getter call still
+     * reports the previous value - reading back here would throw away the
+     * key press. */
     p->vol = v;
     p->vol_known = 1;
 }
@@ -785,6 +848,7 @@ typedef struct {
 
     int  body_mode;             /* 0 empty, 1 picture, 2 card */
     int  card_state;            /* libvlc_state_t the card was drawn for */
+    int  card_played;           /* the card was drawn with len>0 + ended */
     unsigned drawn_seq;         /* frame count already on screen */
     Rect drawn_video;           /* destination rect of that picture */
     int  force_body;            /* geometry or mode changed */
@@ -956,13 +1020,20 @@ static int wrap_text(Surface *s, Font *f, int x, int y, int maxw, int lineh,
 
 static void layout_window(int w, int h, Layout *L) {
     int foot_y = h - FOOT_H;
+    int body_y = imin(HEAD_H, h);
     if (foot_y < HEAD_H + BODY_MIN_H) foot_y = HEAD_H + BODY_MIN_H;
     if (foot_y > h) foot_y = h;
 
+    /* The three bands must tile the surface exactly, at every height:
+     * head.y == 0, body.y == head.y + head.h, foot.y == body bottom and
+     * foot.y + foot.h == h. body_y is clamped to h for a window that is
+     * shorter than the header (a dragged-to-nothing window); pinning it to
+     * HEAD_H instead would leave body.y above the surface and foot.h computed
+     * from a negative height. .work/p1/layout.c checks all of it, 1..300. */
     L->head.x = 0; L->head.y = 0; L->head.w = w;
     L->head.h = imin(HEAD_H, h);
-    L->body.x = 0; L->body.y = HEAD_H; L->body.w = w;
-    L->body.h = imax(0, foot_y - HEAD_H);
+    L->body.x = 0; L->body.y = body_y; L->body.w = w;
+    L->body.h = imax(0, foot_y - body_y);
     L->foot.x = 0; L->foot.y = foot_y; L->foot.w = w;
     L->foot.h = imax(0, h - foot_y);
 }
@@ -1035,6 +1106,10 @@ static void draw_card(PlayerApp *a, Layout *L) {
     int w = b.w - 80;
     int lh = (int)(font_height(bdy) + 5);
     int y;
+    /* Whether the media played to its end; kept on the app so the render
+     * loop can tell a card that was drawn before libVLC had parsed the
+     * duration from one that already knows the answer. */
+    int played_out = 0;
 
     surf_fill(&a->s, b.x, b.y, b.w, b.h, C_BG);
 
@@ -1109,15 +1184,42 @@ static void draw_card(PlayerApp *a, Layout *L) {
         const char *err = a->pl.last_err[0] ? a->pl.last_err
                        : (a->pl.api.errmsg ? a->pl.api.errmsg() : NULL);
         int lines = 0;
-        /* Ended/Stopped with no picture is VLC 3's answer for a file it
-         * could not open (a missing path lands here, not in libvlc_Error).
-         * Saying "Opening" forever would be a lie. */
+        /* Ended/Stopped with no picture means one of two different things,
+         * and only libVLC's own clock can tell them apart:
+         *
+         *   ended with no duration -> it never played. A missing path lands
+         *     here: VLC 3 reports Ended, and get_length() answers 0 because
+         *     no demuxer ever opened the media.
+         *   ended with a duration -> it played TO THE END. An audio-only file
+         *     does exactly this, and calling that "did not play this file"
+         *     would be a lie about a file that played.
+         *
+         * The DURATION is the signal, not the position: libVLC resets the
+         * clock to 0 at end of stream and whenever a restart is requested, so
+         * a zero position says nothing. A non-zero duration cannot be
+         * invented for media that never opened - measured on the host: a
+         * path that does not exist answers length=0, the 2 s WAV answers
+         * length=2000 at the same state. */
+        int64_t len = a->pl.mp ? a->pl.api.player_get_length(a->pl.mp) : -1;
+        played_out = (st == libvlc_Ended && len > 0);
         int dead = (st == libvlc_Error || st == libvlc_Ended ||
                     st == libvlc_Stopped);
 
         y = b.y + b.h / 2 - 70;
-        if (dead) {
+        if (played_out) {
+            txt(&a->s, t, x, y, "Playback ended", C_TEXT);
+        } else if (dead) {
             txt(&a->s, t, x, y, "libVLC did not play this file", C_WARN);
+        } else if (a->pl.started &&
+                   (st == libvlc_Playing || st == libvlc_Paused)) {
+            /* Playing with no picture yet. "Opening" would be stale once
+             * the clock is running; "no video" would claim too much, so
+             * say exactly what libVLC reports and nothing else. */
+            char shown[640];
+            snprintf(shown, sizeof(shown), "Playing %s - no picture",
+                     leaf(a->pl.media_path));
+            elide(line, sizeof(line), shown, t, w);
+            txt(&a->s, t, x, y, line, C_TEXT);
         } else if (a->pl.started) {
             char shown[640];
             snprintf(shown, sizeof(shown), "Opening %s", leaf(a->pl.media_path));
@@ -1130,13 +1232,24 @@ static void draw_card(PlayerApp *a, Layout *L) {
 
         snprintf(line, sizeof(line),
                  "state: %s   video: %s", state_name(st),
-                 a->pl.started ? "no picture decoded yet" : "not started");
+                 !a->pl.started ? "not started"
+                 : played_out ? "no picture decoded"
+                              : "no picture decoded yet");
         wrap_text(&a->s, bdy, x, y, w, lh, 2, line, C_DIM);
         y += lh * 2;
 
         if (err && *err) {
             lines = wrap_text(&a->s, sm, x, y, w,
                               (int)(font_height(sm) + 4), 4, err, C_WARN);
+            y += lines * (int)(font_height(sm) + 4);
+        } else if (played_out) {
+            lines = wrap_text(&a->s, sm, x, y, w,
+                              (int)(font_height(sm) + 4), 3,
+                              "libVLC played this file to its end (the clock "
+                              "above is its own) but decoded no video track, "
+                              "so there is no picture to show. Space or a "
+                              "click starts it again.",
+                              C_DIM);
             y += lines * (int)(font_height(sm) + 4);
         } else if (dead) {
             lines = wrap_text(&a->s, sm, x, y, w,
@@ -1157,6 +1270,7 @@ static void draw_card(PlayerApp *a, Layout *L) {
     txt(&a->s, sm, x, b.y + b.h - 24, "q quits.", C_FAINT);
     a->body_mode = 2;
     a->card_state = (int)st;
+    a->card_played = played_out;
 }
 
 static void draw_video(PlayerApp *a, Layout *L, int full) {
@@ -1164,6 +1278,14 @@ static void draw_video(PlayerApp *a, Layout *L, int full) {
     Rect v;
     unsigned seq = 0;
     int copied = 0;
+
+    /* Layout invariant: layout_window() never lets the body reach past the
+     * surface. foot_y = min(max(h - FOOT_H, HEAD_H + BODY_MIN_H), h), so
+     * body.y + body.h == foot_y <= h always, and the rows this function
+     * copies (which bypass surf_set()'s bounds check on purpose, because a
+     * frame must not pay for a per-pixel clip test) stay inside the mapping.
+     * .work/p1/layout.c checks that for every window height, so a change to
+     * layout_window() cannot quietly turn this into an out-of-bounds write. */
 
     fit_rect(a->pl.vid_w, a->pl.vid_h, b.w, b.h, &v.x, &v.y, &v.w, &v.h);
     v.x += b.x;
@@ -1312,10 +1434,21 @@ static int draw_body_if_needed(PlayerApp *a) {
         }
     } else {
         /* No picture yet: redraw the card when libVLC's state changes, so
-         * "opening" turns into the real error or ended state on screen. */
+         * "opening" turns into the real error or ended state on screen, and
+         * also when the played-to-the-end verdict changes. That second test
+         * matters: libVLC reports Ended first and only answers get_length()
+         * once the input has been torn down, so a card drawn at the instant
+         * of the transition can still see length=0. Without the refresh the
+         * window would keep saying "did not play this file" about a file
+         * that played, which is exactly the kind of false statement this app
+         * must not make. */
         libvlc_state_t st = a->pl.mp ? a->pl.api.player_get_state(a->pl.mp)
                                      : libvlc_NothingSpecial;
-        if (a->body_mode != 2 || a->card_state != (int)st) {
+        int played = 0;
+        if (a->pl.mp && st == libvlc_Ended)
+            played = a->pl.api.player_get_length(a->pl.mp) > 0;
+        if (a->body_mode != 2 || a->card_state != (int)st ||
+            a->card_played != played) {
             draw_card(a, &L);
             return 1;
         }
@@ -1448,6 +1581,7 @@ int main(int argc, char **argv) {
         Layout L;
         MEvent ev;
         long long now;
+        libvlc_state_t st = libvlc_NothingSpecial;
         int want_footer = 0;
 
         layout_window(a.win_w, a.win_h, &L);
@@ -1481,6 +1615,8 @@ int main(int argc, char **argv) {
         now = now_ms();
 
         if (a.pl.mp) {
+            st = a.pl.api.player_get_state(a.pl.mp);
+
             /* Live facts: the video's own size once a picture exists, and
              * the time/state row a few times a second. */
             if (surf_frames(&a.pl.surf) > 0 &&
@@ -1492,12 +1628,16 @@ int main(int argc, char **argv) {
                 last_size_ms = now;
             }
             if (!a.pl.vol_init && a.pl.started &&
-                surf_frames(&a.pl.surf) > 0) {
-                vp_start_volume(&a.pl, 1); /* the audio output exists now */
+                (st == libvlc_Playing || st == libvlc_Paused)) {
+                /* Playback really started, so the audio output exists now
+                 * (or never will): this second attempt is final. A file
+                 * with no video track has no frames but does have sound. */
+                vp_start_volume(&a.pl, 1);
                 want_footer = 1;
             }
             if (a.pl.started &&
                 now - a.last_hud_ms >= (a.pl.paused ? 250 : 100)) {
+                vp_refresh_volume(&a.pl);   /* the output's own number */
                 want_footer = 1;
                 a.last_hud_ms = now;
             }
@@ -1509,7 +1649,6 @@ int main(int argc, char **argv) {
 
         /* Sleep for the next frame, or lazily when nothing is moving. */
         if (a.pl.mp && a.pl.started) {
-            libvlc_state_t st = a.pl.api.player_get_state(a.pl.mp);
             if (st == libvlc_Playing || st == libvlc_Opening ||
                 st == libvlc_Buffering)
                 usleep(8 * 1000);

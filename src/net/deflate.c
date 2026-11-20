@@ -779,7 +779,16 @@ static int df_block(DfStream *s) {
         s->state = DF_ST_CODES;
         return DF_OK;
     case 2:                                    /* dynamic, section 3.2.7 */
-        return df_dyn_header(s, bfinal);
+        r = df_dyn_header(s, bfinal);
+        /* df_dyn_header restores to the start of *its* part, but this
+         * function already took the 3-bit block header.  If the dynamic
+         * header needs more input the block header must be re-read too,
+         * or the next call would decode the header's HLIT/HDIST bits as
+         * a new BTYPE (the 1-byte-feed failures: bogus bad-header and
+         * incomplete-tree errors on streams that decode fine in one
+         * pass).  Restore the whole block, not half of it. */
+        if (r == DF_NEED_INPUT) df_unmark(s, mk);
+        return r;
     default:                                   /* BTYPE=11 reserved */
         return DF_ERR_BAD_HEADER;
     }

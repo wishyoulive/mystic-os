@@ -190,6 +190,7 @@ static int utf8_feed(int *need, uint32_t *cp, int *seq,
         if (*need == 0) {
             if (c < 0x80) continue;
             if (c >= 0xF5) return 0;             /* > U+10FFFF by construction */
+            if (c == 0xC0 || c == 0xC1) return 0; /* overlong 2-byte lead */
             if ((c & 0xE0) == 0xC0)      { *need = 1; *seq = 2; *cp = c & 0x1Fu; }
             else if ((c & 0xF0) == 0xE0) { *need = 2; *seq = 3; *cp = c & 0x0Fu; }
             else if ((c & 0xF8) == 0xF0) { *need = 3; *seq = 4; *cp = c & 0x07u; }
@@ -301,12 +302,17 @@ static int protocols_ok(const char *s) {
     while (*p) {
         while (*p == ' ' || *p == '\t') p++;
         if (!*p) break;
+        const char *start = p;
         while (*p && *p != ',') {
             if (!is_tchar((unsigned char)*p)) return 0;
             p++;
         }
+        if (p == start) return 0;    /* RFC 7230: no empty list element */
         any = 1;
-        if (*p == ',') p++;
+        if (*p == ',') {
+            p++;
+            if (!*p) return 0;       /* nor a trailing comma          */
+        }
     }
     return any;
 }
@@ -422,7 +428,8 @@ static int random_bytes(WsConn *c, void *buf, size_t n) {
 }
 
 /* ============================================================
- *  The accept value: base64(SHA-1(key || GUID)), RFC 6455 §4.1.
+ *  The accept value: base64(SHA-1(base64(key) || GUID)), where
+ *  base64(key) is the Sec-WebSocket-Key header value, RFC 6455 §4.1.
  * ============================================================ */
 int ws_accept_key(const uint8_t key[WS_KEY_LEN], char out[WS_ACCEPT_BUF]) {
     if (!key || !out) return WS_ERR_INVAL;
@@ -682,7 +689,8 @@ static int parse_response(WsConn *c, size_t hdrlen, WsResponse *out,
     }
     if (strcmp(expect, out->accept) != 0) {
         set_err(err, esz,
-                "Sec-WebSocket-Accept is \"%s\" but SHA-1 of the key gives \"%s\"",
+                "Sec-WebSocket-Accept is \"%s\" but SHA-1 of the "
+                "Sec-WebSocket-Key header value gives \"%s\"",
                 out->accept, expect);
         return WS_ERR_HANDSHAKE;
     }
