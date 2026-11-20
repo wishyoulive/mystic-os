@@ -203,6 +203,9 @@
     "libVLC is not installed - install it with: pkg install vlc"
 #define VLC_NEED_FILE_MSG \
     "give a media file: Player <path>"
+#define VLC_BAD_SYMBOL_MSG \
+    "the library loaded but is missing symbols it must export - " \
+    "reinstall it with: pkg install vlc"
 
 /* Linux evdev codes, the numbers src/input.c forwards (the same values
  * the other apps in src/apps use). */
@@ -1114,14 +1117,23 @@ static void draw_card(PlayerApp *a, Layout *L) {
     surf_fill(&a->s, b.x, b.y, b.w, b.h, C_BG);
 
     if (!a->pl.lib_ok) {
-        /* Title, then the package manager's own sentence, then the real
-         * loader reason, then where we looked. */
+        /* Title, then the sentence that is actually true, then the real
+         * loader reason, then where we looked.
+         *
+         * "libVLC is not installed" is only true when nothing loaded. When
+         * libvlc.so.5 DID load and a symbol was missing, the library is
+         * present - a truncated or foreign build - and telling the user it
+         * is not installed would be false. The reinstall advice stays the
+         * same, in pkg's own words. */
         y = b.y + b.h / 2 - 96;
         txt(&a->s, t, x, y,
             a->pl.symbol_missing ? "This libVLC cannot be used"
                                  : "libVLC is not installed", C_WARN);
         y += (int)font_height(t) + 10;
-        wrap_text(&a->s, bdy, x, y, w, lh, 2, VLC_MISSING_MSG, C_TEXT);
+        wrap_text(&a->s, bdy, x, y, w, lh, 2,
+                  a->pl.symbol_missing ? VLC_BAD_SYMBOL_MSG
+                                       : VLC_MISSING_MSG,
+                  C_TEXT);
         y += lh * 2 + 8;
         {
             int dlh = (int)(font_height(sm) + 4);

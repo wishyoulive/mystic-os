@@ -810,12 +810,15 @@ and `libVLC 3.0.23 Vetinari` in its footer. Screenshot:
    versioned file was present. `tools/pack-vlc.py` re-creates every `libX.so.N`,
    `libX.so` alias from the versioned names: 337 links.
 
-### Audio is not there yet, and the reason is measured
+### Audio
 
-The footer says `no audio output`. The package's `lib/vlc/plugins/audio_output/`
-contains exactly one plugin, `libadummy_plugin.so`, and the closure has no
-`libasound.so.2` at all: the ALSA output was never in the dependency set that
-was packaged. Video is unaffected - libVLC decoded and displayed without an
-audio device. Closing this needs `libalsa_plugin.so` plus `libasound` in the
-bundle and `/dev/snd/pcmC0D0p` reachable from the process (the OS already
-exposes it for the Clock's tone).
+`libalsa_plugin.so` and `libasound.so.2` now ship in the bundle
+(`tools/pack-vlc.py --extras build/vlc.apk build/alsa.apk`), and the player's
+footer shows `vol 100` where it used to show `no audio output` - the ALSA output
+opened the OS's PCM device and libVLC reports a working volume.
+`docs/screenshots/video-vlc-audio.png`.
+
+Why it was missing: the first closure was built with a filter that kept 27
+plugins, and `audio_output/` contained only `libadummy_plugin.so` - a sink that
+discards samples - with no `libasound` dependency at all. Nothing failed loudly:
+libVLC simply reported that it had no audio output and played the video.

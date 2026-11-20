@@ -50,6 +50,10 @@ def main():
     ap.add_argument("--bin", default=os.path.join(here, "build", "vlc-pack", "bin"))
     ap.add_argument("--out", default=os.path.join(here, "build", "repo", "vlc.tar.gz"))
     ap.add_argument("--version", default="3.0.23")
+    ap.add_argument("--extras", nargs="*", default=[],
+                    help="packages whose audio plugins and libasound are added: "
+                         "the upstream vlc package carries libalsa_plugin.so, and "
+                         "alsa-lib carries libasound.so.2")
     args = ap.parse_args()
 
     for p in (args.src, args.bin):
@@ -122,6 +126,29 @@ def main():
             base = os.path.basename(out)
             if out.startswith("lib/") and ".so." in base:
                 libs.append((os.path.dirname(out), base))
+
+        # ---- audio: the output plugin and libasound ----------------------
+        # The closure this package was first built from had only the dummy
+        # output, so the player honestly reported "no audio output". These two
+        # packages are the ones that provide a real one.
+        for apk in args.extras:
+            if not os.path.exists(apk):
+                sys.exit("missing extra package %s" % apk)
+            with tarfile.open(apk, "r:*") as ex:
+                for ti in ex:
+                    name = ti.name.lstrip("./")
+                    keep = (name.startswith("usr/lib/vlc/plugins/audio_output/")
+                            or re.match(r"usr/lib/libasound\.so[.0-9]*$", name) is not None)
+                    if not keep or not ti.isreg():
+                        continue
+                    out = name[len("usr/"):] if name.startswith("usr/") else name
+                    blob = ex.extractfile(ti).read()
+                    mode = 0o755 if blob[:4] == b"ELF" else 0o644
+                    add(out, data=io.BytesIO(blob), mode=mode, size=len(blob))
+                    n_files += 1
+                    base = os.path.basename(out)
+                    if ".so." in base:
+                        libs.append((os.path.dirname(out), base))
 
         # soname links next to each versioned library
         for d, base in sorted(libs):
