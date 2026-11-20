@@ -7,6 +7,9 @@ text terminal
 wait 40
 enter
 wait 90
-text /root/apps/engine/bin &
+text wget -q http://10.0.2.2:8000/sample.mp4 -O /root/sample.mp4
 enter
-wait 300
+wait 200
+text echo /root/sample.mp4 > /run/mystic/open.request
+enter
+wait 400

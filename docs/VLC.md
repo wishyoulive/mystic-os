@@ -887,3 +887,34 @@ Why it was missing: the first closure was built with a filter that kept 27
 plugins, and `audio_output/` contained only `libadummy_plugin.so` - a sink that
 discards samples - with no `libasound` dependency at all. Nothing failed loudly:
 libVLC simply reported that it had no audio output and played the video.
+
+### Through the OS, with no terminal involved
+
+The tile path is now measured end to end. A file is handed to the desktop the
+way Files does it, the type registry picks the app, and the installed bundle
+plays it inside the sandbox:
+
+```
+$ echo /root/sample.mp4 > /run/mystic/open.request
+open: /root/sample.mp4 -> vlc pid 602
+wms: vlc connected 960x640 as uid 2000 (/run/mystic/jail/vlc/dev/shm/mystic-1-1)
+```
+
+The window then shows the decoded frame with `ended 0:09 / 0:10`, `640x360`,
+`vol 100` and `libVLC 3.0.23 Vetinari`. Screenshot:
+`docs/screenshots/video-vlc-tile.png`.
+
+Two things this settles that the manual run could not:
+
+- **The static launcher works inside the jail.** Launched with no arguments the
+  tile reports `libVLC 3.0.23 Vetinari loaded from /app/lib/libvlc.so.5` - the
+  jailed bundle path, so `bin` found the bundled loader, the loader found
+  `libexec/vlcplay`, and the player loaded libVLC from `/app/lib`. A dynamic
+  `bin` could not have done this: `PT_INTERP` is absolute and the jail has no
+  `/lib`.
+- **Audio output is a real sink, not the dummy.** The footer says `vol 100`
+  where it previously said `no audio output`, which only happens when an
+  `audio_output` module initialises; the bundle ships `libalsa_plugin.so` and
+  `libasound.so.2` and the OS exposes `/dev/snd/pcmC0D0p`. Audible sound cannot
+  be confirmed from inside this VM, so what is claimed is that the output opens
+  and libVLC reports a volume, not that a listener heard it.
