@@ -24,3 +24,5 @@ stage/usr/lib/
 
 # agent scratch space
 .work/
+# test hook for the scripted input device (see src/input.c)
+run/mystic/input-script
