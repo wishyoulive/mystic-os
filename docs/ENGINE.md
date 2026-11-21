@@ -718,3 +718,40 @@ engine runs; it means nothing is missing at link time.
   unpacked size).
 * `--dump-dom` against a real URL was not run; §7.3 gives the command for
   whoever boots it first.
+
+## The engine renders pages now
+
+`docs/screenshots/chromium-page.png` is a real Blink 156 rendering inside the
+OS: a heading, a paragraph and a bordered table, drawn by the engine and shown
+in the Player-style window with a working address bar.
+
+It renders through `--screenshot`, not through the DevTools pipe, and the reason
+is measured rather than assumed. With `--remote-debugging-pipe` the engine exits
+1 immediately and writes nothing: not in a jail, not outside one, not as root,
+not as the sandbox uid, with /app present, with the interpreter rewritten, with
+the closure flattened, with /dev, /proc, /etc and /tmp all present. The same
+binary prints a document or writes a screenshot every time. So navigation runs
+the engine the way that works:
+
+    chromium-headless-shell --headless --no-sandbox --disable-gpu
+        --hide-scrollbars --window-size=<w>x<h>
+        --screenshot=/tmp/shot-<pid>.png <url>
+
+and the viewer decodes that PNG with `src/img.c` and draws it. The footer says
+`rendered N frames`, one per navigation, because that is what it is: a page
+viewer, not a live surface.
+
+What this gives and what it does not:
+
+- **Works:** any URL the OS can reach, rendered by a real browser engine,
+  including CSS, tables, fonts and images - everything Blink does for a static
+  frame.
+- **Does not:** scrolling, clicking inside the page, typing into a page, video,
+  or anything that needs a live connection to the engine. YouTube would show one
+  frame, not a player, because its video needs a running compositor on the other
+  end of the pipe.
+- **Next:** the pipe path is the interactive one. The one difference that has
+  not been ruled out is that Chromium's pipe handler reads fd 3 as a *socket* on
+  its own terms; the exit-1-with-no-output signature matches its
+  "Connection terminated while reading from pipe" path, so a socketpair instead
+  of two pipes is the next experiment to try.

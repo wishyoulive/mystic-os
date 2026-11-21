@@ -760,6 +760,7 @@ typedef struct {
     int  page_w, page_h;        /* the viewport we asked for */
     Img  frame;                 /* the last decoded frame */
     unsigned frames;            /* frames decoded since start */
+    int shot_mode;              /* rendering via --screenshot, not the pipe */
     long last_frame_ms;
     long first_send_ms;
     long next_id;
@@ -1296,6 +1297,76 @@ static void draw_ui(MClient *c, Page *p, Engine *e, Font *fs, Font *fb,
 /* The card shown when the engine is not installed at all. It states the real
  * cost, because the user has to raise the guest's memory and disk for the
  * package to fit. */
+/* ---- screenshot mode -----------------------------------------------------
+ *
+ * The DevTools pipe path is the interactive one, but on this kernel the engine
+ * exits 1 as soon as it is given --remote-debugging-pipe, in a jail and outside
+ * one alike, while the very same binary renders happily when asked for a
+ * document or a screenshot. So navigation is done the way that is proven: run
+ * the engine with --screenshot at the window size, then show the PNG it wrote.
+ * It is one frame per navigation rather than 30 per second, and it is honest
+ * about that in the footer.
+ */
+static int shot_render(const char *bundle, const char *url, int w, int h,
+                       Page *p, char *err, size_t esz) {
+    char exe[600], out[300], size[64], shot[340], libs[900];
+    snprintf(exe, sizeof(exe), "%s/usr/lib/chromium/chromium-headless-shell", bundle);
+    snprintf(out, sizeof(out), "/tmp/shot-%d.png", (int)getpid());
+    snprintf(size, sizeof(size), "--window-size=%dx%d", w, h);
+    snprintf(shot, sizeof(shot), "--screenshot=%s", out);
+    collect_lib_dirs(bundle, 0, libs, sizeof libs);
+    unlink(out);
+
+    pid_t pid = fork();
+    if (pid < 0) { set_err(err, esz, "fork: %s", strerror(errno)); return -1; }
+    if (pid == 0) {
+        setenv("LD_LIBRARY_PATH", libs, 1);
+        setenv("HOME", "/tmp", 1);
+        setenv("TMPDIR", "/tmp", 1);
+        execl(exe, "chrome", "--headless", "--no-sandbox", "--disable-gpu",
+              "--hide-scrollbars", "--force-device-scale-factor=1",
+              size, shot, url, (char *)NULL);
+        _exit(127);
+    }
+    int st = 0, waited = 0;
+    while (waited < 200) {
+        pid_t r = waitpid(pid, &st, WNOHANG);
+        if (r == pid) break;
+        usleep(100000);
+        waited++;
+    }
+    if (waited >= 200) { kill(pid, SIGKILL); waitpid(pid, &st, 0); }
+
+    FILE *f = fopen(out, "rb");
+    if (!f) {
+        set_err(err, esz, "the engine wrote no screenshot (%s), status %d",
+                strerror(errno), WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+        return -1;
+    }
+    static unsigned char *buf;
+    static size_t cap;
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len <= 0) { fclose(f); set_err(err, esz, "empty screenshot"); return -1; }
+    if ((size_t)len > cap) {
+        unsigned char *nb = realloc(buf, (size_t)len);
+        if (!nb) { fclose(f); set_err(err, esz, "out of memory"); return -1; }
+        buf = nb; cap = (size_t)len;
+    }
+    size_t got = fread(buf, 1, (size_t)len, f);
+    fclose(f);
+    unlink(out);
+    if (got != (size_t)len) { set_err(err, esz, "short read"); return -1; }
+
+    Img im;
+    if (img_decode(buf, got, &im, err, esz) != 0) return -1;
+    img_free(&p->frame);
+    p->frame = im;
+    p->frames++;
+    return 0;
+}
+
 static void draw_missing(MClient *c, Font *fs, Font *fb, const char *why) {
     Surface s;
     int x = 34, y = 34;
@@ -1467,13 +1538,17 @@ int main(int argc, char **argv) {
             if (mute)
                 fprintf(stderr, "engineview: no /dev/snd PCM node - passing "
                                 "--mute-audio once (decode still happens)\n");
-            if (engine_spawn(&e, bundle, p.page_w, p.page_h, mute,
-                             err, sizeof(err)) != 0) {
+            /* Screenshot mode: one rendered frame per navigation, through the
+             * code path that is proven to work on this kernel. */
+            char surl[EVP_URL_MAX];
+            snprintf(surl, sizeof(surl), "%s", p.url);
+            if (shot_render(bundle, surl, p.page_w, p.page_h, &p,
+                            err, sizeof(err)) != 0) {
                 draw_missing(&c, fs, fb, err);
-                snprintf(p.state, sizeof(p.state), "spawn failed");
+                snprintf(p.state, sizeof(p.state), "render failed");
             } else {
-                snprintf(p.state, sizeof(p.state), "engine pid %d", (int)e.pid);
-                page_create(&p, &e);
+                snprintf(p.state, sizeof(p.state), "rendered");
+                p.shot_mode = 1;
             }
         }
     }
@@ -1519,7 +1594,14 @@ int main(int argc, char **argv) {
                 } else if (p.bar_focus) {
                     if (ev.key == KEY_ENTER) {
                         p.bar_focus = 0;
-                        if (p.typing[0]) page_navigate(&p, &e, p.typing);
+                        if (p.typing[0]) {
+                            snprintf(p.url, sizeof(p.url), "%s", p.typing);
+                            if (shot_render(bundle, p.url, p.page_w, p.page_h,
+                                            &p, err, sizeof(err)) != 0)
+                                snprintf(p.state, sizeof(p.state), "%s", err);
+                            else
+                                snprintf(p.state, sizeof(p.state), "rendered");
+                        }
                         dirty = 1;
                     } else if (ev.key == KEY_BACKSPACE) {
                         size_t n = strlen(p.typing);
@@ -1534,6 +1616,13 @@ int main(int argc, char **argv) {
             } else if (ev.type == MC_KEY && !ev.press) {
                 if (!p.bar_focus) input_key(&e, &p, ev.key, ev.mods, 0);
             } else if (ev.type == MC_TEXT) {
+                /* Typing into the window starts an address, the way a browser
+                 * behaves when nothing else on the page takes the keyboard:
+                 * the first character puts the bar in focus. */
+                if (!p.bar_focus && ev.text[0] && ev.text[0] != 10) {
+                    p.bar_focus = 1;
+                    if (!strcmp(p.url, "about:blank")) p.typing[0] = 0;
+                }
                 if (p.bar_focus) {
                     size_t n = strlen(p.typing), i;
                     for (i = 0; ev.text[i] && n + 1 < sizeof(p.typing); i++)
