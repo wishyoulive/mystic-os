@@ -124,6 +124,13 @@ typedef struct {
                         * namespace and a fresh procfs. The trade is named,
                         * one manifest line, and documented in
                         * docs/SECURITY.md; sysmon is the only app that asks. */
+    int  no_chroot;    /* manifest says 'chroot = no': keep the mount, pid,
+                        * net and ipc namespaces, the uid drop and the private
+                        * /dev/shm and /tmp, but do not chroot. A third-party
+                        * runtime that insists on the real /lib, /etc and
+                        * /usr/share (a browser engine does) cannot start in a
+                        * chroot holding only its own bundle. Stated in the
+                        * manifest, and recorded in docs/SECURITY.md. */
 } WmApp;
 
 /* Tell the server how big the screen is, so a client buffer can be allocated

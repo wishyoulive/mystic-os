@@ -99,6 +99,7 @@ def main():
         add_path("manifest", os.path.join(args.bundle, "manifest"))
         n_files += 2
 
+        seen_flat = set()
         for ti in src:
             name = ti.name.lstrip("./")
             if not name or name.split("/")[0] in SKIP_AT_ROOT:
@@ -111,16 +112,40 @@ def main():
                 print("interp: %s -> /app%s" % (old_interp, old_interp[4:]))
                 n_files += 1
                 continue
-            dst.addfile(ti, src.extractfile(ti) if ti.isreg() else None)
+            blob = src.extractfile(ti).read() if ti.isreg() else None
+            dst.addfile(ti, io.BytesIO(blob) if blob is not None else None)
             if ti.issym() or ti.islnk():
                 n_links += 1
             else:
                 n_files += 1
+            # Libraries in private subdirectories (libpulsecommon under
+            # usr/lib/pulseaudio, the dri/dri drivers, gio modules) are found
+            # only if the loader is told about that exact directory. A flat copy
+            # in usr/lib makes the closure loadable with a single -L, which is
+            # what the jail needs: a missing libpulsecommon is reported as
+            # 'Error relocating libpulse.so.0: pa_strbuf_puts: symbol not found'.
+            parts = name.split("/")
+            if (blob is not None and len(parts) >= 4 and parts[0] == "usr"
+                    and parts[1] == "lib" and ".so" in parts[-1]):
+                flat = "usr/lib/" + parts[-1]
+                if flat not in src.getnames() and flat not in seen_flat:
+                    seen_flat.add(flat)
+                    fti = tarfile.TarInfo(flat)
+                    fti.size = len(blob)
+                    fti.mode = 0o755 if blob[:4] == b"ELF" else 0o644
+                    dst.addfile(fti, io.BytesIO(blob))
+                    n_files += 1
 
         loader_src = os.path.join(here, "stage", "lib", "ld-musl-x86_64.so.1")
         if not os.path.exists(loader_src):
             sys.exit("missing %s (the image ships it)" % loader_src)
         add_path("ld-musl-x86_64.so.1", loader_src)
+        # empty marker: sends the engine child's stderr to the console
+        marker = tarfile.TarInfo("engine-log")
+        marker.size = 0
+        marker.mode = 0o644
+        dst.addfile(marker)
+        n_files += 1
         n_files += 1
 
         for extra, text in ((".pkg-name", "engine\n"),

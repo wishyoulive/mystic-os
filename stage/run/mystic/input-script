@@ -1,0 +1,9 @@
+wait 300
+abs 24 20
+press
+release
+wait 40
+text engine
+wait 40
+enter
+wait 400

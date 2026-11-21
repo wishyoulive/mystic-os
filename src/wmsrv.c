@@ -240,6 +240,8 @@ typedef struct {
     char dst[SBX_PATH];              /* absolute for the parent, jail-relative
                                       * for the child */
     char opts[112];
+    int absolute;                    /* dst is a host path, not jail-relative */
+    int dst_is_abs;                  /* same, for tmpfs steps */
 } SbxStep;
 
 typedef struct {
@@ -248,6 +250,9 @@ typedef struct {
     int  uid, gid;
     unsigned ns;                     /* SBX_NS_* */
     int  procs, net, audio;
+    int  no_chroot;                  /* namespaces and uid, but no chroot */
+    char tmpdir[SBX_PATH];           /* the app's private temp directory */
+    char appdata[SBX_PATH];          /* the app's own data directory */
     int  reuse;                      /* a window of this app is already up */
     int  stride, maxh;
     unsigned long long buf_bytes, shm_size, tmp_size;
@@ -273,8 +278,15 @@ static unsigned long long sbx_buf_bytes(int stride, int maxh) {
     if (maxh < 1) maxh = 1;
     return (unsigned long long)stride * (unsigned long long)maxh * 4ull;
 }
+/* The per-app tmpfs holds the client's frame buffer and whatever the app maps.
+ * Two frames plus a megabyte is the minimum a GUI client needs, but a browser
+ * engine maps tens of megabytes of shared memory before it draws anything, and
+ * with only the minimum it dies during startup. The floor is stated here so the
+ * arithmetic stays in one place; it is still a cap, not a free-for-all. */
+#define SBX_SHM_FLOOR (64ull * 1024ull * 1024ull)
 static unsigned long long sbx_tmpfs_size(unsigned long long buf) {
-    return 2ull * buf + SBX_MIB;
+    unsigned long long need = 2ull * buf + SBX_MIB;
+    return need > SBX_SHM_FLOOR ? need : SBX_SHM_FLOOR;
 }
 
 static void sbx_ns_names(unsigned ns, char *buf, size_t cap) {
@@ -316,13 +328,14 @@ static SbxStep *sbx_add(SbxPlan *p, int where, int op,
 static void sbx_plan_init(SbxPlan *p, const char *run, const char *id,
                           const char *exe, const char *appdata,
                           int uid, int procs, int net, int audio,
-                          int stride, int maxh, const char *arg) {
+                          int no_chroot, int stride, int maxh, const char *arg) {
     memset(p, 0, sizeof(*p));
     snprintf(p->id, sizeof(p->id), "%s", id ? id : "");
     snprintf(p->jail, sizeof(p->jail), "%s/jail/%s", run, p->id);
     p->uid = uid;
     p->gid = uid;
     p->procs = procs ? 1 : 0;
+    p->no_chroot = no_chroot ? 1 : 0;
     p->net = net ? 1 : 0;
     p->audio = audio ? 1 : 0;
     p->stride = stride;
@@ -346,6 +359,8 @@ static void sbx_plan_init(SbxPlan *p, const char *run, const char *id,
     /* ---- parent: skeleton + the two per-app tmpfs mounts */
     sbx_add(p, SBX_PARENT, SBX_MKDIR, NULL, p->jail)->mode = 0755;
     snprintf(dir, sizeof(dir), "%s/tmp", p->jail);
+    snprintf(p->tmpdir, sizeof(p->tmpdir), "%s", dir);
+    snprintf(p->appdata, sizeof(p->appdata), "%s", appdata);
     sbx_add(p, SBX_PARENT, SBX_MKDIR, NULL, dir)->mode = 0755;
     {
         SbxStep *s = sbx_add(p, SBX_PARENT, SBX_TMPFS, "tmpfs", dir);
@@ -353,6 +368,15 @@ static void sbx_plan_init(SbxPlan *p, const char *run, const char *id,
         s->flags = SBX_F_NOSUID | SBX_F_NODEV;
         snprintf(s->opts, sizeof(s->opts),
                  "size=%llu,mode=0700,uid=%d,gid=%d", p->tmp_size, uid, uid);
+    }
+    if (p->no_chroot) {
+        /* The frame buffer lives in the per-app tmpfs; without a chroot the app
+         * sees the host /dev/shm, so that tmpfs is mounted over it. */
+        char shmdir[SBX_PATH];
+        snprintf(shmdir, sizeof(shmdir), "%s/dev/shm", p->jail);
+        SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, shmdir, "/dev/shm");
+        s->mode = 0700;
+        s->absolute = 1;
     }
     snprintf(dir, sizeof(dir), "%s/dev/shm", p->jail);
     sbx_add(p, SBX_PARENT, SBX_MKDIR, NULL, dir)->mode = 0755;
@@ -364,14 +388,19 @@ static void sbx_plan_init(SbxPlan *p, const char *run, const char *id,
                  "size=%llu,mode=0700,uid=%d,gid=%d", p->shm_size, uid, uid);
     }
 
+    /* Without a chroot the child's /tmp is the host's, which an app uid cannot
+     * write: the private tmpfs is bound over it instead, so an un-chrooted app
+     * still gets its own writable /tmp and nothing else. */
+    if (p->no_chroot) {
+        char tmpdir[SBX_PATH];
+        snprintf(tmpdir, sizeof(tmpdir), "%s/tmp", p->jail);
+        SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, tmpdir, "/tmp");
+        s->mode = 0700;
+    }
+
     /* ---- parent: the app's own /root, owned by the app */
     sbx_add(p, SBX_PARENT, SBX_CHOWN, appdata, appdata)->mode = 0700;
 
-    /* ---- child: the payload and its own bundle, read-only */
-    {
-        SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, exe, "/bin/app");
-        s->ro = 1; s->mode = 0755;
-    }
     {
         /* the bundle directory: a package may ship a runtime beside the
          * executable (libVLC and its plugins), and only that one directory is
@@ -382,8 +411,18 @@ static void sbx_plan_init(SbxPlan *p, const char *run, const char *id,
         if (slash) *slash = 0;
         SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, bundle, "/app");
         s->ro = 1; s->mode = 0755;
+        s->absolute = p->no_chroot;      /* /app is the interpreter path */
     }
 
+    /* ---- child: the payload and its own bundle, read-only.
+     * Without a chroot the bundle still goes to /app, because the interpreter
+     * the package writes into PT_INTERP is /app/ld-musl-x86_64.so.1. */
+    /* Without a chroot the payload runs from its real path, so it is not
+     * mounted anywhere; inside a chroot it has to be at /bin/app. */
+    if (!p->no_chroot) {
+        SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, exe, "/bin/app");
+        s->ro = 1; s->mode = 0755;
+    }
     /* ---- child: the window socket */
     {
         SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, WM_SOCKET, "/run/mystic/wm.sock");
@@ -417,8 +456,30 @@ static void sbx_plan_init(SbxPlan *p, const char *run, const char *id,
         s->ro = 1; s->mode = 0755;
     }
     {
+        /* /etc is read-only configuration, not secrets: /etc/passwd, /etc/hosts
+         * and the fontconfig files are what a toolkit looks up before it can
+         * draw anything, and an engine without them fails in ways that print
+         * nothing. /etc/shadow is mode 0640 root:root, so an app uid cannot
+         * read it even though the directory is present. */
+        SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, "/etc", "/etc");
+        s->ro = 1; s->mode = 0755;
+    }
+    {
         SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, "/dev/urandom", "/dev/urandom");
         s->ro = 1; s->mode = 0666;
+    }
+    {
+        /* mmap of anonymous memory and libraries is backed by /dev/zero on
+         * some paths; without it an engine's allocator fails early. */
+        SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, "/dev/zero", "/dev/zero");
+        s->mode = 0666;
+    }
+    if (p->procs) {
+        /* Apps that ask for process visibility are the ones that also need to
+         * report why they failed; the console is how that reaches the serial
+         * log. It is tied to procs so it is not handed out to every app. */
+        SbxStep *s = sbx_add(p, SBX_CHILD, SBX_BIND, "/dev/console", "/dev/console");
+        s->mode = 0620;
     }
 
     /* ---- child: the one document the app asked to open, read-only */
@@ -436,7 +497,8 @@ static void sbx_plan_init(SbxPlan *p, const char *run, const char *id,
     else          sbx_add(p, SBX_CHILD, SBX_PROC, "proc", "/proc");
 
     /* ---- child: switch root, drop the credential, prove the result */
-    sbx_add(p, SBX_CHILD, SBX_CHROOT, NULL, NULL);
+    if (!p->no_chroot)
+        sbx_add(p, SBX_CHILD, SBX_CHROOT, NULL, NULL);
     sbx_add(p, SBX_CHILD, SBX_DROP, NULL, NULL);
     sbx_add(p, SBX_CHILD, SBX_VERIFY, NULL, NULL);
 }
@@ -571,6 +633,7 @@ static void sbx_manifest_line(WmApp *a, const char *line) {
     else if (!strcmp(k, "network") && !strcmp(v, "host")) a->net = 1;
     else if (!strcmp(k, "audio") && !strcmp(v, "yes")) a->audio = 1;
     else if (!strcmp(k, "procs") && !strcmp(v, "yes")) a->procs = 1;
+    else if (!strcmp(k, "chroot") && !strcmp(v, "no")) a->no_chroot = 1;
 }
 
 
@@ -1554,8 +1617,12 @@ static int sandbox_prepare(const SbxPlan *p, char *err, size_t errn) {
                 return -1;
             break;
         case SBX_TMPFS: {
-            if (sbx_walk(anchor, s->dst + al, 1, 0755, path, sizeof(path), err, errn) != 0)
+            if (s->dst_is_abs) {
+                snprintf(path, sizeof(path), "%s", s->dst);
+                mkdir(path, 0755);
+            } else if (sbx_walk(anchor, s->dst + al, 1, 0755, path, sizeof(path), err, errn) != 0) {
                 return -1;
+            }
             struct statfs sfs;
             int already = p->reuse && statfs(path, &sfs) == 0 &&
                           (unsigned long)sfs.f_type == (unsigned long)TMPFS_MAGIC;
@@ -1606,8 +1673,18 @@ static int sbx_step_child(const SbxPlan *p, const SbxStep *s, char *err, size_t 
     switch (s->op) {
     case SBX_BIND: {
         int want_dir = stat(s->src, &st) == 0 && S_ISDIR(st.st_mode);
-        if (sbx_walk(p->jail, s->dst, want_dir, s->mode, tgt, sizeof(tgt), err, errn) != 0)
+        if (s->absolute) {
+            /* chroot-less mode: the destination is a real path, created here
+             * rather than inside the jail tree */
+            if (mkdir(s->dst, (mode_t)(s->mode ? s->mode : 0755)) != 0 &&
+                errno != EEXIST) {
+                snprintf(err, errn, "mkdir %s: %s", s->dst, strerror(errno));
+                return -1;
+            }
+            snprintf(tgt, sizeof(tgt), "%s", s->dst);
+        } else if (sbx_walk(p->jail, s->dst, want_dir, s->mode, tgt, sizeof(tgt), err, errn) != 0) {
             return -1;
+        }
         if (mount(s->src, tgt, NULL, MS_BIND, NULL) != 0) {
             snprintf(err, errn, "mount --bind %s on %s: %s", s->src, tgt, strerror(errno));
             return -1;
@@ -1671,20 +1748,34 @@ static int sbx_step_child(const SbxPlan *p, const SbxStep *s, char *err, size_t 
                      (int)getuid(), (int)getgid(), p->uid, p->gid);
             return -1;
         }
-        if (access("/", W_OK) == 0) {
-            snprintf(err, errn, "the jail root is writable by uid %d", p->uid);
+        /* "The root is not writable" is the check that separates a chroot from
+         * a directory, and it is the one that must fail closed. With chroot = no
+         * the root is the real filesystem on purpose, so the check would refuse
+         * every launch; what still holds is that the app runs as its own uid and
+         * cannot write the system tree, which is asserted below instead. */
+        if (!p->no_chroot) {
+            if (access("/", W_OK) == 0) {
+                snprintf(err, errn, "the jail root is writable by uid %d", p->uid);
+                return -1;
+            }
+            if (access("/bin", W_OK) == 0) {
+                snprintf(err, errn, "/bin is writable by uid %d", p->uid);
+                return -1;
+            }
+        } else if (access("/etc/shadow", R_OK) == 0) {
+            snprintf(err, errn, "uid %d can read /etc/shadow", p->uid);
             return -1;
         }
-        if (access("/bin", W_OK) == 0) {
-            snprintf(err, errn, "/bin is writable by uid %d", p->uid);
-            return -1;
-        }
-        if (access("/tmp", W_OK) != 0) {
+        if (access(p->no_chroot ? p->tmpdir : "/tmp", W_OK) != 0) {
             snprintf(err, errn, "the app cannot write /tmp: %s", strerror(errno));
             return -1;
         }
-        if (access("/root", W_OK) != 0) {
-            snprintf(err, errn, "the app cannot write its own /root: %s", strerror(errno));
+        /* In a chroot the payload's data directory is /root; without one it is
+         * the app's own directory, which HOME points at. Checking the wrong one
+         * would pass an app that cannot save anything. */
+        if (access(p->no_chroot ? p->appdata : "/root", W_OK) != 0) {
+            snprintf(err, errn, "the app cannot write its own data directory: %s",
+                     strerror(errno));
             return -1;
         }
         return 0;
@@ -1801,8 +1892,8 @@ static void sandbox_child(const SbxPlan *plan, const char *exe,
         snprintf(sc, sizeof(sc), "%.3f", (double)ui_scale_get());
         setenv("MYSTIC_UI_SCALE", sc, 1);
     }
-    setenv("HOME", "/tmp", 1);
-    setenv("TMPDIR", "/tmp", 1);
+    setenv("HOME", plan->no_chroot ? plan->tmpdir : "/tmp", 1);
+    setenv("TMPDIR", plan->no_chroot ? plan->tmpdir : "/tmp", 1);
     /* the bundle's own tree, if the app needs more than its payload */
     setenv("MYSTIC_BUNDLE", "/app", 1);
     setenv("LD_LIBRARY_PATH", "/app/usr/lib:/app/lib", 1);
@@ -1855,7 +1946,8 @@ static int wms_launch_arg(const WmApp *app, WmClient *cl, int slot, const char *
 
     SbxPlan plan;
     sbx_plan_init(&plan, run_dir(), app->id, exe, appdata, uid,
-                  app->procs, app->net, app->audio, screen_w, screen_h, arg);
+                  app->procs, app->net, app->audio, app->no_chroot,
+                  screen_w, screen_h, arg);
     plan.reuse = reuse;
     if (getenv("MYSTIC_SANDBOX_PRINT") && getenv("MYSTIC_SANDBOX_PRINT")[0])
         sbx_plan_print(&plan, stderr);
@@ -1893,9 +1985,9 @@ static int wms_launch_arg(const WmApp *app, WmClient *cl, int slot, const char *
             /* an app that was asked to open a document gets the path as
              * argv[1]; the path was validated by the desktop, and the app
              * still cannot see anything outside its own jail */
-            execl("/bin/app", "app", arg, (char *)NULL);
+            execl(app->no_chroot ? exe : "/bin/app", "app", arg, (char *)NULL);
         } else {
-            execl("/bin/app", "app", (char *)NULL);   /* inside the jail, or not at all */
+            execl(app->no_chroot ? exe : "/bin/app", "app", (char *)NULL);
         }
         /* exec failed: /bin/app is not an executable (a 0-byte placeholder, a
          * library, a wrong architecture). The kernel says which. */

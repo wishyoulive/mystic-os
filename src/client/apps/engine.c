@@ -610,7 +610,15 @@ static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
          * a message survives if the engine dies before the frame loop drains the
          * pipe, so a copy is kept for the diagnostics below. */
         int console = dup(2);
+        if (console >= 0)
+            dprintf(console, "engineview: pipes in=%d,%d out=%d,%d err=%d,%d\n",
+                    in[0], in[1], out[0], out[1], errp[0], errp[1]);
         if (errp[1] != 2) dup2(errp[1], 2);
+        /* A marker file in the bundle sends the child's stderr to the
+         * console instead of the pipe: with the pipe, a loader that dies
+         * before main() leaves nothing readable at all. */
+        if (console >= 0 && access("/app/engine-log", F_OK) == 0)
+            dup2(console, 2);
         if (in[0] != 3) close(in[0]);
         if (in[1] != 3 && in[1] != 4 && in[1] != 2) close(in[1]);
         if (out[0] != 3 && out[0] != 4 && out[0] != 2) close(out[0]);
@@ -623,11 +631,34 @@ static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
 
         argv[n++] = exe;
         argv[n++] = "--headless=new";          /* without it the shell prints
-                                               * usage and exits 0, silently */
+        /* Chromium writes startup failures to this file as well as to
+         * stderr; when a child dies before the pipe is read the file
+         * is the only copy left, and it is readable from the jail. */
+        argv[n++] = "--enable-logging";
+        {
+            static char logf[400];
+            const char *td = getenv("TMPDIR");
+            snprintf(logf, sizeof logf, "--log-file=%s/chrome.log",
+                     td && td[0] ? td : "/tmp");
+            argv[n++] = logf;
+        }
+                                               argv[n++] = "--headless=new";   /* without it the shell prints usage */
+                                                                                 /* and exits 0, silently */
         argv[n++] = "--remote-debugging-pipe";
         argv[n++] = "--no-sandbox";            /* the OS jail IS the sandbox */
+        /* The jail makes process creation fragile: every child would
+         * have to resolve the interpreter and the closure again. One
+         * process avoids the whole class. */
+        argv[n++] = "--single-process";
+        argv[n++] = "--no-zygote";
         argv[n++] = "--disable-gpu";           /* no GPU: no GL, no DRI driver */
-        argv[n++] = "--user-data-dir=/tmp/engine-profile";
+        {
+            static char prof[400];
+            const char *td = getenv("TMPDIR");
+            snprintf(prof, sizeof prof, "--user-data-dir=%s/engine-profile",
+                     td && td[0] ? td : "/tmp");
+            argv[n++] = prof;
+        }
         argv[n++] = "--no-first-run";
         argv[n++] = "--no-default-browser-check";
         argv[n++] = "--disable-background-networking";
@@ -1395,6 +1426,30 @@ int main(int argc, char **argv) {
     }
 
     bundle_dir(bundle, sizeof(bundle));
+    /* What the jail really gives this process: a silent exit 1 from the
+     * engine is not explainable without knowing which of these are absent. */
+    fprintf(stderr, "jail: uid=%d dev_null=%d urandom=%d shm=%d proc=%d tmp=%d\n",
+            (int)getuid(), access("/dev/null", F_OK) == 0,
+            access("/dev/urandom", F_OK) == 0, access("/dev/shm", F_OK) == 0,
+            access("/proc/self/exe", F_OK) == 0, access("/tmp", W_OK) == 0);
+    {
+        DIR *jd = opendir("/dev");
+        if (jd) {
+            struct dirent *de;
+            char names[512] = {0};
+            while ((de = readdir(jd)) != NULL) {
+                if (de->d_name[0] == '.') continue;
+                if (strlen(names) + strlen(de->d_name) + 2 < sizeof names) {
+                    strcat(names, de->d_name);
+                    strcat(names, " ");
+                }
+            }
+            closedir(jd);
+            fprintf(stderr, "jail: /dev = %s\n", names);
+        } else {
+            fprintf(stderr, "jail: /dev missing\n");
+        }
+    }
     snprintf(exe, sizeof(exe), "%s/usr/lib/chromium/chromium-headless-shell", bundle);
 
     if (access(exe, X_OK) != 0) {
@@ -1540,6 +1595,12 @@ int main(int argc, char **argv) {
             int st = 0;
             pid_t r = waitpid(e.pid, &st, WNOHANG);
             if (r == e.pid) {
+                /* The pipe still holds whatever the engine wrote before it
+                 * died; closing it here without reading loses the only copy of
+                 * the reason. */
+                engine_note_stderr(&e);
+                if (e.stderr_len)
+                    fprintf(stderr, "engine: %s\n", engine_last_stderr(&e));
                 e.status = WIFEXITED(st) ? WEXITSTATUS(st)
                          : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : -1;
                 e.pid = 0;
