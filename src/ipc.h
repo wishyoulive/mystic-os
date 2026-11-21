@@ -124,6 +124,13 @@ typedef struct {
                         * namespace and a fresh procfs. The trade is named,
                         * one manifest line, and documented in
                         * docs/SECURITY.md; sysmon is the only app that asks. */
+    int  host_ns;      /* manifest says 'host = yes': the payload runs in the
+                        * host namespaces as the sandbox uid, with its bundle
+                        * bind-mounted at /app, and is not chrooted. Used by a
+                        * third-party runtime (a browser engine) that will not
+                        * start inside a chroot holding only its own bundle.
+                        * The uid drop still applies, and docs/SECURITY.md
+                        * records that such an app can read the system tree. */
     int  no_chroot;    /* manifest says 'chroot = no': keep the mount, pid,
                         * net and ipc namespaces, the uid drop and the private
                         * /dev/shm and /tmp, but do not chroot. A third-party

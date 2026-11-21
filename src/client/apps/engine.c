@@ -646,11 +646,6 @@ static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
                                                                                  /* and exits 0, silently */
         argv[n++] = "--remote-debugging-pipe";
         argv[n++] = "--no-sandbox";            /* the OS jail IS the sandbox */
-        /* The jail makes process creation fragile: every child would
-         * have to resolve the interpreter and the closure again. One
-         * process avoids the whole class. */
-        argv[n++] = "--single-process";
-        argv[n++] = "--no-zygote";
         argv[n++] = "--disable-gpu";           /* no GPU: no GL, no DRI driver */
         {
             static char prof[400];

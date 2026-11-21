@@ -95,6 +95,7 @@
 
 typedef struct {
     char id[32];                  /* bundle that owns this uid, "" = slot free */
+    int  host;                    /* the app runs in the host namespaces */
     int  nanchor;                 /* launches whose process is still alive */
     int  npid;                    /* connections the kernel attributes here */
     long anchor[SBX_UID_SLOTS];
@@ -634,6 +635,7 @@ static void sbx_manifest_line(WmApp *a, const char *line) {
     else if (!strcmp(k, "audio") && !strcmp(v, "yes")) a->audio = 1;
     else if (!strcmp(k, "procs") && !strcmp(v, "yes")) a->procs = 1;
     else if (!strcmp(k, "chroot") && !strcmp(v, "no")) a->no_chroot = 1;
+    else if (!strcmp(k, "host") && !strcmp(v, "yes")) a->host_ns = 1;
 }
 
 
@@ -988,6 +990,10 @@ static void handle_line(WmClient *c, char *line) {
                 c->pid = (long)uc.pid;
                 if (cred) {
                     c->jailed = 1;
+                    /* An app launched in the host namespaces maps /dev/shm
+                     * itself, so its buffer belongs in the real one: the
+                     * credential records that when the uid is reserved. */
+                    if (cred->host) c->jailed = 0;
                     snprintf(c->jail_id, sizeof(c->jail_id), "%s", cred->id);
                     sbx_cred_add_pid(c->uid, c->pid);
                     if (strcmp(cred->id, id) != 0)
@@ -1935,6 +1941,7 @@ static int wms_launch_arg(const WmApp *app, WmClient *cl, int slot, const char *
      * already up: then the tmpfs it mounted is kept. */
     int reuse = 0;
     int uid = sbx_cred_acquire(app->id, &reuse);
+    if (uid >= 0 && sbx_uid_valid(uid)) sbx_creds[uid - SBX_UID_BASE].host = app->host_ns;
     if (uid < 0) {
         launch_failed("%s: no sandbox uid free (%d apps are already running)",
                       app->id, SBX_UID_SLOTS);
@@ -1943,6 +1950,43 @@ static int wms_launch_arg(const WmApp *app, WmClient *cl, int slot, const char *
 
     char appdata[512];
     snprintf(appdata, sizeof(appdata), "/root/appdata/%s", app->id);
+
+    if (app->host_ns) {
+        /* Mount the bundle at /app once: the engine's PT_INTERP is
+         * /app/ld-musl-x86_64.so.1, which is what makes it runnable outside a
+         * chroot without rewriting the package per launch. */
+        char bundle[512];
+        snprintf(bundle, sizeof(bundle), "%s", exe);
+        char *slash = strrchr(bundle, '/');
+        if (slash) *slash = 0;
+        mkdir("/app", 0755);
+        if (mount(bundle, "/app", NULL, MS_BIND, NULL) != 0 && errno != EBUSY)
+            fprintf(stderr, "wms: %s: bind %s at /app: %s (continuing)\n",
+                    app->id, bundle, strerror(errno));
+
+        pid_t hp = fork();
+        if (hp < 0) {
+            launch_failed("%s: fork: %s", app->id, strerror(errno));
+            return -1;
+        }
+        if (hp == 0) {
+            setgid((gid_t)uid);
+            setuid((uid_t)uid);
+            setenv("MYSTIC_SOCKET", WM_SOCKET, 1);
+            setenv("MYSTIC_APP_ID", app->id, 1);
+            setenv("MYSTIC_BUNDLE", "/app", 1);
+            setenv("LD_LIBRARY_PATH", "/app/usr/lib:/app/lib", 1);
+            setenv("HOME", "/tmp", 1);
+            setenv("TMPDIR", "/tmp", 1);
+            if (arg && arg[0]) execl(exe, "app", arg, (char *)NULL);
+            else               execl(exe, "app", (char *)NULL);
+            fprintf(stderr, "wms: %s: exec %s: %s\n", app->id, exe, strerror(errno));
+            _exit(127);
+        }
+        fprintf(stderr, "wms: launched %s pid %d (host namespaces, uid %d)\n",
+                app->id, (int)hp, uid);
+        return (int)hp;
+    }
 
     SbxPlan plan;
     sbx_plan_init(&plan, run_dir(), app->id, exe, appdata, uid,
