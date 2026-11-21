@@ -94,6 +94,7 @@
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 #endif
@@ -589,7 +590,15 @@ static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
     if (access(loader, X_OK) != 0)
     snprintf(size, sizeof(size), "--window-size=%dx%d", page_w, page_h);
 
-    if (pipe(in) != 0 || pipe(out) != 0 || pipe(errp) != 0) {
+    /* Chromium's pipe handler reads fd 3 and writes fd 4, but it treats them as
+     * one connection: with two independent pipes it exits 1 without writing a
+     * byte, which is its 'connection terminated while reading' path. A stream
+     * socketpair gives it that connection - the child writes into one end and
+     * the parent reads the other. */
+    int sp[2] = { -1, -1 }, rp[2] = { -1, -1 };
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, rp) != 0 ||
+        pipe(errp) != 0) {
         set_err(err, esz, "pipe(): %s", strerror(errno));
         return -1;
     }
@@ -604,8 +613,8 @@ static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
          * are the DevTools pipe's contract, not a choice. The != guards matter:
          * pipe() can hand us 3 or 4 and closing them after dup2 would close
          * the very descriptor the engine is about to read. */
-        if (in[0] != 3) dup2(in[0], 3);
-        if (out[1] != 4) dup2(out[1], 4);
+        if (sp[0] != 3) dup2(sp[0], 3);
+        if (rp[0] != 4) dup2(rp[0], 4);
         /* The desktop's stderr is the serial console, and it is the only place
          * a message survives if the engine dies before the frame loop drains the
          * pipe, so a copy is kept for the diagnostics below. */
@@ -619,10 +628,10 @@ static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
          * before main() leaves nothing readable at all. */
         if (console >= 0 && access("/app/engine-log", F_OK) == 0)
             dup2(console, 2);
-        if (in[0] != 3) close(in[0]);
-        if (in[1] != 3 && in[1] != 4 && in[1] != 2) close(in[1]);
-        if (out[0] != 3 && out[0] != 4 && out[0] != 2) close(out[0]);
-        if (out[1] != 4) close(out[1]);
+        if (sp[0] != 3 && sp[0] != 4 && sp[0] != 2) close(sp[0]);
+        if (sp[1] != 3 && sp[1] != 4 && sp[1] != 2) close(sp[1]);
+        if (rp[0] != 3 && rp[0] != 4 && rp[0] != 2) close(rp[0]);
+        if (rp[1] != 3 && rp[1] != 4 && rp[1] != 2) close(rp[1]);
         if (errp[0] != 3 && errp[0] != 4 && errp[0] != 2) close(errp[0]);
         if (errp[1] != 2) close(errp[1]);
         setenv("LD_LIBRARY_PATH", libdir, 1);
@@ -703,12 +712,12 @@ static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
         _exit(127);
     }
 
-    close(in[0]);
-    close(out[1]);
+    close(sp[0]);
+    close(rp[0]);
     close(errp[1]);
     e->pid = pid;
-    e->to_engine = in[1];
-    e->from_engine = out[0];
+    e->to_engine = sp[1];
+    e->from_engine = rp[1];
     e->from_stderr = errp[0];
     e->alive = 1;
     fcntl(e->to_engine, F_SETFL, fcntl(e->to_engine, F_GETFL, 0) | O_NONBLOCK);
@@ -1538,17 +1547,46 @@ int main(int argc, char **argv) {
             if (mute)
                 fprintf(stderr, "engineview: no /dev/snd PCM node - passing "
                                 "--mute-audio once (decode still happens)\n");
-            /* Screenshot mode: one rendered frame per navigation, through the
-             * code path that is proven to work on this kernel. */
-            char surl[EVP_URL_MAX];
-            snprintf(surl, sizeof(surl), "%s", p.url);
-            if (shot_render(bundle, surl, p.page_w, p.page_h, &p,
-                            err, sizeof(err)) != 0) {
-                draw_missing(&c, fs, fb, err);
-                snprintf(p.state, sizeof(p.state), "render failed");
-            } else {
-                snprintf(p.state, sizeof(p.state), "rendered");
-                p.shot_mode = 1;
+            /* Try the live DevTools channel first: if the engine survives its
+             * first second it is interactive, and the frame loop takes over.
+             * If it dies - which is what this kernel did for every earlier
+             * transport - fall back to rendering a screenshot, which is one
+             * frame per navigation but always works. */
+            int fallback = 1;
+            int spawned = engine_spawn(&e, bundle, p.page_w, p.page_h, mute,
+                                       err, sizeof(err));
+            fprintf(stderr, "engineview: live channel %s%s%s\n",
+                    spawned == 0 ? "started" : "not started",
+                    spawned == 0 ? "" : ": ",
+                    spawned == 0 ? "" : err);
+            if (spawned == 0) {
+                usleep(1200000);
+                int st0 = 0;
+                pid_t r0 = waitpid(e.pid, &st0, WNOHANG);
+                if (r0 == e.pid) {
+                    e.status = WIFEXITED(st0) ? WEXITSTATUS(st0) : -1;
+                    e.pid = 0;
+                    e.alive = 0;
+                    engine_close_pipe(&e);
+                    fprintf(stderr, "engineview: live channel exited (%d), "
+                                    "falling back to rendering\n", e.status);
+                } else {
+                    fallback = 0;
+                    snprintf(p.state, sizeof(p.state), "live pid %d", (int)e.pid);
+                    page_create(&p, &e);
+                }
+            }
+            if (fallback) {
+                char surl[EVP_URL_MAX];
+                snprintf(surl, sizeof(surl), "%s", p.url);
+                if (shot_render(bundle, surl, p.page_w, p.page_h, &p,
+                                err, sizeof(err)) != 0) {
+                    draw_missing(&c, fs, fb, err);
+                    snprintf(p.state, sizeof(p.state), "render failed");
+                } else {
+                    snprintf(p.state, sizeof(p.state), "rendered");
+                    p.shot_mode = 1;
+                }
             }
         }
     }
