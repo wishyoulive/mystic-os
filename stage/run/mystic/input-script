@@ -12,9 +12,14 @@ wait 30
 text https://www.youtube.com/watch?v=dQw4w9WgXcQ
 wait 30
 enter
-wait 700
+wait 900
 abs 480 300
 press
-wait 20
+wait 30
 release
-wait 600
+wait 200
+abs 480 300
+press
+wait 30
+release
+wait 700

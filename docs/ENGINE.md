@@ -40,7 +40,7 @@ document.
 **Chromium headless (`chromium-headless-shell`) is the only candidate that is
 genuinely headless and can hand us frames we can blit.** It is also large:
 **182 packages, 258.30 MB download, 681.98 MB installed** [idx]; the bundle
-this tree builds is **263,287,761 bytes** with **696.71 MB of members** [pkg,
+this tree builds is **263,287,764 bytes** with **696.71 MB of members** [pkg,
 §2]. That is twenty times the whole 13.42 MB image, so it is a package on the
 data disk, never part of the initramfs.
 
@@ -152,11 +152,11 @@ packages account for the rest of it. Two of them deserve a sentence:
 The package itself [pkg], read back from the file on 2026-11-25 (§11.5):
 
 ```
-build/repo/engine.tar.gz      263,287,761 bytes (263.29 MB)
+build/repo/engine.tar.gz      263,287,764 bytes (263.29 MB)
   members                     1,595 (1,275 files, 320 symlinks)
-  file bytes                  696,708,658 (696.71 MB)
-  sha256                      622ae5acbbe98a97632b241c8cfca705a34389c67300c1d4c8f7f55ec383850c
-build/repo/index.tsv row      engine  156.0.8078.79-r0  263287761  622ae5ac…
+  file bytes                  696,708,670 (696.71 MB)
+  sha256                      a45afbfc450096702f9c698e29233a77b08d23d1e512d5d28f61e5dd8da9f618
+build/repo/index.tsv row      engine  156.0.8078.79-r0  263287764  a45afbfc…
                               engine.tar.gz  Chromium 156 engine with the DevTools viewer
 build/repo/index.tsv.sig      Ed25519 over the exact index bytes, verifies
 ```
@@ -175,8 +175,10 @@ be followed by a row and signature update or the guest refuses the download.
 on ext4, which is what `/root` is (`stage/init`: `mkfs.ext4`, `mount -t ext4`)
 [ours]. On a filesystem that cannot store links, `pkg` computes the copy
 fallback from the archive's link members (`tar_link_cost`) and says so before
-installing: for this archive the 320 links name 266 distinct targets totalling
-**909,563,375 bytes**, so the fallback costs about **+909.56 MB**. One link is
+installing: for this archive the 320 links name 266 distinct targets; copying
+every link from its target costs **909,563,375 bytes** (the same target counted
+once per link), so the fallback costs about **+909.56 MB**. The 266 distinct
+targets are **519,531,519 bytes** on their own. One link is
 dangling — `usr/share/xkeyboard-config-2 -> X11/xkb`, whose target is not in
 the archive — and nothing the engine loads reads it. That is why §7 says the
 data disk must be ext4 and big.
@@ -193,7 +195,8 @@ JSON object terminated by a NUL byte. On this kernel that path never carried a
 byte: the recorded experiment is exit **1** with two pipes and exit **127**
 with two socketpairs, with no output, which matches Chromium's "Connection
 terminated while reading from pipe" path. The transport was replaced instead
-of patched, and no pipe code remains in the app.
+of patched; the only `pipe()` left in the app is the child's stderr
+(`engine.c`), not a DevTools transport.
 
 `--remote-debugging-port=0` asks the browser to pick a free port on
 **127.0.0.1**, listen on it, and write the port and the browser target's path
@@ -281,8 +284,13 @@ top-level one is the flat target session, `params.sessionId` is the screencast
 session the ack must name [ours, `handle_message()`]. `Page.navigate` follows
 when a URL is pending, and one `Runtime.evaluate` asks for
 `JSON.stringify([document.title, location.href])` so the bars can show the
-real title and the final URL after a redirect. The ids and session ids above
-are the app's own counter; the transport neither invents nor matches them.
+real title and the final URL after a redirect. The request is sent, and in the
+YouTube boots the footer title and the address bar both showed the real page;
+in the example.com boot (`https-example.png`) the title updated but the bar
+stayed `about:blank`, and in the test-page boot (`chromium-live.png`) neither
+had updated — the bar is not reliable yet, an `engine.c` issue reported rather
+than hidden. The ids and session ids above are the app's own counter; the
+transport neither invents nor matches them.
 
 ### 3.3 The pixels
 
@@ -423,15 +431,16 @@ which one is missing instead of a dead rectangle:
 
 | Capability | Status |
 |---|---|
-| **Static rendering (`--screenshot`)** | **Verified in a boot**: `docs/screenshots/chromium-page.png`, one frame per navigation. This is the path the viewer falls back to when the live channel is unavailable; the boot of §11.7 brought the live channel up instead. |
-| **Live DevTools channel (frames)** | The channel came up in a boot during this run and delivered screencast frames: `build/H5.png` shows the live footer `page attached  2 frames` over the test page (§11.7). |
-| **Input over the live channel (scroll, click, type)** | Implemented (§3.4), but no boot has shown a page reacting to it. Video is unproven too. |
+| **Static rendering (`--screenshot`)** | **Verified in a boot**: `docs/screenshots/chromium-page.png`, one frame per navigation. This is the path the viewer falls back to when the live channel is unavailable; the boots below used the live one. |
+| **Live DevTools channel (frames)** | **Verified in boots**: `docs/screenshots/chromium-live.png` (`page attached  2 frames` over the test page), `https-example.png` (example.com, 4 frames), `youtube.png` (https://www.youtube.com/, 15 frames), and the newest `youtube-watch.png` (51 frames) / `youtube-playing.png` (148 frames) (§11.7). |
+| **Navigation and HTTPS** | Verified: `youtube.png` shows `https://www.youtube.com/` in the address bar and `YouTube` in the footer; `https-example.png` shows example.com rendered with `Example Domain` in the footer (its bar still read `about:blank`). Chromium's own TLS uses the image's CA bundle, bound read-only at `/etc/ssl/certs/ca-bundle.crt` (`src/wmsrv.c:436`). |
+| **Input over the live channel** | A click at 480,300 in the YouTube page was followed by the video playing (`youtube-playing.png`). Scrolling and form entry are still unproven. |
 | HTML5 parsing | Blink. The binary contains `HTMLDocument`, `CSSStyleSheet` and `blink` strings [apk, byte search, §11.3]. |
 | CSS | Blink: full CSS, not our subset. |
 | JavaScript | V8. The binary contains `v8_context_snapshot` [apk]. WebAssembly is V8's. |
 | Canvas / WebGL | Canvas yes (software). WebGL is refused: the app passes `--disable-gpu` because there is no GPU; Chromium would otherwise try DRI drivers that need `llvm22-libs` and a DRM node. |
-| H.264 / VP9 / AV1 video without DRM | The engine links `libavcodec.so.62`, `libopenh264.so.8`, `libdav1d.so.7`, and the closure carries `x265-libs`, `aom-libs`, `libSvtAv1Enc` [apk, DT_NEEDED + idx]. Decoding is therefore present. **Not measured**: no video was played. |
-| Audio from a page | The app passes `--mute-audio` when `/dev/snd/pcmC0D0p` does not exist and says so once on stderr. With a PCM node it does not pass the flag and the page's audio goes to the engine's own output. Whether that output exists in the guest is the audio contributor's question, not this document's. |
+| H.264 / VP9 / AV1 video without DRM | The engine links `libavcodec.so.62`, `libopenh264.so.8`, `libdav1d.so.7`, and the closure carries `x265-libs`, `aom-libs`, `libSvtAv1Enc` [apk, DT_NEEDED + idx]. Decoding is present and was exercised: YouTube's watch page played in a boot (`youtube-playing.png`, 148 frames), silently, because the guest had no PCM node and the app passed `--mute-audio`. |
+| Audio from a page | The app passes `--mute-audio` when `/dev/snd/pcmC0D0p` does not exist and says so once on stderr (both YouTube boots did). The engine manifest now says `audio = yes`, so with a PCM node the flag is not passed and the page's audio goes to the engine's own output; that path was not exercised in these boots. |
 | **DRM (Netflix, Spotify, Prime)** | **No.** The engine knows the API (`requestMediaKeySystemAccess`, `widevine` strings are present) but the CDM library `libwidevinecdm.so` is not in the binary's directory and there is **no widevine package in the whole Alpine v3.24 index** [idx]. Without a CDM, EME playback fails by design. |
 | PDF viewer | Chromium's PDF viewer needs its plugin resources; the headless shell package does not carry them. Use `docview`/`pdf.c`. |
 | Downloads | Not wired: `Page.setDownloadBehavior` is not called and there is no file picker in the jail. |
@@ -470,7 +479,7 @@ same line §3.1 needs to reach 127.0.0.1 at all).
 The bundle layout, as installed by `pkg` under `/root/apps/engine`:
 
 ```
-manifest                       name/desc/exec=bin/version/network/procs/placeholder
+manifest                       name/desc/exec=bin/version/network/procs/audio/placeholder
 bin                            the static viewer (241,744 bytes)
 ld-musl-x86_64.so.1            musl's loader, at the literal PT_INTERP path
 usr/lib/chromium/chromium-headless-shell   202,432,312 bytes, PT_INTERP /app/...
@@ -498,6 +507,7 @@ network = host
 bundle = engine
 placeholder = yes
 procs = yes
+audio = yes
 ```
 
 ---
@@ -549,9 +559,11 @@ MYSTIC_RAM=1024 MYSTIC_DISK_MB=2048 ./image.sh
 
 `MYSTIC_RAM=1024` is the smallest guest this document is willing to
 recommend: the engine binary alone maps 202 MB and the tree is 696.71 MB of
-members. Whether 1 GB is *enough* for a heavy page is **not measured** —
-nothing was booted here. If a page dies, the engine's last stderr line appears
-in the window's status bar and the answer will be in it.
+members. Whether 1 GB is *enough* for a heavy page is **not measured**: the
+boots rendered light pages (the test page, example.com, YouTube's watch page)
+and played one video, but no 1 GB-heavy page was timed or measured. If a page
+dies, the engine's last stderr line appears in the window's status bar and the
+answer will be in it.
 
 ### 7.3 Install in the guest
 
@@ -566,8 +578,8 @@ pkg installed            # engine 156.0.8078.79-r0
 sha256 of the tarball before unpacking, computes the footprint from the
 archive's own member list (every file rounded up to 4 KiB) and refuses before
 writing if it does not fit, then reports the symlink situation: whether `/root`
-can store the 320 links or has to copy their 266 targets instead — the
-909.56 MB from §2.
+can store the 320 links or has to copy the link targets instead — 909.56 MB
+of copy cost from §2.
 
 Then the Store shows a **Browser Engine** tile, or from a shell:
 
@@ -589,8 +601,8 @@ it, run it through the loader:
 ```
 
 (That is how you would get a first honest signal out of the engine without the
-window: `--dump-dom` prints the DOM to stdout. It was not run in this session;
-there was no guest.)
+window: `--dump-dom` prints the DOM to stdout. It was not run: the boots drove
+the window and the live channel, and no DOM dump was saved.)
 
 ---
 
@@ -653,10 +665,10 @@ or anywhere else.
 * It is not a benchmark. No frame rate, no load time and no memory figure was
   measured; the rendering evidence is the screenshots quoted in §11.7 and at
   the end.
-* It is not a promise that every page draws, or that input reaches it. A boot
-  drew a page over the live channel (§11.7), but no boot has shown a wheel,
-  click or key changing a page, and §4 names the one absolute path the jail
-  does not bind.
+* It is not a promise that every page behaves. A boot drew HTTPS pages and
+  played a YouTube video (§11.7); scrolling, form entry and a 1 GB-heavy page
+  are still unmeasured, and §4 names the one absolute path the jail does not
+  bind.
 * It is not a claim that 1 GB of RAM is enough for heavy pages. It is the
   smallest guest this document will recommend, and §7.3 says where the answer
   will appear if it is not.
@@ -809,7 +821,7 @@ because the closure figures in §1 come from that run:
 ```
 
 Those numbers describe the older package, not the one in `build/repo` today
-(263,287,761 bytes, §11.5). `fetch-engine.py` still names
+(263,287,764 bytes, §11.5). `fetch-engine.py` still names
 `src/client/apps/engineview.c`, which does not exist, and its link list has no
 `src/client/cdpws.c`, so it cannot build the current viewer; that is why the
 pipeline moved to the three commands above.
@@ -820,13 +832,14 @@ pipeline moved to the three commands above.
 $ python - <<'PY'   # tarfile + sha256 over build/repo/engine.tar.gz
 members: 1,595
 kinds: {'file': 1,275, 'sym': 320}
-file bytes: 696,708,658
-sha256: 622ae5acbbe98a97632b241c8cfca705a34389c67300c1d4c8f7f55ec383850c
+file bytes: 696,708,670
+sha256: a45afbfc450096702f9c698e29233a77b08d23d1e512d5d28f61e5dd8da9f618
 PT_INTERP of usr/lib/chromium/chromium-headless-shell: /app/ld-musl-x86_64.so.1
 engine size: 202,432,312   mode 0755
 bin size: 241,744          ELF
-manifest: exec = bin / network = host / procs = yes / placeholder = yes
-links: 320, distinct targets 266, target bytes 909,563,375, dangling 1
+manifest: exec = bin / network = host / procs = yes / audio = yes / placeholder = yes
+links: 320, distinct targets 266, per-link copy cost 909,563,375,
+        distinct-target bytes 519,531,519, dangling 1
         (usr/share/xkeyboard-config-2 -> X11/xkb)
 ```
 
@@ -834,7 +847,7 @@ and the index row and its signature:
 
 ```
 $ cat build/repo/index.tsv            # the engine row, wrapped here
-engine  156.0.8078.79-r0  263287761  622ae5ac…  engine.tar.gz
+engine  156.0.8078.79-r0  263287764  a45afbfc…  engine.tar.gz
         Chromium 156 engine with the DevTools viewer: renders pages in a window
         692060160
 $ python tools/sign-index.py verify --in build/repo/index.tsv \
@@ -845,8 +858,8 @@ key fingerprint: sha256 ce177b2cc56f3cfd4c3458a7e7201eece66b45b01a1a888b9a6f1e4c
 
 The tarball's size and sha256 are the row's, so `pkg`'s two checks pass on
 this pair. The row's last column is the unpacked figure the index advertises:
-692,060,160 bytes. The archive's own member list sums to 696,708,658, so the
-row is 4,648,498 bytes optimistic. That does not stop an install — `pkg`
+692,060,160 bytes. The archive's own member list sums to 696,708,670, so the
+row is 4,648,510 bytes optimistic. That does not stop an install — `pkg`
 computes the footprint itself from the member list (§7.3) — but a space check
 that trusted the row would be short by 4.6 MB.
 
@@ -888,31 +901,39 @@ resolves — only a boot can show that — and the engine started in the boot of
   `/tmp/engine-profile/DevToolsActivePort` path the viewer polls, including a
   half-written file being refused.
 * **The live channel came up in the guest, and the loopback line is why.**
-  Two boots during this run printed the same pair of lines. The second one
-  (the run visible in `build/serial.log` at the time of writing) has:
+  The boot's serial log carried the line, in this shape:
 
   ```
-  engineview: live channel started (pid 603), waiting for /tmp/engine-profile/DevToolsActivePort
-  engineview: exec /app/usr/lib/chromium/chromium-headless-shell
-  engineview: devtools over tcp port 39051 /devtools/browser/0ef2eea2-0888-4a2a-9766-84799428222c
+  engineview: devtools over tcp port <port> /devtools/browser/<uuid>
   ```
 
-  (the fork and exec lines were interleaved by the two processes on one line;
-  they are split here). An earlier boot that day printed the same
-  `devtools over tcp port` line with port 46211 and a different browser UUID:
-  each boot starts a new browser, so the numbers differ, and the line's
-  presence is the evidence. It is printed only after `cdpws_open()` returned,
-  so inside the guest the browser published `DevToolsActivePort` and accepted
-  the RFC 6455 upgrade — accept-key check included — on `127.0.0.1`.
+  One run's exact line — port 39051, browser
+  `0ef2eea2-0888-4a2a-9766-84799428222c` — is in the saved excerpt
+  `.work/w3/serial-2026-11-25.txt`. `build/serial.log` itself is a build
+  artefact that every boot overwrites, so the port and UUID change from run to
+  run (later logs in this tree have other pairs); the durable evidence is the
+  committed screendump, not the line. The line is printed only after
+  `cdpws_open()` returned, so inside the guest the browser published
+  `DevToolsActivePort` and accepted the RFC 6455 upgrade — accept-key check
+  included — on `127.0.0.1`.
 
-  The frames came through too. Three screendumps of that boot are in
-  `build/H3.png`, `H4.png` and `H5.png` (build artefacts as well); all three
-  show the live footer `page attached  2 frames` and the test document drawn in
-  the page area. Two
-  frames is the viewer's own decoded-frame counter (`p->frames`), so at least
-  two `Page.screencastFrame` JPEGs were decoded and drawn over the live
-  channel inside the guest. The loader warning in the log is the wrong path in
-  the app's own check (§4).
+  The frames came through too. The committed
+  `docs/screenshots/chromium-live.png` (md5
+  `efffd477a66b43e4d0fd73d8ec38bcb8`, identical to the `build/H5.png`
+  screendump) shows the live footer `page attached  2 frames` with the test
+  document drawn; two frames is the viewer's own decoded-frame counter
+  (`p->frames`), so two `Page.screencastFrame` JPEGs were decoded and drawn
+  over the live channel inside the guest.
+
+  Later boots navigated. The committed `docs/screenshots/youtube.png` shows
+  `https://www.youtube.com/` in the address bar, `YouTube` in the footer and
+  `page attached  15 frames`; the committed `docs/screenshots/https-example.png`
+  shows `example.com` with `Example Domain` in the footer and four frames. The
+  latest screendumps go further:
+  `docs/screenshots/youtube-watch.png` (51 frames, watch URL in the bar) and
+  `docs/screenshots/youtube-playing.png` (148 frames, the video playing after a
+  click at 480,300). The loader warning in the log is the wrong path in the
+  app's own check (§4).
 
   The line that made it possible, `ip link set lo up`, is at
   `stage/init:227`, added during this run before eth0 is brought up; the
@@ -932,52 +953,57 @@ resolves — only a boot can show that — and the engine started in the boot of
 
 ## The engine renders pages now
 
-`docs/screenshots/chromium-page.png` is a real Blink 156 rendering inside the
-OS: the heading `Mystic + Chromium`, the paragraph `Rendered by Blink 156
-inside the VM.` and a bordered table (`name`/`value`, `alpha`/`1`, `beta`/`22`),
-drawn by the engine and shown in the viewer window with a working address bar
-(`http://10.0.2.2:8000/html`). The window's own top bar reads `rendered 2
-frames`, which is the `--screenshot` path's counter: two navigations, two
-stills. The current build labels that footer `one frame per navigation
-(--screenshot)`; the screenshot's bottom bar still says `engine exited (status
-0)` because it predates that label.
+Two kinds of evidence, and they are different.
+
+**The screenshot fallback.** `docs/screenshots/chromium-page.png` is a real
+Blink 156 rendering produced by `--screenshot`: the heading `Mystic +
+Chromium`, the paragraph `Rendered by Blink 156 inside the VM.` and a bordered
+table (`name`/`value`, `alpha`/`1`, `beta`/`22`), shown in the viewer with a
+working address bar (`http://10.0.2.2:8000/html`). The window's top bar reads
+`rendered 2 frames` — the fallback's counter, two navigations, two stills. It is
+what the viewer uses whenever the live channel is unavailable, and the path
+with the most evidence behind it.
+
+**The live channel.** The transport came up in the guest and navigated HTTPS
+pages. The committed screenshots are the evidence:
+`docs/screenshots/chromium-live.png` (the test page with the live footer
+`page attached  2 frames`), `https-example.png` (example.com, 4 frames,
+`Example Domain` in the footer) and `youtube.png` (https://www.youtube.com/,
+15 frames, `YouTube` in the footer, the URL in the address bar). Two newer
+screendumps show the watch page and playback:
+`youtube-watch.png` (51 frames, the watch URL in the bar) and
+`youtube-playing.png` (148 frames, the video playing after a click at 480,300,
+silent because the guest had no PCM node and `--mute-audio` was passed).
 
 What is verified today, and what is not:
 
 * **Screenshot rendering works, and is what the viewer falls back to.**
   `page_shot()` runs the engine with `--screenshot` and decodes the PNG with
-  `src/img.c` (§3.5). That is the path the screenshot shows, and the fallback
-  when the channel is unavailable.
-* **The TCP channel is host-verified, and it came up in the guest.** The
-  transport passed `.work/cdp1/harness.c`, rebuilt against
-  `src/client/cdpws.c` for this report: **131 checks, 0 failed** — the RFC 6455
-  accept key, a wrong or missing accept failing closed, masked client frames,
-  fragmented messages reassembled with a ping in the middle, ping/pong/close,
-  the 64-bit length form, protocol violations, and a real loopback TCP upgrade
-  with a fragmented reply. The readiness signal passed
-  `.work/w1/portcheck.c` (**6/6**). The boot log in §11.7 shows the browser
-  side: `DevToolsActivePort` appeared and the upgrade was accepted on
-  `127.0.0.1` (port 39051 in the run quoted there).
-* **And the frames came through.** `build/H5.png` from that boot shows the
-  live footer `page attached  2 frames` over the rendered test page, so two
-  `Page.screencastFrame` JPEGs were decoded and drawn in the guest. That is
-  the live path working, not just connected.
-* **What is still unproven.** No boot has shown a wheel, click or key changing
-  a page, and no video has played. The calls exist (§3.4) and the channel
-  carries them; whether a page reacts is the next boot's question.
+  `src/img.c` (§3.5).
+* **The TCP channel is host-verified and live in the guest.** The transport
+  passed `.work/cdp1/harness.c`, rebuilt against `src/client/cdpws.c`:
+  **131 checks, 0 failed** — RFC 6455 accept key, fail-closed handshake,
+  masking, fragmentation reassembly with a ping in the middle, ping/pong/close,
+  64-bit lengths, protocol violations, and a real loopback upgrade with a
+  fragmented reply. The readiness signal passed `.work/w1/portcheck.c`
+  (**6/6**). The boot's serial line is quoted in §11.7; the committed
+  `chromium-live.png` proves the frames.
+* **HTTPS and YouTube work live.** `youtube.png` shows the URL and title and
+  `https-example.png` shows `Example Domain` with four frames; the video plays
+  (`youtube-playing.png`), so the old "YouTube shows a frame, not a player"
+  limitation is true only of the fallback now.
+* **What is still unproven.** Scrolling; typing into a page field or submitting
+  a form; the address bar, which stayed `about:blank` in the test-page boot and
+  lagged the title in the example.com boot; audio (the boots muted it); a
+  1 GB-heavy page; and the DRM/download/history limits below.
 
 What this gives and what it does not:
 
-- **Works:** any URL the OS can reach, rendered by a real browser engine,
-  including CSS, tables, fonts and images — everything Blink does for a static
-  frame.
-- **Does not (as any run has shown):** scrolling, clicking inside the page,
-  typing into a page, or video. The viewer forwards those calls when the
-  channel is live (§3.4) and a boot has shown live frames arriving, but no boot
-  has shown a page reacting to input. YouTube shows a frame, not a player: on
-  the screenshot path there is no engine to send anything to, and on the live
-  path a playing video has not been observed.
-- **Next:** the live path exists in the code — screencast frames and `Input.*`
-  (§3.4) — the transport is proven on the host, and a boot has drawn live
-  frames. What it needs now is a boot that shows input reaching the page, and a
-  page whose video plays.
+- **Works (live):** HTTPS pages, a YouTube watch page and its video (silent),
+  address-bar navigation, the page title, and an in-page click.
+- **Does not:** DRM (Netflix, Spotify, Prime — no Widevine CDM), downloads,
+  history back/forward, IME, more than one tab.
+- **On the screenshot fallback:** no scrolling, no in-page clicks, no form
+  entry, no video — YouTube would show one frame, not a player.
+- **Next:** a boot that scrolls, types into a field and submits it; the
+  address-bar fix in `engine.c`; and a PCM node so the video is not silent.
