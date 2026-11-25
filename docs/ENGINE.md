@@ -1020,3 +1020,42 @@ What this gives and what it does not:
   entry, no video — YouTube would show one frame, not a player.
 - **Next:** a boot that scrolls, types into a field and submits it; the
   address-bar fix in `engine.c`; and a PCM node so the video is not silent.
+
+## DRM: the browser half is here, the CDM is not shippable
+
+`chromium-headless-shell` carries Widevine EME support - the binary contains
+`com.widevine.alpha`, the `WidevineH` path and the persistent-license strings -
+but the CDM itself, `libwidevinecdm.so`, is proprietary: it is not in Alpine, it
+cannot be redistributed with this OS, and Netflix additionally requires a
+device certificate that comes with that CDM.
+
+What the viewer does now: if a CDM is installed into the bundle at
+`WidevineCdm/<version>/_platform_specific/linux_x64/`, it is linked into the
+browser profile before launch (`link_widevine()` in `engine.c`), which is where
+Chromium looks for it. So a user who supplies their own CDM gets it loaded
+without touching this code. Nothing here downloads, ships or bypasses anything,
+and **`--disable-component-update` still prevents Chromium from fetching a CDM
+by itself** - that is deliberate.
+
+**Not proven:** no CDM was present, so no DRM content has been played. Netflix,
+Spotify and Prime Video will refuse until a licensed CDM is supplied.
+
+## Frame rate: measured, and where it goes
+
+The screencast is flow-controlled by `Page.screencastFrameAck`; the viewer used
+to acknowledge after decoding, so its own JPEG decode was inside the browser's
+frame pacing. Acknowledging first, then decoding, and measuring instead of
+estimating:
+
+| setting | rate | decode | gap |
+|---|---|---|---|
+1100x668, q70 | 5.0 fps | 181 ms | 190 ms |
+733x445, q60 | 10.2 fps | 90 ms | 95 ms |
+550x334, q60 | **14.4 fps** | 48 ms | 51 ms |
+
+`gap ≈ decode + 3 ms` is the important number: the engine is ready as soon as
+the viewer is, so the ceiling is `src/img.c`'s scalar JPEG decoder at roughly
+3.8 megapixels/second. The bundle already carries libjpeg-turbo 3.1.3 with
+AVX2/SSE2; using it requires the viewer to be dynamic (static musl cannot
+dlopen), which is the same static-launcher/dynamic-payload shape the VLC player
+already uses.

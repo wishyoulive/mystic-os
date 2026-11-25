@@ -1460,6 +1460,31 @@ static void draw_ui(MClient *c, Page *p, Engine *e, Font *fs, Font *fb,
  * PNG it wrote. It is one frame per navigation rather than 30 per second, and
  * the footer says so.
  */
+/* ---- Widevine ------------------------------------------------------------
+ *
+ * Chromium's EME support is compiled in (the binary carries com.widevine.alpha
+ * and the WidevineH path), but the CDM itself - libwidevinecdm.so - is
+ * proprietary and cannot be redistributed with this OS. If a user installs one
+ * into the bundle at WidevineCdm/<version>/_platform_specific/linux_x64/, the
+ * browser expects to find it inside its profile; this links that directory into
+ * the profile so a CDM that is present is actually loaded. Nothing here
+ * downloads or ships a CDM.
+ */
+static void link_widevine(const char *bundle)
+{
+    char src[600], dst[600], parent[600];
+    const char *td = getenv("TMPDIR");
+    snprintf(src, sizeof(src), "%s/WidevineCdm", bundle);
+    if (access(src, R_OK) != 0) return;
+    snprintf(dst, sizeof(dst), "%s/engine-profile/WidevineCdm",
+             td && td[0] ? td : "/tmp");
+    if (access(dst, F_OK) == 0) return;
+    snprintf(parent, sizeof(parent), "%s/engine-profile", td && td[0] ? td : "/tmp");
+    mkdir(parent, 0700);
+    if (symlink(src, dst) == 0)
+        fprintf(stderr, "engineview: WidevineCdm linked from %s\n", src);
+}
+
 static int shot_render(const char *bundle, const char *url, int w, int h,
                        Page *p, char *err, size_t esz) {
     char exe[600], out[300], size[64], shot[340], libs[900];
@@ -1705,6 +1730,7 @@ int main(int argc, char **argv) {
              * the endpoint is waited for by engine_attach() in the frame loop, so
              * a browser that is slow to listen (or never does) is a countdown in
              * the window, not ten seconds of frozen screen. */
+            link_widevine(bundle);
             int spawned = engine_spawn(&e, bundle, p.page_w, p.page_h, mute,
                                        err, sizeof(err));
             if (spawned == 0) {
