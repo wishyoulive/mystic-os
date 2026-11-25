@@ -132,11 +132,13 @@ fi
 RAM=${MYSTIC_RAM:-256}
 if [ "$VARIANT" = "lts" ] && [ "${MYSTIC_RAM:-0}" = "0" ]; then RAM=1024; fi
 
-# Four cores, not one: software video decode is per-frame work that splits
-# across threads, and a single vCPU cannot sustain 1080p50 with libavcodec, let
-# alone 4K. The guest sees nproc=4 and VLC/Chromium size their decoder threads
-# from it. Override with MYSTIC_SMP=1 for a single-core run.
-SMP=${MYSTIC_SMP:-4}
+# Eight cores, not one: software video decode is per-frame work that splits
+# across threads, and the measured difference is not marginal - the same 4K
+# H.264 file plays at 17 fps on four vCPUs and 24 fps on eight, while 1080p60
+# needs the threads just to hold the frame rate. VLC and Chromium size their
+# decoder pools from nproc, so the guest is told the truth about its CPUs.
+# Override with MYSTIC_SMP=1 for a single-core run, or 4 for a small host.
+SMP=${MYSTIC_SMP:-8}
 BOOT=( -kernel "$KERNEL" -initrd "$CPIO" -m "$RAM" -smp "$SMP" -vga std -no-reboot
        -drive file="$DISK",format=raw,if=virtio
        -netdev user,id=n0 -device virtio-net-pci,netdev=n0 -audiodev sdl,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 )
