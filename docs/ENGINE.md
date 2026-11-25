@@ -432,7 +432,7 @@ which one is missing instead of a dead rectangle:
 | Capability | Status |
 |---|---|
 | **Static rendering (`--screenshot`)** | **Verified in a boot**: `docs/screenshots/chromium-page.png`, one frame per navigation. This is the path the viewer falls back to when the live channel is unavailable; the boots below used the live one. |
-| **Live DevTools channel (frames)** | **Verified in boots**: `docs/screenshots/chromium-live.png` (`page attached  2 frames` over the test page), `https-example.png` (example.com, 4 frames), `youtube.png` (https://www.youtube.com/, 15 frames), and the newest `youtube-watch.png` (51 frames) / `youtube-playing.png` (148 frames) (§11.7). |
+| **Live DevTools channel (frames)** | **Verified in boots**: `docs/screenshots/chromium-live.png` (`page attached  2 frames` over the test page), `https-example.png` (example.com, 4 frames), `youtube.png` (https://www.youtube.com/, 15 frames), `youtube-watch.png` (51 frames) and `youtube-playing.png` (148 frames) / `youtube-video-audio-jail.png` (252 frames, the audio-jail boot) (§11.7). |
 | **Navigation and HTTPS** | Verified: `youtube.png` shows `https://www.youtube.com/` in the address bar and `YouTube` in the footer; `https-example.png` shows example.com rendered with `Example Domain` in the footer (its bar still read `about:blank`). Chromium's own TLS uses the image's CA bundle, bound read-only at `/etc/ssl/certs/ca-bundle.crt` (`src/wmsrv.c:436`). |
 | **Input over the live channel** | A click at 480,300 in the YouTube page was followed by the video playing (`youtube-playing.png`, 148 frames; `youtube-video-audio-jail.png`, 252 frames). Scrolling and form entry are still unproven. |
 | **A second heavy site** | `github.com` renders in full - hero, sign-up form, Mona, footer - at `docs/screenshots/github.png` with 455 frames, so the result is not specific to one site's markup. |
@@ -440,8 +440,8 @@ which one is missing instead of a dead rectangle:
 | CSS | Blink: full CSS, not our subset. |
 | JavaScript | V8. The binary contains `v8_context_snapshot` [apk]. WebAssembly is V8's. |
 | Canvas / WebGL | Canvas yes (software). WebGL is refused: the app passes `--disable-gpu` because there is no GPU; Chromium would otherwise try DRI drivers that need `llvm22-libs` and a DRM node. |
-| H.264 / VP9 / AV1 video without DRM | The engine links `libavcodec.so.62`, `libopenh264.so.8`, `libdav1d.so.7`, and the closure carries `x265-libs`, `aom-libs`, `libSvtAv1Enc` [apk, DT_NEEDED + idx]. Decoding is present and was exercised: YouTube's watch page played in a boot (`youtube-playing.png`, 148 frames), silently, because the guest had no PCM node and the app passed `--mute-audio`. |
-| Audio from a page | The app passes `--mute-audio` when `/dev/snd/pcmC0D0p` does not exist and says so once on stderr (both YouTube boots did). The engine manifest now says `audio = yes`, so with a PCM node the flag is not passed and the page's audio goes to the engine's own output; that path was not exercised in these boots. |
+| H.264 / VP9 / AV1 video without DRM | The engine links `libavcodec.so.62`, `libopenh264.so.8`, `libdav1d.so.7`, and the closure carries `x265-libs`, `aom-libs`, `libSvtAv1Enc` [apk, DT_NEEDED + idx]. Decoding is present and was exercised: YouTube's watch page played in the `youtube-playing.png` (148 frames) and `youtube-video-audio-jail.png` (252 frames) boots, silently, because the guest had no PCM node and the app passed `--mute-audio`. |
+| Audio from a page | The app passes `--mute-audio` when `/dev/snd/pcmC0D0p` does not exist and says so once on stderr (every YouTube boot did). The engine manifest now says `audio = yes`, and the jail's `/dev` lists `snd`; the QEMU guest still has no PCM node (`snd_hda_intel: Cannot probe codecs`), so the flag stays on and the video remains silent. The un-muted path is unexercised. |
 | **DRM (Netflix, Spotify, Prime)** | **No.** The engine knows the API (`requestMediaKeySystemAccess`, `widevine` strings are present) but the CDM library `libwidevinecdm.so` is not in the binary's directory and there is **no widevine package in the whole Alpine v3.24 index** [idx]. Without a CDM, EME playback fails by design. |
 | PDF viewer | Chromium's PDF viewer needs its plugin resources; the headless shell package does not carry them. Use `docview`/`pdf.c`. |
 | Downloads | Not wired: `Page.setDownloadBehavior` is not called and there is no file picker in the jail. |
@@ -975,11 +975,13 @@ pages. The committed screenshots are the evidence:
 `docs/screenshots/chromium-live.png` (the test page with the live footer
 `page attached  2 frames`), `https-example.png` (example.com, 4 frames,
 `Example Domain` in the footer) and `youtube.png` (https://www.youtube.com/,
-15 frames, `YouTube` in the footer, the URL in the address bar). Two newer
-screendumps show the watch page and playback:
-`youtube-watch.png` (51 frames, the watch URL in the bar) and
-`youtube-playing.png` (148 frames, the video playing after a click at 480,300,
-silent because the guest had no PCM node and `--mute-audio` was passed).
+15 frames, `YouTube` in the footer, the URL in the address bar). Later screendumps show the watch page and playback:
+`youtube-watch.png` (51 frames, the watch URL in the bar), `youtube-playing.png`
+(148 frames, the video playing after a click at 480,300) and
+`youtube-video-audio-jail.png` (252 frames, committed with the jail's
+`audio = yes` manifest). All of them are silent: the jail now binds `/dev/snd`,
+but the guest has no PCM node (`snd_hda_intel: Cannot probe codecs`) and the app
+passes `--mute-audio`.
 
 What is verified today, and what is not:
 
@@ -996,19 +998,23 @@ What is verified today, and what is not:
   `chromium-live.png` proves the frames.
 * **HTTPS and YouTube work live.** `youtube.png` shows the URL and title and
   `https-example.png` shows `Example Domain` with four frames; the video plays
-  (`youtube-playing.png`), so the old "YouTube shows a frame, not a player"
-  limitation is true only of the fallback now.
-* **What is still unproven.** Scrolling; typing into a page field or submitting
-  a form; the address bar, which stayed `about:blank` in the test-page boot and
-  lagged the title in the example.com boot; audio (the boots muted it); a
-  1 GB-heavy page; and the DRM/download/history limits below.
+  (`youtube-playing.png`, 148 frames; `youtube-video-audio-jail.png`, 252), so
+  the old "YouTube shows a frame, not a player" limitation is true only of the
+  fallback now.
+* **Unproven:** scrolling; typing into a page field or submitting a form; audio
+  without `--mute-audio`; and a 1 GB-heavy page.
+* **Known limits:** the address bar is unreliable — it stayed `about:blank` in
+  the test-page boot and lagged the title in the example.com boot, while the
+  YouTube boots show it correct; DRM (no Widevine CDM); downloads; history
+  back/forward; IME; one tab.
 
 What this gives and what it does not:
 
-- **Works (live):** HTTPS pages, a YouTube watch page and its video (silent),
-  address-bar navigation, the page title, and an in-page click.
-- **Does not:** DRM (Netflix, Spotify, Prime — no Widevine CDM), downloads,
-  history back/forward, IME, more than one tab.
+- **Works (live):** HTTPS pages, the YouTube watch page and its video (silent),
+  address-bar navigation where the bar draws it, the page title, and an in-page
+  click.
+- **Known limits:** the unreliable address bar, DRM (Netflix, Spotify, Prime —
+  no Widevine CDM), downloads, history back/forward, IME, one tab.
 - **On the screenshot fallback:** no scrolling, no in-page clicks, no form
   entry, no video — YouTube would show one frame, not a player.
 - **Next:** a boot that scrolls, types into a field and submits it; the
