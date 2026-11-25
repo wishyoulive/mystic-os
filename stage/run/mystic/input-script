@@ -8,8 +8,8 @@ wait 40
 enter
 wait 250
 sendkey f6
-wait 40
-text http://10.0.2.2:8000/t.html
-wait 40
+wait 30
+text https://www.youtube.com/
+wait 30
 enter
-wait 500
+wait 900

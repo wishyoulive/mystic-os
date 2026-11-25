@@ -25,11 +25,12 @@ command that produced it. The tag says where it came from:
 | **[run]** | output of a command actually executed in this tree, quoted in §1, §7 or §11 |
 | **[not measured]** | says so, and what would settle it |
 
-No QEMU was run for this document and no engine process was started on the
-host that wrote it: the numbers are index arithmetic and bytes in this tree.
-The screenshot in the last section came from a boot; §11 says exactly what was
-verified here and what still needs one, because the difference between
-"compiled and checked" and "seen working" is the whole point of this
+No QEMU was run by the worker who wrote this document; a boot run on this
+tree during the same session is quoted in §11.7. No engine process was started
+on the host that wrote it: the numbers are index arithmetic and bytes in this
+tree. The screenshot in the last section came from an earlier boot; §11 says
+exactly what was verified here and what still needs one, because the difference
+between "compiled and checked" and "seen working" is the whole point of this
 document.
 
 ---
@@ -423,7 +424,8 @@ which one is missing instead of a dead rectangle:
 | Capability | Status |
 |---|---|
 | **Static rendering (`--screenshot`)** | **Verified in a boot**: `docs/screenshots/chromium-page.png`, one frame per navigation. This is the path the viewer falls back to when the live channel is unavailable; the boot of §11.7 brought the live channel up instead. |
-| **Live DevTools channel (scroll, click, type)** | The channel came up in a boot during this run: `DevToolsActivePort` plus the RFC 6455 upgrade on 127.0.0.1:46211 (§11.7). A screencast frame being drawn and an `Input.*` call changing a page are still unproven in a boot. |
+| **Live DevTools channel (frames)** | The channel came up in a boot during this run and delivered screencast frames: `build/H5.png` shows the live footer `page attached  2 frames` over the test page (§11.7). |
+| **Input over the live channel (scroll, click, type)** | Implemented (§3.4), but no boot has shown a page reacting to it. Video is unproven too. |
 | HTML5 parsing | Blink. The binary contains `HTMLDocument`, `CSSStyleSheet` and `blink` strings [apk, byte search, §11.3]. |
 | CSS | Blink: full CSS, not our subset. |
 | JavaScript | V8. The binary contains `v8_context_snapshot` [apk]. WebAssembly is V8's. |
@@ -649,10 +651,12 @@ or anywhere else.
 ## 10. What this document is not
 
 * It is not a benchmark. No frame rate, no load time and no memory figure was
-  measured; the only rendering evidence is the single screenshot at the end.
-* It is not a promise that every page draws. The live channel came up in a
-  boot (§11.7), but no boot has yet shown a screencast frame being drawn, and
-  §4 names the one absolute path the jail does not bind.
+  measured; the rendering evidence is the screenshots quoted in §11.7 and at
+  the end.
+* It is not a promise that every page draws, or that input reaches it. A boot
+  drew a page over the live channel (§11.7), but no boot has shown a wheel,
+  click or key changing a page, and §4 names the one absolute path the jail
+  does not bind.
 * It is not a claim that 1 GB of RAM is enough for heavy pages. It is the
   smallest guest this document will recommend, and §7.3 says where the answer
   will appear if it is not.
@@ -740,9 +744,8 @@ DT_NEEDED (59): libglib-2.0.so.0 … libgbm.so.1 libdrm.so.2 libavcodec.so.62
 ```
 
 Byte search of the same file for the protocol surface the app uses. The search
-is case-sensitive, and that matters: the domain and method of the `Target.*`
-calls are stored separately, so the string that proves them is
-`attachToTarget` / `createTarget`, not the joined name.
+is case-sensitive, and that matters: the binary carries the method names
+(`attachToTarget`, `createTarget`) rather than the joined `Target.` form.
 
 ```
 DevToolsActivePort         present   startScreencast           present
@@ -761,9 +764,9 @@ blink                      present   CSSStyleSheet             present
 libwidevinecdm             ABSENT
 ```
 
-An earlier version of this table searched lowercase and printed
-`devtoolsactiveport`, `startscreencast`, `dispatchmouseevent`,
-`attachtotarget` and `createtarget` as present. Those exact spellings do not
+An earlier version of this table listed lowercase spellings
+(`devtoolsactiveport`, `startscreencast`, `dispatchmouseevent`,
+`attachtotarget`, `createtarget`) as present. Those exact spellings do not
 occur in this binary; the strings that do are the real protocol names above.
 The conclusion — the surface is there — is unchanged, and the evidence is now
 the evidence.
@@ -885,33 +888,39 @@ resolves — only a boot can show that — and the engine started in the boot of
   `/tmp/engine-profile/DevToolsActivePort` path the viewer polls, including a
   half-written file being refused.
 * **The live channel came up in the guest, and the loopback line is why.**
-  The boot run on 2026-11-25 wrote these lines to `build/serial.log`:
+  Two boots during this run printed the same pair of lines. The second one
+  (the run visible in `build/serial.log` at the time of writing) has:
 
   ```
-  engineview: no /dev/snd PCM node - passing --mute-audio once (decode still happens)
-  engineview: warning: /app/lib/ld-musl-x86_64.so.1 is not executable; ...
-  engineview: live channel started (pid 1192), waiting for /tmp/engine-profile/DevToolsActivePort
+  engineview: live channel started (pid 603), waiting for /tmp/engine-profile/DevToolsActivePort
   engineview: exec /app/usr/lib/chromium/chromium-headless-shell
-  engineview: devtools over tcp port 46211 /devtools/browser/4bc11b6f-5ea5-4a4f-8a3c-973f15e86777
+  engineview: devtools over tcp port 39051 /devtools/browser/0ef2eea2-0888-4a2a-9766-84799428222c
   ```
 
-  `build/serial.log` is a build artefact and the next boot overwrites it; the
-  lines above are from this run. The `waiting` line is the fork. The last line
-  is printed only after
-  `cdpws_open()` returned, so inside the guest the browser published
-  `DevToolsActivePort` and accepted the RFC 6455 upgrade — accept-key check
-  included — on `127.0.0.1:46211`. That is the channel working in the VM, not
-  just against a host harness. The same boot was driven to type
-  `http://10.0.2.2:8000/t.html`, but the serial log has no frame count or CDP
-  error, so it does not prove that a screencast frame was drawn. The loader
-  warning is the wrong path in the app's own check (§4).
+  (the fork and exec lines were interleaved by the two processes on one line;
+  they are split here). An earlier boot that day printed the same
+  `devtools over tcp port` line with port 46211 and a different browser UUID:
+  each boot starts a new browser, so the numbers differ, and the line's
+  presence is the evidence. It is printed only after `cdpws_open()` returned,
+  so inside the guest the browser published `DevToolsActivePort` and accepted
+  the RFC 6455 upgrade — accept-key check included — on `127.0.0.1`.
+
+  The frames came through too. Three screendumps of that boot are in
+  `build/H3.png`, `H4.png` and `H5.png` (build artefacts as well); all three
+  show the live footer `page attached  2 frames` and the test document drawn in
+  the page area. Two
+  frames is the viewer's own decoded-frame counter (`p->frames`), so at least
+  two `Page.screencastFrame` JPEGs were decoded and drawn over the live
+  channel inside the guest. The loader warning in the log is the wrong path in
+  the app's own check (§4).
 
   The line that made it possible, `ip link set lo up`, is at
   `stage/init:227`, added during this run before eth0 is brought up; the
   comment there records the bind timeout that happened without it. The engine's
   manifest says `network = host`, so `src/wmsrv.c:355` does not give it a
   private netns: the guest's `lo` is the interface that matters.
-* The full install path through `pkg` was executed in the boot below — the
+
+* The full install path through `pkg` was executed in the boot above — the
   engine that printed those lines runs from the installed bundle, after the
   input script's `pkg install engine` — but `pkg`'s console output is not in the
   serial log (it is in the terminal window on the guest's screen). The checks
@@ -948,24 +957,27 @@ What is verified today, and what is not:
   with a fragmented reply. The readiness signal passed
   `.work/w1/portcheck.c` (**6/6**). The boot log in §11.7 shows the browser
   side: `DevToolsActivePort` appeared and the upgrade was accepted on
-  `127.0.0.1:46211`.
-* **What the boot does not show.** No line records a `Page.screencastFrame`
-  being drawn or an `Input.*` call changing a page; the boot typed a URL but
-  the serial log has no frame count. The channel is proven, the picture and the
-  input are not.
+  `127.0.0.1` (port 39051 in the run quoted there).
+* **And the frames came through.** `build/H5.png` from that boot shows the
+  live footer `page attached  2 frames` over the rendered test page, so two
+  `Page.screencastFrame` JPEGs were decoded and drawn in the guest. That is
+  the live path working, not just connected.
+* **What is still unproven.** No boot has shown a wheel, click or key changing
+  a page, and no video has played. The calls exist (§3.4) and the channel
+  carries them; whether a page reacts is the next boot's question.
 
 What this gives and what it does not:
 
 - **Works:** any URL the OS can reach, rendered by a real browser engine,
   including CSS, tables, fonts and images — everything Blink does for a static
   frame.
-- **Does not:** scrolling, clicking inside the page, typing into a page, or
-  video, as far as any run has shown. The viewer forwards those calls when the
-  channel is live (§3.4) and a boot has now shown the channel up, but no boot
-  has shown a page reacting; the screenshot path has no engine to send them to.
-  YouTube on the screenshot path shows one frame, not a player, because its
-  video needs a running compositor on the other end of a live connection.
+- **Does not (as any run has shown):** scrolling, clicking inside the page,
+  typing into a page, or video. The viewer forwards those calls when the
+  channel is live (§3.4) and a boot has shown live frames arriving, but no boot
+  has shown a page reacting to input. YouTube shows a frame, not a player: on
+  the screenshot path there is no engine to send anything to, and on the live
+  path a playing video has not been observed.
 - **Next:** the live path exists in the code — screencast frames and `Input.*`
-  (§3.4) — and the transport behind it is proven on the host and up in the
-  guest. What it needs now is a boot that shows a frame being drawn; that is
-  the difference between the still in the screenshot and a browser window.
+  (§3.4) — the transport is proven on the host, and a boot has drawn live
+  frames. What it needs now is a boot that shows input reaching the page, and a
+  page whose video plays.
