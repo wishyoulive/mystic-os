@@ -1049,9 +1049,25 @@ estimating:
 
 | setting | rate | decode | gap |
 |---|---|---|---|
-1100x668, q70 | 5.0 fps | 181 ms | 190 ms |
-733x445, q60 | 10.2 fps | 90 ms | 95 ms |
-550x334, q60 | **14.4 fps** | 48 ms | 51 ms |
+1100x668, q70, scalars | 5.0 fps | 181 ms | 190 ms |
+733x445, q60, scalars | 10.2 fps | 90 ms | 95 ms |
+550x334, q60, scalars | 14.4 fps | 48 ms | 51 ms |
+550x334, turbo | 24 fps instant | **1.3 ms** | 41.7 ms |
+1100x668, turbo | 24 fps instant | **5.4 ms** | 41.8 ms |
+
+Two changes produced those numbers, both measured:
+
+1. The frame is acknowledged before it is decoded, so our decoder stopped sitting
+   inside Chromium's frame pacing.
+2. The viewer is now the same shape as the VLC player: a static launcher
+   (`engine_launch.c`, 27 KB, no `PT_INTERP`) execs the bundle's own musl loader
+   on a dynamic payload at `libexec/engine` whose `PT_INTERP` is rewritten to
+   `/app/ld-musl-x86_64.so.1` and which links `libjpeg.so.8` from the bundle.
+   Static musl cannot `dlopen`, which is why this was necessary at all.
+
+With decode at 1.3-5.4 ms the remaining 41.8 ms gap is Chromium's own screencast
+cadence (about 24 frames/s at this window size), so the viewer now asks for
+full-resolution frames: the decoder is no longer the reason to shrink them.
 
 `gap ≈ decode + 3 ms` is the important number: the engine is ready as soon as
 the viewer is, so the ceiling is `src/img.c`'s scalar JPEG decoder at roughly

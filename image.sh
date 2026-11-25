@@ -132,7 +132,12 @@ fi
 RAM=${MYSTIC_RAM:-256}
 if [ "$VARIANT" = "lts" ] && [ "${MYSTIC_RAM:-0}" = "0" ]; then RAM=1024; fi
 
-BOOT=( -kernel "$KERNEL" -initrd "$CPIO" -m "$RAM" -vga std -no-reboot
+# Four cores, not one: software video decode is per-frame work that splits
+# across threads, and a single vCPU cannot sustain 1080p50 with libavcodec, let
+# alone 4K. The guest sees nproc=4 and VLC/Chromium size their decoder threads
+# from it. Override with MYSTIC_SMP=1 for a single-core run.
+SMP=${MYSTIC_SMP:-4}
+BOOT=( -kernel "$KERNEL" -initrd "$CPIO" -m "$RAM" -smp "$SMP" -vga std -no-reboot
        -drive file="$DISK",format=raw,if=virtio
        -netdev user,id=n0 -device virtio-net-pci,netdev=n0 -audiodev sdl,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 )
 

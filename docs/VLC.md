@@ -918,3 +918,30 @@ Two things this settles that the manual run could not:
   `libasound.so.2` and the OS exposes `/dev/snd/pcmC0D0p`. Audible sound cannot
   be confirmed from inside this VM, so what is claimed is that the output opens
   and libVLC reports a volume, not that a listener heard it.
+
+## Measured playback rates
+
+The player reports what the decoder actually sustains, every hundred frames, so
+the following are measurements rather than expectations:
+
+| file | surface | cores | rate |
+|---|---|---|---|
+1080p H.264 (local, via `open.request`) | 1920x1080 | 4 | **60.0 fps** |
+4K H.264 (3840x2160) | 3840x2160 | 4 | 17 fps |
+4K H.264 | 3840x2160 | 8 | **24 fps** |
+
+The VM now gets four cores by default (`image.sh`, `-smp 4`, override with
+`MYSTIC_SMP`): software decoding is per-frame work that splits across threads and
+one vCPU could not sustain 1080p50 at all. 1080p at 60 fps leaves the CPU with
+headroom; 4K scales with cores but stays below 60 on this host, which is a CPU
+limit, not a container-format limit - the same file plays at the source rate
+once the decoder keeps up.
+
+## Codecs
+
+Decoding goes through libVLC's `avcodec` plugin, so the formats libavcodec can
+decode are available in the container libavcodec understands: MP4 and MKV
+demuxers are both shipped, with H.264/HEVC/MPEG-4/VC-1 packetizers. VP9/WebM
+plays through the same avcodec path; AV1 depends on the libavcodec build in the
+bundle. `filetypes.c` routes mp4, mkv, webm, avi and mov to the player, so a
+downloaded file opens from Files exactly like a video attached to a message.

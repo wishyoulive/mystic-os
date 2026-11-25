@@ -20,10 +20,14 @@
  *
  *  WHAT WAS VERIFIED, AND HOW
  *  -------------------------
- *  [built]   zig cc -target x86_64-linux-musl -Os -static -Isrc -Isrc/client
+ *  [built]   this file compiles both ways, silently, with
+ *            zig cc -target x86_64-linux-musl -Os -static -Isrc -Isrc/client
  *            -Isrc/client/apps -Wall -Wextra -Wno-unused-parameter -c this
- *            file is silent, and ./tools/mkapp.sh engine links the app with
- *            src/client/cdpws.c (the DevTools transport) and src/img.c.
+ *            file (also with -DHAVE_TURBOJPEG), and ./tools/mkapp.sh engine
+ *            links it with src/client/cdpws.c and src/img.c as the image's
+ *            static placeholder. The package's copy is the DYNAMIC build that
+ *            tools/pack-engine.py makes with -DHAVE_TURBOJPEG -ljpeg; see
+ *            THE SCREENCAST DECODE below.
  *  [api]     the switches and protocol names used here are present in the
  *            exact binary the package ships (chromium-headless-shell
  *            156.0.8078.79): "remote-debugging-port", "user-data-dir",
@@ -41,9 +45,62 @@
  *            DevToolsActivePort half is checked on the host against the very
  *            path this file polls. What no host run can show is the browser
  *            publishing that file inside the jail and connect() succeeding.
- *            And on this build it will not: see LOOPBACK below - stage/init
- *            never brings up lo, so a booted guest takes the fallback path,
- *            not the live one. That is readable today and is not fixed here.
+ *            The earlier claim that stage/init leaves lo down was stale -
+ *            stage/init:227 runs "ip link set lo up" - but whether the live
+ *            path then works is still unobserved; see LOOPBACK below.
+ *
+ *  THE SCREENCAST DECODE: libjpeg-turbo INSTEAD OF src/img.c
+ *  --------------------------------------------------------
+ *  img.c decodes JPEG in scalar C, and that costs real time per frame:
+ *  measured on the host this was built on, one 550x334 quality-60 frame takes
+ *  3.00 ms best / 3.37 ms mean at -O2 and 5.00 / 7.32 ms at -Os, and a noise
+ *  frame (the worst case) 5.87 ms mean. libjpeg-turbo's SIMD IDCT, SIMD
+ *  colour conversion and SIMD upsampling replace that work, so the bundle's
+ *  own libjpeg (libjpeg-turbo 3.1.3, usr/lib/libjpeg.so.8.3.2) is used when
+ *  this file is built with -DHAVE_TURBOJPEG:
+ *
+ *    - it decodes straight into the page's frame buffer with
+ *      out_color_space = JCS_EXT_BGRA (13), which writes the bytes B,G,R,A -
+ *      the exact 0xAARRGGBB Img.px format, opaque, no conversion pass;
+ *    - two frame buffers are swapped, so steady state does no malloc and a
+ *      corrupt frame cannot damage the one on screen;
+ *    - the existing "frames in N ms (x fps), decode ... ms, gap ... ms" line
+ *      is unchanged, so a boot log measures the difference.
+ *
+ *  WHAT THIS DOES *NOT* ESTABLISH
+ *  ------------------------------
+ *  That the scalar decoder is the whole reason a guest sat at ~14 fps is a
+ *  HYPOTHESIS, not a measurement. The frame period is
+ *  1 / max(decode, engine encode + transfer + ack), and the encode side runs
+ *  inside Chromium, which no host here can execute. Measured on this host the
+ *  scalar decode alone is 3-7 ms, well under the 71 ms of a 14 fps period, so
+ *  the guest was either on a much slower CPU or its pipeline was dominated by
+ *  encode and transfer. The decode/gap split on the log line is what tells
+ *  those two apart on a boot; this file does not assert which it was.
+ *
+ *  It is the CLASSIC jpeg_* ABI, not TurboJPEG's tj*: Alpine ships the
+ *  TurboJPEG wrapper as a separate libturbojpeg.so.0 package that this bundle
+ *  does not contain, and libjpeg.so.8.3.2 exports no tj_* symbol at all - the
+ *  link error and the .dynsym count are recorded in src/client/tjmin.h. Same
+ *  library, same SIMD decoder, one dependency fewer.
+ *
+ *  That is also why the viewer must be DYNAMIC, and why the package ships a
+ *  static launcher (src/client/apps/engine_launch.c) as `bin` with this file
+ *  at libexec/engine behind the bundle's own musl loader: a static musl
+ *  program has no dynamic loader and could not link libjpeg at all.
+ *
+ *  WHAT IS PROVEN, AND WHAT IS NOT
+ *  -------------------------------
+ *  tools/pack-engine.py reads the shipped ELF back and checks PT_INTERP
+ *  /app/ld-musl-x86_64.so.1, DT_NEEDED libjpeg.so.8, and a launcher with
+ *  neither; it also resolves every undefined symbol of the viewer against the
+ *  packaged loader and libjpeg. src/client/tjmin.h pins every ABI offset
+ *  against the 3.1.3 headers, and jpeg_CreateDecompress validates the version
+ *  and the struct size at run time, so a wrong declaration fails loudly in
+ *  this window's error line instead of corrupting pixels. What no host here
+ *  can show - no WSL, no emulator, no x86-64 Linux execution - is the decode
+ *  time of that ELF or the guest's frame rate. Both come from the boot log
+ *  line above.
  *
  *  THE TRANSPORT: TCP AND A WEBSOCKET, NOT THE PIPE
  *  -----------------------------------------------
@@ -84,20 +141,23 @@
  *  Both facts are checked before exec, and the window says which one is
  *  missing instead of showing a dead rectangle.
  *
- *  LOOPBACK: THE ONE THING THIS FILE CANNOT FIX
- *  --------------------------------------------
- *  DevTools over TCP is a loopback connection - the browser binds 127.0.0.1 and
- *  this process connects to 127.0.0.1. stage/init's setup_net() runs
- *  "ip link set eth0 up" and udhcpc, and nothing else; no other script in
- *  stage/ or tools/ brings lo up, and Linux boots it down. So on a booted guest
- *  the browser cannot bind, this window cannot connect, no DevToolsActivePort
- *  ever appears, engine_attach() spends its full 10 s, and every navigation is
- *  one --screenshot. The engine's manifest says "network = host", so
- *  src/wmsrv.c (line 355) does not give it a new network namespace: the
- *  guest's lo is the one that matters, and in a namespace (CLONE_NEWNET) it
- *  would be that namespace's lo. The fix is one line in stage/init, which is
- *  not this file's to change; it is written down here so that nobody spends a
- *  QEMU run on the wrong question.
+ *  LOOPBACK: WHAT THE IMAGE DOES, AND WHAT IS STILL UNVERIFIED
+ *  ----------------------------------------------------------
+ *  DevTools over TCP is a loopback connection - the browser binds 127.0.0.1
+ *  and this process connects to 127.0.0.1. An earlier revision of this comment
+ *  said stage/init never brought lo up, so a booted guest always fell back to
+ *  one --screenshot per navigation. That is STALE: stage/init's setup_net()
+ *  runs "ip link set lo up" (stage/init:227) before "ip link set eth0 up",
+ *  so the interface the engine needs is configured.
+ *
+ *  What that does NOT establish is that the live path runs: whether Chromium
+ *  binds 127.0.0.1 inside the jail, whether DevToolsActivePort appears, and
+ *  whether this window attaches have not been observed in any run that touched
+ *  this file (no QEMU here). The startup diagnostic below prints lo=(-1,0,1)
+ *  from /proc/net/dev and the engine's own exit status and last stderr line,
+ *  so one boot log answers it without guessing. The engine's manifest says
+ *  "network = host", so src/wmsrv.c (line 355) does not give it a new network
+ *  namespace: the guest's lo is the one that matters.
  *
  *  KNOWN LIMITS, STATED IN THE WINDOW
  *  ---------------------------------
@@ -113,6 +173,10 @@
 #include "../../mystic.h"
 #include "../../img.h"
 #include "cdpws.h"          /* the DevTools transport: TCP + RFC 6455 WebSocket */
+#if defined(HAVE_TURBOJPEG)
+#include "../tjmin.h"       /* the libjpeg-turbo ABI slice, hand-declared */
+#include <setjmp.h>        /* libjpeg reports errors by longjmp           */
+#endif
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -124,9 +188,12 @@
 #ifndef EVP_SELFTEST
 /* The self-test at the bottom of this file runs on the host and only needs the
  * parsers, so the POSIX headers are not required to build it. */
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -191,6 +258,26 @@ static unsigned char evp_jpeg[EVP_FRAME_MAX];
  *  1. Small utilities
  * ============================================================ */
 #ifndef EVP_SELFTEST
+/* Can a socket bind 127.0.0.1:0? That is exactly what the engine must do for
+ * DevTools over TCP, and what this window must connect to. When lo is down the
+ * bind fails with EADDRNOTAVAIL, every navigation degrades to --screenshot,
+ * and the boot log otherwise says nothing about why. Returns 1 bindable,
+ * 0 not bindable (errno can be reported), -1 when socket() itself failed - so
+ * "no loopback" can never be confused with "the probe could not run". */
+static int lo_bindable(void) {
+    struct sockaddr_in a;
+    int fd = socket(AF_INET, SOCK_STREAM, 0), ok;
+
+    if (fd < 0) return -1;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;
+    ok = bind(fd, (struct sockaddr *)&a, sizeof(a)) == 0;
+    close(fd);
+    return ok;
+}
+
 static long now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -674,7 +761,9 @@ static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
     }
     collect_lib_dirs(bundle, 0, libdir, sizeof libdir);
     if (!libdir[0]) snprintf(libdir, sizeof(libdir), "%s/usr/lib:%s/lib", bundle, bundle);
-    snprintf(loader, sizeof(loader), "%s/lib/ld-musl-x86_64.so.1", bundle);
+    /* The bundle carries the loader at its ROOT (chromium's PT_INTERP is
+     * /app/ld-musl-x86_64.so.1), not under lib/. */
+    snprintf(loader, sizeof(loader), "%s/ld-musl-x86_64.so.1", bundle);
     /* The loader is not exec'd (see the comment above execv), but a bundle
      * without it can only fail there, and this line says why before the fork. */
     if (access(loader, X_OK) != 0)
@@ -881,6 +970,143 @@ static int engine_attach(Engine *e, char *err, size_t esz) {
 #endif
 }
 
+#if defined(HAVE_TURBOJPEG)
+/* ------------------------------------------------------------
+ *  The screencast decoder: libjpeg-turbo, once, into an Img
+ *
+ *  libjpeg reports a bad file by calling error_exit and NOT returning, so
+ *  the handler must be ours (the default prints and calls exit(), which in a
+ *  window app means the window vanishes on one corrupt frame). The wrapper
+ *  puts the standard error manager FIRST so the callback can recover its
+ *  jmp_buf with a cast - the idiom libjpeg's own manual describes.
+ * ------------------------------------------------------------ */
+typedef struct {
+    struct tj_error_mgr pub;            /* must be first: cast target      */
+    jmp_buf             jb;
+    char                msg[TJ_MSG_LENGTH_MAX];
+} TjErr;
+
+static void tj_error_exit(tj_common_ptr cinfo) {
+    tj_decompress_ptr d = (tj_decompress_ptr)cinfo;
+    TjErr *e = (TjErr *)d->err;
+
+    e->msg[0] = 0;
+    if (d->err->format_message) d->err->format_message(cinfo, e->msg);
+    if (!e->msg[0])
+        snprintf(e->msg, sizeof(e->msg), "libjpeg error %d",
+                 d->err->msg_code);
+    longjmp(e->jb, 1);
+}
+
+/* Give the Img a buffer of exactly w*h 0xAARRGGBB pixels, reusing the one it
+ * already has when the size is the same - which is every frame of a
+ * screencast that is not being resized. Returns 0 and leaves the Img empty on
+ * a failed allocation. */
+static int jpeg_frame_alloc(Img *im, int w, int h) {
+    size_t bytes = (size_t)w * (size_t)h * 4u;
+
+    if (im->px && im->w == w && im->h == h) return 1;
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = im->stride = 0;
+    im->px = (uint32_t *)malloc(bytes);
+    if (!im->px) return 0;
+    im->w = w;
+    im->h = h;
+    im->stride = w;
+    return 1;
+}
+
+/* Decode one JPEG into *out. 0 on success; -1 with the library's own message
+ * in err on any failure (not a JPEG, arithmetic coding, 12-bit, truncated,
+ * out of memory). On failure *out may hold a freshly allocated, PARTIALLY
+ * filled buffer: jpeg_frame_alloc() runs before the scanline loop and reuses
+ * the buffer only when the size matches. That is harmless for the picture
+ * because *out is the spare buffer - handle_message() swaps only on a 0
+ * return, so the frame on screen is never touched. */
+static int jpeg_decode(const unsigned char *buf, size_t len, Img *out,
+                       char *err, size_t esz) {
+    struct tj_decompress d;
+    TjErr je;
+    tj_dimension w, h;
+    int iw, ih;
+
+    if (!buf || !len || !out) {
+        set_err(err, esz, "jpeg_decode: no input or no output image");
+        return -1;
+    }
+    memset(&d, 0, sizeof(d));
+    memset(&je, 0, sizeof(je));
+    d.err = jpeg_std_error(&je.pub);
+    je.pub.error_exit = tj_error_exit;
+
+    if (setjmp(je.jb)) {
+        /* jpeg_CreateDecompress zeroed the struct before it could fail, and
+         * jpeg_destroy_decompress tolerates a missing memory manager, so this
+         * is safe on every error path, including a version mismatch. */
+        jpeg_destroy_decompress(&d);
+        set_err(err, esz, "%s", je.msg[0] ? je.msg
+                                         : "libjpeg could not decode the frame");
+        return -1;
+    }
+
+    /* These two numbers are the runtime check on tjmin.h: the library refuses
+     * to run with any other version or struct size, and says so in je.msg. */
+    jpeg_CreateDecompress(&d, TJ_JPEG_LIB_VERSION, sizeof(d));
+    jpeg_mem_src(&d, buf, (unsigned long)len);
+    jpeg_read_header(&d, TJ_TRUE);
+
+    /* B,G,R,A bytes == 0xAARRGGBB on little endian, alpha 0xFF: the Img
+     * format and opaque, exactly what draw_page() memcpy()s to the surface. */
+    d.out_color_space = TJ_CS_EXT_BGRA;
+    jpeg_start_decompress(&d);
+
+    w = d.output_width;
+    h = d.output_height;
+    /* The same denial-of-service caps img.c applies, checked before the
+     * allocation rather than after: a 100-byte file can claim 60000x60000. */
+    if (!w || !h || w > IMG_MAX_DIM || h > IMG_MAX_DIM ||
+        (double)w * (double)h > (double)IMG_MAX_PIXELS) {
+        jpeg_destroy_decompress(&d);
+        set_err(err, esz, "JPEG is %ux%u, outside the %dx%d / %u-pixel limit",
+                (unsigned)w, (unsigned)h, (int)IMG_MAX_DIM, (int)IMG_MAX_DIM,
+                (unsigned)IMG_MAX_PIXELS);
+        return -1;
+    }
+    if (d.output_components != 4) {
+        jpeg_destroy_decompress(&d);
+        set_err(err, esz, "JPEG decoded to %d components, not the 4 of "
+                          "JCS_EXT_BGRA", d.output_components);
+        return -1;
+    }
+    iw = (int)w;
+    ih = (int)h;
+    if (!jpeg_frame_alloc(out, iw, ih)) {
+        jpeg_destroy_decompress(&d);
+        set_err(err, esz, "out of memory for a %dx%d frame (%lu bytes)",
+                iw, ih, (unsigned long)((size_t)iw * (size_t)ih * 4u));
+        return -1;
+    }
+
+    /* Up to 16 rows per call, each pointing into the destination buffer: one
+     * call per row would work but pays the call overhead 300+ times a frame. */
+    while (d.output_scanline < h) {
+        tj_sample_row rows[16];
+        tj_dimension y = d.output_scanline, n = 0, got;
+        unsigned char *px = (unsigned char *)out->px;
+        while (n < 16u && y + n < h) {
+            rows[n] = (tj_sample_row)(px + (size_t)(y + n) * (size_t)iw * 4u);
+            n++;
+        }
+        got = jpeg_read_scanlines(&d, rows, n);
+        if (!got) break;             /* never loop without progress */
+    }
+    jpeg_finish_decompress(&d);
+    jpeg_destroy_decompress(&d);
+    return 0;
+}
+#endif /* HAVE_TURBOJPEG */
+
 /* ============================================================
  *  6. What the window knows about the page
  * ============================================================ */
@@ -895,6 +1121,7 @@ typedef struct {
     int  bar_focus;
     int  page_w, page_h;        /* the viewport we asked for */
     Img  frame;                 /* the last decoded frame */
+    Img  decode;                /* the buffer the next frame lands in */
     unsigned frames;            /* frames decoded since start */
     long     sum_decode_ms;     /* time we spend decoding, per 100 frames */
     long     sum_gap_ms;        /* time between frames, per 100 frames */
@@ -925,7 +1152,7 @@ static void page_start_cast(Page *p, Engine *e) {
         "{\"id\":%ld,\"sessionId\":\"%s\",\"method\":\"Page.startScreencast\","
         "\"params\":{\"format\":\"jpeg\",\"quality\":60,"
         "\"maxWidth\":%d,\"maxHeight\":%d,\"everyNthFrame\":1}}",
-        ++p->next_id, p->session, p->page_w / 2, p->page_h / 2);
+        ++p->next_id, p->session, p->page_w, p->page_h);
 }
 
 static void page_navigate(Page *p, Engine *e, const char *url) {
@@ -1115,18 +1342,50 @@ static void handle_message(Page *p, Engine *e, const char *js, size_t n,
                     long got = b64_decode(payload + 1, plen - 2,
                                           evp_jpeg, sizeof(evp_jpeg));
                     if (got > 0) {
-                        Img im;
                         char ierr[160];
-                        memset(&im, 0, sizeof(im));
                         long t0 = now_ms();
-                        if (img_decode(evp_jpeg, (size_t)got, &im, ierr, sizeof(ierr)) == 0) {
+                        int ok;
+                        ierr[0] = 0;
+#if defined(HAVE_TURBOJPEG)
+                        /* Decode into the page's spare frame buffer and swap
+                         * it in only when the decode succeeded: no allocation
+                         * in steady state, and a corrupt frame leaves the
+                         * picture already on screen untouched. */
+                        ok = jpeg_decode(evp_jpeg, (size_t)got, &p->decode,
+                                         ierr, sizeof(ierr)) == 0;
+                        if (ok) {
+                            Img t = p->frame;
+                            p->frame = p->decode;
+                            p->decode = t;
+                        }
+#else
+                        Img im;
+                        memset(&im, 0, sizeof(im));
+                        ok = img_decode(evp_jpeg, (size_t)got, &im, ierr,
+                                        sizeof(ierr)) == 0;
+                        if (ok) {
+                            img_free(&p->frame);
+                            p->frame = im;
+                        }
+#endif
+                        if (ok) {
                             p->sum_decode_ms += now_ms() - t0;
                             if (p->last_recv_ms) p->sum_gap_ms += recv_ms - p->last_recv_ms;
                             p->last_recv_ms = recv_ms;
-                            img_free(&p->frame);
-                            p->frame = im;
                             p->frames++;
                             p->last_frame_ms = now_ms();
+                            if (p->frames == 1) {
+#if defined(HAVE_TURBOJPEG)
+                                fprintf(stderr, "engineview: screencast decode = "
+                                                "libjpeg.so.8 (JCS_EXT_BGRA), "
+                                                "src/img.c only for "
+                                                "--screenshot\n");
+#else
+                                fprintf(stderr, "engineview: screencast decode = "
+                                                "src/img.c (scalar); built "
+                                                "without -DHAVE_TURBOJPEG\n");
+#endif
+                            }
                             *new_frame = 1;
                         } else {
                             set_err(p->cdperr, sizeof(p->cdperr),
@@ -1680,11 +1939,16 @@ int main(int argc, char **argv) {
 
     bundle_dir(bundle, sizeof(bundle));
     /* What the jail really gives this process: a silent exit 1 from the
-     * engine is not explainable without knowing which of these are absent. */
-    fprintf(stderr, "jail: uid=%d dev_null=%d urandom=%d shm=%d proc=%d tmp=%d\n",
+     * engine is not explainable without knowing which of these are absent.
+     * lo_bind is the loopback question in one number (-1 probe failed, 0 the
+     * bind to 127.0.0.1 failed, 1 it succeeded, i.e. the live DevTools path
+     * can work at all). */
+    fprintf(stderr, "jail: uid=%d dev_null=%d urandom=%d shm=%d proc=%d tmp=%d "
+                    "lo_bind=%d\n",
             (int)getuid(), access("/dev/null", F_OK) == 0,
             access("/dev/urandom", F_OK) == 0, access("/dev/shm", F_OK) == 0,
-            access("/proc/self/exe", F_OK) == 0, access("/tmp", W_OK) == 0);
+            access("/proc/self/exe", F_OK) == 0, access("/tmp", W_OK) == 0,
+            lo_bindable());
     {
         DIR *jd = opendir("/dev");
         if (jd) {
@@ -1970,6 +2234,7 @@ int main(int argc, char **argv) {
     engine_stop(&e);
     engine_close_pipe(&e);
     img_free(&p.frame);
+    img_free(&p.decode);        /* the spare screencast buffer */
     mc_close(&c);
     return 0;
 }

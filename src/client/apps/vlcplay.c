@@ -464,6 +464,8 @@ int main(int argc, char **argv) {
 #define SEEK_MS 5000
 #define VOL_STEP 5
 
+static long long now_ms(void);
+
 /* Colours: the same quiet dark surface the other client apps use. */
 static const u32 C_BG     = RGB(0x0E, 0x13, 0x1B);
 static const u32 C_HEAD   = RGB(0x14, 0x1B, 0x26);
@@ -536,6 +538,7 @@ typedef struct {
     int             pitch;     /* bytes per row */
     int             busy;      /* one side owns fb */
     unsigned        frames;    /* complete pictures (unlock ran) */
+    long long       first_frame_ms;  /* when the first picture arrived */
     unsigned        displays;  /* presentations (display ran) */
 } VlcSurface;
 
@@ -789,7 +792,17 @@ static void cb_unlock(void *opaque, void *picture, void *const *planes) {
     (void)planes;
     pthread_mutex_lock(&s->m);
     s->busy = 0;
+    if (!s->frames) s->first_frame_ms = now_ms();
     s->frames++;
+    /* Report the rate the decoder actually sustains, every hundred frames:
+     * whether a 4K file plays is a number, not an opinion. */
+    if (s->frames % 100 == 0) {
+        long long t = now_ms();
+        if (s->first_frame_ms && t > s->first_frame_ms)
+            fprintf(stderr, "vlcplay: %u frames in %lld ms (%.1f fps)\n",
+                    s->frames, t - s->first_frame_ms,
+                    (double)s->frames * 1000.0 / (double)(t - s->first_frame_ms));
+    }
     pthread_cond_broadcast(&s->cv);
     pthread_mutex_unlock(&s->m);
 }
