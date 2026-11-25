@@ -19,7 +19,7 @@ WHAT IT PRODUCES (all under build/, nothing in the image):
     build/engine-pkg/           the package stage (manifest, bin, ld-musl, usr/)
     build/repo/engine.tar.gz    the installable package
     build/repo/engine.row       its index row, and index.tsv is updated+re-signed
-    build/engine-build.log      the compiler output for bin (engineview)
+    build/engine-build.log      the compiler output for bin (engine viewer)
 
 THE CHOICE, AND WHY (numbers are printed by --candidates, not hard-coded):
 
@@ -677,15 +677,20 @@ def find_zig():
     return None
 
 
-APP_SRC = os.path.join("src", "client", "apps", "engineview.c")
+# The viewer was renamed to engine.c, and it now speaks DevTools over a
+# WebSocket, so the transport is part of the app's own link list. Without both
+# of these the packaged build fails with seven undefined cdpws_* symbols.
+APP_SRC = os.path.join("src", "client", "apps", "engine.c")
 APP_DEPS = [os.path.join("src", "client", "mystic_client.c"),
             os.path.join("src", "gfx.c"), os.path.join("src", "font.c"),
             os.path.join("src", "ui.c"), os.path.join("src", "filetypes.c"),
-            os.path.join("src", "img.c")]
+            os.path.join("src", "img.c"),
+            os.path.join("src", "audio.c"),
+            os.path.join("src", "client", "cdpws.c")]
 
 
 def build_app(out_path):
-    """Compile engineview statically. Returns the compiler's own words."""
+    """Compile the engine viewer statically. Returns the compiler's own words."""
     zig = find_zig()
     if not zig:
         raise SystemExit("error: zig not found (set ZIG=)")
@@ -1163,7 +1168,7 @@ def main():
         print("      PT_INTERP already %s" % INTERP_JAIL)
 
     # ---- the window app ---------------------------------------------
-    app_out = os.path.join("build", "app-engineview")
+    app_out = os.path.join("build", "app-engine")
     app_size = build_app(app_out)
     print("==> window app: build/app-engineview, %.0f KB static"
           % (app_size / 1e3))

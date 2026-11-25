@@ -441,7 +441,7 @@ which one is missing instead of a dead rectangle:
 | JavaScript | V8. The binary contains `v8_context_snapshot` [apk]. WebAssembly is V8's. |
 | Canvas / WebGL | Canvas yes (software). WebGL is refused: the app passes `--disable-gpu` because there is no GPU; Chromium would otherwise try DRI drivers that need `llvm22-libs` and a DRM node. |
 | H.264 / VP9 / AV1 video without DRM | The engine links `libavcodec.so.62`, `libopenh264.so.8`, `libdav1d.so.7`, and the closure carries `x265-libs`, `aom-libs`, `libSvtAv1Enc` [apk, DT_NEEDED + idx]. Decoding is present and was exercised: YouTube's watch page played in the `youtube-playing.png` (148 frames) and `youtube-video-audio-jail.png` (252 frames) boots, silently, because the guest had no PCM node and the app passed `--mute-audio`. |
-| Audio from a page | The app passes `--mute-audio` when `/dev/snd/pcmC0D0p` does not exist and says so once on stderr (every YouTube boot did). The engine manifest now says `audio = yes`, and the jail's `/dev` lists `snd`; the QEMU guest still has no PCM node (`snd_hda_intel: Cannot probe codecs`), so the flag stays on and the video remains silent. The un-muted path is unexercised. |
+| Audio from a page | The app passes `--mute-audio` when `/dev/snd/pcmC0D0p` does not exist and says so once on stderr (the boot logs show it). The engine manifest now says `audio = yes`, and the jail's `/dev` lists `snd`; the QEMU guest still has no PCM node (`snd_hda_intel: Cannot probe codecs`), so the flag stays on and the video remains silent. The un-muted path is unexercised. |
 | **DRM (Netflix, Spotify, Prime)** | **No.** The engine knows the API (`requestMediaKeySystemAccess`, `widevine` strings are present) but the CDM library `libwidevinecdm.so` is not in the binary's directory and there is **no widevine package in the whole Alpine v3.24 index** [idx]. Without a CDM, EME playback fails by design. |
 | PDF viewer | Chromium's PDF viewer needs its plugin resources; the headless shell package does not carry them. Use `docview`/`pdf.c`. |
 | Downloads | Not wired: `Page.setDownloadBehavior` is not called and there is no file picker in the jail. |
@@ -894,11 +894,12 @@ resolves — only a boot can show that — and the engine started in the boot of
 * Apart from the guest boots described below, the DevTools TCP channel has only
   been exercised on the host, through the harness. What was run there, rebuilt
   for this report: `.work/cdp1/harness.c` against `src/client/cdpws.c` →
-  **131 checks, 0 failed**. It covers the RFC 6455 example key and the accept-key calculation, a
-  wrong or missing `Sec-WebSocket-Accept` failing closed, masked client frames
-  with a fresh key per frame, fragmented server messages reassembled with a ping
-  between fragments, ping/pong/close, 64-bit lengths, protocol violations, and a
-  real loopback TCP upgrade followed by a fragmented reply.
+  **131 checks, 0 failed**. It covers the RFC 6455 example key and the
+  accept-key calculation, a wrong or missing `Sec-WebSocket-Accept` failing
+  closed, masked client frames with a fresh key per frame, fragmented server
+  messages reassembled with a ping between fragments, ping/pong/close, 64-bit
+  lengths, protocol violations, and a real loopback TCP upgrade followed by a
+  fragmented reply.
   `.work/w1/portcheck.c` against the same `cdpws.c` → **6/6** — covers the exact
   `/tmp/engine-profile/DevToolsActivePort` path the viewer polls, including a
   half-written file being refused.
@@ -931,7 +932,7 @@ resolves — only a boot can show that — and the engine started in the boot of
   `https://www.youtube.com/` in the address bar, `YouTube` in the footer and
   `page attached  15 frames`; the committed `docs/screenshots/https-example.png`
   shows `example.com` with `Example Domain` in the footer and four frames.
-  Further commits record the watch page and playback:
+  Further screendumps record the watch page and playback:
   `youtube-watch.png` (51 frames, watch URL in the bar), `youtube-playing.png`
   (148 frames, the video playing after a click at 480,300), and
   `youtube-video-audio-jail.png` (252 frames, committed with the jail's
@@ -975,13 +976,13 @@ pages. The committed screenshots are the evidence:
 `docs/screenshots/chromium-live.png` (the test page with the live footer
 `page attached  2 frames`), `https-example.png` (example.com, 4 frames,
 `Example Domain` in the footer) and `youtube.png` (https://www.youtube.com/,
-15 frames, `YouTube` in the footer, the URL in the address bar). Later screendumps show the watch page and playback:
-`youtube-watch.png` (51 frames, the watch URL in the bar), `youtube-playing.png`
-(148 frames, the video playing after a click at 480,300) and
-`youtube-video-audio-jail.png` (252 frames, committed with the jail's
-`audio = yes` manifest). All of them are silent: the jail now binds `/dev/snd`,
-but the guest has no PCM node (`snd_hda_intel: Cannot probe codecs`) and the app
-passes `--mute-audio`.
+15 frames, `YouTube` in the footer, the URL in the address bar). Later
+screendumps show the watch page and playback: `youtube-watch.png` (51 frames,
+the watch URL in the bar), `youtube-playing.png` (148 frames, the video playing
+after a click at 480,300) and `youtube-video-audio-jail.png` (252 frames,
+committed with the jail's `audio = yes` manifest). The video boots are silent:
+the jail now binds `/dev/snd`, but the guest has no PCM node
+(`snd_hda_intel: Cannot probe codecs`) and the app passes `--mute-audio`.
 
 What is verified today, and what is not:
 
