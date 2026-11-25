@@ -18,6 +18,13 @@ APP="${1:-}"
 [ -n "$APP" ] || { echo "usage: ./tools/mkapp.sh <app-id>" >&2; exit 1; }
 
 SRC="src/client/apps/$APP.c"
+# Optional runtime sources that only some apps need. The engine viewer drives a
+# browser over the DevTools protocol, so it links the transport when that file
+# exists - a client that does not use it costs nothing.
+EXTRA_SRC=""
+for extra in src/client/cdpws.c; do
+    [ -f "$extra" ] && EXTRA_SRC="$EXTRA_SRC $extra"
+done
 [ -f "$SRC" ] || { echo "error: no $SRC" >&2; exit 1; }
 
 ZIG="${ZIG:-}"
@@ -35,7 +42,7 @@ OUT="build/app-$APP"
 echo "==> compiling $SRC"
 # gfx.c and font.c are generic: the app draws its own pixels with them
 "$ZIG" cc -target x86_64-linux-musl -Os -static -Isrc -Isrc/client \
-    -o "$OUT" "$SRC" src/client/mystic_client.c src/gfx.c src/font.c src/ui.c     src/filetypes.c src/audio.c src/img.c -lm
+    -o "$OUT" "$SRC" src/client/mystic_client.c src/gfx.c src/font.c src/ui.c     src/filetypes.c src/audio.c src/img.c $EXTRA_SRC -lm
 
 DEST="stage/usr/share/mystic/apps/$APP"
 mkdir -p "$DEST"

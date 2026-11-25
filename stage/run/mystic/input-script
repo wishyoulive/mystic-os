@@ -1,0 +1,15 @@
+wait 300
+abs 24 20
+press
+release
+wait 40
+text engine
+wait 40
+enter
+wait 250
+sendkey f6
+wait 40
+text http://10.0.2.2:8000/t.html
+wait 40
+enter
+wait 500

@@ -220,6 +220,11 @@ hw_devices() {
 }
 
 setup_net() {
+    # Loopback first: a process that binds 127.0.0.1 gets nothing but a timeout
+    # when lo is down, which is how the browser's DevTools port failed - no
+    # "DevTools listening" line, and a probe that timed out instead of being
+    # refused.
+    ip link set lo up 2>/dev/null && echo "net: lo up"
     [ -d /sys/class/net/eth0 ] || { echo "net: no eth0"; return 0; }
     ip link set eth0 up 2>/dev/null
     if command -v udhcpc >/dev/null 2>&1; then

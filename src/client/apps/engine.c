@@ -2,9 +2,9 @@
  *  Mystic OS - apps (external) / engineview
  *
  *  A real browser window: it starts the Chromium headless engine that the
- *  `engine` package installs, speaks the DevTools protocol to it over a pair
- *  of pipes, and puts the frames the engine renders into our surface. Our
- *  pointer and key events are forwarded to the page with
+ *  `engine` package installs, speaks the DevTools protocol to it over TCP and
+ *  an RFC 6455 WebSocket, and puts the frames the engine renders into our
+ *  surface. Our pointer and key events are forwarded to the page with
  *  Input.dispatchMouseEvent / Input.dispatchKeyEvent.
  *
  *      Engine [url]        (after: pkg install engine)
@@ -20,31 +20,51 @@
  *
  *  WHAT WAS VERIFIED, AND HOW
  *  -------------------------
- *  [built]   zig cc -target x86_64-linux-musl -Os -static -Isrc -Wall -Wextra
- *            -Wno-unused-parameter -c this file is silent, and the app links
- *            with tools/mkapp.sh's line plus src/img.c.
+ *  [built]   zig cc -target x86_64-linux-musl -Os -static -Isrc -Isrc/client
+ *            -Isrc/client/apps -Wall -Wextra -Wno-unused-parameter -c this
+ *            file is silent, and ./tools/mkapp.sh engine links the app with
+ *            src/client/cdpws.c (the DevTools transport) and src/img.c.
  *  [api]     the switches and protocol names used here are present in the
  *            exact binary the package ships (chromium-headless-shell
- *            156.0.8078.79): "remote-debugging-pipe", "user-data-dir",
+ *            156.0.8078.79): "remote-debugging-port", "user-data-dir",
  *            "startscreencast", "screencastframe", "dispatchmouseevent",
  *            "dispatchkeyevent", "attachtotarget", "createtarget",
  *            "navigate", "no-sandbox", "disable-gpu", "devtoolsactiveport".
  *            Measured by byte search on the unpacked binary, not assumed.
  *  [parsers] the JSON reader, the base64 decoder and the key table are
  *            exercised by the EVP_SELFTEST block at the bottom: built for the
- *            host and run (docs/ENGINE.md quotes the output).
+ *            host and run (18 checks, all passing).
  *  [not]     no boot, no QEMU, no page was rendered in the run that added
- *            this file. The frame path is therefore written, compiled and its
- *            parsers tested - not observed.
+ *            this file, and the browser was not started in the run that moved
+ *            the transport to TCP. The socket half of the channel is
+ *            compiled and its framing comes from cdpws.c's own harness; the
+ *            DevToolsActivePort half is checked on the host against the very
+ *            path this file polls. What no host run can show is the browser
+ *            publishing that file inside the jail and connect() succeeding.
+ *            And on this build it will not: see LOOPBACK below - stage/init
+ *            never brings up lo, so a booted guest takes the fallback path,
+ *            not the live one. That is readable today and is not fixed here.
  *
- *  WHY THE PIPE AND NOT A PORT
- *  --------------------------
- *  --remote-debugging-pipe hands the browser two file descriptors: it reads
- *  commands on fd 3 and writes replies on fd 4. That is one fork/exec and no
- *  HTTP, no WebSocket handshake (which would need SHA-1, nonce handling and
- *  client-side frame masking) and no listening socket inside the jail. Each
- *  message is a JSON object terminated by a NUL byte, so the reader is "split
- *  on NUL" and the writer appends one.
+ *  THE TRANSPORT: TCP AND A WEBSOCKET, NOT THE PIPE
+ *  -----------------------------------------------
+ *  --remote-debugging-pipe hands the browser two file descriptors (commands on
+ *  fd 3, replies on fd 4, NUL-delimited JSON). On this kernel that path is
+ *  dead: the engine exits 1 with two pipes and 127 with two socketpairs,
+ *  before it writes a byte. --remote-debugging-port=0 has it pick a free
+ *  loopback port, publish it in <user-data-dir>/DevToolsActivePort and speak
+ *  HTTP plus WebSocket on it - connect/read/write only, none of the pipe
+ *  semantics the kernel gets wrong.
+ *
+ *  src/client/cdpws.c does the handshake and the framing: the upgrade is
+ *  RFC 6455 with Sec-WebSocket-Accept checked against SHA-1 of the key, client
+ *  frames are masked, and fragmented messages are reassembled before they
+ *  reach handle_message() below. This file owns only the CDP JSON, exactly as
+ *  it did with the pipe: an id in, an id out, no command routing table.
+ *
+ *  The channel is not the only way to a picture. If no DevToolsActivePort
+ *  appears, the window says why and falls back to shot_render() - the engine
+ *  run with --screenshot, one frame per navigation - which is proven to work
+ *  on this kernel.
  *
  *  WHY IT STARTS, WHERE IT STARTS
  *  -----------------------------
@@ -64,6 +84,21 @@
  *  Both facts are checked before exec, and the window says which one is
  *  missing instead of showing a dead rectangle.
  *
+ *  LOOPBACK: THE ONE THING THIS FILE CANNOT FIX
+ *  --------------------------------------------
+ *  DevTools over TCP is a loopback connection - the browser binds 127.0.0.1 and
+ *  this process connects to 127.0.0.1. stage/init's setup_net() runs
+ *  "ip link set eth0 up" and udhcpc, and nothing else; no other script in
+ *  stage/ or tools/ brings lo up, and Linux boots it down. So on a booted guest
+ *  the browser cannot bind, this window cannot connect, no DevToolsActivePort
+ *  ever appears, engine_attach() spends its full 10 s, and every navigation is
+ *  one --screenshot. The engine's manifest says "network = host", so
+ *  src/wmsrv.c (line 355) does not give it a new network namespace: the
+ *  guest's lo is the one that matters, and in a namespace (CLONE_NEWNET) it
+ *  would be that namespace's lo. The fix is one line in stage/init, which is
+ *  not this file's to change; it is written down here so that nobody spends a
+ *  QEMU run on the wrong question.
+ *
  *  KNOWN LIMITS, STATED IN THE WINDOW
  *  ---------------------------------
  *  US keyboard layout only (evdev codes, no IME); one tab; no downloads, no
@@ -77,6 +112,7 @@
 #include "../mystic_client.h"
 #include "../../mystic.h"
 #include "../../img.h"
+#include "cdpws.h"          /* the DevTools transport: TCP + RFC 6455 WebSocket */
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -90,11 +126,9 @@
  * parsers, so the POSIX headers are not required to build it. */
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 #endif
@@ -164,6 +198,10 @@ static long now_ms(void) {
 }
 #endif
 
+/* The format attribute is what makes -Wformat check every JSON template in
+ * this file against its arguments; without it the compiler cannot see them. */
+static void set_err(char *dst, size_t cap, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
 static void set_err(char *dst, size_t cap, const char *fmt, ...) {
     if (!dst || cap == 0) return;
     va_list ap;
@@ -459,22 +497,26 @@ static int cdp_mods(int mods) {
 #ifndef EVP_SELFTEST
 
 /* ============================================================
- *  5. The engine process and the CDP pipe
+ *  5. The engine process and the DevTools connection
  * ============================================================ */
 typedef struct {
     pid_t  pid;
-    int    to_engine;      /* parent writes; child has it as fd 3 */
-    int    from_engine;    /* parent reads;  child has it as fd 4 */
-    int    from_stderr;
+    int    from_stderr;    /* the engine's own diagnostics, not the protocol */
     int    alive;
+    int    waiting;        /* forked; the DevTools endpoint is not up yet */
+    long   spawned_ms;     /* monotonic start, for the 10 s endpoint deadline */
+    long   polled_ms;      /* last look at the port file (100 ms apart) */
     char   stderr_tail[EVP_STDERR_KEEP + 1];
     size_t stderr_len;
     int    status;
+    Cdpws *ws;             /* the upgraded DevTools connection, NULL until then */
+#ifndef _WIN32
+    CdpwsNet net;          /* the TCP socket behind ws; fd is -1 until connect */
+#endif
 } Engine;
 
 static void engine_close_pipe(Engine *e) {
-    if (e->to_engine >= 0)   { close(e->to_engine); e->to_engine = -1; }
-    if (e->from_engine >= 0) { close(e->from_engine); e->from_engine = -1; }
+    if (e->ws) { cdpws_free(e->ws); e->ws = NULL; }
     if (e->from_stderr >= 0) { close(e->from_stderr); e->from_stderr = -1; }
 }
 
@@ -568,15 +610,61 @@ static void collect_lib_dirs(const char *base, int depth, char *out, size_t cap)
     closedir(d);
 }
 
+/* Where the profile and its port file live. Both the child's --user-data-dir
+ * and the parent's DevToolsActivePort path are built from these, never from
+ * getenv: the child is given TMPDIR=/tmp below, so a parent that read its own
+ * TMPDIR could look in a different directory from the one the browser writes. */
+#define EVP_TMP          "/tmp"
+#define EVP_PROFILE_DIR  EVP_TMP "/engine-profile"
+#define EVP_ACTIVE_PORT  EVP_PROFILE_DIR "/DevToolsActivePort"
+
+/* SIGTERM, then SIGKILL after 500 ms, and reap. Idempotent. */
+static void engine_stop(Engine *e) {
+    int st = 0, i;
+    if (e->pid <= 0) return;
+    kill(e->pid, SIGTERM);
+    for (i = 0; i < 50; i++) {
+        if (waitpid(e->pid, &st, WNOHANG) == e->pid) {
+            e->status = WIFEXITED(st) ? WEXITSTATUS(st)
+                      : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : -1;
+            e->pid = 0;
+            e->alive = 0;
+            return;
+        }
+        {
+            struct timespec ts;
+            ts.tv_sec = 0;
+            ts.tv_nsec = 10L * 1000L * 1000L;
+            nanosleep(&ts, NULL);
+        }
+    }
+    kill(e->pid, SIGKILL);
+    waitpid(e->pid, &st, 0);
+    e->status = WIFEXITED(st) ? WEXITSTATUS(st)
+              : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : -1;
+    e->pid = 0;
+    e->alive = 0;
+}
+
+/* Start the headless engine. The DevTools endpoint is not waited for here: see
+ * engine_attach(), which the frame loop calls, so that a browser that takes
+ * seconds to listen is a countdown in the window rather than a frozen one.
+ *
+ * Returns 0 once the child is running (e->waiting is set), or -1 with err set
+ * when the browser could not be started at all - a missing payload, pipe() or
+ * fork() - in which case the caller renders with --screenshot. */
 static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
                         int mute_audio, char *err, size_t esz) {
     char exe[512], libdir[640], size[64], loader[600];
     char *argv[32];
-    int in[2] = {-1, -1}, out[2] = {-1, -1}, errp[2] = {-1, -1};
+    int errp[2] = {-1, -1};
     int n = 0;
 
     memset(e, 0, sizeof(*e));
-    e->to_engine = e->from_engine = e->from_stderr = -1;
+    e->from_stderr = -1;
+#ifndef _WIN32
+    e->net.fd = -1;         /* memset makes it 0, and fd 0 is stdin */
+#endif
 
     snprintf(exe, sizeof(exe), "%s/usr/lib/chromium/chromium-headless-shell", bundle);
     if (access(exe, X_OK) != 0) {
@@ -587,18 +675,20 @@ static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
     collect_lib_dirs(bundle, 0, libdir, sizeof libdir);
     if (!libdir[0]) snprintf(libdir, sizeof(libdir), "%s/usr/lib:%s/lib", bundle, bundle);
     snprintf(loader, sizeof(loader), "%s/lib/ld-musl-x86_64.so.1", bundle);
+    /* The loader is not exec'd (see the comment above execv), but a bundle
+     * without it can only fail there, and this line says why before the fork. */
     if (access(loader, X_OK) != 0)
+        fprintf(stderr, "engineview: warning: %s is not executable; execv will "
+                        "report the real error\n", loader);
     snprintf(size, sizeof(size), "--window-size=%dx%d", page_w, page_h);
 
-    /* Chromium's pipe handler reads fd 3 and writes fd 4, but it treats them as
-     * one connection: with two independent pipes it exits 1 without writing a
-     * byte, which is its 'connection terminated while reading' path. A stream
-     * socketpair gives it that connection - the child writes into one end and
-     * the parent reads the other. */
-    int sp[2] = { -1, -1 }, rp[2] = { -1, -1 };
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0 ||
-        socketpair(AF_UNIX, SOCK_STREAM, 0, rp) != 0 ||
-        pipe(errp) != 0) {
+    /* A DevToolsActivePort left by a previous run would be read as this run's,
+     * and the connect() to a dead port would look like a browser that never
+     * started. The browser deletes the file on a clean exit; a killed one does
+     * not. */
+    unlink(EVP_ACTIVE_PORT);
+
+    if (pipe(errp) != 0) {
         set_err(err, esz, "pipe(): %s", strerror(errno));
         return -1;
     }
@@ -606,61 +696,41 @@ static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
     pid_t pid = fork();
     if (pid < 0) {
         set_err(err, esz, "fork(): %s", strerror(errno));
+        close(errp[0]);
+        close(errp[1]);
         return -1;
     }
     if (pid == 0) {
-        /* fd 3 = commands into the browser, fd 4 = replies. Those two numbers
-         * are the DevTools pipe's contract, not a choice. The != guards matter:
-         * pipe() can hand us 3 or 4 and closing them after dup2 would close
-         * the very descriptor the engine is about to read. */
-        if (sp[0] != 3) dup2(sp[0], 3);
-        if (rp[0] != 4) dup2(rp[0], 4);
-        /* The desktop's stderr is the serial console, and it is the only place
-         * a message survives if the engine dies before the frame loop drains the
-         * pipe, so a copy is kept for the diagnostics below. */
+        /* dup(2) keeps the desktop's serial console: it is the one place a
+         * message survives when the engine dies before the frame loop drains
+         * its stderr. The marker file /app/engine-log in the bundle then sends
+         * that stderr to a file in the jail as well, so a death during startup
+         * leaves evidence after the console has scrolled away. */
         int console = dup(2);
-        if (console >= 0)
-            dprintf(console, "engineview: pipes in=%d,%d out=%d,%d err=%d,%d\n",
-                    in[0], in[1], out[0], out[1], errp[0], errp[1]);
         if (errp[1] != 2) dup2(errp[1], 2);
-        /* A marker file in the bundle sends the child's stderr to the
-         * console instead of the pipe: with the pipe, a loader that dies
-         * before main() leaves nothing readable at all. */
-        if (console >= 0 && access("/app/engine-log", F_OK) == 0)
-            dup2(console, 2);
-        if (sp[0] != 3 && sp[0] != 4 && sp[0] != 2) close(sp[0]);
-        if (sp[1] != 3 && sp[1] != 4 && sp[1] != 2) close(sp[1]);
-        if (rp[0] != 3 && rp[0] != 4 && rp[0] != 2) close(rp[0]);
-        if (rp[1] != 3 && rp[1] != 4 && rp[1] != 2) close(rp[1]);
-        if (errp[0] != 3 && errp[0] != 4 && errp[0] != 2) close(errp[0]);
+        if (errp[0] != 2) close(errp[0]);
         if (errp[1] != 2) close(errp[1]);
+        if (console >= 0 && access("/app/engine-log", F_OK) == 0) {
+            int lf = open(EVP_TMP "/engine-child.log",
+                          O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (lf >= 0) { dup2(lf, 2); if (lf != 2) close(lf); }
+        }
+        if (console >= 0)
+            dprintf(console, "engineview: exec %s\n", exe);
         setenv("LD_LIBRARY_PATH", libdir, 1);
-        setenv("HOME", "/tmp", 1);
-        setenv("TMPDIR", "/tmp", 1);
+        setenv("HOME", EVP_TMP, 1);
+        setenv("TMPDIR", EVP_TMP, 1);
 
         argv[n++] = exe;
-        argv[n++] = "--headless=new";          /* without it the shell prints
-        /* Chromium writes startup failures to this file as well as to
-         * stderr; when a child dies before the pipe is read the file
-         * is the only copy left, and it is readable from the jail. */
-        argv[n++] = "--enable-logging";
-        {
-            static char logf[400];
-            const char *td = getenv("TMPDIR");
-            snprintf(logf, sizeof logf, "--log-file=%s/chrome.log",
-                     td && td[0] ? td : "/tmp");
-            argv[n++] = logf;
-        }
-                                               argv[n++] = "--headless=new";   /* without it the shell prints usage */
-                                                                                 /* and exits 0, silently */
-        argv[n++] = "--remote-debugging-pipe";
+        argv[n++] = "--headless=new";          /* without it the shell prints usage
+                                                  * and exits 0, silently */
+        argv[n++] = "--remote-debugging-port=0"; /* the port and the browser path
+                                                  * are published in the profile */
         argv[n++] = "--no-sandbox";            /* the OS jail IS the sandbox */
         argv[n++] = "--disable-gpu";           /* no GPU: no GL, no DRI driver */
         {
-            static char prof[400];
-            const char *td = getenv("TMPDIR");
-            snprintf(prof, sizeof prof, "--user-data-dir=%s/engine-profile",
-                     td && td[0] ? td : "/tmp");
+            static char prof[256];
+            snprintf(prof, sizeof prof, "--user-data-dir=%s", EVP_PROFILE_DIR);
             argv[n++] = prof;
         }
         argv[n++] = "--no-first-run";
@@ -678,80 +748,137 @@ static int engine_spawn(Engine *e, const char *bundle, int page_w, int page_h,
         if (mute_audio) argv[n++] = "--mute-audio";
         argv[n++] = "about:blank";
         argv[n] = NULL;
-        if (console >= 0) {
-            char p3d[64], p4d[64];
-            ssize_t x = readlink("/proc/self/fd/3", p3d, sizeof p3d - 1);
-            ssize_t y = readlink("/proc/self/fd/4", p4d, sizeof p4d - 1);
-            p3d[x > 0 ? x : 0] = 0;
-            p4d[y > 0 ? y : 0] = 0;
-            dprintf(console, "engineview: exec %s fd3=%s fd4=%s\n",
-                    exe, p3d, p4d);
-        }
-        if (console >= 0) {
-            /* The child's stderr normally goes into the viewer's pipe, which is
-             * only drained once the frame loop runs; a child that dies during
-             * startup would leave no evidence at all. With the marker present it
-             * also goes to a file inside the jail, readable from the terminal. */
-            int lf = open("/tmp/engine-child.log",
-                          O_WRONLY | O_CREAT | O_APPEND, 0644);
-            if (lf >= 0) { dup2(lf, 2); if (lf != 2) close(lf); }
-            char p3[64], p4[64];
-            ssize_t a = readlink("/proc/self/fd/3", p3, sizeof p3 - 1);
-            ssize_t b = readlink("/proc/self/fd/4", p4, sizeof p4 - 1);
-            p3[a > 0 ? a : 0] = 0;
-            p4[b > 0 ? b : 0] = 0;
-            fprintf(stderr, "engineview: exec %s fd3=%s fd4=%s\n", exe, p3, p4);
-        }
         /* The binary is exec'd directly: chromium re-execs
          * /proc/self/exe for its child processes, so starting it through
          * the loader would make every child restart the loader with no
          * arguments ("GPU process launch failed"). The package rewrites
          * PT_INTERP to /app/ld-musl-x86_64.so.1, which exists in the jail. */
         execv(exe, argv);
-        fprintf(stderr, "engineview: execv %s: %s\n", loader, strerror(errno));
+        fprintf(stderr, "engineview: execv %s: %s\n", exe, strerror(errno));
         _exit(127);
     }
 
-    close(sp[0]);
-    close(rp[0]);
     close(errp[1]);
     e->pid = pid;
-    e->to_engine = sp[1];
-    e->from_engine = rp[1];
     e->from_stderr = errp[0];
     e->alive = 1;
-    fcntl(e->to_engine, F_SETFL, fcntl(e->to_engine, F_GETFL, 0) | O_NONBLOCK);
-    fcntl(e->from_engine, F_SETFL, fcntl(e->from_engine, F_GETFL, 0) | O_NONBLOCK);
     fcntl(e->from_stderr, F_SETFL, fcntl(e->from_stderr, F_GETFL, 0) | O_NONBLOCK);
+
+    /* The endpoint is not up yet: the browser publishes its port in
+     * DevToolsActivePort only once it is listening, and on a slow guest that is
+     * seconds after this fork. engine_attach() polls for it from the frame loop,
+     * so the window keeps drawing (and counting) in the meantime. */
+    e->waiting = 1;
+    e->spawned_ms = now_ms();
     return 0;
 }
 
+/* One CDP message, one WebSocket text frame. The transport owns the framing,
+ * so there is no NUL delimiter and no partial-message state here; a JSON
+ * object that does not fit the buffer is a bug in the caller, and cdpws_send_json
+ * would be handed invalid JSON, so the size is checked first. */
+static int engine_send(Engine *e, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
 static int engine_send(Engine *e, const char *fmt, ...) {
     char buf[4096];
     int n;
     va_list ap;
-    size_t off = 0;
-    if (e->to_engine < 0) return -1;
+    if (!e->ws) return -1;
     va_start(ap, fmt);
-    n = vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
+    n = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (n < 0) return -1;
-    if (n > (int)sizeof(buf) - 2) n = (int)sizeof(buf) - 2;
-    buf[n++] = '\0';                         /* the pipe's message delimiter */
-    while (off < (size_t)n) {
-        ssize_t w = write(e->to_engine, buf + off, (size_t)n - off);
-        if (w > 0) { off += (size_t)w; continue; }
-        if (w < 0 && (errno == EINTR || errno == EAGAIN)) {
-            struct pollfd pf;
-            pf.fd = e->to_engine;
-            pf.events = POLLOUT;
-            pf.revents = 0;
-            if (poll(&pf, 1, 100) <= 0) return -1;
-            continue;
-        }
+    if (n < 0 || (size_t)n >= sizeof(buf)) return -1;
+    return cdpws_send_json(e->ws, buf) < 0 ? -1 : 0;
+}
+
+/* Wait for the browser's DevTools endpoint and upgrade it - one attempt per
+ * pass of the frame loop, at most every 100 ms, so the window keeps drawing and
+ * the elapsed time in its card keeps counting.
+ *
+ * --remote-debugging-port=0 has the browser pick a free loopback port and write
+ * it, plus the WebSocket path for the browser target, into
+ * <user-data-dir>/DevToolsActivePort - and only once it is listening. That file
+ * is the readiness signal: cdpws_read_active_port() refuses a port outside
+ * 1..65535 or a path without '/', so a half-written file is never mistaken for a
+ * listening browser.
+ *
+ *   1  e->ws is upgraded and the channel is usable
+ *   0  not yet; call again
+ *  -1  it will not happen: err says why, and the child has been stopped
+ */
+static int engine_attach(Engine *e, char *err, size_t esz) {
+    int st = 0, port = 0;
+    char path[CDPWS_PATH_MAX], perr[CDPWS_ERR_MAX];
+
+    if (e->ws) return 1;
+    if (e->pid <= 0) {
+        set_err(err, esz, "the engine is not running");
         return -1;
     }
-    return 0;
+    /* Draining stderr is not optional while waiting: the pipe holds 64 KiB and
+     * a browser that fills it blocks on its own diagnostics. */
+    engine_note_stderr(e);
+    if (waitpid(e->pid, &st, WNOHANG) == e->pid) {
+        e->pid = 0;
+        e->alive = 0;
+        e->status = WIFEXITED(st) ? WEXITSTATUS(st)
+                  : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : -1;
+        engine_note_stderr(e);           /* whatever it said before it died */
+        set_err(err, esz, "the engine exited %d before it published %s%s%s",
+                e->status, EVP_ACTIVE_PORT,
+                e->stderr_len ? ": " : "", engine_last_stderr(e));
+        return -1;
+    }
+
+    if (e->polled_ms && now_ms() - e->polled_ms < 100) return 0;
+    e->polled_ms = now_ms();
+
+    path[0] = 0;
+    perr[0] = 0;
+    if (cdpws_read_active_port(EVP_ACTIVE_PORT, &port, path, sizeof path,
+                               perr, sizeof perr) != CDPWS_OK) {
+        if (now_ms() - e->spawned_ms >= 10000) {
+            set_err(err, esz, "no %s after 10 s: %s", EVP_ACTIVE_PORT,
+                    perr[0] ? perr : "the file never appeared");
+            engine_stop(e);
+            return -1;
+        }
+        return 0;
+    }
+#ifndef _WIN32
+    {
+        CdpwsTransport tr = cdpws_net_transport(&e->net);
+        CdpwsOpenOpts o;
+        char werr[CDPWS_ERR_MAX];
+        /* cdpws_open has no event loop to come back to: its upgrade response
+         * must be allowed to wait, so the transport polls for the full open
+         * deadline here. The frame loop sets it short below. */
+        e->net.io_timeout_ms = 5000;
+        memset(&o, 0, sizeof o);
+        o.host = "127.0.0.1";
+        o.port = port;
+        o.path = path;
+        o.timeout_ms = 5000;
+        o.max_message = 2u * EVP_MSG_MAX;   /* one base64 JPEG is ~150 KiB */
+        e->ws = cdpws_open(&tr, &o, werr, sizeof werr);
+        if (!e->ws) {
+            set_err(err, esz, "port %d did not accept the WebSocket upgrade: %s",
+                    port, werr);
+            engine_stop(e);
+            return -1;
+        }
+        /* Now the frame loop owns the socket: a read that waited would stop the
+         * window from drawing, and cdpws_recv reports a 20 ms timeout as
+         * "nothing complete yet" without failing the connection. */
+        e->net.io_timeout_ms = 20;
+    }
+    fprintf(stderr, "engineview: devtools over tcp port %d %s\n", port, path);
+    return 1;
+#else
+    set_err(err, esz, "the DevTools TCP transport is not built on this host");
+    engine_stop(e);
+    return -1;
+#endif
 }
 
 /* ============================================================
@@ -769,7 +896,8 @@ typedef struct {
     int  page_w, page_h;        /* the viewport we asked for */
     Img  frame;                 /* the last decoded frame */
     unsigned frames;            /* frames decoded since start */
-    int shot_mode;              /* rendering via --screenshot, not the pipe */
+    int  busy;                  /* a long render is running; no frame yet */
+    int  shot_mode;             /* rendering via --screenshot, not DevTools */
     long last_frame_ms;
     long first_send_ms;
     long next_id;
@@ -936,15 +1064,13 @@ static void input_text(Engine *e, Page *p, const char *text) {
 }
 
 /* ============================================================
- *  8. Reading the pipe
+ *  8. Reading the DevTools socket
+ *
+ *  cdpws_recv hands over whole messages only: it reassembles fragments,
+ *  answers pings itself and never returns a partial frame. A message is one
+ *  CDP JSON object, so unlike the pipe there is no NUL split and no
+ *  reassembly buffer in this file.
  * ============================================================ */
-typedef struct {
-    char  *buf;
-    size_t cap, len;
-    int    overflow;
-} Rx;
-
-static void rx_reset(Rx *r) { r->len = 0; r->overflow = 0; }
 
 static void handle_message(Page *p, Engine *e, const char *js, size_t n,
                            int *new_frame) {
@@ -1093,63 +1219,41 @@ static void handle_message(Page *p, Engine *e, const char *js, size_t n,
     }
 }
 
-/* Read everything available; returns the number of frames decoded. */
-static int engine_pump(Page *p, Engine *e, Rx *rx, long *last_rx_ms) {
-    char chunk[8192];
+/* Read everything the browser has sent; returns the number of frames decoded.
+ * Called once per pass of the frame loop, never blocks (the transport's read
+ * timeout is 20 ms and cdpws_recv reports a timeout as "nothing yet"). */
+static int engine_pump(Page *p, Engine *e) {
     int frames = 0;
 
     engine_note_stderr(e);
+    if (!e->ws) return 0;
 
     for (;;) {
-        ssize_t n = read(e->from_engine, chunk, sizeof(chunk));
-        if (n > 0) {
-            size_t off = 0;
-            *last_rx_ms = now_ms();
-            while (off < (size_t)n) {
-                char *nl = memchr(chunk + off, '\0', (size_t)n - off);
-                size_t take = nl ? (size_t)(nl - (chunk + off)) : (size_t)n - off;
-                if (rx->len + take >= rx->cap - 1) {
-                    /* A message we cannot hold is dropped whole, never
-                     * half-parsed: a truncated JSON would move the parser
-                     * into the middle of the next frame. */
-                    rx->overflow = 1;
-                    rx->len = 0;
-                } else {
-                    memcpy(rx->buf + rx->len, chunk + off, take);
-                    rx->len += take;
-                }
-                off += take;
-                if (nl) {
-                    off++;
-                    if (!rx->overflow && rx->len) {
-                        int nf = 0;
-                        rx->buf[rx->len] = 0;
-                        handle_message(p, e, rx->buf, rx->len, &nf);
-                        frames += nf;
-                    }
-                    rx_reset(rx);
-                }
-            }
-            continue;
-        }
-        if (n == 0) {
+        CdpwsMessage m;
+        int nf = 0;
+        int r = cdpws_recv(e->ws, &m);
+        if (r == 0) break;                     /* nothing pending */
+        if (r < 0) {
+            set_err(p->cdperr, sizeof(p->cdperr), "devtools: %s",
+                    cdpws_last_error(e->ws));
+            snprintf(p->state, sizeof(p->state), "devtools closed");
             e->alive = 0;
-            /* Drain what the child wrote before it died: without
-             * this the reason it exited is lost, because the exit is
-             * observed before the frame loop ever reads the pipe. */
-            engine_note_stderr(e);
-            if (e->stderr_len)
-                fprintf(stderr, "engine: %s\n", engine_last_stderr(e));
-            snprintf(p->state, sizeof(p->state), "engine exited");
-            return frames;
+            break;
         }
-        if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return frames;
-        e->alive = 0;
-        set_err(p->cdperr, sizeof(p->cdperr), "read from the engine: %s", strerror(errno));
-        snprintf(p->state, sizeof(p->state), "engine pipe closed");
-        return frames;
+        if (m.opcode == CDPWS_OP_CLOSE) {
+            /* The browser closed the session itself: a dead engine, but not a
+             * protocol error, so it gets its own sentence. */
+            snprintf(p->state, sizeof(p->state),
+                     "the engine closed the DevTools session (%d)", m.code);
+            e->alive = 0;
+            break;
+        }
+        if (m.opcode != CDPWS_OP_TEXT) continue;   /* ping answered inside */
+        /* cdpws guarantees NUL termination for text messages */
+        handle_message(p, e, (const char *)m.data, (size_t)m.len, &nf);
+        frames += nf;
     }
+    return frames;
 }
 
 /* ============================================================
@@ -1253,7 +1357,16 @@ static void draw_ui(MClient *c, Page *p, Engine *e, Font *fs, Font *fb,
     if (p->cdperr[0]) {
         draw_clip(&s, fs, 10, c->h - EVP_FOOT_H + 5, c->w - 20, p->cdperr,
                   RGB(255, 150, 150));
-    } else if (!e->alive) {
+    } else if (p->shot_mode) {
+        /* No live process exists in this mode, by design: the frame came from
+         * --screenshot. Say that rather than "engine exited". */
+        snprintf(line, sizeof(line),
+                 "%s   %dx%d   one frame per navigation (--screenshot)   "
+                 "F6 address   Esc closes",
+                 p->title[0] ? p->title : "(no title yet)", p->page_w, p->page_h);
+        draw_clip(&s, fs, 10, c->h - EVP_FOOT_H + 5, c->w - 20, line,
+                  RGB(230, 190, 120));
+    } else if (!e->alive && !p->busy) {
         const char *why = engine_last_stderr(e);
         snprintf(line, sizeof(line), "engine exited (status %d)%s%s",
                  e->status, why && why[0] ? ": " : "", why ? why : "");
@@ -1276,7 +1389,7 @@ static void draw_ui(MClient *c, Page *p, Engine *e, Font *fs, Font *fb,
         font_draw(&s, fb, (float)cx, (float)cy,
                   "Waiting for the engine's first frame", RGB(226, 232, 242));
         cy += (int)font_height(fb) + 10;
-        if (!e->alive) {
+        if (!e->alive && !p->busy) {
             snprintf(line, sizeof(line), "The engine process is not running: %s",
                      engine_last_stderr(e));
             draw_clip(&s, fs, cx, cy, pw - 52, line, RGB(255, 160, 160));
@@ -1308,13 +1421,14 @@ static void draw_ui(MClient *c, Page *p, Engine *e, Font *fs, Font *fb,
  * package to fit. */
 /* ---- screenshot mode -----------------------------------------------------
  *
- * The DevTools pipe path is the interactive one, but on this kernel the engine
- * exits 1 as soon as it is given --remote-debugging-pipe, in a jail and outside
- * one alike, while the very same binary renders happily when asked for a
- * document or a screenshot. So navigation is done the way that is proven: run
- * the engine with --screenshot at the window size, then show the PNG it wrote.
- * It is one frame per navigation rather than 30 per second, and it is honest
- * about that in the footer.
+ * DevTools over TCP is the interactive path, and it is only taken when the
+ * browser publishes a port and accepts the WebSocket upgrade. When it does not
+ * - an engine that dies in the jail, a port file that never appears - nothing
+ * can be driven, while the very same binary renders happily when asked for a
+ * document or a screenshot. So navigation then falls back to the way that is
+ * measured: run the engine with --screenshot at the window size, then show the
+ * PNG it wrote. It is one frame per navigation rather than 30 per second, and
+ * the footer says so.
  */
 static int shot_render(const char *bundle, const char *url, int w, int h,
                        Page *p, char *err, size_t esz) {
@@ -1374,6 +1488,23 @@ static int shot_render(const char *bundle, const char *url, int w, int h,
     p->frame = im;
     p->frames++;
     return 0;
+}
+
+/* The --screenshot fallback, with its bookkeeping in one place: a render can
+ * take tens of seconds, and while it runs the window must say so (p->busy)
+ * rather than claim the engine exited. Returns shot_render's result. */
+static int page_shot(const char *bundle, Page *p, char *err, size_t esz) {
+    int rc;
+    p->busy = 1;
+    rc = shot_render(bundle, p->url, p->page_w, p->page_h, p, err, esz);
+    p->busy = 0;
+    if (rc != 0) {
+        snprintf(p->state, sizeof(p->state), "%s", err);
+    } else {
+        snprintf(p->state, sizeof(p->state), "rendered");
+        p->shot_mode = 1;
+    }
+    return rc;
 }
 
 static void draw_missing(MClient *c, Font *fs, Font *fb, const char *why) {
@@ -1448,17 +1579,19 @@ int main(int argc, char **argv) {
     MClient c;
     Engine e;
     Page p;
-    Rx rx;
     Font *fs, *fb;
     char bundle[512], url[EVP_URL_MAX], err[512], exe[600];
     int px = 0, py = EVP_BAR_H, pw, ph;
     int quit = 0, dirty = 1, new_frame = 0, prev_buttons = 0;
     int last_mx = 0, last_my = 0;
-    long last_rx = 0, last_status = 0;
+    long last_status = 0;
 
     memset(&p, 0, sizeof(p));
     memset(&e, 0, sizeof(e));
-    e.to_engine = e.from_engine = e.from_stderr = -1;
+    e.from_stderr = -1;
+#ifndef _WIN32
+    e.net.fd = -1;
+#endif
 
     if (argc > 1 && argv[1] && argv[1][0]) {
         if (argv[1][0] == '/') snprintf(url, sizeof(url), "file://%s", argv[1]);
@@ -1489,16 +1622,6 @@ int main(int argc, char **argv) {
     p.first_send_ms = now_ms();
     snprintf(p.url, sizeof(p.url), "%s", url);
     if (strcmp(url, "about:blank")) snprintf(p.typing, sizeof(p.typing), "%s", url);
-
-    rx.cap = EVP_MSG_MAX;
-    rx.buf = (char *)malloc(rx.cap);
-    rx.len = 0;
-    rx.overflow = 0;
-    if (!rx.buf) {
-        fprintf(stderr, "engineview: out of memory for the protocol buffer\n");
-        mc_close(&c);
-        return 1;
-    }
 
     bundle_dir(bundle, sizeof(bundle));
     /* What the jail really gives this process: a silent exit 1 from the
@@ -1547,46 +1670,30 @@ int main(int argc, char **argv) {
             if (mute)
                 fprintf(stderr, "engineview: no /dev/snd PCM node - passing "
                                 "--mute-audio once (decode still happens)\n");
-            /* Try the live DevTools channel first: if the engine survives its
-             * first second it is interactive, and the frame loop takes over.
-             * If it dies - which is what this kernel did for every earlier
-             * transport - fall back to rendering a screenshot, which is one
-             * frame per navigation but always works. */
-            int fallback = 1;
+            /* The live DevTools channel is the interactive path; the fallback is
+             * --screenshot, one frame per navigation. engine_spawn() only forks:
+             * the endpoint is waited for by engine_attach() in the frame loop, so
+             * a browser that is slow to listen (or never does) is a countdown in
+             * the window, not ten seconds of frozen screen. */
             int spawned = engine_spawn(&e, bundle, p.page_w, p.page_h, mute,
                                        err, sizeof(err));
-            fprintf(stderr, "engineview: live channel %s%s%s\n",
-                    spawned == 0 ? "started" : "not started",
-                    spawned == 0 ? "" : ": ",
-                    spawned == 0 ? "" : err);
             if (spawned == 0) {
-                usleep(1200000);
-                int st0 = 0;
-                pid_t r0 = waitpid(e.pid, &st0, WNOHANG);
-                if (r0 == e.pid) {
-                    e.status = WIFEXITED(st0) ? WEXITSTATUS(st0) : -1;
-                    e.pid = 0;
-                    e.alive = 0;
-                    engine_close_pipe(&e);
-                    fprintf(stderr, "engineview: live channel exited (%d), "
-                                    "falling back to rendering\n", e.status);
-                } else {
-                    fallback = 0;
-                    snprintf(p.state, sizeof(p.state), "live pid %d", (int)e.pid);
-                    page_create(&p, &e);
-                }
-            }
-            if (fallback) {
-                char surl[EVP_URL_MAX];
-                snprintf(surl, sizeof(surl), "%s", p.url);
-                if (shot_render(bundle, surl, p.page_w, p.page_h, &p,
-                                err, sizeof(err)) != 0) {
+                snprintf(p.state, sizeof(p.state),
+                         "pid %d, waiting for DevToolsActivePort", (int)e.pid);
+                fprintf(stderr, "engineview: live channel started (pid %d), "
+                                "waiting for %s\n", (int)e.pid, EVP_ACTIVE_PORT);
+                /* The card goes up now; the loop counts the wait. */
+                draw_ui(&c, &p, &e, fs, fb, px, py, pw, ph);
+            } else {
+                fprintf(stderr, "engineview: live channel not started: %s\n", err);
+                /* A --screenshot render can take tens of seconds; paint the
+                 * card first so the wait is a message, not a blank window. */
+                p.busy = 1;
+                snprintf(p.state, sizeof(p.state), "rendering %s with --screenshot",
+                         p.url);
+                draw_ui(&c, &p, &e, fs, fb, px, py, pw, ph);
+                if (page_shot(bundle, &p, err, sizeof(err)) != 0)
                     draw_missing(&c, fs, fb, err);
-                    snprintf(p.state, sizeof(p.state), "render failed");
-                } else {
-                    snprintf(p.state, sizeof(p.state), "rendered");
-                    p.shot_mode = 1;
-                }
             }
         }
     }
@@ -1595,9 +1702,32 @@ int main(int argc, char **argv) {
         MEvent ev;
         new_frame = 0;
 
-        if (e.from_engine >= 0) {
-            new_frame = engine_pump(&p, &e, &rx, &last_rx);
+        if (e.ws) {
+            new_frame = engine_pump(&p, &e);
             if (new_frame) dirty = 1;
+        } else if (e.waiting) {
+            char aerr[256];
+            int r = engine_attach(&e, aerr, sizeof(aerr));
+            if (r == 1) {
+                e.waiting = 0;
+                p.shot_mode = 0;          /* a live channel replaced any still */
+                p.first_send_ms = now_ms();   /* the frame clock starts now */
+                snprintf(p.state, sizeof(p.state), "live pid %d", (int)e.pid);
+                page_create(&p, &e);
+                dirty = 1;
+            } else if (r < 0) {
+                e.waiting = 0;
+                fprintf(stderr, "engineview: live channel not started: %s\n", aerr);
+                p.busy = 1;
+                snprintf(p.state, sizeof(p.state), "rendering %s with --screenshot",
+                         p.url);
+                draw_ui(&c, &p, &e, fs, fb, px, py, pw, ph);
+                if (page_shot(bundle, &p, err, sizeof(err)) != 0)
+                    draw_missing(&c, fs, fb, err);
+                else
+                    snprintf(p.state, sizeof(p.state), "rendered (live: %s)", aerr);
+                dirty = 1;
+            }
         } else {
             engine_note_stderr(&e);
         }
@@ -1628,17 +1758,46 @@ int main(int argc, char **argv) {
                              strcmp(p.url, "about:blank") ? p.url : "");
                     dirty = 1;
                 } else if (ev.key == KEY_F5 || (ev.key == KEY_R && (ev.mods & MOD_CTRL))) {
-                    if (p.ready && p.url[0]) page_navigate(&p, &e, p.url);
+                    if (e.ws) {
+                        /* A live channel reloads the page it has. Before the
+                         * page is attached page_navigate() is a no-op, and the
+                         * attach path navigates to p->url itself. */
+                        page_navigate(&p, &e, p.url);
+                    } else if (e.waiting) {
+                        /* The channel is coming up; it navigates to p->url when
+                         * it attaches, so there is nothing to render now. */
+                        snprintf(p.state, sizeof(p.state),
+                                 "reload when the channel is up");
+                        dirty = 1;
+                    } else if (p.url[0]) {
+                        /* the fallback has no live page to reload */
+                        if (page_shot(bundle, &p, err, sizeof(err)) != 0)
+                            draw_missing(&c, fs, fb, err);
+                        dirty = 1;
+                    }
                 } else if (p.bar_focus) {
                     if (ev.key == KEY_ENTER) {
                         p.bar_focus = 0;
                         if (p.typing[0]) {
                             snprintf(p.url, sizeof(p.url), "%s", p.typing);
-                            if (shot_render(bundle, p.url, p.page_w, p.page_h,
-                                            &p, err, sizeof(err)) != 0)
-                                snprintf(p.state, sizeof(p.state), "%s", err);
-                            else
-                                snprintf(p.state, sizeof(p.state), "rendered");
+                            if (e.ws || e.waiting) {
+                                /* The live page navigates itself; nothing is
+                                 * rendered here. page_navigate() drops the URL
+                                 * until the page is attached, and the attach
+                                 * handler navigates to p->url - so this also
+                                 * works while a tab is being created, or while
+                                 * the channel itself is still coming up. Never
+                                 * start a second browser to answer this. */
+                                page_navigate(&p, &e, p.url);
+                                /* A channel with no page (createTarget or
+                                 * attachToTarget failed) gets one more try:
+                                 * that is the only state where this happens. */
+                                if (e.ws && !p.ready && !p.creating)
+                                    page_create(&p, &e);
+                            } else if (page_shot(bundle, &p, err,
+                                                 sizeof(err)) != 0) {
+                                draw_missing(&c, fs, fb, err);
+                            }
                         }
                         dirty = 1;
                     } else if (ev.key == KEY_BACKSPACE) {
@@ -1712,23 +1871,31 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* reap a dead engine exactly once */
+        /* Reap a dead engine, or stop one this window can no longer drive,
+         * exactly once. Without the second half a browser whose DevTools socket
+         * failed would keep running - hundreds of megabytes - while nothing
+         * could reach it. */
         if (e.pid > 0 && !e.alive) {
             int st = 0;
-            pid_t r = waitpid(e.pid, &st, WNOHANG);
-            if (r == e.pid) {
-                /* The pipe still holds whatever the engine wrote before it
-                 * died; closing it here without reading loses the only copy of
-                 * the reason. */
+            if (waitpid(e.pid, &st, WNOHANG) == e.pid) {
+                /* The stderr pipe still holds whatever the engine wrote before
+                 * it died; closing it here without reading loses the only copy
+                 * of the reason. */
                 engine_note_stderr(&e);
                 if (e.stderr_len)
                     fprintf(stderr, "engine: %s\n", engine_last_stderr(&e));
                 e.status = WIFEXITED(st) ? WEXITSTATUS(st)
                          : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : -1;
                 e.pid = 0;
-                engine_close_pipe(&e);
-                dirty = 1;
+            } else {
+                engine_note_stderr(&e);
+                engine_stop(&e);
+                fprintf(stderr, "engineview: stopped an unreachable engine "
+                                "(status %d): %s\n", e.status,
+                        p.cdperr[0] ? p.cdperr : p.state);
             }
+            engine_close_pipe(&e);
+            dirty = 1;
         }
 
         if (dirty) {
@@ -1742,26 +1909,11 @@ int main(int argc, char **argv) {
             ts.tv_nsec = (new_frame ? 4L : 12L) * 1000L * 1000L;
             nanosleep(&ts, NULL);
         }
-        (void)last_rx;
     }
 
-    if (e.pid > 0) {
-        int st = 0, i;
-        kill(e.pid, SIGTERM);
-        for (i = 0; i < 50; i++) {                    /* up to 500 ms */
-            if (waitpid(e.pid, &st, WNOHANG) == e.pid) { e.pid = 0; break; }
-            {
-                struct timespec ts;
-                ts.tv_sec = 0;
-                ts.tv_nsec = 10L * 1000L * 1000L;
-                nanosleep(&ts, NULL);
-            }
-        }
-        if (e.pid > 0) { kill(e.pid, SIGKILL); waitpid(e.pid, &st, 0); }
-    }
+    engine_stop(&e);
     engine_close_pipe(&e);
     img_free(&p.frame);
-    free(rx.buf);
     mc_close(&c);
     return 0;
 }
