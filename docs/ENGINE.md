@@ -434,7 +434,8 @@ which one is missing instead of a dead rectangle:
 | **Static rendering (`--screenshot`)** | **Verified in a boot**: `docs/screenshots/chromium-page.png`, one frame per navigation. This is the path the viewer falls back to when the live channel is unavailable; the boots below used the live one. |
 | **Live DevTools channel (frames)** | **Verified in boots**: `docs/screenshots/chromium-live.png` (`page attached  2 frames` over the test page), `https-example.png` (example.com, 4 frames), `youtube.png` (https://www.youtube.com/, 15 frames), and the newest `youtube-watch.png` (51 frames) / `youtube-playing.png` (148 frames) (§11.7). |
 | **Navigation and HTTPS** | Verified: `youtube.png` shows `https://www.youtube.com/` in the address bar and `YouTube` in the footer; `https-example.png` shows example.com rendered with `Example Domain` in the footer (its bar still read `about:blank`). Chromium's own TLS uses the image's CA bundle, bound read-only at `/etc/ssl/certs/ca-bundle.crt` (`src/wmsrv.c:436`). |
-| **Input over the live channel** | A click at 480,300 in the YouTube page was followed by the video playing (`youtube-playing.png`). Scrolling and form entry are still unproven. |
+| **Input over the live channel** | A click at 480,300 in the YouTube page was followed by the video playing (`youtube-playing.png`, 148 frames; `youtube-video-audio-jail.png`, 252 frames). Scrolling and form entry are still unproven. |
+| **A second heavy site** | `github.com` renders in full - hero, sign-up form, Mona, footer - at `docs/screenshots/github.png` with 455 frames, so the result is not specific to one site's markup. |
 | HTML5 parsing | Blink. The binary contains `HTMLDocument`, `CSSStyleSheet` and `blink` strings [apk, byte search, §11.3]. |
 | CSS | Blink: full CSS, not our subset. |
 | JavaScript | V8. The binary contains `v8_context_snapshot` [apk]. WebAssembly is V8's. |
@@ -884,15 +885,16 @@ resolves — only a boot can show that — and the engine started in the boot of
 
 ### 11.7 What was run, what was not, and the loopback line
 
-* No QEMU was run by the worker that wrote this section; a boot was run on
-  this tree while the document was being finished, and its serial log is
-  quoted below. No Chromium process was started on this host. A page **was**
+* No QEMU was run by the worker that wrote this section; boots were run on
+  this tree while the document was being finished, and the serial line cited
+  below is quoted from a saved excerpt (`build/serial.log` is overwritten by
+  every boot). No Chromium process was started on this host. A page **was**
   rendered by Blink in the boot that produced
   `docs/screenshots/chromium-page.png`; nothing here reproduced that image.
-* Apart from the boot quoted below, the DevTools TCP channel has never been
-  exercised against a browser. What was run on the host, rebuilt for this
-  report: `.work/cdp1/harness.c` against `src/client/cdpws.c` → **131 checks, 0
-  failed**. It covers the RFC 6455 example key and the accept-key calculation, a
+* Apart from the guest boots described below, the DevTools TCP channel has only
+  been exercised on the host, through the harness. What was run there, rebuilt
+  for this report: `.work/cdp1/harness.c` against `src/client/cdpws.c` →
+  **131 checks, 0 failed**. It covers the RFC 6455 example key and the accept-key calculation, a
   wrong or missing `Sec-WebSocket-Accept` failing closed, masked client frames
   with a fresh key per frame, fragmented server messages reassembled with a ping
   between fragments, ping/pong/close, 64-bit lengths, protocol violations, and a
@@ -928,12 +930,16 @@ resolves — only a boot can show that — and the engine started in the boot of
   Later boots navigated. The committed `docs/screenshots/youtube.png` shows
   `https://www.youtube.com/` in the address bar, `YouTube` in the footer and
   `page attached  15 frames`; the committed `docs/screenshots/https-example.png`
-  shows `example.com` with `Example Domain` in the footer and four frames. The
-  latest screendumps go further:
-  `docs/screenshots/youtube-watch.png` (51 frames, watch URL in the bar) and
-  `docs/screenshots/youtube-playing.png` (148 frames, the video playing after a
-  click at 480,300). The loader warning in the log is the wrong path in the
-  app's own check (§4).
+  shows `example.com` with `Example Domain` in the footer and four frames.
+  Further commits record the watch page and playback:
+  `youtube-watch.png` (51 frames, watch URL in the bar), `youtube-playing.png`
+  (148 frames, the video playing after a click at 480,300), and
+  `youtube-video-audio-jail.png` (252 frames, committed with the jail's
+  `audio = yes` manifest). The video is still silent in all of them: the jail
+  now binds `/dev/snd` (`jail: /dev = snd console zero urandom null shm`) but
+  the guest has no PCM node (`snd_hda_intel: Cannot probe codecs`), so the app
+  still passes `--mute-audio`. The loader warning in the log is the wrong path
+  in the app's own check (§4).
 
   The line that made it possible, `ip link set lo up`, is at
   `stage/init:227`, added during this run before eth0 is brought up; the
