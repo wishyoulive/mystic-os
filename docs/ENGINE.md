@@ -467,7 +467,7 @@ same line §3.1 needs to reach 127.0.0.1 at all).
 |---|---|
 | `tools/fetch-chromium.py` | resolves the closure for `chromium-headless-shell`, downloads with resume, unpacks and packs `build/repo/chromium.tar.gz` |
 | `tools/pack-engine.py` | takes that closure plus the viewer, rewrites the engine's `PT_INTERP` in place and packs `build/repo/engine.tar.gz` |
-| `tools/mkapp.sh engine` | compiles the viewer and installs it as the bundle's `bin`; it adds `src/client/cdpws.c` to the link when that file exists |
+| `tools/mkapp.sh engine` | compiles the STATIC viewer and installs it as the bundle's `bin` - the in-image stand-in only; the package's `bin` is `engine_launch.c` |
 | `src/client/apps/engine.c` | the window app: CDP over TCP + WebSocket, JPEG→`0xAARRGGBB` frames, input forwarding, address bar, honest failure cards, `--screenshot` fallback. `EVP_SELFTEST` builds the parser tests |
 | `src/client/cdpws.c` / `cdpws.h` | the transport: `DevToolsActivePort` parsing, TCP connect to 127.0.0.1, RFC 6455 upgrade with accept-key validation, masked client frames, fragment reassembly |
 | `tools/serve-repo.sh` | rebuilds the index over `build/repo` and serves it; it copies the `engine` row from `build/repo/engine.row` verbatim (§7.1) |
@@ -481,7 +481,10 @@ The bundle layout, as installed by `pkg` under `/root/apps/engine`:
 
 ```
 manifest                       name/desc/exec=bin/version/network/procs/audio/placeholder
-bin                            the static viewer (241,744 bytes)
+bin                            the STATIC launcher (27 KB, no PT_INTERP): it execs
+                               the bundle's loader on the payload below
+libexec/engine                 the viewer (906 KB), PT_INTERP
+                               /app/ld-musl-x86_64.so.1, DT_NEEDED libjpeg.so.8
 ld-musl-x86_64.so.1            musl's loader, at the literal PT_INTERP path
 usr/lib/chromium/chromium-headless-shell   202,432,312 bytes, PT_INTERP /app/...
 usr/lib/…                      the shared-object closure (59 DT_NEEDED for the engine)
@@ -490,10 +493,14 @@ usr/share/fonts/, etc/fonts/   fonts and fontconfig config from the closure
 etc/, PKGINFO, post-install   inherited from the Alpine package for the closure
 ```
 
-`exec = bin`, and that is a deliberate change from the first bundle: the
-closure has a top-level `bin/` directory (Alpine's shell) and a tar cannot
-create a file and a directory with the same name, so `tools/pack-engine.py`
-drops the closure's `bin/` tree and puts the viewer there. Nothing in it is
+`exec = bin`, and `bin` is a launcher rather than the viewer. Both halves of
+that are deliberate. The name is forced: the closure has a top-level `bin/`
+directory (Alpine's shell) and a tar cannot create a file and a directory with
+the same name, so `tools/pack-engine.py` drops the closure's `bin/` tree and puts
+the launcher there. It is a launcher because a static binary cannot `dlopen`,
+and the frame-rate work needs the bundle's own libjpeg-turbo; the payload
+therefore lives at `libexec/engine` with `PT_INTERP /app/ld-musl-x86_64.so.1`,
+the same shape the VLC player uses with `libexec/vlcplay`. Nothing in it is
 needed: the engine lives under `usr/lib`. `src/wmsrv.c` only requires the exec
 to be a bare file name.
 

@@ -1021,6 +1021,23 @@ def main():
     ap.add_argument("--list", action="store_true", help="print the whole closure")
     args = ap.parse_args()
 
+    # This builder predates the frame-rate work: it compiles a STATIC viewer and
+    # installs it as the bundle's exec, which cannot use the bundle's
+    # libjpeg-turbo (static musl has no dlopen) and would silently ship the
+    # old, slow decoder. The supported pipeline is fetch-chromium.py for the
+    # closure and pack-engine.py for the bundle, which ships a static launcher
+    # plus a dynamic payload at libexec/engine. Resolution and measurement
+    # (--candidates) still work here; packing does not.
+    if not (args.candidates or args.dry_run or args.list or args.no_pack):
+        raise SystemExit(
+            "error: tools/fetch-engine.py no longer packs the bundle - it would "
+            "ship the static viewer without libjpeg-turbo.
+"
+            "       use: python tools/fetch-chromium.py --branch v3.24 --id "
+            "chromium
+"
+            "            python tools/pack-engine.py")
+
     roots = args.root or [DEFAULT_ROOT]
     if args.force:
         for d in (APK_CACHE,):
