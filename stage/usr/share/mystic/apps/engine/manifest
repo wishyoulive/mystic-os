@@ -6,3 +6,4 @@ network = host
 bundle = engine
 placeholder = yes
 procs = yes
+audio = yes

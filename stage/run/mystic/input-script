@@ -9,7 +9,12 @@ enter
 wait 250
 sendkey f6
 wait 30
-text https://www.youtube.com/
+text https://www.youtube.com/watch?v=dQw4w9WgXcQ
 wait 30
 enter
-wait 900
+wait 700
+abs 480 300
+press
+wait 20
+release
+wait 600
