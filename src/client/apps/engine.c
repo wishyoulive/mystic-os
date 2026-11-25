@@ -896,6 +896,9 @@ typedef struct {
     int  page_w, page_h;        /* the viewport we asked for */
     Img  frame;                 /* the last decoded frame */
     unsigned frames;            /* frames decoded since start */
+    long     sum_decode_ms;     /* time we spend decoding, per 100 frames */
+    long     sum_gap_ms;        /* time between frames, per 100 frames */
+    long     last_recv_ms;
     int  busy;                  /* a long render is running; no frame yet */
     int  shot_mode;             /* rendering via --screenshot, not DevTools */
     long last_frame_ms;
@@ -920,9 +923,9 @@ static void page_start_cast(Page *p, Engine *e) {
     if (!p->ready) return;
     engine_send(e,
         "{\"id\":%ld,\"sessionId\":\"%s\",\"method\":\"Page.startScreencast\","
-        "\"params\":{\"format\":\"jpeg\",\"quality\":70,"
+        "\"params\":{\"format\":\"jpeg\",\"quality\":60,"
         "\"maxWidth\":%d,\"maxHeight\":%d,\"everyNthFrame\":1}}",
-        ++p->next_id, p->session, p->page_w, p->page_h);
+        ++p->next_id, p->session, p->page_w / 2, p->page_h / 2);
 }
 
 static void page_navigate(Page *p, Engine *e, const char *url) {
@@ -1084,10 +1087,29 @@ static void handle_message(Page *p, Engine *e, const char *js, size_t n,
             const char *data;
             size_t dlen;
             long cast_id = 0;
+            const char *payload = NULL;
+            size_t plen = 0;
             if (!js_get(js, n, "params", &data, &dlen)) return;
+
+            /* Acknowledge FIRST, then decode. Chromium's screencast is
+             * flow-controlled by the ack: it sends the next frame only after
+             * this one is acknowledged. Decoding before acknowledging put our
+             * JPEG decode inside the browser's frame pacing, so the frame rate
+             * we saw was 1 / (engine encode + transfer + our decode) instead of
+             * 1 / (engine encode + transfer). The browser can encode the next
+             * frame while this one is being decoded. */
+            if (js_get(data, dlen, "sessionId", &payload, &plen))
+                cast_id = strtol(payload, NULL, 10);
+            if (js_get_str(js, n, "sessionId", session, sizeof(session))) {
+                engine_send(e,
+                    "{\"id\":%ld,\"sessionId\":\"%s\","
+                    "\"method\":\"Page.screencastFrameAck\","
+                    "\"params\":{\"sessionId\":%ld}}",
+                    ++p->next_id, session, cast_id);
+            }
+
+            long recv_ms = now_ms();
             {
-                const char *payload = NULL;
-                size_t plen = 0;
                 if (js_get(data, dlen, "data", &payload, &plen) &&
                     plen >= 2 && payload[0] == '"') {
                     long got = b64_decode(payload + 1, plen - 2,
@@ -1096,7 +1118,11 @@ static void handle_message(Page *p, Engine *e, const char *js, size_t n,
                         Img im;
                         char ierr[160];
                         memset(&im, 0, sizeof(im));
+                        long t0 = now_ms();
                         if (img_decode(evp_jpeg, (size_t)got, &im, ierr, sizeof(ierr)) == 0) {
+                            p->sum_decode_ms += now_ms() - t0;
+                            if (p->last_recv_ms) p->sum_gap_ms += recv_ms - p->last_recv_ms;
+                            p->last_recv_ms = recv_ms;
                             img_free(&p->frame);
                             p->frame = im;
                             p->frames++;
@@ -1111,16 +1137,20 @@ static void handle_message(Page *p, Engine *e, const char *js, size_t n,
                                 "screencastFrame: base64 data is not valid");
                     }
                 }
-                if (js_get(data, dlen, "sessionId", &payload, &plen))
-                    cast_id = strtol(payload, NULL, 10);
             }
-            /* The ACK is mandatory: without it the engine stops sending. */
-            if (js_get_str(js, n, "sessionId", session, sizeof(session))) {
-                engine_send(e,
-                    "{\"id\":%ld,\"sessionId\":\"%s\","
-                    "\"method\":\"Page.screencastFrameAck\","
-                    "\"params\":{\"sessionId\":%ld}}",
-                    ++p->next_id, session, cast_id);
+            /* Frame-rate report: one line per hundred frames, so a boot log
+             * says what the pipeline really did instead of leaving it a guess. */
+            if (p->frames && p->frames % 100 == 0) {
+                long dt = now_ms() - p->first_send_ms;
+                long blk = 100;
+                if (dt > 0)
+                    fprintf(stderr, "engineview: %u frames in %ld ms (%.1f fps), "
+                                    "decode %.1f ms, gap %.1f ms\n",
+                            p->frames, dt, (double)p->frames * 1000.0 / (double)dt,
+                            (double)p->sum_decode_ms / (double)blk,
+                            (double)p->sum_gap_ms / (double)blk);
+                p->sum_decode_ms = 0;
+                p->sum_gap_ms = 0;
             }
             return;
         }
