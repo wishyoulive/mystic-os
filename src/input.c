@@ -422,11 +422,14 @@ void input_set_screen(Input *in, int w, int h) {
  * makes a resize or a drag untestable; with a script the same interaction can
  * be reproduced deterministically, on any machine, in CI.
  */
+static void push_key(int *arr, int *n, int cap, int code);
+
 static FILE *test_script;
 static int   test_eof;
 static int   test_wait;          /* frames still to skip before the next line */
 static char  test_pending[512];  /* text that did not fit in one frame */
 static int   test_pending_len, test_pending_off;
+static int   test_key_release, test_key_release_wait;
 
 /* Hand the focused window as much of the pending text as one frame carries. */
 static void test_pump(Input *in) {
@@ -459,6 +462,13 @@ static void test_open(void) {
 static void test_step(Input *in) {
     char line[192];
     if (!test_script || test_eof) return;
+    if (test_key_release_wait > 0 && --test_key_release_wait == 0) {
+        int code = test_key_release;
+        test_key_release = 0;
+        push_key(in->keys_up, &in->nkeys_up,
+                 (int)(sizeof(in->keys_up) / sizeof(in->keys_up[0])), code);
+        in->key_pressed = 1;
+    }
     if (test_wait > 0) { test_wait--; return; }
     if (test_pending_off < test_pending_len) { test_pump(in); return; }
     if (!fgets(line, sizeof line, test_script)) { test_eof = 1; return; }
@@ -481,6 +491,20 @@ static void test_step(Input *in) {
     } else if (!strcmp(what, "rrelease")) {
         if (in->buttons & 2) in->released = 1;
         in->buttons &= ~2;
+    } else if (!strcmp(what, "key")) {
+        /* Inject an evdev keycode as a press+release pair. `text` fills the
+         * text queue (which is what a shell or a search field reads), so a
+         * key an app handles by CODE - a speed key, a shortcut - could not be
+         * exercised before this. a is the code; the release follows after a
+         * few frames so the app sees a complete press. */
+        if (a > 0 && a < 0x300) {
+            in->key = a;
+            push_key(in->keys, &in->nkeys,
+                     (int)(sizeof(in->keys) / sizeof(in->keys[0])), a);
+            in->key_pressed = 1;
+            test_key_release = a;
+            test_key_release_wait = 3;
+        }
     } else if (!strcmp(what, "wheel")) {
         in->wheel += a;
     } else if (!strcmp(what, "text")) {

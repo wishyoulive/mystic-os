@@ -15,9 +15,13 @@ measurements instead of hope:
 3. **What does it cost, and is it realistic?** Two profiles, both measured:
    a **minimal** player (libVLC + vmem + PNG/JPEG/raw decode) adds **1.1 MB
    gzipped** to the image (2.15 MB as our stage tree stores it) and needs no
-   codec library at all - that is the first milestone and it is realistic. A player that decodes **H.264/HEVC** needs
-   libavcodec and adds **67.5 MB gzipped** - 5x the whole image. That one is a
-   separate disk image or a 9p mount, not part of the 13 MB initramfs.
+   codec library at all - that is the first milestone and it is realistic. The
+   default **playback** profile (libavcodec + dedicated dav1d/vpx/theora/opus/
+   vorbis/mpg123 decoders + all 14 packetizers + subtitle decoding) is
+   **39.55 MB compressed / 105.24 MB installed** - about three copies of the
+   whole image, so a separate disk image or a 9p mount, not part of the 13 MB
+   initramfs. Section 3.6 has the current table; the old 67.5 MB figure in
+   this paragraph was measured before the soname/symlink fix.
 
 Audio is the honest casualty: there is **no sound device configured for QEMU**
 and **no sound driver staged in the image**, so a libVLC player can decode audio
@@ -58,7 +62,7 @@ prints `I:` and calls it "compressed"; `tools/fetch-vlc.py` prints both, labelle
 | Staging tree | 32 MB | `du -sh stage` **[ours]** |
 | Data disk | 64 MB FAT, formatted on first boot | `image.sh` `MYSTIC_DISK_MB` **[ours]** |
 | Kernel | Alpine `linux-virt` 6.18.63, modules from the same package | `tools/fetch-kernel.sh` **[ours]** |
-| Sound | **none**: no `-audiodev`, no sound `-device` in the QEMU line | `image.sh` BOOT array **[ours]** |
+| Sound | **device present**: `-audiodev sdl,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0`; `stage/init` loads the `snd*` modules, and **devtmpfs** creates `/dev/snd/pcmC0D0p`; `init` then `chmod 0666`s the playback nodes (there is no udev here). Whether a PCM open succeeds and sound reaches the host is unproven - section 4 | `image.sh` line with `-audiodev`, `stage/lib/modules/*/kernel/sound/`, `stage/init` lines 66-87 (modprobe + chmod, not mknod) **[ours]** |
 | Screen | 1280x800 in the default `-vga std` setup; the real size comes from `FBIOGET_FSCREENINFO` | `src/fb.c` **[ours]** |
 | Pixel format | `0xAARRGGBB` in a `u32`; little-endian bytes B,G,R,A | `src/mystic.h`, `RGB()`/`GET_R()` **[ours]** |
 | Window blit | one `memcpy` per row from the client shm buffer into the scene, **no alpha blending** | `src/main.c`, the `WIN_CLIENT` branch (`cl->px` rows) **[ours]** |
@@ -145,7 +149,16 @@ take individual plugin files out of `vlc` without installing its dependency list
 
 ---
 
-## 3. The display path: `vmem` + `RV32`
+## 3. The display path: `vmem` + the decoder's own I420 planes
+
+> **Rewritten 2026-11-26.** This section used to describe asking libVLC for
+> RV32 at the window size. That is not what the player does any more, and the
+> packed `libexec/vlcplay` of this build contains no `RV32` string (byte
+> search, not an assumption). The vmem API is unchanged; what changed is what
+> `setup()` answers and which thread does the conversion. The 4K rate in the
+> table below was measured on the old path; *why* it was 17 fps (vout thread vs
+> decoder threads) is not proven by that measurement, only that the old path
+> converts 8.3 M pixels per frame on one thread.
 
 ### 3.1 The API
 
@@ -167,46 +180,64 @@ void libvlc_video_set_format_callbacks( libvlc_media_player_t *mp,
                                         libvlc_video_cleanup_cb cleanup );
 ```
 
-The callbacks we implement, with the header's own contract:
+The player uses `set_callbacks` + `set_format_callbacks`. It does **not** call
+`libvlc_video_set_format`: that is the fixed-format variant (the RV32 path this
+document used to describe), and it cannot answer the decoder's own fourcc.
 
-| Callback | Signature | What we do |
-|---|---|---|
-| `lock` | `void *(*)(void *opaque, void **planes)` | `planes[0] = window->px; return window;` |
-| `unlock` | `void (*)(void *opaque, void *picture, void *const *planes)` | nothing |
-| `display` | `void (*)(void *opaque, void *picture)` | send `FRAME` to the window server |
-| `setup` | `unsigned (*)(void **opaque, char *chroma, unsigned *w, unsigned *h, unsigned *pitches, unsigned *lines)` | write `"RV32"`, set `w`=window width, `h`=window height, `pitches[0]=stride*4` from the wm's `OK` line, `lines[0]=h`, return 1 |
-| `cleanup` | `void (*)(void *opaque)` | nothing |
+The callbacks we implement, with the header's contract and what the shipped
+`src/client/apps/vlcplay.c` actually does:
+
+| Callback | What the player does |
+|---|---|
+| `setup` | keeps the decoder's I420 or NV12 fourcc **and the decoder's width/height**, allocates three plane sets (a ring, `VLC_SETS`), writes back `pitches[]`/`lines[]`. For a format we cannot sample (10-bit, 4:2:2, hardware surface) it answers I420 at the same size. Returning 1 means "deliver this". |
+| `lock` | hands libVLC the next free plane set (`planes[0..2]`); waits on a condition variable until that slot is neither being filled nor being read |
+| `unlock` | marks the set complete, counts the frame, and every 100 frames prints the measured fps (last 100 and average since start) |
+| `display` | counts a display; the **window thread** samples the newest complete set into the window buffer and sends `FRAME` |
+| `cleanup` | frees all three plane sets |
 
 Header notes we must respect, quoted **[apk]**:
 
 - "one or three pixel planes ... Those planes must be aligned on 32-bytes
-  boundaries" - our shm mapping is page-aligned, so this is free.
-- "we recommend that pitches and lines be multiple of 32" - the pitch comes
-  from the wm (see 3.4); on the 1280x800 screen the stride is 1280 pixels, so
-  `pitch = 5120` bytes, a multiple of 32. If the screen width is ever not a
-  multiple of 8, round the buffer's stride up, not the window's width.
-- "Rendering video into custom memory buffers is considerably less efficient
-  than rendering in a custom window as normal" - true in general, irrelevant
-  here because we have no window system to render into.
+  boundaries" - `planes_alloc()` `malloc`s and aligns the base by hand, then
+  checks the real address and every pitch against 32 and refuses the frame if
+  the contract is not met.
+- "we recommend that pitches and lines be multiple of 32" - the plane pitches
+  are rounded up to a multiple of 32 bytes.
+- "Memory copying is required between LibVLC reference picture buffers and
+  application buffers" - true, and section 3.3 says exactly what it costs.
 
-### 3.2 `RV32` is our pixel format, exactly
+### 3.2 I420/NV12 at the decoder's size is the format
 
-`RV32` is `VLC_CODEC_RGB32` (`include/vlc_fourcc.h`: "24 bits RGB padded to
-32 bits") **[apk]**. Its bit layout is set twice in upstream, identically:
+`vmem`'s `setup` callback receives the decoder's fourcc and picture size, and
+`Prepare()` then copies pixels **plane for plane** (`picture_CopyPixels`) into
+whatever we answered. Answering the same fourcc and the same size therefore
+means **no chroma conversion and no scaling inside libVLC** - the only work it
+does is the plane copy.
 
-- `modules/video_output/vmem.c`, `Open()`, for `VLC_CODEC_RGB32`:
-  `rmask = 0xff0000, gmask = 0x00ff00, bmask = 0x0000ff` **[src]**
-- `src/misc/es_format.c`, `video_format_FixRgb()`, same three masks for
-  `VLC_CODEC_RGB32` **[src]**
+- We accept `I420` (three planes) and `NV12` (Y + interleaved UV), because some
+  decoders propose NV12. Anything else is answered with `I420` at the same
+  size; libVLC must then find a converter. For 8-bit 4:2:0 the shipped
+  `i420_rgb`/`chain` plugins are not needed at all; for 10-bit and 4:2:2 they
+  are not sufficient (the Codecs section lists that gap).
+- **Colour** is BT.601 limited range, integer only (`src/yuv.h`): `C = Y-16`,
+  `D = U-128`, `E = V-128`, `R = (298C + 409E + 128) >> 8`, etc. libVLC 3's
+  vmem API has no colour-space field, so a BT.709 or full-range stream gets
+  slightly different hues - a stated limitation, not a hidden one.
+- **RV32 is what the API also offers, and it is what the player used before.**
+  It is `VLC_CODEC_RGB32`: masks `0xff0000`/`0x00ff00`/`0x0000ff`
+  (`modules/video_output/vmem.c`, `Open()`), so a pixel is `u32 = 0x00RRGGBB`
+  and on little-endian the bytes are `B, G, R, 0x00` - byte-identical to a
+  Mystic window pixel (`0xAARRGGBB`, alpha ignored by the compositor). That is
+  still true, and it is why the first working player was 120 lines. But asking
+  vmem for RV32 at the window size makes libVLC's single video-output thread
+  convert and rescale every decoded picture to RGB: 8,294,400 converted pixels
+  per 4K frame before the player sees one. Whether that thread was the exact
+  17 fps ceiling on the four-vCPU guest is a hypothesis the old measurement
+  cannot separate from decoder saturation; what is certain is the work it does
+  per frame. The bundle still ships `rv32`/`chain`/`i420_rgb*` because they
+  are the plugins that path needs; the current player never requests them.
 
-A pixel is therefore `u32 = 0x00RRGGBB`, and on little-endian the bytes in
-memory are `B, G, R, 0x00`. Our window buffer is `0xAARRGGBB` with the alpha
-byte ignored by the compositor's `memcpy` **[ours]**. **Same u32, same bytes.**
-
-That is the entire "port": there is no conversion code to write, and the only
-thing we must not do is treat the top byte as meaningful.
-
-### 3.3 The copy vmem makes - and how to spend it well
+### 3.3 The copy vmem makes - and where the work moved
 
 `modules/video_output/vmem.c`, `Prepare()` **[src]**:
 
@@ -219,33 +250,32 @@ for (unsigned i = 0; i < PICTURE_PLANE_MAX; i++) {
 }
 picture_t *locked = picture_NewFromResource(&vd->fmt, &rsc);
 if (likely(locked != NULL)) {
-    picture_CopyPixels(locked, pic);      /* <-- VLC copies into OUR planes */
+    picture_CopyPixels(locked, pic);      /* <-- VLC copies planes into OUR buffers */
     picture_Release(locked);
 }
 ```
 
-Two consequences, both important:
+1. **vmem is not zero-copy.** libVLC decodes into its own pooled picture and
+   copies it into the planes we handed over. With I420 that copy is a plane
+   memcpy (Y, U, V rows), not an RGB conversion.
+2. **The conversion is ours, on our thread, at the displayed size.** The window
+   thread takes the newest complete plane set and calls
+   `yuv420_to_rgb_nearest()` (`src/yuv.h`) for exactly the pixels the window
+   shows: a 960x540 body is 518,400 reads, not the 8,294,400 a 4K RGB
+   conversion touches. The per-pixel work no longer sits on libVLC's
+   video-output thread.
+3. **Three plane sets in a ring** (`VLC_SETS`) mean libVLC can fill frame
+   N+1 while the window thread reads frame N; `lock` waits for its slot to be
+   free instead of overwriting a frame being sampled, and `unlock` publishes
+   the newest complete slot through `ready`.
+4. **Nearest neighbour is deliberate.** At a 4:1 downscale it picks every
+   fourth source pixel, so fine detail can alias. A box filter or bilinear
+   taps are a later refinement behind the same `yuv.h` interface; this is not
+   passed off as one.
 
-1. **vmem is not zero-copy.** VLC decodes into its own pooled picture and then
-   copies it into the planes we handed over. The header warns about exactly
-   this ("Memory copying is required between LibVLC reference picture buffers
-   and application buffers").
-2. **So hand it the window itself.** If `planes[0]` *is* the window's shm
-   mapping, that internal `picture_CopyPixels` **is** our present: VLC's copy
-   becomes the blit, and the player has no second copy to do. That is the design
-   in Appendix B.
-
-The one thing that forces a copy in the other direction is scaling. `setup()`
-tells VLC the size to deliver. If we ask for the window size and the video is
-1920x1080 in a 1280x720 window, VLC needs a converter that also scales: the
-`i420_rgb` converters only convert chroma and copy rows 1:1 (they reject odd
-width or height outright in `Activate()`) **[src]**, while
-`modules/video_chroma/swscale.c` does scale but costs
-`video_chroma/libswscale_plugin.so` (26 KB) + `ffmpeg7-libswscale` (0.63 MB
-installed) **[pkg]**. For the first milestone: **ask for the video's own size,
-open the window at that size, and crop if it does not fit.** A nearest-neighbour
-scaler in the player is ~20 lines and 0 bytes; measuring whether it is needed is
-part of milestone 2.
+Scaling no longer happens inside VLC at all: the sampler *is* the scaler. The
+old paragraph here about needing `libswscale_plugin.so` to scale is obsolete -
+with the I420 path there is no VLC-side scale to pay for.
 
 ### 3.4 Integration with the window server
 
@@ -258,17 +288,22 @@ app -> wm : FRAME
 ```
 
 - The app `mmap`s the shm file the window server created (`/dev/shm/mystic-*`).
-- **The buffer is screen-sized, not window-sized.** `src/wmsrv.c` sets
+- **The window buffer is screen-sized, not window-sized.** `src/wmsrv.c` sets
   `c->maxw = max(w, screen_w)`, `c->stride = c->maxw`, and `OK` reports
   `path stride maxw maxh`. So a 640x360 window still gets a 1280-pixel stride,
-  and `pitch = stride * 4 = 5120`.
-- Therefore tell VLC the video is **`w` = window width, `h` = window height,
-  pitch = stride*4**: each row is written at the start of a stride-wide row, no
-  scaling, no repacking. The compositor copies exactly `cl->w` pixels per row
-  from `cl->px`, which is the same window, so the extra column space is never
-  read. Getting this wrong - telling VLC `pitch = w*4` - makes VLC write rows
-  on top of each other, which looks like a diagonal smear.
-- `planes[0]` points at that mapping; `display` writes the FRAME line.
+  and the destination pitch is `stride * 4 = 5120`.
+- **The plane buffers are not that mapping.** `setup()` asks libVLC to deliver
+  the decoder's own size, and allocates plane sets of exactly that size
+  (pitches rounded up to 32). The sampler writes the displayed rectangle into
+  the shm at the wm's stride: `yuv420_to_rgb_nearest_stride(yp, up, vp,
+  ypitch, upitch, vpitch, dst, dststride, srcw, srch, dstw, dsth)` in
+  `src/client/apps/vlcplay.c`. Getting the destination stride wrong - passing
+  `dstw * 4` instead of the wm's `stride * 4` - writes rows on top of each
+  other, which looks like a diagonal smear.
+- The compositor copies exactly `cl->w` pixels per row from `cl->px`, so the
+  extra column space is never read. `display` does not write to the shm: it
+  marks the newest plane set ready, and the window thread samples it and sends
+  the `FRAME` line.
 - A/V sync and the frame clock are VLC's problem - the `display` callback is
   called "as determined by the media playback clock" **[apk]**, so we do not
   schedule anything. We present the newest frame when the compositor next draws.
@@ -294,61 +329,131 @@ not as the architecture.
 
 `tools/fetch-vlc.py` computes the closure from the **real `DT_NEEDED` of the
 plugin `.so` files it extracts from the `.apk`**, so the numbers below are not a
-hand-written list. Four profiles **[pkg]** + **[apk]**:
+hand-written list. Profiles **[pkg]** + **[apk]**, re-measured on 2026-11-26
+against `vlc-3.0.23-r4.apk`:
 
-| Profile | Plugins kept | Closure | Download | Installed | Payload gzipped |
+| Profile | Plugins kept | Closure | Index download (`S:`) | Index installed (`I:`) | Built package |
 |---|---|---|---|---|---|
-| `minimal` | 10 (vmem, rv32, chain, i420_rgb, image/raw demuxers, rawvideo/png/jpeg codecs, filesystem access) | **8 packages** | **1.98 MB** | **4.01 MB** | **1.10 MB** with symlinks (17 files, 2.85 MB raw) / **2.15 MB** as the copies our image actually gets (23 files, 5.37 MB raw) |
-| `trim` | 17 (+ mp4/mkv/avi demux, avcodec, h264/hevc packetizers, http access) | **71 packages** | **38.19 MB** | **103.35 MB** | **67.50 MB** (250 files, 173.15 MB raw) |
-| `trim+subs` | 18 (+ `text_renderer/libfreetype_plugin.so`) | **83 packages** | **42.34 MB** | **113.55 MB** | not measured (the freetype stack adds 10.2 MB installed) |
+| `minimal` | 12 (vmem, rv32, chain, i420_rgb*, image/rawvid demuxers, rawvideo/png/jpeg codecs, filesystem access) | **8 packages** | **1.98 MB** | **4.01 MB** | 1.10 MB gzipped with symlinks (measured 2026-11-17); this profile has not changed |
+| `playback` (default) | 50 (containers, libavcodec, dedicated dav1d/vpx/theora/opus/vorbis/mpg123 decoders, all 14 packetizers, raw ES demuxers, subtitle decode, alsa+adummy) | **73 packages** | **38.73 MB** | **104.73 MB** | **39.55 MB compressed / 105.24 MB installed / 184 files**, 131 files under `lib/` (130 shared objects + the loader), 115 soname aliases; a fresh build fetches **71 `.apk` files, 43.27 MB** = the 73-package closure (38.73 MB) minus the three base packages it does not fetch (musl + busybox + busybox-binsh = 0.92 MB) plus `vlc.apk` itself (5.46 MB, not a dependency of itself) |
+| `subs` | 52 (+ `text_renderer/libfreetype_plugin.so` + `codec/liblibass_plugin.so`) | **87 packages** | **42.99 MB** | **115.26 MB** | the styled-subtitle stack (FreeType + fontconfig + fribidi + harfbuzz + glib + libass) is **+14 packages, +4.26 MB download, +10.53 MB installed** over `playback`. **Built and verified separately**: 43.34 MB compressed / 114.14 MB installed / 208 files, 206 objects with 0 NEEDED and 0 symbol failures, kept at `build/repo-subs/vlc.tar.gz` with its own `build/vlc-pkg-repo-subs.stamp`, so `--verify-only --repo build/repo-subs` gates it exactly like the default (same gate digest, same player hash; the published package stays the default profile). That directory also carries a matching signed index (`index.tsv`, `index.tsv.sig`, `index.pub`, `vlc.row`) containing only the vlc row - it is a proof artifact, not a served repository |
 | `full` | the whole package, `apk add vlc` | 279 packages | 184.68 MB | 502.88 MB | n/a |
+
+> An earlier revision of this document called the default profile `trim` and
+> quoted 67.50 MB gzipped for it. That figure predates the symlink fix: the
+> tarball now stores one copy of each library and 115 symlinks, so the same
+> closure packs to **39.55 MB**. 67.50 MB is superseded, not a second estimate.
 
 The `minimal` line is the important one: **1.10 MB gzipped** on top of a 13.42 MB
 image (2.15 MB in the shape our stage tree can actually hold - see risk 5, the
 symlink copies), for a player that can decode PNG, JPEG and raw frames into a
-window. Those files are 1.28 MB of `vlc-libs` itself, 0.28 MB of the ten plugins,
-and 1.25 MB of `libjpeg-turbo` + `libpng` + `zlib` + `dbus-libs` **[apk]**.
+window. Those files are 1.28 MB of `vlc-libs` itself, 0.28 MB of the twelve
+plugins, and 1.25 MB of `libjpeg-turbo` + `libpng` + `zlib` + `dbus-libs`
+**[apk]**. It has no VP8/VP9/AV1 decoder: those plugin files are not in this
+profile and neither are `libvpx`/`libdav1d`/`libtheora` - section 3.7 used to
+claim otherwise and was wrong.
 
-`trim` is where it becomes a different product. **67.5 MB gzipped is 5x the
-entire image.** The reason is visible in the download: ffmpeg's `libavcodec`
-links ~24 shared libraries, and the ones that hurt are encoders we never call -
-`x265-libs` 21.3 MB, `aom-libs` 8.4 MB, `libSvtAv1Enc` 7.2 MB, `rav1e-libs`
-2.4 MB, `libjxl` 3.7 MB **[pkg]**. There is one genuine absurdity worth naming:
-`libavutil.so.59` has a hard `DT_NEEDED` on **`libX11.so.6`** **[apk]**, so the
-X11-free video player ships an X11 library it never calls - 1.16 MB of it.
+`playback` is where it becomes a different product. **39.55 MB compressed is
+about three copies of the entire image.** The reason is visible in the
+download: ffmpeg's `libavcodec` links ~24 shared libraries, and the ones that
+hurt are encoders we never call - `x265-libs` 21.3 MB, `aom-libs` 8.4 MB,
+`libSvtAv1Enc` 7.2 MB, `rav1e-libs` 2.4 MB, `libjxl` 3.7 MB **[pkg]**. There is
+one genuine absurdity worth naming: `libavutil.so.59` has a hard `DT_NEEDED` on
+**`libX11.so.6`** **[apk]**, so the X11-free video player ships an X11 library it
+never calls - 1.16 MB of it.
 
-Measured on disk after unpacking `--profile trim`: 469 files, 178.83 MB
-(the index says 103.35 MB installed; the difference is 117 symlink targets
+Measured on disk after unpacking `--profile playback`: 575 files, 178.53 MB
+(the index says 104.73 MB installed; the difference is 116 symlink targets
 materialised as copies, which is a Windows artefact of the unpacker - inside the
-image they are symlinks).
+image they are symlinks). **116 is the loose root's count, not the package's.**
+Measured accounting: the closure's `.apk`s carry 119 symlinks under `usr/lib`;
+two belong to `vlc-libs` and are not extracted (only the versioned files are
+wanted), and `usr/lib/vdpau/libvdpau_trace.so` is skipped because its target is
+itself a pending symlink during the unpacker's one-pass link fix-up - 116
+copies in the root. The tarball keeps **115 symlinks**: 113 version-pair
+aliases derived from byte-identical copies plus `libvlc.so.5` /
+`libvlccore.so.9` from `DT_SONAME`. The arithmetic, so it does not read as
+"three copies disappeared": **116 root copies - 3 links kept as separate files
++ 2 DT_SONAME aliases = 115 package symlinks**. The three are apk links whose
+names are not version prefixes of their targets (`libmbedcrypto.so.16` ->
+`.so.3.6.8`, `libmbedtls.so.21`, `libmbedx509.so.7`); the packager deliberately
+keeps those as separate files rather than inventing an alias, and
+`--verify-only` counts what the tarball actually has.
 
-### 3.7 Which codecs work without ffmpeg
+### 3.7 Which decoders exist that are not libavcodec
 
-Also worth stating precisely, because it decides whether `minimal` is a toy.
-Alpine's VLC build has these **decoders** that need no external codec library
-(plugin files in `codec/`) **[apk]**: `rawvideo`, `png`, `jpeg`, `theora`,
-`vorbis`, `flac`, `opus`, `speex`, `mpg123` (MP3), `a52` (AC-3), `faad` (AAC),
-`vpx` (VP8/VP9), `dav1d` (AV1), `subsdec`.
+Worth stating precisely, because an earlier revision of this section claimed
+`minimal` could play WebM - it cannot. Measured from `vlc-3.0.23-r4.apk`:
+**53 files under `codec/`**, split by what they link against.
 
-It has **no H.264, HEVC, MPEG-2 or VC-1 decoder at all**: there is no
-H.264 decoder plugin, no `libmpeg2_plugin.so`, no `libvc1_plugin.so` in the
-package. The `packetizer/libpacketizer_h264_plugin.so` and `..._hevc_plugin.so`
-files only *parse* the bitstream, and `codec/libx264_plugin.so` /
-`codec/libx265_plugin.so` are **encoders** - neither decodes anything. So:
+**31 need no external codec library** (sizes in KB, read from the `.apk`).
+28 of them link `libvlccore`; `libcdg`, `libedummy` and `libspdif` have no
+`libvlccore` `DT_NEEDED` at all - their only shared dependency is libc:
 
-- **Without libavcodec** you can play: WebM/Matroska with VP8/VP9/AV1, Ogg
-  Theora, FLAC/MP3/Opus/Vorbis audio, and still images. That is a real player,
-  and it is the `minimal` set plus the `libvpx`/`libdav1d`/`libtheora`/`opus`
-  libraries - **7.50 MB installed / 3.08 MB of `.apk`** for exactly
-  `libvpx 3.34 + libdav1d 1.75 + libtheora 0.73 + libvorbis 0.80 + opus 0.47
-  + libogg 0.04 + mpg123-libs 0.37` **[pkg]** (the plugins themselves are
-  14-26 KB each).
-- **H.264/HEVC/MPEG-2 require `codec/libavcodec_plugin.so`**, which is the
-  38 MB download. There is no cheaper option in Alpine's VLC 3.0.23.
+```
+libadpcm 18   libaes3 14    libaraw 30    libcc 46      libcdg 18
+libcvdsub 18  libddummy 14  libdvbsub 90  libedummy 14  libg711 26
+liblpcm 22    liboggspots 14 librtpvideo 14 libscte18 18  libscte27 26
+librawvideo 14 libspdif 14  libspudec 22  libstl 18     libsubsdec 26
+libsubstx3g 18 libsubsusf 30 libsvcdsub 18 libt140 14   libtelx 18
+libtextst 18  libttml 50    libuleaddvaudio 14 libwebvtt 102
+libwma_fixed 118 libxwd 14
+```
+
+**22 need a library the profile may or may not ship**:
+
+| Plugin | Needed library | In the bundle? |
+|---|---|---|
+| `libavcodec` | `libavcodec.so.61`, `libavformat.so.61`, `libavutil.so.59` | yes |
+| `libdav1d` | `libdav1d.so.7` | yes |
+| `libvpx` | `libvpx.so.11` | yes |
+| `libtheora` | `libtheoradec.so.2`, `libtheoraenc.so.2` | yes |
+| `libopus` | `libopus.so.0` | yes |
+| `libvorbis` | `libvorbis.so.0`, `libvorbisenc.so.2` | yes |
+| `libmpg123` | `libmpg123.so.0` | yes |
+| `libjpeg` / `libpng` | `libjpeg.so.8` / `libpng16.so.16` | yes |
+| `liba52` / `libfaad` / `libspeex` / `libflac` | `liba52.so.0` / `libfaad.so.2` / `libspeex.so.1` / `libFLAC.so.12` | no - libavcodec decodes all four |
+| `liblibass` | `libass.so.9` | not in the default profile; `--profile subs` ships it (see below) |
+| `libx264`, `libx26410b`, `libx265` | `libx264.so.164`, `libx265.so.215` | libraries are present, but these are **encoders** |
+| `libvaapi`, `libvaapi_drm` | `libva.so.2`, `libva-drm.so.2` | `libva` is in the closure, but there is no GPU in the VM |
+| `libsvgdec` | `librsvg-2.so.2`, `libcairo.so.2` | no |
+| `libgstdecode` | the GStreamer stack | no - deliberately, it is 3.2 MB of plugins we do not need |
+| `libfluidsynth` | `libfluidsynth.so.3` | no - MIDI synthesis, not playback |
+
+The default profile ships **12 of those 53**: `avcodec`, `dav1d`, `vpx`,
+`theora`, `opus`, `vorbis`, `mpg123`, `jpeg`, `png`, `rawvideo`, `subsdec`,
+`webvtt`.
+
+And the correction to the old paragraph: there is **no H.264, HEVC, MPEG-2 or
+VC-1 decoder plugin at all** in the package - no `libmpeg2_plugin.so`, no
+`libvc1_plugin.so`, no `libav1_plugin.so`. `packetizer/*` only parses
+elementary streams, and `libx264`/`libx265` are encoders. So:
+
+- **Without libavcodec** the package can decode: PNG, JPEG, raw frames,
+  Theora, Vorbis, Opus, MP3 (mpg123), FLAC (only if libFLAC is shipped - it is
+  not), A/52 (only with a52dec - not shipped), VP8/VP9 (libvpx), AV1 (dav1d),
+  and the libvlccore-only subtitle/caption codecs. That is a real player, but
+  **it is not `minimal`**: `minimal` is 12 plugins / 8 packages and contains
+  none of those decoders. It is `playback` minus libavcodec, which no profile
+  in the tool builds.
+- **H.264/HEVC/MPEG-2/VC-1 require `codec/libavcodec_plugin.so`** and its
+  16.33 MB + 2.85 MB + 0.19 MB of libraries. There is no cheaper option in
+  Alpine's VLC 3.0.23, and no build we could make offline.
 
 ---
 
 ## 4. Audio: honest verdict
+
+> **Update 2026-11-26.** The first two of the three steps below have since been
+> taken: `image.sh` boots with `-audiodev sdl,id=snd0 -device intel-hda -device
+> hda-duplex,audiodev=snd0`, `tools/fetch-kernel.sh` stages `kernel/sound`
+> (`stage/lib/modules/6.18.63-0-virt/kernel/sound/` exists), `stage/init` loads
+> the modules (devtmpfs creates `/dev/snd/pcmC0D0p`, and `init` then
+> `chmod 0666`s the playback nodes), and the bundle ships
+> `audio_output/libalsa_plugin.so`. So the "absent" column below describes the
+> image this section was written against, not today's. What is still not proven
+> is that a PCM open succeeds and that sound reaches the host - see the note at
+> the end of "Through the OS, with no terminal involved".
 
 libVLC can decode audio and hand it to us as raw PCM with no sound server:
 
@@ -368,16 +473,18 @@ with the header's note: "The audio callbacks override any other audio output
 mechanism. If the callbacks are set, LibVLC will **not** output audio in any
 way." **[apk]**
 
-Decoding is not the problem. **There is nothing to write the PCM to.**
+Decoding is not the problem. In the image this section was written against,
+**there was nothing to write the PCM to** (the note above says what changed).
 
-| Thing needed | State today | Evidence |
+| Thing needed | State in that image | Evidence |
 |---|---|---|
 | An emulated sound card | **absent**: QEMU is started with `-kernel -initrd -m -vga -drive -netdev -device virtio-net-pci` and no sound device or `-audiodev` | `image.sh` BOOT array **[ours]** |
 | A driver | **absent**: `CONFIG_SND=m`, `CONFIG_SND_PCM=m`, `CONFIG_SND_HDA_INTEL=m`, `CONFIG_SND_VIRTIO=m` are all modules, and `tools/fetch-kernel.sh` stages `gpu video i2c input block net fs/* lib` but **not `kernel/sound`** - 188 `.ko` files end up in `stage/`, zero of them sound | `build/cache/linux-virt-6.18.63-r0/boot/config-6.18.63-0-virt`, `find stage/lib/modules -name '*snd*'` **[ours]** |
-| A `/dev/snd/*` node, a mixer, a volume UI | **absent**; nothing in `stage/init` creates or uses one | `stage/init` **[ours]** |
+| A `/dev/snd/*` node, a mixer, a volume UI | **absent then**; devtmpfs now creates `/dev/snd/pcmC0D0p` and `stage/init` chmods the playback nodes (there is still no mixer daemon or volume UI) | `stage/init` lines 66-87 **[ours]** |
 
-So: **sound cannot work today, and it is not a libVLC problem.** What it would
-take, with measured costs:
+So: **sound could not work in that image, and it was not a libVLC problem.**
+What it took, with measured costs (all three steps are now in the tree; the
+PCM open itself is still unproven):
 
 1. `image.sh`: add `-device intel-hda -device hda-duplex` (or `-device
    virtio-snd-pci`, `CONFIG_SND_VIRTIO=m` is set) to the QEMU line.
@@ -395,11 +502,12 @@ take, with measured costs:
      volume slider without a mixer daemon.
 
 Either way the *hardware* half is not ours: QEMU needs an audio backend for the
-host, which is a QEMU-build/host question and not a guest one. Until steps 1 and
-2 are done, `libvlc_audio_set_callbacks` would happily deliver PCM to a ring
-buffer that nobody drains - so the honest first player should pass `--aout=dummy`
-(or simply not set audio callbacks) and show "no sound device" in its status line
-rather than pretend.
+host, which is a QEMU-build/host question and not a guest one. Steps 1-2 are in
+the tree (device, `snd` modules, devtmpfs nodes, libalsa), so the old failure
+mode - callbacks delivering PCM to a ring buffer nobody drains - is no longer
+the default; what remains unproven is that a PCM actually opens and that a
+listener hears anything, which is why the player reports the audio output
+libVLC chose and not "sound works".
 
 ---
 
@@ -416,19 +524,19 @@ What is measurable without running it:
 | 10 `minimal` plugins | 283,432 | **[apk]** |
 | libjpeg + libpng + zlib + dbus | 1,248,840 | **[apk]** |
 | **`minimal` mapped-code floor** | **2.81 MB** | **[calc]** sum of the above |
-| `trim` extra libraries (avcodec, avformat, avutil, swresample, dav1d, matroska, ebml, libstdc++, libgcc) | 25,737,576 | **[apk]** |
-| **`trim` mapped-code floor** | **29.81 MB** | **[calc]** |
+| `playback` extra libraries (avcodec, avformat, avutil, swresample, dav1d, matroska, ebml, libstdc++, libgcc) | 25,737,576 | **[apk]** |
+| **`playback` mapped-code floor** | **29.81 MB** | **[calc]** |
 
 The player's own allocation is the frame buffer, and if the frame buffer *is* the
 window mapping then it is already counted in the window server's budget. The
 desktop uses two full-screen surfaces (~4.1 MB each at 1280x800) **[ours]**.
 
 What is **not** measured here is libVLC's heap: thread stacks, the decoder's
-internal buffers, the plugin registry, and for `trim` whatever libavcodec
+internal buffers, the plugin registry, and for `playback` whatever libavcodec
 allocates while decoding (which for H.264 1080p is tens of MB in the general
 case). **[est]** With 256 MB of RAM, `minimal` should sit comfortably
 (frame buffer + 2.8 MB of code + VLC's heap, call it "tens of MB at most");
-`trim` is the one to watch. The way to settle it is one boot and reading
+`playback` is the one to watch. The way to settle it is one boot and reading
 `/proc/<pid>/status` `VmRSS` plus `VmHWM` after playing a file - that is
 milestone 1's acceptance test, and it takes ten minutes once the tree exists.
 
@@ -438,19 +546,25 @@ milestone 1's acceptance test, and it takes ten minutes once the tree exists.
 
 **Is a libVLC-based player with `vmem` output realistic for a 13 MB image?**
 
-- **As a player for images and VLC's own codecs (VP8/VP9/AV1/Theora/MP3/FLAC/
-  Opus): yes.** 1.98 MB of download, **1.10 MB gzipped** added to the image
-  (2.15 MB with the symlink copies our packer produces), no
-  X11, no Wayland, no window-system server, no conversion code. The display
-  path is the callbacks in section 3.1 and a `FRAME` line.
-- **As a player for H.264/HEVC/MP4: not inside the initramfs.** 38.19 MB of
-  download and **67.5 MB gzipped**, i.e. five copies of the whole OS, to gain
-  one decoder. If the design wants that, it belongs on the data disk or a
-  read-only 9p mount the way `docs/BROWSER_PLAN.md` proposes for the browser
-  engine - and the 64 MB data disk is too small for it too, so the disk size
-  becomes a knob (`MYSTIC_DISK_MB`).
-- **Sound: no, not today**, for reasons that have nothing to do with VLC
-  (section 4). 732 KB of kernel modules and one QEMU device away, plus a sink.
+- **As a player for images and raw frames: yes.** 1.98 MB of download,
+  **1.10 MB gzipped** added to the image (2.15 MB with the symlink copies our
+  packer produces), no X11, no Wayland, no window-system server, no conversion
+  code. The display path is the callbacks in section 3.1 and a `FRAME` line.
+- **As a player for VLC's own codecs (VP8/VP9/AV1/Theora/Opus/Vorbis/MP3): yes,
+  and they are now in the default profile** - `libdav1d`, `libvpx`, `libtheora`,
+  `libopus`, `libvorbis` and `libmpg123` plugin files (125,128 B together) whose
+  libraries libavcodec already pulled in. `minimal` alone does **not** include
+  them: its 8 packages have no libvpx, libdav1d or libtheora, which section 3.7
+  used to get wrong.
+- **As a player for H.264/HEVC/MP4: not inside the initramfs.** 38.73 MB of
+  index download and **39.55 MB compressed**, i.e. about three copies of the
+  whole OS, to gain one decoder. If the design wants that, it belongs on the
+  data disk or a read-only 9p mount the way `docs/BROWSER_PLAN.md` proposes for
+  the browser engine - and the 64 MB data disk is too small for it too, so the
+  disk size becomes a knob (`MYSTIC_DISK_MB`).
+- **Sound: device present, still unproven.** The HDA device, the `snd` modules
+  and `/dev/snd/pcmC0D0p` are in the tree and the bundle ships libalsa (section
+  4); whether a PCM actually opens and reaches the host is the open question.
 
 **What it costs in RAM:** the frame buffer (3.69 MB at 720p, 7.68 MB at the
 1600x1200 maximum) + 2.81 MB of mapped code for `minimal`; unmeasured heap on
@@ -470,7 +584,7 @@ Wayland, a GPU, or a sound card.
 
 **M0 - the tree exists (done, verifiable now).**
 `python3 tools/fetch-vlc.py --profile minimal --download` produces a tree with
-`libvlc.so.5`, `libvlccore.so.9`, the 10 plugins and their libraries, and prints
+`libvlc.so.5`, `libvlccore.so.9`, the 12 plugins and their libraries, and prints
 the size. *Acceptance:* the script prints 8 packages / 1.98 MB / 4.01 MB and the
 tree contains `usr/lib/vlc/plugins/video_output/libvmem_plugin.so`. Measured:
 8.28 MB on disk including musl and busybox that the base image already has.
@@ -485,17 +599,21 @@ process's `VmHWM` is recorded; `ldd` shows no `libX11`.
 *Fails if:* libvlccore cannot find its plugins (then set `VLC_PLUGIN_PATH`, see
 section 8), or a plugin we did not ship is required (then the log says so).
 
-**M2 - a real video, VLC's own codecs.**
-Add `libvpx` (VP8/VP9), `libdav1d` (AV1), `libtheora`, `libvorbis`, `libogg`,
-`libopus`, `libmpg123` **plugins** (each 14-26 KB) and their libraries:
-**7.50 MB installed / 3.08 MB of `.apk`** **[pkg]**. Play a WebM file.
-*Acceptance:* 30 s of VP9 in WebM plays at the file's frame rate in a window;
-`display` is called ~N times for N frames.
+**M2 - a real video with VLC's own codecs. DONE in the package, not yet watched.**
+The default profile now ships `libvpx` (VP8/VP9), `libdav1d` (AV1),
+`libtheora`, `libvorbis`, `libopus`, `libmpg123`, the subtitle decoders and all
+14 packetizers. They cost **no new package**: those libraries were already in
+libavcodec's closure, so the addition is **6 plugin files / 125,128 B (0.125 MB)** plus the
+subtitle/packetizer files (50 plugins, 2.89 MB of the `.apk` 13.04 MB).
+*Acceptance (still open):* 30 s of VP9 in WebM plays at the file's frame rate in
+a window; `display` is called ~N times for N frames. Nobody has done this yet;
+the static proof only says the files load.
 
 **M3 - decide about H.264.**
-Either accept a 67.5 MB tree on the data disk (`--profile trim --download`,
-which works today and produces 469 files), or stay with M2. Nothing in the code
-changes; only which libraries are on the filesystem.
+Either accept the **39.55 MB** tree on the data disk (`--profile playback`,
+which works today and produces 575 files / 178.53 MB unpacked), or stay with
+M2. Nothing in the code changes; only which libraries are on the filesystem.
+The older 67.5 MB figure in this section predates the symlink fix.
 
 **M4 - sound, if the design wants it.** Section 4, steps 1-3. Acceptance: a small
 test program opens `/dev/snd/pcmC0D0p`, writes a 440 Hz sine, and it is audible
@@ -505,9 +623,12 @@ from the host.
 
 ## 8. Risks, and what this document does not prove
 
-1. **The plugin set is a hypothesis tested only by `DT_NEEDED`.** A plugin whose
-   libraries all resolve can still fail in `Activate()` (missing hardware,
-   missing sub-module), and VLC then falls back to another module or reports the
+1. **The plugin set is a hypothesis tested by the loader, not by the decoder.**
+   `--verify-only` now proves both halves of loading - every `DT_NEEDED` has
+   an entry with exactly that name under `lib/`, and every strong undefined
+   symbol is defined by a shipped library - but a plugin whose libraries all
+   resolve can still fail in `Activate()` (missing hardware, missing
+   sub-module), and VLC then falls back to another module or reports the
    format as unsupported. And VLC modules probe for other modules at runtime (a
    text renderer for subtitles, a demuxer for a container, an audio output).
    The first run in the VM is what settles it. This
@@ -556,11 +677,26 @@ from the host.
 
 ```
 python tools/fetch-vlc.py                 # build: image bundle + package + index row
-python tools/fetch-vlc.py --dry-run       # resolve and print; build nothing
+python tools/fetch-vlc.py --dry-run       # resolve, audit the plugins, build nothing
+python tools/fetch-vlc.py --audit-only    # just the plugin audit (reads the cached vlc.apk)
+python tools/fetch-vlc.py --verify-only   # re-prove the packed tarball's DT_NEEDED + symbols
 python tools/fetch-vlc.py --profile minimal
+python tools/fetch-vlc.py --profile subs  # playback + FreeType text renderer + libass (ASS/SSA)
 python tools/fetch-vlc.py --force         # ignore the caches
 ```
 
+- **Provenance is a gate, and it does not need a compiler.** Each repo has its
+  own stamp (`build/vlc-pkg.stamp` for the default, `build/vlc-pkg-<repo>.stamp`
+  for e.g. `build/repo-subs`), recording three things: `app_digest` (sources +
+  tool + manifest + **zig version**, the cache key), `app_digest_src` (the same
+  without the compiler) and the sha256 of `src/client/apps/vlcplay.c`. The
+  publish gate is **`app_digest_src` + the player hash**; the build prints
+  those two plus the cache key (`app_digest`), and `--verify-only` recomputes
+  the gate from the tree and **exits 1** with `STALE package: ...` if either
+  moved. On a host without zig the toolchain component is simply not
+  compared (a printed note says so), so verification works there too; if zig is
+  present and its version differs from the build, that is a note as well - a
+  compiler upgrade is not a source change. A rebuild is one command.
 - **It builds by default.** The expensive steps are cached: `build/vlc-index/`
   (APKINDEX), `build/vlc-apks/` (the `.apk` files), `build/vlc-root/` (a
   signature stamp, so a second run makes no network call) and the package
@@ -568,30 +704,44 @@ python tools/fetch-vlc.py --force         # ignore the caches
   this script). `--dry-run` downloads nothing beyond the two vlc packages it
   must read `DT_NEEDED` from, and says so.
 - Output 1, the **image bundle**: `stage/usr/share/mystic/apps/vlc/{manifest,bin}`.
-  `bin` there is the player compiled statically (171,152 bytes). It cannot
-  dlopen, so its window says libVLC is not installed and that `pkg install vlc`
-  brings it: a placeholder with the truth in it, never a fake player.
-- Output 2, the **package** `build/repo/vlc.tar.gz` (38.79 MB compressed /
-  38,792,152 bytes, 103.39 MB installed / 103,387,892 bytes) plus the `vlc`
-  row in `build/repo/index.tsv`:
-  `manifest`; `bin` (static launcher, 29,128 bytes, no PT_INTERP);
-  `libexec/vlcplayer` (dynamic, 531,520 bytes, PT_INTERP
-  `/lib/ld-musl-x86_64.so.1`, RUNPATH `$ORIGIN/../lib`);
+  `bin` there is the player compiled statically (180,968 bytes as of this
+  build). It cannot dlopen, so its window says libVLC is not installed and that
+  `pkg install vlc` brings it: a placeholder with the truth in it, never a fake
+  player.
+- Output 2, the **package** `build/repo/vlc.tar.gz` (39.55 MB compressed /
+  105.24 MB installed, 184 regular files + 115 symlinks + 12 directories = 311
+  tar entries; the compressed and installed byte counts move by a few KB
+  whenever `libexec/vlcplay` is rebuilt - the build prints the exact values and
+  the file list is what is stable) plus the `vlc` row in `build/repo/index.tsv`:
+  `manifest`; `bin` (static launcher, 27,648 bytes, no PT_INTERP);
+  `libexec/vlcplay` (dynamic, the player itself - its size changes as the vmem
+  path is reworked, PT_INTERP `/lib/ld-musl-x86_64.so.1`, RUNPATH
+  `$ORIGIN/../lib`);
   `lib/ld-musl-x86_64.so.1` (from Alpine's musl apk, 670,312 bytes, mode 0755);
-  and the closure - 129 regular files under `lib/` (128 shared objects plus
-  the loader), 113 soname/version symlinks, 27 plugin modules in 7 plugin
-  directories, and the soname aliases
+  and the closure - 131 files under `lib/` (130 shared objects plus the
+  loader), 115 soname/version symlinks, **50 plugin modules in 7 plugin
+  directories**, and the soname aliases
   `libvlc.so.5` and `libvlccore.so.9` that `dlopen()`/`DT_NEEDED` actually use.
+  The plugin list is in the Codecs section; it is 50 files because the default
+  profile now takes the dedicated AV1/VP9/Theora/Opus/Vorbis/MP3 decoders, all
+  14 packetizers and the subtitle decoders, not just the 28 the first package shipped.
+  The packed player at the time of writing is `vlcplay.c` sha256
+  `bb5c69f415441890...` (95,224 B source, 589,992 B binary) with gate digest
+  `a90382e250ee5cd0...`; the build prints three values - the player hash, the
+  **gate digest** (`app_digest_src`) and the cache key (`app_digest`, which
+  also covers the zig version) - and `--verify-only` exits 1 if the tarball is
+  not the one those sources produce, so "which revision is published?" is
+  answered by the artifact and enforced by the check.
 - Why three files: the image has `/lib/ld-musl-x86_64.so.1` from the Alpine
   base, but the jail is a chroot that binds only `/bin/app`, `/app` (the
   bundle), the fonts, `/dev` bits and `/proc`. PT_INTERP cannot resolve there,
   so `bin` is static and runs the bundled loader explicitly:
-  `lib/ld-musl-x86_64.so.1 --library-path <bundle>/lib <bundle>/libexec/vlcplayer`.
+  `lib/ld-musl-x86_64.so.1 --library-path <bundle>/lib <bundle>/libexec/vlcplay`.
 - The manifest's `exec` is a **bare file name**, and it has to be: `wmsrv`
   rejects any `exec` containing `/` or `..` (`wms_launch_arg`, "unsafe exec"),
-  so `exec = libexec/vlcplayer` is not a layout Mystic can launch and no
+  so `exec = libexec/vlcplay` is not a layout Mystic can launch and no
   document should suggest it. `exec = bin` names the static launcher at the
-  bundle root; `libexec/vlcplayer` and `lib/` are internal paths the
+  bundle root; `libexec/vlcplay` and `lib/` are internal paths the
   launcher (and its `$ORIGIN/../lib` RUNPATH) use. The one line `wmsrv`
   could add does **not** change that:
   `mount("/lib", "<jail>/lib", NULL, MS_BIND | MS_RDONLY, NULL);` would only
@@ -613,20 +763,63 @@ Closure and profiles (all from `tools/fetch-vlc.py`, Alpine v3.24 x86_64):
 ```
 ==> apk add vlc (whole package + whole D: line): 279 packages,
     184.68 MB download, 502.88 MB installed
-==> profile 'minimal' (libvlc + 10 plugins): 8 packages,
+==> profile 'minimal' (libvlc + 12 plugins): 8 packages,
     1.98 MB download, 4.01 MB installed
-==> profile 'trim' (libvlc + 17 plugins): 71 packages,
-    38.19 MB download, 103.35 MB installed
+==> profile 'playback' (libvlc + 50 plugins): 73 packages,
+    38.73 MB download, 104.73 MB installed
+==> profile 'subs' (libvlc + 52 plugins): 87 packages,
+    42.99 MB download, 115.26 MB installed
+==> apk add vlc (whole package + whole D: line): 279 packages,
+    184.68 MB download, 502.88 MB installed
 ```
 
-`DT_NEEDED` of the plugin set, read from the unpacked `.so` files:
+`DT_NEEDED` of the default profile's plugin set, read from the unpacked `.so`
+files (the 50-plugin set, so it is longer than this section used to show):
 
 ```
-==> DT_NEEDED of those files: so:libavcodec.so.61, so:libavformat.so.61,
-    so:libavutil.so.59, so:libebml.so.5, so:libgcc_s.so.1, so:libjpeg.so.8,
-    so:libmatroska.so.7, so:libpng16.so.16, so:libstdc++.so.6,
-    so:libvlccore.so.9, so:libz.so.1
+==> DT_NEEDED of those files: so:libasound.so.2, so:libavcodec.so.61,
+    so:libavformat.so.61, so:libavutil.so.59, so:libdav1d.so.7,
+    so:libdbus-1.so.3, so:libdvbpsi.so.10, so:libebml.so.5, so:libgcc_s.so.1,
+    so:libjpeg.so.8, so:libmatroska.so.7, so:libmpg123.so.0, so:libogg.so.0,
+    so:libopus.so.0, so:libpng16.so.16, so:libstdc++.so.6, so:libtheoradec.so.2,
+    so:libtheoraenc.so.2, so:libvlc.so.5, so:libvlccore.so.9, so:libvorbis.so.0,
+    so:libvorbisenc.so.2, so:libvpx.so.11, so:libz.so.1
 ```
+
+What the `.apk` really contains, and what this profile takes (`--audit-only`):
+
+```
+==> plugin audit: vlc-3.0.23-r4.apk carries 365 plugin files; profile 'playback' takes 50
+    codec watchlist (shipped = the file is taken AND its libraries are):
+    plugin                                       in apk    in profile  libraries
+    codec/libdav1d_plugin.so                       13.7 KB SHIPPED     libvlccore.so.9, libdav1d.so.7
+    codec/libav1_plugin.so                       ABSENT    -           AV1 via a plugin by that name
+    codec/libvpx_plugin.so                         17.7 KB SHIPPED     libvlccore.so.9, libvpx.so.11
+    codec/libtheora_plugin.so                      21.8 KB SHIPPED     libvlccore.so.9, libtheoraenc.so.2, libtheoradec.so.2
+    codec/libmpeg2_plugin.so                     ABSENT    -           MPEG-1/2 video
+    codec/libavcodec_plugin.so                    137.8 KB SHIPPED     libvlccore.so.9, libavformat.so.61, libavcodec.so.61, libavutil.so.59
+    packetizer/libpacketizer_av1_plugin.so         37.7 KB SHIPPED     libvlccore.so.9
+    demux/libsubtitle_plugin.so                    37.7 KB SHIPPED     libvlccore.so.9
+    codec/libsubsdec_plugin.so                     25.7 KB SHIPPED     libvlccore.so.9
+    codec/libwebvtt_plugin.so                     101.7 KB SHIPPED     libvlccore.so.9
+    codec/liblibass_plugin.so                      25.7 KB not selected libvlccore.so.9, libass.so.9  (not shipped: libass.so.9)
+    text_renderer/libfreetype_plugin.so            73.7 KB not selected ... (not shipped)
+    verdict: 8 shipped, 2 present but not in this profile, 2 absent from VLC 3.0.23, 0 selected but unresolvable
+    codec/packetizer plugins that would load against this closure but the profile does not take: 33
+```
+
+And the proof on the **packed artifact** (every `DT_NEEDED` soname and every
+imported symbol resolved inside the tarball, not in the loose tree):
+
+```
+$ python tools/fetch-vlc.py --verify-only
+==> build/repo/vlc.tar.gz verified: 182 objects checked for DT_NEEDED by exact name,
+    51 plugin/player symbol sets, 115 aliases, 1 dlopen target(s) (libvlc.so.5),
+    1880 imports, 0 NEEDED failures, 0 symbol failures
+```
+
+That is 50 plugins + the player; `libexec/vlcplay` imports 66 symbols, and the
+plugin with the most imports (`demux/libmkv_plugin.so`) imports 356.
 
 The vmem output plugin needs nothing but libVLC:
 
@@ -672,7 +865,7 @@ is comparable with the 13.42 MB initramfs):
 ```
 minimal   17 files      2.85 MB raw      1.10 MB gzipped   (symlinks as symlinks)
 minimal   23 files      5.37 MB raw      2.15 MB gzipped   (as stored by our unpacker)
-trim     250 files    173.15 MB raw     67.50 MB gzipped   (duplicate copies included)
+playback 184 files    105.24 MB raw     39.55 MB gzipped   (the real tarball: 115 symlinks kept)
 ```
 
 ## Appendix B - the harness that compiles clean
@@ -926,9 +1119,15 @@ the following are measurements rather than expectations:
 
 | file | surface | cores | rate |
 |---|---|---|---|
-1080p H.264 (local, via `open.request`) | 1920x1080 | 4 | **60.0 fps** |
-4K H.264 (3840x2160) | 3840x2160 | 4 | 17 fps |
-4K H.264 | 3840x2160 | 8 | **24 fps** |
+| 1080p H.264 (local, via `open.request`) | 1920x1080 | 4 | **60.0 fps** |
+| 4K H.264 (3840x2160) | 3840x2160 | 4 | 17 fps |
+| 4K H.264 | 3840x2160 | 8 | **24 fps** |
+
+These were taken through the original `vmem` callback path that converts each
+frame to RV32 in libVLC (section 3.3). A rewrite of that path - taking the I420
+planes and sampling only the displayed pixels - changes these numbers, so the
+authoritative figure is the fps the player prints in its own status line, not
+this table. The codec conclusions in the Codecs section do not depend on it.
 
 The VM now gets four cores by default (`image.sh`, `-smp 4`, override with
 `MYSTIC_SMP`): software decoding is per-frame work that splits across threads and
@@ -939,9 +1138,232 @@ once the decoder keeps up.
 
 ## Codecs
 
-Decoding goes through libVLC's `avcodec` plugin, so the formats libavcodec can
-decode are available in the container libavcodec understands: MP4 and MKV
-demuxers are both shipped, with H.264/HEVC/MPEG-4/VC-1 packetizers. VP9/WebM
-plays through the same avcodec path; AV1 depends on the libavcodec build in the
-bundle. `filetypes.c` routes mp4, mkv, webm, avi and mov to the player, so a
+This section is built from the package's own bytes, not from what libavcodec
+is capable of in the abstract. Everything below comes from two commands:
+
+```
+python tools/fetch-vlc.py --audit-only    # reads vlc-3.0.23-r4.apk's file list and ELF headers
+python tools/fetch-vlc.py --verify-only   # reads build/repo/vlc.tar.gz and resolves every import
+```
+
+The rule a format has to pass to be called *covered* here has three parts:
+(a) a plugin file that decodes it is **inside the package**; (b) for **every**
+shipped object - plugin, library, player - each `DT_NEEDED` name has an
+**entry with exactly that name** under `lib/` (a regular file or a symlink),
+and the player's `dlopen("libvlc.so.5")` target has one too; (c) every strong
+undefined symbol of each plugin and of the player is **defined by one of the
+shipped libraries** (the bundled musl loader counts as libc).
+
+Part (b) is by name, not by SONAME. A file whose `DT_SONAME` is
+`libvpx.so.11` but whose name is `libvpx.so.11.0.1` does **not** satisfy the
+loader: musl opens `lib/libvpx.so.11`, it does not scan the directory for a
+SONAME. `--verify-only` used to accept that, and now does not - deleting both
+`libvpx.so.11` symlinks from the tarball is rejected with
+`libavcodec.so.61.19.101 needs libvpx.so.11 (no entry with that name under
+lib/)`. Part (c) catches the other half: a library shipped at the wrong soname
+is present and `readelf` looks happy, and `dlopen` still fails with "undefined
+symbol". Both halves are exercised by deleting a file from a copy of the
+tarball and confirming a non-zero exit.
+
+> **"libavcodec handles it" is not proof.** libavcodec is one module
+> (`codec/libavcodec_plugin.so`, 141,144 B) and it is only reached if that
+> file, `libavcodec.so.61`, `libavformat.so.61` and `libavutil.so.59` are all
+> in the bundle. Similarly `packetizer/libpacketizer_hevc_plugin.so` splitting
+> HEVC into NAL units says nothing about a HEVC decoder existing. Every claim
+> below is tied to a file that is actually in the tarball.
+
+### 1. What the default profile ships
+
+`--profile playback` takes **50 of the 365 plugin files** in
+`vlc-3.0.23-r4.apk`: 2.89 MB of the package's 13.04 MB of plugins. The
+package is `build/repo/vlc.tar.gz`, **39.55 MB compressed / 105.24 MB
+installed / 184 files**, 131 files under `lib/` (130 shared objects + the musl loader) and 115 soname aliases.
+
+| Job | Shipped plugin(s) | Library the plugin loads |
+|---|---|---|
+| containers | `demux/libmp4`, `libmkv`, `libavi`, `libts`, `libps`, `libwav`, `libogg`, `libasf`, `libflacsys` | own code; `mkv` needs `libmatroska.so.7` + `libebml.so.5`, `ts` needs `libdvbpsi.so.10`, `ogg` needs `libogg.so.0` |
+| raw elementary streams | `demux/libes`, `libh26x`, `libmpgv` | libvlccore only |
+| H.264, HEVC, MPEG-1/2/4, VC-1, AAC, AC-3, DTS, FLAC, ... | `codec/libavcodec_plugin.so` | `libavcodec.so.61` (16.33 MB), `libavformat.so.61`, `libavutil.so.59` |
+| VP8 and VP9 | `codec/libvpx_plugin.so` (18,112 B) | `libvpx.so.11` (3,340,104 B) |
+| AV1 | `codec/libdav1d_plugin.so` (14,016 B) | `libdav1d.so.7` (1,750,640 B) |
+| Theora | `codec/libtheora_plugin.so` (22,360 B) | `libtheoradec.so.2` + `libtheoraenc.so.2` |
+| Opus | `codec/libopus_plugin.so` (26,304 B) | `libopus.so.0` (472,768 B) |
+| Vorbis | `codec/libvorbis_plugin.so` (30,400 B) | `libvorbis.so.0` + `libvorbisenc.so.2` |
+| MP3 (VLC's own decoder) | `codec/libmpg123_plugin.so` (13,936 B) | `libmpg123.so.0` (249,056 B) |
+| stream framing in ts/ogg/ps | **all 14** `packetizer/libpacketizer_*` | libvlccore only (571.5 KB total) |
+| subtitles, decode only | `demux/libsubtitle`, `codec/libsubsdec`, `codec/libwebvtt` | libvlccore only |
+| output | `video_output/libvmem`, chroma `rv32`/`chain`/`i420_rgb*`; `audio_output/libalsa` | see sections 3 and 4 |
+
+The three subtitle files in this list are 169,024 B (demuxer 38,592 +
+`subsdec` 26,304 + `webvtt` 104,128) and, on their own, **inert**: they decode
+a track to SPU bitmaps and there is no text renderer in this profile to paint
+them. They are here because `--profile subs` builds on this profile and adds
+the renderer (+2 files); if a future default should not carry them, remove
+`subs_text` from `PLUGINS["playback"]` and the audit will show the count drop.
+Nothing is claimed to render in the default profile.
+
+The six dedicated decoders (`vpx`, `dav1d`, `theora`, `opus`, `vorbis`,
+`mpg123`) cost **no new package**: their libraries were already in
+libavcodec's closure on this Alpine release (five are in
+`ffmpeg7-libavcodec`'s own `D:` line; `mpg123-libs` arrives through
+`libavformat -> libopenmpt`), so the profile now takes
+**50 of the 365 plugin files, 2.89 MB of the package's 13.04 MB of plugins**,
+and the index closure is 73 packages, 38.73 MB download, 104.73 MB installed -
+the same closure as before the codec work: no library and no package was
+added. A fresh build fetches
+**71 packages / 43.27 MB** of `.apk` bytes: the 73-package closure (38.73 MB)
+minus musl, busybox and busybox-binsh, which the base image already has
+(921,806 B), plus `vlc.apk` itself (5.46 MB), which is not a dependency of
+itself. 38.73 - 0.92 + 5.46 = 43.27.
+
+The full list, as packed (path under `lib/vlc/plugins/`, bytes) - this is the
+output of reading `build/repo/vlc.tar.gz`, not of a profile declaration:
+
+```
+  access/libfilesystem_plugin.so                    18112
+  audio_output/libadummy_plugin.so                  13936
+  audio_output/libalsa_plugin.so                    30400
+  codec/libavcodec_plugin.so                       141144
+  codec/libdav1d_plugin.so                          14016
+  codec/libjpeg_plugin.so                           22360
+  codec/libmpg123_plugin.so                         13936
+  codec/libopus_plugin.so                           26304
+  codec/libpng_plugin.so                            18192
+  codec/librawvideo_plugin.so                       13936
+  codec/libsubsdec_plugin.so                        26304
+  codec/libtheora_plugin.so                         22360
+  codec/libvorbis_plugin.so                         30400
+  codec/libvpx_plugin.so                            18112
+  codec/libwebvtt_plugin.so                        104128
+  demux/libasf_plugin.so                            79552
+  demux/libavi_plugin.so                            95936
+  demux/libes_plugin.so                             42688
+  demux/libflacsys_plugin.so                        30400
+  demux/libh26x_plugin.so                           18112
+  demux/libimage_plugin.so                          30400
+  demux/libmkv_plugin.so                           485328
+  demux/libmp4_plugin.so                           280256
+  demux/libmpgv_plugin.so                           14016
+  demux/libogg_plugin.so                           104128
+  demux/libps_plugin.so                             38592
+  demux/librawvid_plugin.so                         18112
+  demux/libsubtitle_plugin.so                       38592
+  demux/libts_plugin.so                            247488
+  demux/libwav_plugin.so                            22208
+  packetizer/libpacketizer_a52_plugin.so            22208
+  packetizer/libpacketizer_av1_plugin.so            38592
+  packetizer/libpacketizer_copy_plugin.so           18032
+  packetizer/libpacketizer_dirac_plugin.so          30400
+  packetizer/libpacketizer_dts_plugin.so            26304
+  packetizer/libpacketizer_flac_plugin.so           26224
+  packetizer/libpacketizer_h264_plugin.so          120512
+  packetizer/libpacketizer_hevc_plugin.so          116416
+  packetizer/libpacketizer_mlp_plugin.so            26304
+  packetizer/libpacketizer_mpeg4audio_plugin.so     46784
+  packetizer/libpacketizer_mpeg4video_plugin.so     30400
+  packetizer/libpacketizer_mpegaudio_plugin.so      18112
+  packetizer/libpacketizer_mpegvideo_plugin.so      30400
+  packetizer/libpacketizer_vc1_plugin.so            34496
+  video_chroma/libchain_plugin.so                   18032
+  video_chroma/libi420_rgb_mmx_plugin.so            54896
+  video_chroma/libi420_rgb_plugin.so                30320
+  video_chroma/libi420_rgb_sse2_plugin.so          116336
+  video_chroma/librv32_plugin.so                    13936
+  video_output/libvmem_plugin.so                    14016
+```
+
+### 2. Proven to play (booted, with evidence)
+
+| Format | Evidence |
+|---|---|
+| H.264 in MP4 | 640x360 sample decoded and drawn in the Player window, `ended 0:09 / 0:10`, screenshot `docs/screenshots/video-vlc.png` |
+| H.264 1080p | 60.0 fps measured in the running OS (rate table above) |
+| H.264 4K | 17 fps on 4 vCPUs / 24 fps on 8, measured (rate table above) |
+
+That is the whole list. **No other codec has ever been watched in this
+player.** The avcodec plugin is the one decoder we know loads at runtime,
+because it is the only one that has produced a frame.
+
+### 3. Shipped, statically proven to load, never watched
+
+These pass all three checks in `--verify-only` (the file is in the tarball,
+every `DT_NEEDED` has an entry with exactly that name, and all 1,880 imported
+symbols are defined by shipped libraries), but no frame or sample from them has
+been observed in the guest:
+
+| Format | What is in the bundle | Why it is not yet "proven" |
+|---|---|---|
+| **VP8/VP9 in WebM/MKV** (the owner's question) | `libvpx_plugin.so` + `libvpx.so.11`; mkv demuxer; vp8/vp9 also reachable through `libavcodec` | never opened a `.webm` in the player; which module wins is a runtime fact. **8-bit only** (10-bit VP9 has no converter, see below) |
+| **AV1** | `libdav1d_plugin.so` + `libdav1d.so.7`, and `libavcodec.so.61` also links dav1d | same; VLC 3.0.23 has no `libav1_plugin.so` at all. **8-bit only** (10-bit AV1 has no converter) |
+| HEVC | `libavcodec_plugin` + `packetizer_hevc` | no HEVC sample has ever been played. **8-bit only** (10-bit HEVC has no converter) |
+| MPEG-2 / MPEG-1 | `libavcodec_plugin` only (there is no `libmpeg2_plugin.so`) | not watched |
+| VC-1 / WMV3 | `libavcodec_plugin` + `demux/libasf_plugin` | not watched |
+| Theora / Ogg | `libtheora_plugin.so` + `demux/libogg` | not watched |
+| Opus / Vorbis / MP3 / AC-3 / AAC / FLAC / DTS | dedicated plugins + `libavcodec` | decode ships; **nobody has heard it**. The image now has `-device intel-hda -audiodev sdl`, the `snd` modules and `/dev/snd/pcmC0D0p` (section 4 carries the dated note), and libVLC reports an audio output that accepts a volume - but a PCM open has not been proven, only that the module initialises |
+| AVI / TS / PS / ASF / FLAC / WAV containers | their demuxers | only MP4 has been opened |
+| PNG / JPEG / raw frames | `codec/libpng`, `libjpeg`, `librawvideo` | the minimal-profile milestone, not part of the booted evidence above |
+| Subtitles | `libsubtitle` + `libsubsdec` + `libwebvtt` | text is decoded to SPU bitmaps, but **nothing paints it**: no text renderer in this profile |
+
+### 4. Absent from the package (measured, not assumed)
+
+`--audit-only` prints each of these against the real `.apk`:
+
+| Claim | Measured |
+|---|---|
+| `codec/libav1_plugin.so` | **not in `vlc-3.0.23-r4.apk`**. AV1 is `libdav1d_plugin.so`; a plugin with that name does not exist in VLC 3.0. |
+| `codec/libmpeg2_plugin.so` | **not in the `.apk`**. MPEG-2 is libavcodec only. |
+| a dedicated H.264 / HEVC / VC-1 decoder | **none**. Only `libavcodec_plugin.so` and the packetizers. |
+| `codec/liblibass_plugin.so` (styled ASS/SSA) | file present (26,304 B), needs `libass.so.9` -> the `libass` package plus the FreeType/fontconfig stack. **Shipped only by `--profile subs`**, where its marginal cost over the text renderer is +0.12 MB download / +0.33 MB installed; the whole subtitle stack is +14 packages / +4.26 MB / +10.53 MB over the default. |
+| `text_renderer/libfreetype_plugin.so` (draws any subtitle text) | file present (75,456 B), needs `libfontconfig.so.1`, `libfribidi.so.0`, `libharfbuzz.so.0`, `libfreetype.so.6`. Only `--profile subs` ships it: on its own **+12 packages, +4.14 MB download, +10.20 MB installed**; with libass the profile is **87 packages / 42.99 MB / 115.26 MB** (playback 73/38.73/104.73). Whether fontconfig can initialise in the guest is a boot-time fact: the image has TTFs in `/usr/share/fonts` but no `/etc/fonts/fonts.conf`. |
+| an `avformat` demuxer | **not in the `.apk` at all**. VLC's `demux/avformat` module is absent, so containers only libavformat knows - `.flv` is the common one - cannot open. There is no HLS/DASH either: `demux/libadaptive_plugin.so` needs `libgcrypt.so.20`, which is not shipped. |
+| DVD / teletext / CEA-608 captions | `libspudec`, `libdvbsub`, `libcvdsub`, `libsvcdsub`, `libtelx`, `libt140`, `libcc`, `libscte18/27` exist in the `.apk`; none is in the default profile (no DVD demuxer either: `libdvdread`/`libdvdnav` are not shipped). |
+| hardware decode | `libvaapi_plugin`, `libvdpau_*` exist in the `.apk`, not shipped: the VM has no GPU, so they would fail to open and add libraries for nothing. |
+| **10-bit (P010/I420_10) and 4:2:2 (I422)** | **Not covered.** The decoders ship (libavcodec/dav1d/vpx all decode 10-bit), but the chroma set in the bundle is `rv32`/`chain`/`i420_rgb*` only: there is no 10-bit or 4:2:2 converter. `video_chroma/libi420_10_p010_plugin.so` and `libswscale_plugin.so` exist in the `.apk` and are **not shipped**. The player's `setup()` answers `I420` for a 10-bit/4:2:2 proposal, so libVLC would have to convert and has nothing to convert with - a 10-bit HEVC/VP9/AV1 file (common in downloaded 4K) decodes and then produces no picture. Treat the HEVC/VP9/AV1 rows above as **8-bit only**. |
+| FLAC / AC-3 dedicated decoders | plugin files exist but need `libFLAC.so.12` / `liba52.so.0`; **not shipped**. libavcodec decodes both, so the default profile does not pay 0.42 MB + 0.09 MB for a second copy. |
+
+### 5. In the `.apk` but deliberately not in the profile
+
+33 codec/packetizer plugins would load against this closure and are still not
+taken. Grouped by why:
+
+- **encoders**, not decoders: `libx264`, `libx26410b`, `libx265`, `libvaapi`,
+  `libvaapi_drm`;
+- **disc / broadcast subtitles and captions**: `libspudec`, `libdvbsub`,
+  `libcvdsub`, `libsvcdsub`, `libtelx`, `libt140`, `libcc`, `libscte18`,
+  `libscte27`, `libtextst`, `libstl`, `libsubstx3g`, `libsubsusf`, `libttml`;
+- **audio formats libavcodec already decodes**: `libadpcm`, `libaes3`,
+  `libaraw`, `libg711`, `liblpcm`, `libspdif`, `libuleaddvaudio`,
+  `libwma_fixed`;
+- **niche inputs**: `libcdg`, `libxwd`, `liboggspots`, `librtpvideo`,
+  `libddummy`, `libedummy`.
+
+No decoder for a format the default profile can already decode is missing
+from it - that is what the completeness line in `--audit-only` measures
+(`codec/packetizer plugins that would load against this closure but the
+profile does not take: 33`), and it is re-checked on every run.
+
+### 6. What still needs a boot to confirm
+
+1. **VP9 in WebM actually rendering** - the exact case that motivated this
+   section. The plugin, its library, the demuxer and the packetizers are all
+   in the tarball; nobody has watched a frame.
+2. **Which AV1 module VLC selects** (`dav1d` vs the avcodec path) and whether
+   `dav1d_open` succeeds. Both paths are present, so a failure would be a
+   module-selection bug, not a missing file.
+3. **Audio in TS** with the newly shipped `a52`/`mpegaudio`/`dts` packetizers.
+   Even when it decodes, the PCM open and the host audio backend are unproven
+   (section 4), so this can only be confirmed from VLC's log ("using audio
+   decoder") and `/proc/asound/.../status`, not by ear.
+4. **Subtitles painted** in `--profile subs`: fontconfig needs a config file
+   the image does not ship yet.
+5. **No regressions from more plugins.** The change is additive - files only,
+   no library version moved - and VLC picks modules by score at runtime. The
+   static proof says each new file loads; it cannot say the scoreboard still
+   picks the same decoder for H.264, which is what a playback run checks.
+
+`filetypes.c` routes mp4, mkv, webm, avi and mov to the player, so a
 downloaded file opens from Files exactly like a video attached to a message.
+The container list in the bundle is now wider than that routing table
+(ts, ps, asf, flac, wav, ogg, raw h264/hevc/mpg), which is a UI question for
+the next change, not a codec gap.
+

@@ -6,8 +6,11 @@ One command builds every artifact the player needs and prints the real
 numbers it found:
 
     python tools/fetch-vlc.py                 # resolve, download, unpack, build, pack
-    python tools/fetch-vlc.py --dry-run       # resolve and print only
+    python tools/fetch-vlc.py --dry-run       # resolve, print the plugin audit, pack nothing
+    python tools/fetch-vlc.py --audit-only    # which plugins vlc.apk has vs this profile
+    python tools/fetch-vlc.py --verify-only   # re-prove the packed tarball loads
     python tools/fetch-vlc.py --profile minimal
+    python tools/fetch-vlc.py --profile subs  # playback + FreeType renderer + libass
     python tools/fetch-vlc.py --force         # ignore the caches
 
 What it produces:
@@ -78,9 +81,15 @@ ships - and those are only rewritten when their bytes would change.
 Honesty notes:
   * The download cap is enforced before anything big is fetched. A profile
     over --max-download-mb is refused unless --force is given.
-  * `--profile playback` (the default) decodes H.264/HEVC/MPEG-2/VP8/VP9/
-    AV1/AAC/MP3/AC-3 through Alpine's libavcodec. That is a large closure;
-    the printed numbers are the real ones.
+  * `--profile playback` (the default) ships libavcodec plus VLC's own
+    dav1d (AV1), vpx (VP8/VP9), theora, opus, vorbis and mpg123 decoders.
+    "libavcodec handles it" is not proof, so `--audit` lists what is really
+    in vlc.apk, what this profile takes, and every plugin's DT_NEEDED; the
+    package is then rejected unless every DT_NEEDED has an entry with exactly
+    that name under lib/ (a SONAME match is not enough) and every undefined
+    symbol resolves inside the packed tarball (verify_tarball below).
+    VLC 3.0.23 has no libav1_plugin.so and no libmpeg2_plugin.so: AV1 is
+    dav1d, MPEG-2 is libavcodec only. The printed numbers are the real ones.
   * No sound driver is staged in the image and QEMU is started without a
     sound device, so this package contains only the dummy audio output.
     libVLC still decodes audio; nothing can play it until a PCM device
@@ -182,18 +191,87 @@ PLUGINS = {
         "demux/libps_plugin.so",
         "demux/libwav_plugin.so",
         "demux/libogg_plugin.so",
+        # .wmv/.wma (WMV3 + WMA decode through libavcodec) and .flac. Both
+        # link only libvlccore; 77.7 KB + 29.7 KB.
+        "demux/libasf_plugin.so",
+        "demux/libflacsys_plugin.so",
     ],
-    # H.264 / HEVC / MPEG-2 / VC-1 / VP8 / VP9 / AV1 / AAC / MP3 / AC-3:
-    # everything that needs libavcodec. The packetizers split elementary
-    # streams inside mp4/mkv/ts.
-    "ffmpeg": [
-        "codec/libavcodec_plugin.so",
+    # What libavcodec itself provides: H.264, HEVC, MPEG-1/2/4, VC-1,
+    # VP8/VP9/AV1, AAC/MP3/AC-3/DTS/FLAC/... through one module. There is no
+    # separate decoder plugin for H.264, HEVC, MPEG-2 or VC-1 in VLC 3.0.23:
+    # libmpeg2_plugin.so and libav1_plugin.so do not exist in the package.
+    "ffmpeg": ["codec/libavcodec_plugin.so"],
+    # All 14 packetizers. They frame elementary streams inside ts/ogg/ps:
+    # without packetizer_a52 an AC-3 track in a .ts is not reassembled, etc.
+    # Every one of them links nothing but libvlccore; 571.5 KB in total, of
+    # which this profile used to take 333 KB.
+    "packetizer": [
+        "packetizer/libpacketizer_a52_plugin.so",
+        "packetizer/libpacketizer_av1_plugin.so",
+        "packetizer/libpacketizer_copy_plugin.so",
+        "packetizer/libpacketizer_dirac_plugin.so",
+        "packetizer/libpacketizer_dts_plugin.so",
+        "packetizer/libpacketizer_flac_plugin.so",
         "packetizer/libpacketizer_h264_plugin.so",
         "packetizer/libpacketizer_hevc_plugin.so",
-        "packetizer/libpacketizer_mpeg4video_plugin.so",
+        "packetizer/libpacketizer_mlp_plugin.so",
         "packetizer/libpacketizer_mpeg4audio_plugin.so",
+        "packetizer/libpacketizer_mpeg4video_plugin.so",
+        "packetizer/libpacketizer_mpegaudio_plugin.so",
         "packetizer/libpacketizer_mpegvideo_plugin.so",
         "packetizer/libpacketizer_vc1_plugin.so",
+    ],
+    # Dedicated decoders. Every library they name is ALREADY in libavcodec's
+    # closure on this Alpine release (libdav1d 1.5.3, libvpx 1.15.2,
+    # libtheora 1.2.0, opus, libvorbis, mpg123-libs), so each costs only the
+    # plugin file itself - 14 KB to 38 KB, no new package, no new download.
+    # Sizes and DT_NEEDED below are read from vlc.apk by --audit, not guessed:
+    #   libdav1d_plugin.so        14,016 B   libdav1d.so.7
+    #   libvpx_plugin.so          18,112 B   libvpx.so.11
+    #   libtheora_plugin.so       22,360 B   libtheoradec.so.2, libtheoraenc.so.2
+    #   libopus_plugin.so         26,304 B   libopus.so.0
+    #   libvorbis_plugin.so       30,400 B   libvorbis.so.0, libvorbisenc.so.2
+    #   libmpg123_plugin.so       13,936 B   libmpg123.so.0
+    # VLC 3.0.23 has NO libav1_plugin.so and NO libmpeg2_plugin.so; AV1 is
+    # dav1d, MPEG-2 is libavcodec. --audit prints the absence rather than
+    # letting the reader assume otherwise.
+    "codecs": [
+        "codec/libdav1d_plugin.so",
+        "codec/libvpx_plugin.so",
+        "codec/libtheora_plugin.so",
+        "codec/libopus_plugin.so",
+        "codec/libvorbis_plugin.so",
+        "codec/libmpg123_plugin.so",
+    ],
+    # Raw elementary streams: .h264/.hevc/.mpg files that have no container.
+    # All three link nothing but libvlccore (42,688 + 18,112 + 14,016 B).
+    "raw": [
+        "demux/libes_plugin.so",
+        "demux/libh26x_plugin.so",
+        "demux/libmpgv_plugin.so",
+    ],
+    # Subtitles, half one: detect a sidecar file and decode its text to SPU
+    # subpictures. These three link only libvlccore. Drawing them needs a
+    # text renderer, which is the other half below - without it a subtitle
+    # track is recognised and decoded but nothing is painted.
+    "subs_text": [
+        "demux/libsubtitle_plugin.so",
+        "codec/libsubsdec_plugin.so",
+        "codec/libwebvtt_plugin.so",
+    ],
+    # Subtitles, half two: FreeType + fontconfig + fribidi + harfbuzz, which
+    # is +4.14 MB download / +10.20 MB installed over the default profile
+    # (measured from the index, see --audit). Not in the default: the image
+    # has TTFs in /usr/share/fonts but no /etc/fonts/fonts.conf, so whether
+    # fontconfig can initialise in the guest is a boot-time fact, not a
+    # static one. Kept in --profile subs rather than paid for blindly.
+    # libass draws ASS/SSA itself (styled positions, fonts, effects) and needs
+    # libass.so.9 -> libass, which pulls the same freetype/fontconfig stack the
+    # text renderer already needs. Marginal cost over that stack: +0.12 MB
+    # download / +0.33 MB installed, so `subs` ships both halves.
+    "subs_render": [
+        "text_renderer/libfreetype_plugin.so",
+        "codec/liblibass_plugin.so",
     ],
     # Audio outputs. alsa is the one that can open the emulated HDA PCM the
     # image now carries; adummy stays as the honest fallback for an image
@@ -210,17 +288,25 @@ PLUGINS = {
 PROFILES = {
     # images + raw frames, no external codec library.
     "minimal": PLUGINS["vout"] + PLUGINS["image"] + PLUGINS["file"],
-    # the same, plus local containers and libavcodec. This is the default.
+    # the default: local containers, libavcodec, the dedicated decoders for
+    # the formats libavcodec has to reach a separate library for, raw
+    # elementary streams, and subtitle decoding (not drawing).
     "playback": (PLUGINS["vout"] + PLUGINS["image"] + PLUGINS["file"]
-                 + PLUGINS["demux"] + PLUGINS["ffmpeg"] + PLUGINS["aout"]),
+                 + PLUGINS["demux"] + PLUGINS["ffmpeg"] + PLUGINS["packetizer"]
+                 + PLUGINS["codecs"]
+                 + PLUGINS["raw"] + PLUGINS["subs_text"] + PLUGINS["aout"]),
     # playback over HTTP as well (adds TLS, more libraries).
     "network": (PLUGINS["vout"] + PLUGINS["image"] + PLUGINS["file"]
-                + PLUGINS["demux"] + PLUGINS["ffmpeg"] + PLUGINS["aout"]
+                + PLUGINS["demux"] + PLUGINS["ffmpeg"] + PLUGINS["packetizer"]
+                + PLUGINS["codecs"]
+                + PLUGINS["raw"] + PLUGINS["subs_text"] + PLUGINS["aout"]
                 + PLUGINS["http"]),
-    # plus subtitle rendering.
+    # the default plus the FreeType text renderer, so subtitles are painted.
     "subs": (PLUGINS["vout"] + PLUGINS["image"] + PLUGINS["file"]
-             + PLUGINS["demux"] + PLUGINS["ffmpeg"] + PLUGINS["aout"]
-             + PLUGINS["subs"]),
+             + PLUGINS["demux"] + PLUGINS["ffmpeg"] + PLUGINS["packetizer"]
+             + PLUGINS["codecs"]
+             + PLUGINS["raw"] + PLUGINS["subs_text"] + PLUGINS["aout"]
+             + PLUGINS["subs_render"]),
     # what `apk add vlc` would do.
     "full": None,
 }
@@ -445,14 +531,19 @@ def elf_full(path):
     DT_RPATH/DT_RUNPATH, DT_SONAME and the entry point. A file that is not
     an ELF yields the defaults, so the caller can still report its size.
     """
-    out = {"size": 0, "e_type": 0, "interp": "", "needed": [], "rpath": [],
-           "soname": "", "entry": 0}
     try:
         with open(path, "rb") as f:
             b = f.read()
     except OSError:
-        return out
-    out["size"] = len(b)
+        return {"size": 0, "e_type": 0, "interp": "", "needed": [],
+                "rpath": [], "soname": "", "entry": 0}
+    return elf_meta_bytes(b)
+
+
+def elf_meta_bytes(b):
+    """elf_full() over an in-memory image: a tarball member needs no file."""
+    out = {"size": len(b), "e_type": 0, "interp": "", "needed": [],
+           "rpath": [], "soname": "", "entry": 0}
     if b[:4] != b"\x7fELF" or len(b) < 64:
         return out
     is64 = b[4] == 2
@@ -577,6 +668,92 @@ def check_elf(path, kind, what):
             raise RuntimeError("%s has no entry point, so it cannot be exec'd"
                                % what)
     return got
+
+
+def elf_dynsym_bytes(b):
+    """(defined, undefined) symbol names from .dynsym, or (set(), set()).
+
+    This is the second half of "the plugin loads": resolving DT_NEEDED says
+    the loader can find libdav1d.so.7, but the plugin also imports ~40
+    symbols from it (dav1d_open, dav1d_send_data, ...). If one of those is
+    missing the loader fails at dlopen with "undefined symbol" and the file
+    is as dead as if it were absent. So we read the real dynamic symbol
+    table of every shipped object and require each strong undefined symbol to
+    be defined by some library we ship (the loader itself counts - musl
+    keeps libc's symbols in ld-musl-x86_64.so.1).
+
+    STB_WEAK undefined symbols are skipped: they are allowed to be absent.
+    """
+    defined, undefined = set(), set()
+    if b[:4] != b"\x7fELF" or len(b) < 64:
+        return defined, undefined
+    is64 = b[4] == 2
+    le = "<" if b[5] == 1 else ">"
+    try:
+        if is64:
+            shoff, = struct.unpack_from(le + "Q", b, 0x28)
+            shentsize, shnum, shstrndx = struct.unpack_from(le + "HHH", b, 0x3a)
+        else:
+            shoff, = struct.unpack_from(le + "I", b, 0x20)
+            shentsize, shnum, shstrndx = struct.unpack_from(le + "HHH", b, 0x2e)
+
+        def sh(i):
+            off = shoff + i * shentsize
+            if is64:
+                return struct.unpack_from(le + "IIQQQQIIQQ", b, off)
+            return struct.unpack_from(le + "IIIIIIIIII", b, off)
+
+        def name_at(strtab, off):
+            end = b.find(b"\0", strtab + off)
+            return b[strtab + off:end].decode("utf-8", "replace") if end >= 0 else ""
+
+        names = []
+        for i in range(shnum):
+            s = sh(i)
+            names.append(name_at(sh(shstrndx)[4], s[0]))
+        dynsym = dynstr = None
+        for i, nm in enumerate(names):
+            if nm == ".dynsym":
+                dynsym = sh(i)
+            elif nm == ".dynstr":
+                dynstr = sh(i)
+        if dynsym is None or dynstr is None:
+            return defined, undefined
+        strtab = dynstr[4]
+        esz = 24 if is64 else 16
+        count = dynsym[5] // esz
+        for i in range(count):
+            off = dynsym[4] + i * esz
+            if is64:
+                st_name, st_info, _other, st_shndx = struct.unpack_from(le + "IBBH", b, off)
+            else:
+                st_name, = struct.unpack_from(le + "I", b, off)
+                st_info = b[off + 12]
+                st_shndx, = struct.unpack_from(le + "H", b, off + 14)
+            if st_name == 0:
+                continue
+            bind = st_info >> 4
+            if bind not in (1, 2):            # STB_GLOBAL, STB_WEAK only
+                continue
+            nm = name_at(strtab, st_name)
+            if not nm:
+                continue
+            if st_shndx == 0:                 # SHN_UNDEF
+                if bind != 2:                 # a weak import may stay absent
+                    undefined.add(nm)
+            else:
+                defined.add(nm)
+    except (ValueError, IndexError, struct.error):
+        pass
+    return defined, undefined
+
+
+def elf_dynsym(path):
+    try:
+        with open(path, "rb") as f:
+            return elf_dynsym_bytes(f.read())
+    except OSError:
+        return set(), set()
 
 
 def build_player(stage, zig):
@@ -790,6 +967,21 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+def stamp_path_for(repo):
+    """The package stamp that describes a given --repo.
+
+    The default repo owns build/vlc-pkg.stamp; any other repo gets its own, so
+    a second artifact (e.g. --profile subs into build/repo-subs) can be
+    provenance-checked too instead of silently skipping the gate.
+    """
+    same = (os.path.normcase(os.path.realpath(repo))
+            == os.path.normcase(os.path.realpath(REPO)))
+    if same:
+        return os.path.join("build", "vlc-pkg.stamp")
+    return os.path.join("build", "vlc-pkg-%s.stamp"
+                        % os.path.basename(os.path.normpath(repo)))
+
+
 def read_json(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -931,10 +1123,11 @@ def app_inputs_digest(zig):
     for p in APP_SRC:
         with open(p, "rb") as f:
             h.update(p.encode() + b"\0" + f.read() + b"\0")
-    try:
-        h.update(subprocess.check_output([zig, "version"]).strip())
-    except (OSError, subprocess.CalledProcessError):
-        pass
+    if zig:
+        try:
+            h.update(subprocess.check_output([zig, "version"]).strip())
+        except (OSError, subprocess.CalledProcessError):
+            pass
     h.update(open(MANIFEST, "rb").read())
     # The packaging logic itself: a cached tarball must not survive a change
     # to what build_stage puts in it (the soname aliases were one such fix).
@@ -1053,6 +1246,170 @@ def plugin_list(root, profile, plugins):
             if n.endswith(".so"):
                 out.append(os.path.relpath(os.path.join(dirpath, n), base))
     return sorted(out)
+
+
+def apk_plugin_index(pkgs):
+    """{plugin rel path: size} for every plugin file inside vlc.apk.
+
+    Read from the cached .apk; the caller has already fetched it. This is the
+    only honest source for "which codec plugins does Alpine's VLC have":
+    APKINDEX has no file list, and docs that list plugins from memory have
+    been wrong before (there is no libav1_plugin.so in VLC 3.0.23).
+    """
+    path = apk_path(pkgs, "vlc")
+    out = {}
+    try:
+        tf = tarfile.open(path, "r:gz")
+    except (OSError, tarfile.TarError):
+        return out
+    prefix = "usr/lib/vlc/plugins/"
+    for m in tf:
+        if m.isfile() and m.name.startswith(prefix):
+            out[m.name[len(prefix):]] = m.size
+    tf.close()
+    return out
+
+
+# The plugins this assignment is about, in the words it asked for. `why` is
+# printed next to the verdict so the answer cannot drift from the check.
+CODEC_WATCHLIST = [
+    ("codec/libdav1d_plugin.so", "AV1 (the only AV1 decoder VLC 3.0 has)"),
+    ("codec/libav1_plugin.so", "AV1 via a plugin by that name"),
+    ("codec/libvpx_plugin.so", "VP8 + VP9"),
+    ("codec/libtheora_plugin.so", "Theora"),
+    ("codec/libmpeg2_plugin.so", "MPEG-1/2 video"),
+    ("codec/libavcodec_plugin.so", "everything else (H.264/HEVC/MPEG-2/VC-1)"),
+    ("packetizer/libpacketizer_av1_plugin.so", "AV1 OBU packetizer"),
+    ("demux/libsubtitle_plugin.so", "sidecar .srt/.ass/.vtt"),
+    ("codec/libsubsdec_plugin.so", "SubRip/SSA -> SPU"),
+    ("codec/libwebvtt_plugin.so", "WebVTT -> SPU"),
+    ("codec/liblibass_plugin.so", "ASS/SSA rendering via libass"),
+    ("text_renderer/libfreetype_plugin.so", "draws text subpictures"),
+]
+
+
+def apk_plugin_facts(pkgs, wanted):
+    """{rel: (size, [DT_NEEDED])} read from vlc.apk for the wanted files.
+
+    Read from the package, not from the probe tree: --audit has to be able to
+    describe a plugin the profile does not take (liblibass, libfreetype), and
+    a file that is not extracted has no DT_NEEDED to read otherwise.
+    """
+    out = {}
+    want = set(wanted)
+    try:
+        tf = tarfile.open(apk_path(pkgs, "vlc"), "r:gz")
+    except (OSError, tarfile.TarError):
+        return out
+    prefix = "usr/lib/vlc/plugins/"
+    for m in tf:
+        if not m.isfile() or not m.name.startswith(prefix):
+            continue
+        rel = m.name[len(prefix):]
+        if rel not in want:
+            continue
+        meta = elf_meta_bytes(tf.extractfile(m).read())
+        out[rel] = (m.size, meta["needed"])
+    tf.close()
+    return out
+
+
+def audit_plugins(pkgs, provides, closure, selected, profile):
+    """Print what vlc.apk has, what this profile takes, and what is absent.
+
+    Two independent columns, deliberately kept apart:
+      [apk]  the plugin file exists in vlc.apk, its size, and its DT_NEEDED
+             read from the file itself;
+      [pkg]  each needed soname resolves to a package that is in this
+             profile's closure.
+    A plugin that exists but needs a library nobody ships is not coverage,
+    so the verdict is SHIPPED only when both columns agree. Resolution is
+    judged against the closure this run would actually install, never
+    against build/vlc-root, which may be left over from another profile.
+    The stricter proof (undefined symbols, packed tarball) is
+    verify_tarball().
+    """
+    files = apk_plugin_index(pkgs)
+    if not files:
+        print("==> plugin audit: vlc.apk is not readable, skipping")
+        return None
+    facts = apk_plugin_facts(pkgs, [rel for rel, _why in CODEC_WATCHLIST])
+    have_so = set()
+    for so, provider in provides.items():
+        if provider in closure:
+            have_so.add(so.split("=")[0])
+    # --profile full ships the whole package, so every file is selected.
+    sel = set(files) if selected is None else set(selected)
+
+    print("==> plugin audit: vlc-%s.apk carries %d plugin files; profile %r takes %d"
+          % (pkgs["vlc"]["version"], len(files), profile, len(sel)))
+    print("    codec watchlist (shipped = the file is taken AND its libraries are):")
+    print("    %-44s %-9s %-11s %s" % ("plugin", "in apk", "in profile", "libraries"))
+    counts = {"shipped": 0, "absent": 0, "unresolved": 0, "not_selected": 0}
+    for rel, why in CODEC_WATCHLIST:
+        size = files.get(rel)
+        if size is None:
+            print("    %-44s %-9s %-11s %s" % (rel, "ABSENT", "-", why))
+            counts["absent"] += 1
+            continue
+        _size, needed = facts.get(rel, (size, []))
+        needs = [n for n in needed
+                 if not n.startswith("libc.") and n != "libc.so"]
+        bad = [n for n in needs
+               if n != "libvlccore.so.9" and ("so:" + n) not in have_so]
+        chosen = rel in sel
+        if bad and chosen:
+            verdict = "MISSING"
+            counts["unresolved"] += 1
+        elif bad:
+            verdict = "not selected"
+            counts["not_selected"] += 1
+        elif chosen:
+            verdict = "SHIPPED"
+            counts["shipped"] += 1
+        else:
+            verdict = "not selected"
+            counts["not_selected"] += 1
+        libs = ", ".join(needs) or "(libvlccore only)"
+        if bad:
+            libs += "  (not shipped: %s)" % ", ".join(bad)
+        print("    %-44s %6.1f KB %-11s %s" % (rel, size / 1024.0, verdict, libs))
+
+    # Completeness, measured rather than asserted: every codec/ and
+    # packetizer/ plugin whose DT_NEEDED already resolves inside this closure
+    # but which the profile does not take. Anything in this list is a file we
+    # could ship for free; the doc says why each one is not worth it.
+    scope = [rel for rel in files if rel.startswith(("codec/", "packetizer/"))]
+    all_facts = apk_plugin_facts(pkgs, scope)
+    free_not_taken = []
+    for rel, (_size, needed) in sorted(all_facts.items()):
+        if rel in sel:
+            continue
+        bad = [n for n in needed
+               if n != "libvlccore.so.9" and not n.startswith("libc.")
+               and ("so:" + n) not in have_so]
+        if not bad:
+            free_not_taken.append(rel)
+    counts["free_not_taken"] = len(free_not_taken)
+
+    by_dir = {}
+    for rel in files:
+        top = rel.split("/")[0]
+        by_dir[top] = by_dir.get(top, 0) + 1
+    print("    by category in vlc.apk: %s"
+          % ", ".join("%s %d" % (k, v) for k, v in sorted(by_dir.items())))
+    print("    verdict: %d shipped, %d present but not in this profile, %d absent from "
+          "VLC 3.0.23, %d selected but unresolvable"
+          % (counts["shipped"], counts["not_selected"], counts["absent"],
+             counts["unresolved"]))
+    print("    codec/packetizer plugins that would load against this closure but "
+          "the profile does not take: %d (%s)"
+          % (len(free_not_taken),
+             ", ".join(r.split("/", 1)[1].replace("_plugin.so", "")
+                       for r in free_not_taken)))
+    return {"apk_plugins": len(files), "selected": len(sel),
+            "by_category": by_dir, "verdict": counts,
+            "free_not_taken": free_not_taken}
 
 
 def package_manifest(text):
@@ -1259,48 +1616,251 @@ def pack_tarball(entries, stage, out_path):
     return len(data)
 
 
-def upsert_index(tarball):
-    """Put the vlc row into build/repo/index.tsv and re-sign it if we can.
+# What the packed player dlopens by name (src/client/apps/vlcplay.c:
+# dlopen("libvlc.so.5", RTLD_NOW)). A DT_NEEDED scan cannot see this, and a
+# bundle that ships only libvlc.so.5.6.1 with the DT_SONAME libvlc.so.5 is a
+# bundle that fails at runtime - the loader opens files by name, it does not
+# search a directory for a SONAME. Keep this list in step with that call.
+DLOPEN_LIBS = ["libvlc.so.5"]
+
+
+def verify_bundle(files, aliases, label, verbose=True, dlopen=None):
+    """Prove the packed bytes load, by name and by symbol.
+
+    files   {arcname: bytes} for every regular file under lib/ plus the
+            player (libexec/vlcplay);
+    aliases {alias: target} for the soname symlinks the tar carries.
+
+    The rules, each of which has a failing example behind it:
+      1. every DT_NEEDED of every shipped object (libraries, loader, player,
+         plugins) must have an *entry with exactly that name* under lib/ -
+         a regular file or a symlink. Matching a DT_SONAME somewhere is not
+         enough: musl's loader opens libvpx.so.11, it does not scan for a
+         file whose SONAME is libvpx.so.11 (so libvpx.so.11.0.1 alone is a
+         dead bundle, and this check must reject it);
+      2. every alias target must exist, and alias chains must not loop;
+      3. every name in DLOPEN_LIBS must have an entry (the player dlopens
+         libvlc.so.5, which is not in anyone's DT_NEEDED);
+      4. the player's PT_INTERP basename must be shipped at lib/;
+      5. every strong undefined symbol of each plugin and of the player must
+         be defined by some shipped library or by the bundled musl loader
+         (which is the C library here). Weak imports may stay absent.
+
+    Returns the summary dict; raises RuntimeError listing every failure, so a
+    build that would ship a dead plugin cannot finish successfully.
+    """
+    dlopen = DLOPEN_LIBS if dlopen is None else dlopen
+    # Libraries and the loader - not the plugins: a plugin that exports a name
+    # must not be able to satisfy another plugin's import, and nothing loads a
+    # plugin by DT_NEEDED name.
+    lib_files = {a: d for a, d in files.items()
+                 if a.startswith("lib/") and "/vlc/plugins/" not in a}
+    entries = {os.path.basename(a) for a in lib_files} | set(aliases)
+
+    problems = []
+    # (2) every symlink must land on a real entry, without a cycle.
+    for a, t in sorted(aliases.items()):
+        cur, seen = t, {a}
+        while cur in aliases:
+            if cur in seen:
+                problems.append("lib/%s: soname symlink loop (%s)"
+                                % (a, " -> ".join(sorted(seen | {cur}))))
+                cur = None
+                break
+            seen.add(cur)
+            cur = aliases[cur]
+        if cur is not None and cur not in entries:
+            problems.append("lib/%s -> %s (target is not in the bundle)"
+                            % (a, t))
+
+    # (3) dlopen targets, and (4) the interpreter.
+    for name in dlopen:
+        if name not in entries:
+            problems.append("the player dlopens %s but lib/%s is not in the "
+                            "bundle (only a file with that DT_SONAME would "
+                            "not help: the loader opens by name)" % (name, name))
+    player = files.get("libexec/vlcplay")
+    if player is not None:
+        interp = elf_meta_bytes(player)["interp"]
+        if interp:
+            base = os.path.basename(interp)
+            if base not in entries:
+                problems.append("the player's PT_INTERP is %s but lib/%s is not "
+                                "in the bundle" % (interp, base))
+
+    # (1) DT_NEEDED of every object, by exact name.
+    needed_missing = {}
+    for arc in sorted(files):
+        for n in elf_meta_bytes(files[arc])["needed"]:
+            if n == "libc.so" or n.startswith("libc."):
+                continue        # musl resolves these to the loader itself
+            if n not in entries:
+                needed_missing.setdefault(arc, []).append(n)
+
+    # (5) symbols: plugins and the player import into the shipped libraries.
+    defined = set()
+    for arc, data in lib_files.items():
+        d, _u = elf_dynsym_bytes(data)
+        defined |= d
+
+    sym_missing = {}
+    rows = []
+    for arc in sorted(files):
+        if not ("vlc/plugins/" in arc or arc.endswith("libexec/vlcplay")):
+            continue
+        _d, undef = elf_dynsym_bytes(files[arc])
+        miss = sorted(undef - defined)
+        if miss:
+            sym_missing[arc] = miss
+        rows.append((arc.replace("lib/vlc/plugins/", ""),
+                     len(elf_meta_bytes(files[arc])["needed"]), len(undef),
+                     bool(needed_missing.get(arc)), bool(miss)))
+
+    if verbose:
+        print("==> verifying %s: %d plugin/player objects + %d lib files, "
+              "%d soname aliases, %d dlopen target(s)"
+              % (label, len(rows), len(lib_files), len(aliases), len(dlopen)))
+        for arc, nneed, nundef, prev_bad, syms_bad in rows:
+            print("    %-46s NEEDED %2d  imports %3d  %s"
+                  % (arc, nneed, nundef,
+                     "FAIL" if (prev_bad or syms_bad) else "resolve"))
+
+    for arc, miss in needed_missing.items():
+        problems.append("%s needs %s (no entry with that name under lib/)"
+                        % (arc, ", ".join(miss)))
+    for arc, miss in sym_missing.items():
+        problems.append("%s imports %d symbol(s) no shipped library defines: %s"
+                        % (arc, len(miss), ", ".join(miss[:8])))
+    summary = {"objects": len(rows), "libraries": len(lib_files),
+               "aliases": len(aliases), "dlopen": list(dlopen),
+               "needed_objects": len(files),
+               "needed_failures": len(needed_missing),
+               "symbol_failures": len(sym_missing),
+               "undefined_symbols": sum(r[2] for r in rows)}
+    if problems:
+        sys.stdout.flush()          # keep the failure next to its table
+        msg = "%s would not load:" % label
+        for p in problems:
+            msg += os.linesep + "  " + p
+        raise RuntimeError(msg)
+    if verbose:
+        print("    all %d objects have an entry for every DT_NEEDED and all %d "
+              "plugin/player imports resolve" % (len(files), len(rows)))
+    return summary
+
+
+def read_packed_bundle(path):
+    """{arcname: bytes} + {alias: target} from the tarball itself.
+
+    Symlinks are not extracted (Windows cannot create them); their targets are
+    recorded and the soname map is built from the real files' DT_SONAME, so an
+    alias whose target is missing still fails the check.
+    """
+    files, aliases = {}, {}
+    tf = tarfile.open(path, "r:gz")
+    for m in tf:
+        arc = m.name[2:] if m.name.startswith("./") else m.name
+        if m.issym():
+            if arc.startswith("lib/") and \
+                    ("vlc/plugins/" not in arc):
+                aliases[os.path.basename(arc)] = os.path.basename(m.linkname)
+            continue
+        if not m.isfile():
+            continue
+        keep = (arc.startswith("lib/") or arc == "libexec/vlcplay")
+        if not keep or (".so" not in arc and arc != "libexec/vlcplay"):
+            continue
+        files[arc] = tf.extractfile(m).read()
+    tf.close()
+    return files, aliases
+
+
+def packed_player_sha(path):
+    """sha256 of libexec/vlcplay inside a package, or None."""
+    try:
+        tf = tarfile.open(path, "r:gz")
+    except (OSError, tarfile.TarError):
+        return None
+    try:
+        for m in tf:
+            if m.name == "./libexec/vlcplay" and m.isfile():
+                return hashlib.sha256(tf.extractfile(m).read()).hexdigest()
+    finally:
+        tf.close()
+    return None
+
+
+def verify_tarball(path, verbose=True):
+    """verify_bundle() over the packed artifact, not the loose tree."""
+    files, aliases = read_packed_bundle(path)
+    if not files:
+        raise RuntimeError("%s contains no libraries: nothing to verify" % path)
+    return verify_bundle(files, aliases, os.path.basename(path), verbose)
+
+
+def upsert_index(tarball, repo):
+    """Put the vlc row into <repo>/index.tsv and re-sign it if we can.
+
+    `repo` is the --repo that was built, not the module default: building
+    --profile subs --repo build/repo-subs must not rewrite build/repo's index
+    (it did once, and the scratch repo was left pointing at an old tarball's
+    size and hash). Rows whose tarball is not in that repo are dropped, so a
+    scratch repo gets an index that describes only what it actually contains
+    instead of dangling entries.
 
     tools/serve-repo.sh rebuilds index.tsv from stage/usr/share/mystic/apps,
     so a later run of that script will drop this row; the tarball stays. The
     final report says so instead of implying the repository is permanent.
     """
-    os.makedirs(REPO, exist_ok=True)
-    idx = os.path.join(REPO, "index.tsv")
+    NL = chr(10)
+    TAB = chr(9)
+    os.makedirs(repo, exist_ok=True)
+    idx = os.path.join(repo, "index.tsv")
     rows = []
     if os.path.isfile(idx):
         with open(idx, "r", encoding="utf-8", newline="") as f:
             for line in f.read().splitlines():
                 if not line.strip():
                     continue
-                if line.split("\t", 1)[0] == PKG_NAME:
+                fields = line.split(TAB)
+                if fields[0] == PKG_NAME:
                     continue
+                fname = fields[4] if len(fields) > 4 else ""
+                if fname and not os.path.isfile(os.path.join(repo, fname)):
+                    continue          # a row with no tarball in this repo
                 rows.append(line)
     size = os.path.getsize(tarball)
     sha = sha256_file(tarball)
-    desc = "libVLC video player: vmem output, real H.264/HEVC/VP9 decode"
-    rows.append("%s\t%s\t%d\t%s\t%s.tar.gz\t%s"
-                % (PKG_NAME, PKG_VERSION, size, sha, PKG_NAME, desc))
+    # The tile text is a capability claim the user reads before installing.
+    # H.264 has been watched; the rest is shipped and statically proven to
+    # load, not measured, so it must not read as "real ... decode" for all.
+    desc = ("libVLC video player: vmem I420 output; H.264 measured, "
+            "HEVC/VP9/AV1 bundled-unverified")
+    rows.append(TAB.join([PKG_NAME, PKG_VERSION, str(size), sha,
+                          PKG_NAME + ".tar.gz", desc]))
     tmp = idx + ".part"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        f.write("\n".join(rows) + "\n")
+    with open(tmp, "w", encoding="utf-8", newline=NL) as f:
+        f.write(NL.join(rows) + NL)
     os.replace(tmp, idx)
-    with open(os.path.join(REPO, "vlc.row"), "w", encoding="utf-8", newline="\n") as f:
-        f.write(rows[-1] + "\n")
+    with open(os.path.join(repo, "vlc.row"), "w", encoding="utf-8",
+              newline=NL) as f:
+        f.write(rows[-1] + NL)
 
     key = os.path.join("build", "sign", "repo.key")
     pub = os.path.join("stage", "etc", "mystic", "repo.pub")
     if os.path.isfile(key):
+        # flush ours first: the signer is a child process and inherits the
+        # same stdout, so buffered lines would otherwise interleave with it.
+        sys.stdout.flush()
         cmd = [sys.executable, os.path.join("tools", "sign-index.py"), "sign",
                "--seed", key, "--in", idx]
         if os.path.isfile(pub):
             cmd += ["--pub", pub]
         r = subprocess.run(cmd)
         if r.returncode != 0:
-            print("warning: could not sign index.tsv", file=sys.stderr)
+            print("warning: could not sign %s" % idx, file=sys.stderr)
         elif os.path.isfile(pub):
-            shutil.copyfile(pub, os.path.join(REPO, "index.pub"))
+            shutil.copyfile(pub, os.path.join(repo, "index.pub"))
     else:
         print("    no build/sign/repo.key: index.tsv is UNSIGNED and pkg will "
               "refuse it", file=sys.stderr)
@@ -1312,8 +1872,11 @@ def main():
     ap = argparse.ArgumentParser(
         description="build the libVLC vmem player package for Mystic OS")
     ap.add_argument("--profile", default="playback", choices=sorted(PROFILES),
-                    help="playback (default) = local files + libavcodec; "
-                         "minimal = images/raw only; full = apk add vlc")
+                    help="playback (default) = containers + libavcodec + the "
+                         "dedicated dav1d/vpx/theora/opus/vorbis/mpg123 decoders "
+                         "+ subtitle decoding; minimal = images/raw only; "
+                         "subs = playback + the FreeType text renderer + "
+                         "libass (ASS/SSA); full = apk add vlc")
     ap.add_argument("--root", action="append", default=None,
                     help="extra package or so:name to add to the closure")
     ap.add_argument("--dest", default=DEST)
@@ -1321,6 +1884,12 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="resolve and print; download nothing beyond the "
                          "two vlc packages needed to read DT_NEEDED")
+    ap.add_argument("--audit-only", action="store_true",
+                    help="print the plugin audit and stop (needs the cached "
+                         "vlc.apk; --dry-run also prints it)")
+    ap.add_argument("--verify-only", action="store_true",
+                    help="re-verify the already packed tarball and stop: every "
+                         "DT_NEEDED soname and every imported symbol")
     ap.add_argument("--download", action="store_true",
                     help="accepted for compatibility; the default builds")
     ap.add_argument("--no-pack", action="store_true",
@@ -1338,6 +1907,87 @@ def main():
         print("error: run this from the repository root", file=sys.stderr)
         return 2
     os.makedirs(INDEX_CACHE, exist_ok=True)
+
+    tarball_path = os.path.join(args.repo, PKG_NAME + ".tar.gz")
+    tarball_path_default = os.path.join(REPO, PKG_NAME + ".tar.gz")
+    if args.verify_only:
+        if not os.path.isfile(tarball_path):
+            print("error: %s does not exist; build it first" % tarball_path,
+                  file=sys.stderr)
+            return 1
+        try:
+            summary = verify_tarball(tarball_path)
+        except (RuntimeError, OSError, tarfile.TarError) as e:
+            print("error: %s" % e, file=sys.stderr)
+            return 1
+        print("==> %s verified: %d objects checked for DT_NEEDED by exact name, "
+              "%d plugin/player symbol sets, %d aliases, %d dlopen target(s) (%s), "
+              "%d imports, %d NEEDED failures, %d symbol failures"
+              % (tarball_path, summary["needed_objects"], summary["objects"],
+                 summary["aliases"], len(summary["dlopen"]),
+                 ", ".join(summary["dlopen"]), summary["undefined_symbols"],
+                 summary["needed_failures"], summary["symbol_failures"]))
+        # Provenance: is this tarball the one the current sources would build?
+        # The stamp records the player source's own hash, so a stale artifact
+        # is detectable without rebuilding or trusting a timestamp.
+        # Provenance is a gate, not a note: a tarball that verifies but was not
+        # built from these sources is not the artifact this tree publishes.
+        # The gate is app_digest_src (APP_SRC + this tool + the manifest) plus
+        # vlcplay_sha256. The compiler version is part of the cache key, not
+        # of the publish gate: a host without zig can still verify, it just
+        # cannot compare the toolchain component.
+        stamp_path = stamp_path_for(args.repo)
+        stamp = read_json(stamp_path)
+        if not stamp:
+            # No stamp for this repo (e.g. a hand-made repo): fall back to the
+            # only cross-artifact fact available - does the packed player match
+            # the published package's?
+            mine = packed_player_sha(tarball_path)
+            theirs = packed_player_sha(tarball_path_default)
+            if mine and theirs and mine == theirs:
+                print("    (no %s; provenance: player bytes match the default "
+                      "package, sha256 %s...)" % (stamp_path, mine[:16]))
+            elif mine and theirs:
+                print("    (no %s; provenance: player DIFFERS from the default "
+                      "package: %s... vs %s...)"
+                      % (stamp_path, mine[:16], theirs[:16]))
+            else:
+                print("    (no %s; provenance cannot be checked)" % stamp_path)
+            return 0
+        built_src = stamp.get("app_digest_src")
+        built_player = stamp.get("vlcplay_sha256")
+        now_src = app_inputs_digest(None)
+        now_player = sha256_file("src/client/apps/vlcplay.c")
+        stale, notes = [], []
+        if built_src and built_src != now_src:
+            stale.append("sources/tooling built %s..., now %s..."
+                         % (built_src[:16], now_src[:16]))
+        if built_player and built_player != now_player:
+            stale.append("vlcplay.c built %s..., now %s..."
+                         % (built_player[:16], now_player[:16]))
+        if not built_src or not built_player:
+            notes.append("stamp has no source/player digests (old build); "
+                         "rebuild to record them")
+        zig = find_zig()
+        if zig and stamp.get("app_digest"):
+            if app_inputs_digest(zig) != stamp["app_digest"]:
+                notes.append("zig version differs from the build (toolchain "
+                             "component of the cache key, not of the gate)")
+        elif not zig:
+            notes.append("zig not found: the toolchain component is not "
+                         "checked; the gate is source digest + player hash")
+        for n in notes:
+            print("    note: %s" % n)
+        if stale:
+            print("    STALE package: it verifies internally but was not built "
+                  "from these sources (%s)" % "; ".join(stale))
+            print("    the publish gate is app_digest_src + vlcplay_sha256; "
+                  "rebuild with: python tools/fetch-vlc.py")
+            return 1
+        if built_src and built_player:
+            print("    package is current (%s): sources %s..., vlcplay.c %s..."
+                  % (stamp_path, built_src[:16], built_player[:16]))
+        return 0
 
     pkgs, provides = build_world(args.refresh_index)
     print("==> provides: %d" % len(provides))
@@ -1403,6 +2053,16 @@ def main():
             print("    %-28s %-14s %8.2f MB installed" % (n, p["version"],
                                                           p["installed"] / 1e6))
 
+    # What Alpine's VLC really carries vs what this profile takes. Printed on
+    # every run, including --dry-run: it is the evidence the docs quote.
+    audit = audit_plugins(pkgs, provides, closure, plugin_files, args.profile)
+    if args.audit_only:
+        return 0
+    if audit and audit["verdict"]["unresolved"]:
+        print("error: a plugin in this profile needs a library the bundle does "
+              "not ship", file=sys.stderr)
+        return 1
+
     if plugin_files:
         base = os.path.join(APK_CACHE, "_probe", "usr/lib/vlc/plugins")
         payload = sum(os.path.getsize(os.path.join(base, p)) for p in plugin_files
@@ -1440,6 +2100,14 @@ def main():
               "cannot be compiled into the package", file=sys.stderr)
         return 1
     digest = app_inputs_digest(zig)
+    # Two digests: the cache key includes the compiler version; the publish
+    # gate is source-only, so `--verify-only` works on a host without zig.
+    src_digest = app_inputs_digest(None)
+    # Provenance: which source the packed player came from. The package cache
+    # is keyed on this digest, but printing the player's own hash makes the
+    # question "which revision is this tarball?" answerable from the artifact
+    # instead of from a file's mtime.
+    player_src_sha = sha256_file("src/client/apps/vlcplay.c")
 
     # The image bundle first: it is the small, honest half of this tool.
     try:
@@ -1456,8 +2124,8 @@ def main():
               % (OLD_BUNDLE, PKG_NAME), file=sys.stderr)
 
     stage = PKG_STAGE
-    pkg_stamp_path = os.path.join("build", "vlc-pkg.stamp")
-    tarball = os.path.join(args.repo, PKG_NAME + ".tar.gz")
+    pkg_stamp_path = stamp_path_for(args.repo)
+    tarball = tarball_path
     prev = read_json(pkg_stamp_path)
     cache_hit = (not args.force and prev and prev.get("app_digest") == digest
                  and prev.get("profile") == args.profile
@@ -1470,6 +2138,13 @@ def main():
         size = prev["size"]
         sha = prev["sha256"]
         usize, ufiles = prev.get("installed", 0), prev.get("files", 0)
+        # A cache hit is still an artifact we are about to publish: prove it
+        # again. Two seconds of ELF reading beats trusting a stamp.
+        try:
+            info["verify"] = verify_tarball(tarball)
+        except (RuntimeError, OSError, tarfile.TarError) as e:
+            print("error: %s" % e, file=sys.stderr)
+            return 1
     else:
         try:
             entries, info = build_stage(args.dest, stage, args.profile, plugins,
@@ -1481,8 +2156,21 @@ def main():
         print("==> packed %s: %.2f MB, %d entries, %d libraries, %d plugins"
               % (tarball, size / 1e6, len(entries) + 1, info["libs"],
                  len(info["plugins"])))
+        try:
+            info["verify"] = verify_tarball(tarball)
+        except (RuntimeError, OSError, tarfile.TarError) as e:
+            print("error: %s" % e, file=sys.stderr)
+            return 1
+        info["vlcplay_sha256"] = player_src_sha
+        info["app_digest_src"] = src_digest
         sha = sha256_file(tarball)
-        usize, ufiles = tree_bytes(stage)
+        # Payload files and installed bytes are the tarball's own file list,
+        # not the staging tree (which also holds .vlc-pkg.json and would
+        # overcount by one).
+        payload_files = sum(1 for e in entries if e[1] == "file")
+        payload_bytes = sum(os.path.getsize(e[2]) for e in entries
+                            if e[1] == "file")
+        usize, ufiles = payload_bytes, payload_files
         info["size"] = size
         info["sha256"] = sha
         info["installed"] = usize
@@ -1490,7 +2178,7 @@ def main():
         write_json_atomic(pkg_stamp_path, info)
 
     print("==> package: %s  %.2f MB compressed, %.2f MB installed, %d files"
-          % (tarball, size / 1e6, usize / 1e6, ufiles + 1))
+          % (tarball, size / 1e6, usize / 1e6, ufiles))
     print("    bin (launcher): %d bytes, static musl, no PT_INTERP"
           % info.get("boot_size", 0))
     print("    libexec/vlcplay: %d bytes, DYNAMIC musl, PT_INTERP %s"
@@ -1507,7 +2195,20 @@ def main():
           % (info.get("exec", "bin"), info.get("version", PKG_VERSION)))
     print("    id everywhere: package %r = bundle %r = manifest 'bundle = %s'"
           % (PKG_NAME, PKG_NAME, PKG_NAME))
-    isz, isha = upsert_index(tarball)
+    v = info.get("verify") or {}
+    if v:
+        print("    static proof: %d objects x exact DT_NEEDED, %d lib files, "
+              "%d aliases, %d dlopen targets, %d imports, %d unresolved NEEDED, "
+              "%d unresolved symbols"
+              % (v["needed_objects"], v["libraries"], v["aliases"],
+                 len(v.get("dlopen", [])), v["undefined_symbols"],
+                 v["needed_failures"], v["symbol_failures"]))
+    isz, isha = upsert_index(tarball_path, args.repo)
+    print("    built from: src/client/apps/vlcplay.c sha256 %s..., "
+          "gate digest %s... (cache key %s...)"
+          % ((info.get("vlcplay_sha256") or "not recorded")[:16],
+             (info.get("app_digest_src") or "?")[:16],
+             (info.get("app_digest") or "?")[:16]))
     print("    index row: %s %s %d %s..." % (PKG_NAME, PKG_VERSION, isz, isha[:16]))
     return 0
 

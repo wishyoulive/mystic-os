@@ -96,6 +96,8 @@ typedef void (*libvlc_video_display_cb)(void *opaque, void *picture);
     X(libvlc_media_player_set_media,  player_set_media) \
     X(libvlc_media_player_play,       player_play)  \
     X(libvlc_media_player_stop,       player_stop)  \
+    X(libvlc_media_player_set_rate,  player_set_rate) \
+    X(libvlc_media_player_get_rate,  player_get_rate) \
     X(libvlc_media_player_is_playing, player_is_playing) \
     X(libvlc_media_player_set_pause,  player_set_pause) \
     X(libvlc_media_player_get_time,   player_get_time) \
@@ -138,6 +140,8 @@ void libvlc_media_player_set_media(libvlc_media_player_t *p_mi,
 
 /* :251, :275, :243, :260 */
 int  libvlc_media_player_play(libvlc_media_player_t *p_mi);
+int  libvlc_media_player_set_rate(libvlc_media_player_t *p_mi, float rate);
+float libvlc_media_player_get_rate(libvlc_media_player_t *p_mi);
 void libvlc_media_player_stop(libvlc_media_player_t *p_mi);
 int  libvlc_media_player_is_playing(libvlc_media_player_t *p_mi);
 void libvlc_media_player_set_pause(libvlc_media_player_t *mp, int do_pause);
