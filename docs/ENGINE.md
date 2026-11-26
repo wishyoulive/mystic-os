@@ -477,6 +477,12 @@ same line §3.1 needs to reach 127.0.0.1 at all).
 | `build/repo/engine.tar.gz` | the installable engine bundle (263.29 MB, §2) |
 | `build/repo/index.tsv`, `.sig` | the signed index; the `engine` row matches the tarball (§11.5) |
 
+**The image does not ship this bundle at all.** It used to carry a static
+placeholder so that a tile existed before installation; that tile then looked
+like a frozen browser, which is worse than an absent app. The engine is now only
+present once the package is installed (`pkg install engine`, or the Store), and
+the launcher shows no Chromium entry until then.
+
 The bundle layout, as installed by `pkg` under `/root/apps/engine`:
 
 ```

@@ -1,9 +1,0 @@
-name = Chromium
-desc = Chromium engine - stand-in in the image; run: pkg install engine
-exec = bin
-version = 156.0.8078.79
-network = host
-bundle = engine
-placeholder = yes
-procs = yes
-audio = yes
