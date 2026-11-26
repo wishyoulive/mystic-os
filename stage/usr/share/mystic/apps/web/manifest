@@ -1,4 +1,4 @@
 name = Browser
-desc = A real browser: our HTTP client and HTML renderer, no engine
+desc = Our own HTTP client and HTML renderer (no JavaScript)
 exec = bin
 network = host

@@ -25,7 +25,7 @@ The short version:
 ## 1. Credentials — one uid per app, from a pool
 
 `SBX_UID_BASE` `2000` (`src/wmsrv.c:91`), `SBX_UID_SLOTS` = `WM_MAX_CLIENTS`
-(8) → **uids 2000..2007, gids 2000..2007**, `setgroups(0, NULL)` so
+(8) → **uids 2000..2015, gids 2000..2015**, `setgroups(0, NULL)` so
 supplementary groups are empty. The slot index is the pool index:
 `uid = 2000 + slot`, and `src/wmsrv.c:1738` is the drop that makes the gid
 equal the uid.
@@ -186,7 +186,7 @@ engine that cannot find them fails in a way that prints nothing.
 
 The reason it is *not* a credential leak in the classic sense is the shadow
 file: `/etc/shadow` is mode `0640 root:root`, so an app running as uid
-2000..2007 can open the directory and cannot read that file. The `chroot = no`
+2000..2015 can open the directory and cannot read that file. The `chroot = no`
 verifier asserts exactly that — `access("/etc/shadow", R_OK)` must fail
 (`src/wmsrv.c:1771`) — and the shipped tree has no `/etc/shadow` at all.
 
@@ -383,7 +383,7 @@ read, forge and `ftruncate` of *another* app's buffer.
   `/dev/snd` exist to be bound;
 * procfs on `/proc`, so a `procs = yes` app has the host view to bind.
 
-The uids 2000..2007 need no `/etc/passwd` entry: `setuid(2)` takes a number.
+The uids 2000..2015 need no `/etc/passwd` entry: `setuid(2)` takes a number.
 The jail now carries the host `/etc` (read-only), but the shipped `/etc` has no
 `passwd` file in it, so the app sees no user list either way.
 
@@ -533,7 +533,7 @@ not what the plan said.
 The other half of the proof is on the machine: every launch prints one line
 
 ```
-wms: sandbox: uids 2000..2007, one per bundle (gid == uid, no supplementary groups), private /dev/shm and /tmp per app
+wms: sandbox: uids 2000..2015, one per bundle (gid == uid, no supplementary groups), private /dev/shm and /tmp per app
 wms: paint connected 520x360 as uid 2000 (/run/mystic/jail/paint/dev/shm/mystic-312-1)
 wms: paint (uid 2000) disconnected; uid released
 wms: sandbox: unmounted /run/mystic/jail/paint/dev/shm

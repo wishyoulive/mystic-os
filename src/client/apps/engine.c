@@ -1224,6 +1224,8 @@ static void input_wheel(Engine *e, Page *p, int x, int y, int notches) {
 
 /* A key with no text: arrows, Tab, Enter, function keys, Ctrl+letter. */
 static void input_key(Engine *e, Page *p, int evdev, int mods, int down) {
+    /* A line per dispatched key would flood the log; one per named key press
+     * is what makes "Backspace did nothing" testable from the serial console. */
     int vk = 0;
     const char *key = NULL, *code = "";
     char ch[2] = {0, 0};
@@ -1244,12 +1246,20 @@ static void input_key(Engine *e, Page *p, int evdev, int mods, int down) {
         vk = (c >= 'a' && c <= 'z') ? (c - 'a' + 'A') : c;
         key = ch;
     }
+    /* Chromium distinguishes a key that produces text (keyDown) from one that
+     * does not (rawKeyDown). Sending Backspace or an arrow as keyDown makes the
+     * renderer treat it as a character event with no text, and editable fields
+     * ignore it - which is why Backspace did nothing in the address bar's page
+     * and in form fields. Named keys go out as rawKeyDown; keyUp is unchanged. */
+    if (down && !ch[0])
+        fprintf(stderr, "engineview: key %s (vk %d)\n", key, vk);
     engine_send(e,
         "{\"id\":%ld,\"sessionId\":\"%s\",\"method\":\"Input.dispatchKeyEvent\","
         "\"params\":{\"type\":\"%s\",\"key\":\"%s\",\"code\":\"%s\","
         "\"windowsVirtualKeyCode\":%d,\"nativeVirtualKeyCode\":%d,"
         "\"modifiers\":%d}}",
-        ++p->next_id, p->session, down ? "keyDown" : "keyUp",
+        ++p->next_id, p->session,
+        down ? (ch[0] ? "keyDown" : "rawKeyDown") : "keyUp",
         key, code ? code : "", vk, vk, cdp_mods(mods));
 }
 
@@ -1832,31 +1842,31 @@ static void draw_missing(MClient *c, Font *fs, Font *fb, const char *why) {
     surf_clip(&s, 0, 0, c->w, c->h);
     surf_fill(&s, 0, 0, c->w, c->h, RGB(10, 12, 17));
 
-    font_draw(&s, fb, (float)x, (float)y, "The engine is not installed",
-              RGB(255, 170, 170));
-    y += (int)font_height(fb) + 14;
-    draw_clip(&s, fs, x, y, c->w - 68, why, RGB(236, 240, 248));
-    y += (int)font_height(fs) * 2 + 6;
+    /* This is what the image ships: a STAND-IN, because the real engine is a
+     * 258 MB download and would not fit in a 16 MB image. Say that first. The
+     * window is a normal, resizable client - this card redraws at any size. */
+    font_draw(&s, fb, (float)x, (float)y, "Chromium is not installed yet",
+              RGB(255, 196, 120));
+    y += (int)font_height(fb) + 10;
     draw_clip(&s, fs, x, y, c->w - 68,
-              "Install it in the guest:  pkg update && pkg install engine",
-              RGB(200, 212, 228));
-    y += (int)font_height(fs) + 6;
+              "This window is the stand-in that ships in the image. The real "
+              "engine is a package: 258 MB to download, 682 MB installed.",
+              RGB(236, 240, 248));
+    y += (int)font_height(fs) * 2 + 8;
+    font_draw(&s, fb, (float)x, (float)y, "pkg update && pkg install engine",
+              RGB(150, 230, 170));
+    y += (int)font_height(fb) + 12;
     draw_clip(&s, fs, x, y, c->w - 68,
-              "Chromium headless: 682.0 MB installed, 258.3 MB to download.",
-              RGB(200, 212, 228));
-    y += (int)font_height(fs) + 6;
+              "Run that in Terminal, then open this tile again. It becomes a live "
+              "Chromium: real pages, video, JavaScript.", RGB(200, 212, 228));
+    y += (int)font_height(fs) * 2 + 8;
+    if (why && *why) {
+        draw_clip(&s, fs, x, y, c->w - 68, why, RGB(150, 162, 180));
+        y += (int)font_height(fs) * 2 + 6;
+    }
     draw_clip(&s, fs, x, y, c->w - 68,
-              "The guest needs MYSTIC_RAM=1024 and MYSTIC_DISK_MB=2048 in image.sh",
+              "The guest wants MYSTIC_RAM=1024 and a disk of at least 2048 MB.",
               RGB(230, 190, 120));
-    y += (int)font_height(fs) + 6;
-    draw_clip(&s, fs, x, y, c->w - 68,
-              "(delete build/disk.img once: image.sh only creates that file when "
-              "it is missing)", RGB(150, 162, 180));
-    y += (int)font_height(fs) + 14;
-    draw_clip(&s, fs, x, y, c->w - 68,
-              "The package is built by tools/fetch-engine.py; docs/ENGINE.md has "
-              "the measured numbers and what cannot work (DRM).",
-              RGB(150, 162, 180));
     mc_present(c);
 }
 

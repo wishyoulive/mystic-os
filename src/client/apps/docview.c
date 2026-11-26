@@ -15,13 +15,40 @@
  *         r             structured text <-> raw text
  *         i             document information (format, file, limits)
  *         q             quit
- *  Mouse: the wheel scrolls; dragging the page moves it.
+ *
+ *  PLAIN TEXT AND MARKDOWN ARE EDITABLE. With no file argument the
+ *  window opens an empty buffer called "untitled" instead of hunting
+ *  for a document to show; .txt/.md (and any file that decodes as
+ *  UTF-8 text) can be typed into and saved with Ctrl+S. Office
+ *  containers (.docx/.xlsx/.pptx/.odt) stay read-only: they are ZIP
+ *  packages of XML, so editing one means rewriting the package, which
+ *  this reader does not do. The footer says "read-only" on those.
+ *
+ *  Keys, editing:  arrows / Home / End move the caret (Up/Down keep a
+ *         goal column), typing / Enter / Backspace / Delete edit,
+ *         Tab inserts up to four spaces, Ctrl+S saves, Esc closes
+ *         (twice when there are unsaved changes).
+ *         Shift+arrows do NOT select: there is no selection yet, and
+ *         the header says so rather than pretending.
+ *  Mouse: the wheel scrolls; dragging the page moves it, never the caret.
  *
  *  The reader lives in src/office.c. It is compiled into this app
  *  by including it below: tools/mkapp.sh links a fixed object list,
  *  and office.c has no main and no global state, so this keeps the
  *  bundle buildable without changing the tool.
  * ============================================================ */
+#ifdef DOCEDIT_TEST
+/* tools/tests/docedit.c compiles this file with DOCEDIT_TEST defined: only
+ * the editing core below is built - no window server, no fonts, no
+ * filesystem - so the host test drives exactly the functions the app runs. */
+#define DOCVIEW_HOST_TEST 1
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../../office.h"
+#else
 #include "../mystic_client.h"
 #include "../../mystic.h"
 #include "../../office.c"
@@ -32,15 +59,435 @@
 #include <stdlib.h>
 #include <string.h>
 #ifndef DOCVIEW_HOST_TEST
-#include <dirent.h>
 #include <poll.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+#endif /* DOCEDIT_TEST */
+
+/* ============================================================
+ *  THE EDITING CORE
+ *
+ *  An editable document is one contiguous buffer of bytes with '\n'
+ *  between its lines, and a caret that is a byte offset into that
+ *  buffer. Every function in this section is a pure function of
+ *  (buffer, position): no fonts, no window server, no filesystem, so
+ *  tools/tests/docedit.c compiles this same code and asserts the exact
+ *  resulting text. Wrapping and drawing need font metrics and live with
+ *  the window code further down.
+ *
+ *  Laziness is not on offer: an edit is applied to the buffer and the
+ *  layout is rebuilt from it. See dv_layout_edit for that choice.
+ * ============================================================ */
+
+/* A document, not a disk image. The cap is also what keeps a whole-buffer
+ * re-layout affordable on every keystroke. */
+#define DV_TEXT_MAX  (256 * 1024)
+#define DV_TAB_WIDTH 4
+
+typedef struct {
+    char *p;      /* bytes, always NUL-terminated at p[n] */
+    int   n;      /* bytes in use */
+    int   cap;    /* bytes allocated */
+} DvText;
+
+static void dv_text_free(DvText *t)
+{
+    if (!t) return;
+    free(t->p);
+    t->p = NULL;
+    t->n = 0;
+    t->cap = 0;
+}
+
+/* Room for `need` bytes plus the NUL. 0 ok, -1 out of memory or too big. */
+static int dv_text_reserve(DvText *t, int need)
+{
+    if (!t || need < 0 || need > DV_TEXT_MAX) return -1;
+    if (need + 1 <= t->cap) return 0;
+    int cap = t->cap > 0 ? t->cap : 256;
+    while (cap < need + 1) cap *= 2;
+    char *p = realloc(t->p, (size_t)cap);
+    if (!p) return -1;
+    t->p = p;
+    t->cap = cap;
+    return 0;
+}
+
+/* Replace the whole contents. */
+static int dv_text_set(DvText *t, const char *src, int n)
+{
+    if (!t) return -1;
+    if (n < 0) n = 0;
+    if (dv_text_reserve(t, n) != 0) return -1;
+    if (n > 0 && src) memcpy(t->p, src, (size_t)n);
+    t->n = n;
+    t->p[n] = 0;
+    return 0;
+}
+
+/* Insert len bytes at `at` (clamped to the buffer). 0 ok, -1 refused. */
+static int dv_text_insert(DvText *t, int at, const char *s, int len)
+{
+    if (!t || !s || len < 0) return -1;
+    if (len == 0) return 0;
+    if (t->n > DV_TEXT_MAX - len) return -1;
+    if (at < 0) at = 0;
+    if (at > t->n) at = t->n;
+    if (dv_text_reserve(t, t->n + len) != 0) return -1;
+    memmove(t->p + at + len, t->p + at, (size_t)(t->n - at));
+    memcpy(t->p + at, s, (size_t)len);
+    t->n += len;
+    t->p[t->n] = 0;
+    return 0;
+}
+
+/* Remove len bytes at `at`. 1 when something went, 0 when it was a no-op. */
+static int dv_text_erase(DvText *t, int at, int len)
+{
+    if (!t || len <= 0) return 0;
+    if (at < 0) at = 0;
+    if (at > t->n) at = t->n;
+    if (len > t->n - at) len = t->n - at;
+    if (len <= 0) return 0;
+    memmove(t->p + at, t->p + at + len, (size_t)(t->n - at - len));
+    t->n -= len;
+    t->p[t->n] = 0;
+    return 1;
+}
+
+/* Physical lines: 1 for empty text, otherwise 1 + one per '\n'. */
+static int dv_text_lines(const DvText *t)
+{
+    if (!t) return 0;
+    int lines = 1;
+    for (int i = 0; i < t->n; i++)
+        if (t->p[i] == '\n') lines++;
+    return lines;
+}
+
+/* ---- byte positions and UTF-8 boundaries ---- */
+
+/* One code point to the left of pos. Never stops inside a sequence, so
+ * deleting an accented letter deletes the whole letter, not its tail. */
+static int dv_utf8_prev(const char *s, int pos)
+{
+    if (!s || pos <= 0) return 0;
+    int i = pos - 1;
+    int steps = 0;
+    while (i > 0 && steps < 3 && ((unsigned char)s[i] & 0xC0) == 0x80) {
+        i--;
+        steps++;
+    }
+    return i;
+}
+
+static int dv_utf8_next(const char *s, int n, int pos)
+{
+    if (!s || pos >= n) return n;
+    int i = pos + 1;
+    while (i < n && ((unsigned char)s[i] & 0xC0) == 0x80) i++;
+    return i;
+}
+
+/* Start of the physical line holding pos. A pos on a '\n' answers with the
+ * start of the line that newline ends, which is what the caret wants. */
+static int dv_line_start(const DvText *t, int pos)
+{
+    if (!t || t->n <= 0) return 0;
+    if (pos > t->n) pos = t->n;
+    if (pos < 0) pos = 0;
+    while (pos > 0 && t->p[pos - 1] != '\n') pos--;
+    return pos;
+}
+
+/* The offset of the '\n' ending the line (or the buffer length). */
+static int dv_line_end(const DvText *t, int pos)
+{
+    if (!t) return 0;
+    if (pos > t->n) pos = t->n;
+    if (pos < 0) pos = 0;
+    while (pos < t->n && t->p[pos] != '\n') pos++;
+    return pos;
+}
+
+/* ---- caret movement ---- */
+
+static int dv_caret_left(const DvText *t, int caret)
+{
+    return t ? dv_utf8_prev(t->p, caret) : 0;
+}
+
+static int dv_caret_right(const DvText *t, int caret)
+{
+    return t ? dv_utf8_next(t->p, t->n, caret) : 0;
+}
+
+static int dv_caret_home(const DvText *t, int caret)
+{
+    return dv_line_start(t, caret);
+}
+
+static int dv_caret_end(const DvText *t, int caret)
+{
+    return t ? dv_line_end(t, caret) : 0;
+}
+
+/* Up and down remember the column they started from (goal, in bytes from the
+ * line start) so a run of Down keys through short lines comes back out at the
+ * column it went in at. */
+static int dv_caret_up(const DvText *t, int caret, int *goal)
+{
+    if (!t) return 0;
+    int ls = dv_line_start(t, caret);
+    int col = (goal && *goal >= 0) ? *goal : caret - ls;
+    if (goal) *goal = col;
+    if (ls <= 0) return ls;
+    int prev_end = ls - 1;                  /* the '\n' above */
+    int prev_start = dv_line_start(t, prev_end);
+    int pos = prev_start + col;
+    if (pos > prev_end) pos = prev_end;
+    if (pos < prev_start) pos = prev_start;
+    while (pos > prev_start && pos < prev_end &&
+           ((unsigned char)t->p[pos] & 0xC0) == 0x80)
+        pos--;
+    return pos;
+}
+
+static int dv_caret_down(const DvText *t, int caret, int *goal)
+{
+    if (!t) return 0;
+    int ls = dv_line_start(t, caret);
+    int le = dv_line_end(t, caret);
+    int col = (goal && *goal >= 0) ? *goal : caret - ls;
+    if (goal) *goal = col;
+    if (le >= t->n) return caret;           /* last line */
+    int next_start = le + 1;
+    int next_end = dv_line_end(t, next_start);
+    int pos = next_start + col;
+    if (pos > next_end) pos = next_end;
+    while (pos > next_start && pos < next_end &&
+           ((unsigned char)t->p[pos] & 0xC0) == 0x80)
+        pos--;
+    return pos;
+}
+
+/* ---- the edits themselves ---- */
+
+/* Type a run of text at the caret; the caret ends up after it. */
+static int dv_edit_insert(DvText *t, int *caret, const char *s, int len)
+{
+    if (!t) return 0;
+    int at = caret ? *caret : 0;
+    if (at < 0) at = 0;
+    if (at > t->n) at = t->n;
+    if (dv_text_insert(t, at, s, len) != 0) return 0;
+    if (caret) *caret = at + len;
+    return 1;
+}
+
+/* Enter: split the line at the caret. */
+static int dv_edit_split(DvText *t, int *caret)
+{
+    return dv_edit_insert(t, caret, "\n", 1);
+}
+
+/* Join this line onto the one above: remove the '\n' just before the caret.
+ * This is exactly what Backspace does at the start of a line. */
+static int dv_edit_merge(DvText *t, int *caret)
+{
+    int at = caret ? *caret : 0;
+    if (!t || at <= 0 || at > t->n) return 0;
+    if (t->p[at - 1] != '\n') return 0;
+    if (!dv_text_erase(t, at - 1, 1)) return 0;
+    if (caret) *caret = at - 1;
+    return 1;
+}
+
+/* Backspace: one code point before the caret, or a line join. */
+static int dv_edit_backspace(DvText *t, int *caret)
+{
+    int at = caret ? *caret : 0;
+    if (!t || at <= 0 || at > t->n) return 0;
+    if (t->p[at - 1] == '\n') return dv_edit_merge(t, caret);
+    int from = dv_utf8_prev(t->p, at);
+    if (from >= at) from = at - 1;
+    if (!dv_text_erase(t, from, at - from)) return 0;
+    if (caret) *caret = from;
+    return 1;
+}
+
+/* Delete: one code point after the caret, or a line join. The caret stays. */
+static int dv_edit_delete(DvText *t, int *caret)
+{
+    int at = caret ? *caret : 0;
+    if (!t || at < 0 || at >= t->n) return 0;
+    int to = (t->p[at] == '\n') ? at + 1 : dv_utf8_next(t->p, t->n, at);
+    if (to <= at) to = at + 1;
+    if (to > t->n) to = t->n;
+    return dv_text_erase(t, at, to - at);
+}
+
+/* How many spaces a Tab inserts: enough to reach the next stop on a
+ * four-character grid. The font has no tab advance, so a literal '\t' would
+ * be invisible; soft tabs are what a reader can see. */
+static int dv_tab_spaces(const DvText *t, int caret)
+{
+    int ls = dv_line_start(t, caret);
+    int col = caret - ls;
+    int n = DV_TAB_WIDTH - (col % DV_TAB_WIDTH);
+    if (n <= 0) n = DV_TAB_WIDTH;
+    return n;
+}
+
+/* ---- wrapping one visual line ---- */
+
+/* UTF-8 sequence length from its first byte, as the wrap needs it. */
+static int dv_u8_len(unsigned char c)
+{
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+/* How wide a byte range is, in pixels. The caller supplies it so this file
+ * can lay a line out without owning a font - tools/tests/docedit.c passes a
+ * fixed width per character and asserts the exact break offsets. */
+typedef float (*DvMeasure)(void *ud, char *s, int off, int len);
+
+/* One visual line out of the physical line [ls, eol). Returns the offset just
+ * past the last byte that fits in maxw - always strictly greater than ls for a
+ * non-empty line, so a caller can never stall.
+ *
+ * Unlike the reader's paragraph wrapper this keeps every byte: leading and
+ * repeated spaces are the user's text, not layout to be swallowed. A break is
+ * preferred just after a space; a word wider than the body is cut on a UTF-8
+ * boundary so no glyph is ever half drawn.
+ *
+ * The ranges of the visual lines therefore tile the physical line exactly,
+ * with no byte owned by two lines and none skipped. The cost is that a space
+ * which does not itself fit - "hello| world" with the break at the space -
+ * begins the next line and draws as a few pixels of indent. The gain is that
+ * every caret offset belongs to exactly one line, with no special case in
+ * dv_draw_caret or in the caret-to-line search. */
+static int dv_fit_span(char *s, int n, int ls, int eol, int maxw,
+                       DvMeasure measure, void *ud)
+{
+    if (ls < 0) ls = 0;
+    if (eol > n) eol = n;
+    if (ls >= eol) return eol;
+    if (!measure) return eol;
+
+    float w = 0;
+    int p = ls;
+    while (p < eol) {
+        int cl = dv_u8_len((unsigned char)s[p]);
+        if (p + cl > eol) cl = eol - p;
+        float cw = measure(ud, s, p, cl);
+        if (w + cw > (float)maxw && p > ls) break;
+        w += cw;
+        p += cl;
+    }
+    if (p < eol) {
+        int brk = -1;
+        for (int q = p; q > ls; q--)
+            if (s[q - 1] == ' ') { brk = q; break; }
+        if (brk > ls) p = brk;
+    }
+    if (p <= ls) p = ls + 1;               /* one glyph wider than the body */
+    if (p > eol) p = eol;
+    return p;
+}
+
+/* ---- Markdown, only as far as it changes how a line looks ---- */
+
+/* The style of one source line. The markers stay on screen because this is
+ * the source you are editing; the face is what tells you what the line is. */
+static int dv_md_line_style(const char *s, int len)
+{
+    int i = 0;
+    if (!s) return OFFICE_STYLE_BODY;
+    while (i < len && (s[i] == ' ' || s[i] == '\t')) i++;
+    if (i >= len) return OFFICE_STYLE_BODY;
+    if (s[i] == '#') {
+        int n = 0;
+        while (i < len && s[i] == '#') { i++; n++; }
+        if (n < 1 || n > 4) return OFFICE_STYLE_BODY;
+        if (i < len && s[i] != ' ') return OFFICE_STYLE_BODY;
+        if (n == 1) return OFFICE_STYLE_H1;
+        if (n == 2) return OFFICE_STYLE_H2;
+        return OFFICE_STYLE_H3;
+    }
+    if (s[i] == '>') return OFFICE_STYLE_QUOTE;
+    if ((s[i] == '-' || s[i] == '*' || s[i] == '+') &&
+        i + 1 < len && s[i + 1] == ' ')
+        return OFFICE_STYLE_BULLET;
+    return OFFICE_STYLE_BODY;
+}
+
+/* The title a Markdown file declares for itself: its leading '# ' line. */
+static void dv_md_title(const DvText *t, char *out, size_t cap)
+{
+    if (!out || cap == 0) return;
+    out[0] = 0;
+    if (!t || t->n <= 0) return;
+    int i = 0;
+    while (i < t->n && t->p[i] == '#') i++;
+    if (i < 1 || i > 3) return;
+    if (i < t->n && t->p[i] != ' ') return;
+    while (i < t->n && t->p[i] == ' ') i++;
+    int k = 0;
+    while (i < t->n && t->p[i] != '\n' && (size_t)k + 1 < cap) {
+        out[k++] = t->p[i++];
+    }
+    while (k > 0 && (out[k - 1] == ' ' || out[k - 1] == '#')) k--;
+    out[k] = 0;
+}
+
+/* ---- picking a name that does not exist yet ---- */
+
+/* "does this path exist?" - the caller supplies it so the chooser can be
+ * tested against a list instead of a filesystem. */
+typedef int (*DvNameProbe)(void *ud, const char *path);
+
+static int dv_join_path(char *out, size_t cap, const char *dir, const char *name)
+{
+    size_t n = strlen(dir);
+    int need = (n > 0 && dir[n - 1] == '/')
+                   ? snprintf(out, cap, "%s%s", dir, name)
+                   : snprintf(out, cap, "%s/%s", dir, name);
+    return (need < 0 || (size_t)need >= cap) ? -1 : 0;
+}
+
+/* base.ext, then base-2.ext, base-3.ext ... The first one the probe says is
+ * free wins, so a save never overwrites an earlier one. */
+static int dv_choose_save_name(DvNameProbe exists, void *ud,
+                               const char *dir, const char *base,
+                               const char *ext, char *out, size_t cap)
+{
+    if (!dir || !base || !ext || !out || cap == 0) return -1;
+    out[0] = 0;
+    for (int n = 1; n <= 9999; n++) {
+        char name[128];
+        if (n == 1) snprintf(name, sizeof(name), "%s%s", base, ext);
+        else snprintf(name, sizeof(name), "%s-%d%s", base, n, ext);
+        if (dv_join_path(out, cap, dir, name) != 0) return -1;
+        if (!exists || !exists(ud, out)) return 0;
+    }
+    out[0] = 0;
+    return -1;
+}
+
+/* Everything below needs the window server, the fonts and the filesystem;
+ * tools/tests/docedit.c stops at the editing core above. */
+#ifndef DOCEDIT_TEST
 
 /* Linux input event codes, as the window server forwards them. */
 #define DV_KEY_ESC      1
 #define DV_KEY_Q       16
+#define DV_KEY_S       31
 #define DV_KEY_R       19
 #define DV_KEY_I       23
 #define DV_KEY_B       48
@@ -53,6 +500,12 @@
 #define DV_KEY_END    107
 #define DV_KEY_DOWN   108
 #define DV_KEY_PAGEDN 109
+#define DV_KEY_DELETE 111
+
+/* ev.mods bits, as src/main.c sends them to a client window. */
+#define DV_MOD_SHIFT 0x01
+#define DV_MOD_CTRL  0x02
+#define DV_MOD_ALT   0x04
 
 /* Palette: the app owns its pixels, so it carries its own colours,
  * chosen to sit next to the desktop without depending on its theme. */
@@ -107,6 +560,23 @@ typedef struct {
     char err[320];
     char path[512];
 
+    /* ---- the editable buffer (plain text and Markdown) ----
+     * In editing mode this DvText IS the document: there is no second copy
+     * of the text, and doc.text stays NULL. Office files keep using
+     * doc.text/plain and stay read-only. */
+    DvText etext;
+    int editing;               /* the buffer can be typed into */
+    int markdown;              /* style '#'/'-'/>' lines while editing */
+    int caret;                 /* byte offset into etext */
+    int goal_col;              /* column Up/Down aim for, -1 = derive */
+    int caret_line;            /* visual line holding the caret */
+    int dirty_doc;             /* edited since the last save */
+    int quit_armed;            /* Esc seen once with unsaved changes */
+    int status_err;            /* the footer note is an error */
+    int had_path;              /* opened from a file: save back to it */
+    char status[256];          /* "saved <path>", or why it failed */
+    char save_path[512];       /* where Ctrl+S writes, empty until chosen */
+
     DvLine *lines;
     int nlines, cap;
     int y;                     /* layout cursor, content pixels */
@@ -129,14 +599,6 @@ static int dv_min(int a, int b) { return a < b ? a : b; }
 static int dv_max(int a, int b) { return a > b ? a : b; }
 static int dv_clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static int dv_margin(void) { return ui_px(26); }
-
-static int dv_u8_len(unsigned char c) {
-    if (c < 0x80) return 1;
-    if ((c & 0xE0) == 0xC0) return 2;
-    if ((c & 0xF0) == 0xE0) return 3;
-    if ((c & 0xF8) == 0xF0) return 4;
-    return 1;
-}
 
 static Font *dv_font(int style, int bold, int italic) {
     int face = FONT_REGULAR;
@@ -610,6 +1072,92 @@ static void dv_layout_raw(Viewer *v) {
     v->y += ui_px(10);
 }
 
+/* ---- the editable layout ----------------------------------------
+ *
+ * Re-layout policy: the WHOLE buffer, on every edit. Patching only the
+ * changed region would mean recomputing the wrap of one physical line and
+ * then shifting every later DvLine's y - the same work as laying out a
+ * document this size, with a chance of leaving a stale line behind when a
+ * word moves from one visual line to the next. Correctness first: a whole
+ * pass cannot disagree with the buffer, and DV_TEXT_MAX keeps it small.
+ */
+
+/* Advance one visual line inside [ls, eol). Unlike the reader's paragraph
+ * wrapper this keeps every byte: leading and repeated spaces are the user's
+ * text, not layout to be swallowed. A break is preferred after a space; a
+ * word wider than the body is cut on a UTF-8 boundary. */
+/* The editor's measure: real font metrics for the line's own face. */
+typedef struct { Font *f; } DvSpanFont;
+
+static float dv_measure_font(void *ud, char *s, int off, int len)
+{
+    DvSpanFont *m = (DvSpanFont *)ud;
+    return dv_width_mut(s, (uint32_t)off, (uint32_t)len, m->f);
+}
+
+/* Advance one visual line inside [ls, eol). */
+static int dv_fit_line(char *s, int n, int ls, int eol, Font *f, int maxw)
+{
+    DvSpanFont m;
+    m.f = f;
+    return dv_fit_span(s, n, ls, eol, maxw, dv_measure_font, &m);
+}
+
+static void dv_layout_edit(Viewer *v) {
+    if (!v->etext.p) return;
+    int x = dv_margin();
+    int maxw = v->w - x - ui_px(30);
+    if (maxw < ui_px(40)) maxw = ui_px(40);
+
+    int y = ui_px(6);
+    int cur = 0;                            /* start of a physical line */
+    v->caret_line = -1;
+
+    for (;;) {
+        int eol = cur;
+        while (eol < v->etext.n && v->etext.p[eol] != '\n') eol++;
+
+        int style = v->markdown ?
+                    dv_md_line_style(v->etext.p + cur, eol - cur) : OFFICE_STYLE_BODY;
+        Font *f = dv_font(style, 0, 0);
+        int lh = dv_line_h(f);
+
+        int at = cur;
+        do {
+            int le = dv_fit_line(v->etext.p, v->etext.n, at, eol, f, maxw);
+            int idx = v->nlines;
+            dv_add_line(v, IT_TEXT, -1, -1, -1, y, lh, x,
+                        (uint32_t)at, (uint32_t)(le - at), style, 0, 0);
+            if (v->oom) return;
+            if (v->nlines == idx) return;
+            /* the caret belongs to the last visual line that starts at or
+             * before it, which also puts it after the final newline */
+            if ((uint32_t)v->caret >= v->lines[idx].off) v->caret_line = idx;
+            y += lh;
+            at = le;
+        } while (at < eol);
+
+        if (cur >= v->etext.n) break;
+        cur = eol + 1;
+        if (cur > v->etext.n) break;
+    }
+    if (v->caret_line < 0 && v->nlines > 0) v->caret_line = 0;
+    v->y = y + ui_px(12);
+}
+
+static void dv_scroll_by(Viewer *v, int px);
+static void dv_clamp_scroll(Viewer *v);
+
+/* Keep the caret's line on screen: that is the whole of "follow the typing". */
+static void dv_caret_reveal(Viewer *v) {
+    if (!v->editing || v->caret_line < 0 || v->caret_line >= v->nlines) return;
+    const DvLine *l = &v->lines[v->caret_line];
+    int top = l->y - v->scroll;
+    if (top < 0) v->scroll = l->y;
+    else if (top + l->h > v->body_h) v->scroll = l->y + l->h - v->body_h;
+    dv_clamp_scroll(v);
+}
+
 static void dv_layout(Viewer *v) {
     const int head = ui_px(58);
     const int foot = ui_px(30);
@@ -624,7 +1172,9 @@ static void dv_layout(Viewer *v) {
     v->cell_clipped = 0;
     v->oom = 0;
 
-    if (v->loaded && v->doc.nblocks > 0) {
+    if (v->editing) {
+        dv_layout_edit(v);
+    } else if (v->loaded && v->doc.nblocks > 0) {
         if (v->raw) {
             dv_layout_raw(v);
         } else {
@@ -705,6 +1255,45 @@ static void dv_draw_raw_line(Viewer *v, Surface *s, const DvLine *l, int y) {
     if (maxw < 4.0f) maxw = (float)v->w - (float)l->x;
     dv_draw_fit(s, f, (float)l->x, (float)y, maxw, base + l->off, C_TEXT);
     base[l->off + l->len] = saved;
+}
+
+/* One visual line of the editable buffer. The text is drawn exactly as it is
+ * stored - markers and all - because this is the source you are editing. */
+static void dv_draw_edit_line(Viewer *v, Surface *s, const DvLine *l, int y) {
+    char *base = v->etext.p;
+    if (!base) return;
+    Font *f = dv_font(l->style, 0, 0);
+    u32 color = C_TEXT;
+    if (l->style == OFFICE_STYLE_TITLE || l->style == OFFICE_STYLE_H1 ||
+        l->style == OFFICE_STYLE_H2 || l->style == OFFICE_STYLE_H3)
+        color = C_HEAD;
+    else if (l->style == OFFICE_STYLE_QUOTE)
+        color = C_DIM;
+
+    char saved = base[l->off + l->len];
+    base[l->off + l->len] = 0;
+    font_draw(s, f, (float)l->x, (float)y, base + l->off, color);
+    base[l->off + l->len] = saved;
+}
+
+/* The caret is a bar measured from the same font metrics the line was drawn
+ * with, so it sits between the glyphs it sits between in the buffer. */
+static void dv_draw_caret(Viewer *v, Surface *s) {
+    if (!v->editing || v->caret_line < 0 || v->caret_line >= v->nlines) return;
+    const DvLine *l = &v->lines[v->caret_line];
+    int y = l->y - v->scroll;
+    if (y + l->h <= 0 || y >= v->body_h) return;
+    Font *f = dv_font(l->style, 0, 0);
+    float x = (float)l->x;
+    uint32_t at = (uint32_t)v->caret;
+    if (at > l->off) {
+        uint32_t k = at - l->off;
+        if (k > l->len) k = l->len;
+        x += dv_width_mut(v->etext.p, l->off, k, f);
+    }
+    int h = dv_line_h(f) - ui_px(2);
+    if (h < ui_px(8)) h = ui_px(8);
+    surf_fill(s, (int)x, y + ui_px(1), dv_max(2, ui_px(2)), h, C_ACCENT);
 }
 
 static void dv_draw_table_row(Viewer *v, Surface *s, const DvLine *l, int y) {
@@ -813,9 +1402,16 @@ static void dv_draw_info(Viewer *v, Surface *body) {
     int tables = 0;
     for (int i = 0; i < v->doc.nblocks; i++)
         if (v->doc.blocks[i].kind == OFFICE_BLOCK_TABLE) tables++;
+
+    /* This panel is a read-only view of a read-only window: 'i' is a letter
+     * you can type while editing, so it is not a command there. */
     snprintf(line, sizeof(line), "Blocks: %d   Tables: %d   Sheets: %d",
              v->doc.nblocks, tables, v->doc.nsheets);
     dv_draw_fit(&p, fl, (float)x, (float)y, (float)wmax, line, C_DIM);
+    y += dv_line_h(fl);
+    snprintf(line, sizeof(line), "Editing: no - %s is shown read-only here",
+             v->doc.format_name);
+    dv_draw_fit(&p, fl, (float)x, (float)y, (float)wmax, line, C_ERR);
     y += dv_line_h(fl) + ui_px(6);
 
     if (v->doc.message[0]) {
@@ -838,28 +1434,72 @@ static void dv_draw_header(Viewer *v, Surface *s) {
     Font *fs = font_get(FONT_REGULAR, 10.0f);
     int right = ui_px(26);
 
-    const char *title = v->loaded ? v->doc.title : "Document viewer";
-    if (!title || !title[0]) title = v->path[0] ? v->path : "Document viewer";
-    dv_draw_fit(s, ft, (float)x, (float)ui_px(8),
-                (float)(v->w - 2 * x - right), title, C_HEAD);
+    const char *mode = v->editing ? "EDIT" :
+                       (v->loaded ? (v->raw ? "READ-ONLY RAW" : "READ-ONLY") : "");
+    float mw = font_width(fs, mode);
+    float textw = (float)(v->w - 2 * x - right) - mw - ui_px(8);
+    if (textw < ui_px(80)) textw = (float)(v->w - 2 * x - right);
+
+    char title[280];
+    const char *base;
+    if (v->editing)
+        base = v->doc.title[0] ? v->doc.title : "untitled";
+    else if (v->loaded)
+        base = v->doc.title[0] ? v->doc.title :
+               (v->path[0] ? v->path : "Document viewer");
+    else
+        base = "Document viewer";
+    snprintf(title, sizeof(title), "%s%s", base,
+             (v->editing && v->dirty_doc) ? "  *" : "");
+    dv_draw_fit(s, ft, (float)x, (float)ui_px(8), textw, title, C_HEAD);
 
     char sub[400];
-    if (v->loaded) {
+    if (v->editing) {
+        /* the header says what this window can and cannot do, including the
+         * line-editing feature it does not have, and how big the document is */
+        snprintf(sub, sizeof(sub),
+                 "%s  \xC2\xB7  %d lines  \xC2\xB7  editing  \xC2\xB7  no shift-selection yet",
+                 v->doc.format_name[0] ? v->doc.format_name : "Plain text",
+                 dv_text_lines(&v->etext));
+    } else if (v->loaded) {
         if (v->doc.author[0])
-            snprintf(sub, sizeof(sub), "%s  \xC2\xB7  %s", v->doc.format_name, v->doc.author);
+            snprintf(sub, sizeof(sub), "%s  \xC2\xB7  %s  \xC2\xB7  read-only",
+                     v->doc.format_name, v->doc.author);
         else
-            snprintf(sub, sizeof(sub), "%s", v->doc.format_name);
+            snprintf(sub, sizeof(sub), "%s  \xC2\xB7  read-only",
+                     v->doc.format_name);
     } else {
         snprintf(sub, sizeof(sub), "No document loaded");
     }
-    dv_draw_fit(s, fs, (float)x, (float)ui_px(31),
-                (float)(v->w - 2 * x - right), sub, C_DIM);
+    dv_draw_fit(s, fs, (float)x, (float)ui_px(31), textw, sub, C_DIM);
 
-    const char *mode = v->loaded ? (v->raw ? "RAW TEXT" : "STRUCTURED") : "";
-    float mw = font_width(fs, mode);
-    font_draw(s, fs, (float)(v->w - dv_margin() - mw), (float)ui_px(8), mode, C_ACCENT);
+    font_draw(s, fs, (float)(v->w - dv_margin() - mw), (float)ui_px(8), mode,
+              v->editing ? C_ACCENT : C_ERR);
 
     surf_fill(s, 0, ui_px(58) - 1, v->w, 1, C_RULE);
+}
+
+/* Right-aligned fit. For a path the tail is the informative part, so a
+ * too-long string loses characters from the left, not the right. */
+static void dv_draw_fit_tail(Surface *s, Font *f, float right, float y,
+                             float maxw, const char *text, u32 color) {
+    if (!f || !text || !text[0] || maxw < 8) return;
+    float w = font_width(f, text);
+    if (w <= maxw) {
+        font_draw(s, f, right - w, y, text, color);
+        return;
+    }
+    float dots = font_width(f, "..");
+    const char *p = text;
+    while (*p && font_width(f, p) + dots > maxw) {
+        p++;
+        while (*p && ((unsigned char)*p & 0xC0) == 0x80) p++;
+    }
+    if (!*p) return;
+    char buf[600];
+    snprintf(buf, sizeof(buf), "..%s", p);
+    w = font_width(f, buf);
+    font_draw(s, f, right - w, y, buf, color);
 }
 
 static void dv_draw_footer(Viewer *v, Surface *s) {
@@ -869,13 +1509,31 @@ static void dv_draw_footer(Viewer *v, Surface *s) {
     if (!f) return;
     float tx = (float)dv_margin();
     float ty = (float)(y + ui_px(9));
+    float hint_max = (float)(v->w - 2 * dv_margin() - ui_px(150));
 
-    if (v->table_wide || v->cell_clipped) {
-        font_draw(s, f, tx, ty, "wide table clipped  \xC2\xB7  r shows raw text", C_ACCENT);
+    if (v->editing) {
+        if (v->status[0])
+            dv_draw_fit(s, f, tx, ty, hint_max, v->status,
+                        v->status_err ? C_ERR : C_ACCENT);
+        else
+            dv_draw_fit(s, f, tx, ty, hint_max,
+                        "type  \xC2\xB7  arrows  \xC2\xB7  Enter  \xC2\xB7  Ctrl+S saves  "
+                        "\xC2\xB7  Esc quits", C_FAINT);
+    } else if (v->table_wide || v->cell_clipped) {
+        font_draw(s, f, tx, ty, "read-only", C_ERR);
+        font_draw(s, f, tx + font_width(f, "read-only"), ty,
+                  "  \xC2\xB7  wide table clipped  \xC2\xB7  r shows raw text", C_ACCENT);
     } else {
-        font_draw(s, f, tx, ty,
-                  "j/k or wheel scroll  \xC2\xB7  r raw text  \xC2\xB7  i info  \xC2\xB7  q quit",
-                  C_FAINT);
+        if (v->loaded) {
+            font_draw(s, f, tx, ty, "read-only", C_ERR);
+            tx += font_width(f, "read-only");
+            font_draw(s, f, tx, ty, "  \xC2\xB7  ", C_FAINT);
+            tx += font_width(f, "  \xC2\xB7  ");
+        }
+        dv_draw_fit(s, f, tx, ty,
+                    (float)(v->w - dv_margin() - ui_px(80)) - tx,
+                    "j/k or wheel scroll  \xC2\xB7  r raw text  \xC2\xB7  i info  \xC2\xB7  q quit",
+                    C_FAINT);
     }
 
     int maxscroll = v->content_h - v->body_h;
@@ -883,7 +1541,18 @@ static void dv_draw_footer(Viewer *v, Surface *s) {
     char pos[32];
     snprintf(pos, sizeof(pos), "%d%%", pct);
     float pw = font_width(f, pos);
-    font_draw(s, f, (float)(v->w - dv_margin()) - pw, ty, pos, C_DIM);
+    float rx = (float)(v->w - dv_margin()) - pw;
+    font_draw(s, f, rx, ty, pos, C_DIM);
+
+    if (v->editing) {
+        /* the saved path lives here permanently, not just in the transient
+         * "saved ..." note, so there is always an answer to "where is it?" */
+        const char *path = v->save_path[0] ? v->save_path : "not saved yet";
+        float avail = rx - tx - font_width(f, " ");
+        if (avail > ui_px(60))
+            dv_draw_fit_tail(s, f, rx - ui_px(24), ty, avail, path,
+                             v->save_path[0] ? C_DIM : C_FAINT);
+    }
 
     if (maxscroll > 0) {
         int track_h = v->body_h - ui_px(8);
@@ -922,17 +1591,22 @@ static void dv_render(Viewer *v, MClient *c) {
     if (!v->loaded) {
         char body[900];
         snprintf(body, sizeof(body),
-                 "%s\n\nSupported files: .docx, .xlsx, .pptx, .odt, .ods, .odp, and the "
-                 "legacy .doc/.xls/.ppt (detected and named, not decoded).\n\n"
-                 "Looked in /root/Documents, /root, $HOME/Documents and $HOME. "
-                 "Start docview with a path, or set MYSTIC_DOC=/path/to/file, to open one.",
-                 v->err[0] ? v->err : "No document was named and none was found.");
-        dv_draw_message(v, &s, "No Office document to show", body,
+                 "%s\n\n"
+                 "Editable here: .txt and .md, and any file that decodes as UTF-8 "
+                 "text (up to %d KiB). With no file argument this window opens an "
+                 "empty untitled document instead of looking for one.\n\n"
+                 "Read-only: .docx, .xlsx, .pptx, .odt, .ods and .odp, which are ZIP "
+                 "packages of XML - editing one means rewriting the package, and "
+                 "this reader does not do that - and the legacy .doc/.xls/.ppt, "
+                 "which are OLE2 binaries it never decodes.",
+                 v->err[0] ? v->err : "The file could not be opened.",
+                 DV_TEXT_MAX / 1024);
+        dv_draw_message(v, &s, "Nothing open in this window", body,
                         "q quits", C_ERR);
         return;
     }
 
-    if (v->doc.nblocks == 0) {
+    if (!v->editing && v->doc.nblocks == 0) {
         dv_draw_message(v, &s, v->doc.format_name, v->doc.message,
                         "q quits  \xC2\xB7  this window shows text only", C_ERR);
         return;
@@ -959,12 +1633,14 @@ static void dv_render(Viewer *v, MClient *c) {
         if (y + l->h <= 0) continue;
         if (y >= body_h) break;
         if (l->kind == IT_TEXT) {
-            if (v->raw) dv_draw_raw_line(v, &body, l, y);
+            if (v->editing) dv_draw_edit_line(v, &body, l, y);
+            else if (v->raw) dv_draw_raw_line(v, &body, l, y);
             else dv_draw_para_line(v, &body, l, y);
         } else if (l->kind == IT_ROW) {
             dv_draw_table_row(v, &body, l, y);
         }
     }
+    if (v->editing) dv_draw_caret(v, &body);
 
     dv_draw_footer(v, &s);
 }
@@ -991,50 +1667,253 @@ static int dv_supported(const char *name) {
     return 0;
 }
 
-/* The first supported file in a directory, chosen by name so the same
- * boot shows the same document. Real directory listings, no fixtures. */
-static int dv_find_in(const char *dir, char *out, size_t cap) {
-    DIR *d = opendir(dir);
-    if (!d) return 0;
-    char best[256];
-    best[0] = 0;
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        if (de->d_name[0] == '.') continue;
-        if (!dv_supported(de->d_name)) continue;
-        char full[512];
-        snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
-        struct stat st;
-        if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) continue;
-        if (best[0] == 0 || strcmp(de->d_name, best) < 0)
-            snprintf(best, sizeof(best), "%s", de->d_name);
-    }
-    closedir(d);
-    if (!best[0]) return 0;
-    snprintf(out, cap, "%s/%s", dir, best);
+/* A named file that exists and is a regular file. There is no directory
+ * search any more: with no argument the window opens an empty document, which
+ * is the whole point of being able to create one. */
+static int dv_openable(const char *arg, char *out, size_t cap) {
+    if (!arg || !arg[0]) return 0;
+    struct stat st;
+    if (stat(arg, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
+    snprintf(out, cap, "%s", arg);
     return 1;
 }
 
-static int dv_resolve(const char *arg, char *out, size_t cap) {
-    if (arg && arg[0]) {
-        struct stat st;
-        if (stat(arg, &st) == 0 && S_ISREG(st.st_mode)) {
-            snprintf(out, cap, "%s", arg);
-            return 1;
+/* A byte stream is text when it has no NUL and decodes as UTF-8. Anything else
+ * is refused by name instead of shown as mojibake. */
+static int dv_is_text(const char *p, int n) {
+    int i = 0;
+    while (i < n) {
+        unsigned char c = (unsigned char)p[i];
+        if (c == 0) return 0;
+        if (c < 0x80) { i++; continue; }
+        int need;
+        if ((c & 0xE0) == 0xC0) need = 1;
+        else if ((c & 0xF0) == 0xE0) need = 2;
+        else if ((c & 0xF8) == 0xF0) need = 3;
+        else return 0;
+        if (i + need >= n) return 0;
+        for (int k = 1; k <= need; k++)
+            if (((unsigned char)p[i + k] & 0xC0) != 0x80) return 0;
+        i += need + 1;
+    }
+    return 1;
+}
+
+static int dv_ext_is(const char *path, const char *ext) {
+    const char *dot = strrchr(path, '.');
+    if (!dot) return 0;
+    size_t n = strlen(ext);
+    if (strlen(dot) != n) return 0;
+    for (size_t k = 0; k < n; k++)
+        if (tolower((unsigned char)dot[k]) != ext[k]) return 0;
+    return 1;
+}
+
+static int dv_md_path(const char *path) {
+    return path && (dv_ext_is(path, ".md") || dv_ext_is(path, ".markdown"));
+}
+
+/* Load a text file into the editable buffer. Nothing is duplicated: the
+ * DvText IS the document from here on. */
+static int dv_load_text(Viewer *v, const char *path, char *err, size_t errsz) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        snprintf(err, errsz, "%s: %s", path, strerror(errno));
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        snprintf(err, errsz, "%s: cannot seek: %s", path, strerror(errno));
+        fclose(f);
+        return -1;
+    }
+    long end = ftell(f);
+    if (end < 0) {
+        snprintf(err, errsz, "%s: cannot size: %s", path, strerror(errno));
+        fclose(f);
+        return -1;
+    }
+    if (end > DV_TEXT_MAX) {
+        snprintf(err, errsz,
+                 "%s is %ld bytes; editable documents are capped at %d KiB so "
+                 "that a re-layout on every keystroke stays affordable",
+                 path, end, DV_TEXT_MAX / 1024);
+        fclose(f);
+        return -1;
+    }
+    if (dv_text_reserve(&v->etext, (int)end) != 0) {
+        snprintf(err, errsz, "%s: out of memory for %ld bytes", path, end);
+        fclose(f);
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        snprintf(err, errsz, "%s: cannot rewind: %s", path, strerror(errno));
+        fclose(f);
+        return -1;
+    }
+    size_t got = end ? fread(v->etext.p, 1, (size_t)end, f) : 0;
+    int bad = ferror(f);
+    fclose(f);
+    if (got != (size_t)end) {
+        snprintf(err, errsz, "%s: read %zu of %ld bytes%s", path, got, end,
+                 bad ? " (I/O error)" : "");
+        dv_text_free(&v->etext);
+        return -1;
+    }
+    v->etext.p[got] = 0;
+    v->etext.n = (int)got;
+    if (!dv_is_text(v->etext.p, v->etext.n)) {
+        dv_text_free(&v->etext);
+        snprintf(err, errsz,
+                 "%s is not UTF-8 text (it contains NUL or invalid bytes); only "
+                 "plain text and Markdown are editable here", path);
+        return -1;
+    }
+    return 0;
+}
+
+/* Fill in what the header, footer and info panel read. `path` may be NULL for
+ * a brand new document, which has no path until the first save. */
+static void dv_set_text_meta(Viewer *v, const char *path) {
+    v->editing = 1;
+    v->markdown = dv_md_path(path);
+    snprintf(v->doc.format_name, sizeof(v->doc.format_name), "%s",
+             v->markdown ? "Markdown" : "Plain text");
+    v->doc.fmt = OFFICE_FMT_UNKNOWN;
+    v->path[0] = 0;
+    v->save_path[0] = 0;
+    v->had_path = 0;
+
+    if (path && path[0]) {
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        snprintf(v->doc.title, sizeof(v->doc.title), "%s", base);
+        snprintf(v->path, sizeof(v->path), "%s", path);
+        snprintf(v->save_path, sizeof(v->save_path), "%s", path);
+        v->had_path = 1;
+    } else {
+        snprintf(v->doc.title, sizeof(v->doc.title), "untitled");
+    }
+    if (v->markdown) {
+        char md[192];
+        dv_md_title(&v->etext, md, sizeof(md));
+        if (md[0]) snprintf(v->doc.title, sizeof(v->doc.title), "%s", md);
+    }
+    v->caret = 0;
+    v->goal_col = -1;
+    v->loaded = 1;
+}
+
+static void dv_new_text(Viewer *v) {
+    dv_text_free(&v->etext);
+    dv_text_set(&v->etext, "", 0);
+    dv_set_text_meta(v, NULL);
+}
+
+/* ---- saving ---- */
+
+#define DV_SAVE_DIR "/root/Documents"
+
+static int dv_probe_file(void *ud, const char *path) {
+    (void)ud;
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+static int dv_ensure_dir(const char *dir) {
+    struct stat st;
+    if (stat(dir, &st) == 0) return S_ISDIR(st.st_mode) ? 0 : -1;
+    if (mkdir(dir, 0755) == 0 || errno == EEXIST) return 0;
+    return -1;
+}
+
+/* Write the buffer to v->save_path, choosing a fresh name under
+ * /root/Documents the first time an untitled document is saved. The write goes
+ * to a temporary file that is renamed over the target, so a full disk leaves
+ * the previous version of the file intact. */
+static int dv_save(Viewer *v) {
+    if (!v->editing) return -1;
+    v->status_err = 0;
+
+    if (!v->save_path[0]) {
+        /* a new document: /root/Documents, and a name nothing else has */
+        if (dv_ensure_dir(DV_SAVE_DIR) != 0) {
+            snprintf(v->status, sizeof(v->status), "cannot create %s: %s",
+                     DV_SAVE_DIR, strerror(errno));
+            v->status_err = 1;
+            fprintf(stderr, "docview: %s\n", v->status);
+            return -1;
+        }
+        if (dv_choose_save_name(dv_probe_file, NULL, DV_SAVE_DIR, "untitled",
+                                v->markdown ? ".md" : ".txt",
+                                v->save_path, sizeof(v->save_path)) != 0) {
+            snprintf(v->status, sizeof(v->status),
+                     "no free name in %s (untitled.txt .. untitled-9999.txt all exist)",
+                     DV_SAVE_DIR);
+            v->status_err = 1;
+            return -1;
+        }
+    } else {
+        /* An opened file saves where it came from, so only ITS directory has
+         * to exist. Creating /root/Documents here would make saving
+         * /root/notes.txt fail whenever /root was read-only. */
+        char dir[512];
+        snprintf(dir, sizeof(dir), "%s", v->save_path);
+        char *slash = strrchr(dir, '/');
+        if (!slash) snprintf(dir, sizeof(dir), ".");
+        else if (slash == dir) dir[1] = 0;
+        else *slash = 0;
+        if (dv_ensure_dir(dir) != 0) {
+            snprintf(v->status, sizeof(v->status), "cannot use %s: %s",
+                     dir, strerror(errno));
+            v->status_err = 1;
+            fprintf(stderr, "docview: %s\n", v->status);
+            return -1;
         }
     }
-    const char *home = getenv("HOME");
-    char dirs[6][320];
-    int n = 0;
-    snprintf(dirs[n++], sizeof(dirs[0]), "/root/Documents");
-    snprintf(dirs[n++], sizeof(dirs[0]), "/root");
-    if (home && home[0]) {
-        snprintf(dirs[n++], sizeof(dirs[0]), "%s/Documents", home);
-        snprintf(dirs[n++], sizeof(dirs[0]), "%s", home);
+
+    char tmp[600];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", v->save_path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) {
+        snprintf(v->status, sizeof(v->status), "cannot write %s: %s",
+                 tmp, strerror(errno));
+        v->status_err = 1;
+        fprintf(stderr, "docview: %s\n", v->status);
+        return -1;
     }
-    for (int i = 0; i < n; i++)
-        if (dv_find_in(dirs[i], out, cap)) return 1;
-    out[0] = 0;
+    size_t want = (size_t)v->etext.n;
+    size_t wrote = want ? fwrite(v->etext.p, 1, want, f) : 0;
+    int bad = ferror(f);
+    if (fclose(f) != 0) bad = 1;
+    if (bad || wrote != want) {
+        snprintf(v->status, sizeof(v->status), "save failed: %s", strerror(errno));
+        v->status_err = 1;
+        unlink(tmp);
+        fprintf(stderr, "docview: %s\n", v->status);
+        return -1;
+    }
+    if (rename(tmp, v->save_path) != 0) {
+        snprintf(v->status, sizeof(v->status), "cannot replace %s: %s",
+                 v->save_path, strerror(errno));
+        v->status_err = 1;
+        unlink(tmp);
+        fprintf(stderr, "docview: %s\n", v->status);
+        return -1;
+    }
+
+    v->dirty_doc = 0;
+    v->quit_armed = 0;
+    if (!v->had_path) {
+        /* the document now has a name: the header stops saying "untitled" */
+        const char *base = strrchr(v->save_path, '/');
+        base = base ? base + 1 : v->save_path;
+        snprintf(v->doc.title, sizeof(v->doc.title), "%s", base);
+        snprintf(v->path, sizeof(v->path), "%s", v->save_path);
+        v->had_path = 1;
+    }
+    snprintf(v->status, sizeof(v->status), "saved %s (%d bytes)",
+             v->save_path, v->etext.n);
+    fprintf(stderr, "docview: saved %s\n", v->save_path);
     return 0;
 }
 
@@ -1043,6 +1922,7 @@ static int dv_resolve(const char *arg, char *out, size_t cap) {
 static void dv_free(Viewer *v) {
     if (!v) return;
     office_free(&v->doc);
+    dv_text_free(&v->etext);
     free(v->lines);
     v->lines = NULL;
 }
@@ -1071,18 +1951,28 @@ int main(int argc, char **argv) {
     v->w = c.w;
     v->h = c.h;
 
-    const char *arg = argc > 1 ? argv[1] : getenv("MYSTIC_DOC");
+    /* argv[1] then MYSTIC_DOC name the file to open. With neither, this is a
+     * new document: an empty untitled buffer you can type into and save. The
+     * old behaviour - search four directories for something to show - is gone,
+     * because it made "start a new document" impossible. */
+    const char *want = (argc > 1 && argv[1][0]) ? argv[1] : getenv("MYSTIC_DOC");
     char path[512];
-    if (dv_resolve(arg, path, sizeof(path))) {
+    if (!want || !want[0]) {
+        dv_new_text(v);
+    } else if (!dv_openable(want, path, sizeof(path))) {
+        snprintf(v->err, sizeof(v->err), "%s: no such file", want);
+        v->loaded = 0;
+    } else if (dv_supported(path)) {
+        /* an Office container: read-only, exactly as before */
         snprintf(v->path, sizeof(v->path), "%s", path);
-        if (office_open(&v->doc, path, v->err, sizeof(v->err)) == 0)
-            v->loaded = 1;
+        v->loaded = office_open(&v->doc, path, v->err, sizeof(v->err)) == 0;
+    } else {
+        /* anything else is offered as text if its bytes decode as text */
+        snprintf(v->path, sizeof(v->path), "%s", path);
+        if (dv_load_text(v, path, v->err, sizeof(v->err)) == 0)
+            dv_set_text_meta(v, path);
         else
             v->loaded = 0;
-    } else {
-        snprintf(v->err, sizeof(v->err),
-                 "%s", arg && arg[0] ? arg : "");
-        v->loaded = 0;
     }
     dv_layout(v);
 
@@ -1104,12 +1994,56 @@ int main(int argc, char **argv) {
 
         MEvent ev;
         int quit = 0;
+        int edited = 0;      /* the buffer changed: re-lay out once, below */
+        int saved = 0;       /* Ctrl+S arrives as a key AND as 0x13: save once */
         while (mc_poll(&c, &ev)) {
-            if (ev.type == MC_CLOSE) { quit = 1; break; }
+            if (ev.type == MC_CLOSE) {
+                /* the title-bar close is the same as Esc: do not drop unsaved
+                 * text on the floor without saying so first */
+                if (v->editing && v->dirty_doc && !v->quit_armed) {
+                    v->quit_armed = 1;
+                    v->status_err = 1;
+                    snprintf(v->status, sizeof(v->status),
+                             "unsaved changes - Ctrl+S saves, close again to discard them");
+                    dirty = 1;
+                    continue;
+                }
+                quit = 1;
+                break;
+            }
 
             if (ev.type == MC_TEXT) {
                 for (const char *t = ev.text; *t; t++) {
-                    switch (*t) {
+                    unsigned char ch = (unsigned char)*t;
+
+                    if (v->editing) {
+                        /* Ctrl+S reaches us as 0x13 as well as a key event;
+                         * either path saves, and a save is never typed. */
+                        if (ch == 0x13) {
+                            if (!saved) { dv_save(v); saved = 1; }
+                        } else if (ch == '\n' || ch == '\r') {
+                            if (dv_edit_split(&v->etext, &v->caret)) edited = 1;
+                            v->goal_col = -1;
+                        } else if (ch == '\b') {
+                            if (dv_edit_backspace(&v->etext, &v->caret)) edited = 1;
+                            v->goal_col = -1;
+                        } else if (ch == '\t') {
+                            int n = dv_tab_spaces(&v->etext, v->caret);
+                            for (int k = 0; k < n; k++)
+                                if (dv_edit_insert(&v->etext, &v->caret, " ", 1))
+                                    edited = 1;
+                            v->goal_col = -1;
+                        } else if (ch >= 32 && ch != 127) {
+                            if (dv_edit_insert(&v->etext, &v->caret,
+                                               (const char *)t, 1))
+                                edited = 1;
+                            v->goal_col = -1;
+                        }
+                        /* other control bytes are not text */
+                        continue;
+                    }
+
+                    switch (ch) {
                     case 'q': quit = 1; break;
                     case 'r':
                         if (v->loaded && v->doc.nblocks > 0) {
@@ -1154,18 +2088,71 @@ int main(int argc, char **argv) {
             } else if (ev.type == MC_KEY) {
                 if (ev.press) {
                     int step = ui_px(DV_SCROLL_STEP);
-                    switch (ev.key) {
-                    case DV_KEY_DOWN:  if (!v->show_info) dv_scroll_by(v, step); break;
-                    case DV_KEY_UP:    if (!v->show_info) dv_scroll_by(v, -step); break;
-                    case DV_KEY_PAGEDN: if (!v->show_info) dv_scroll_by(v, (v->body_h * 9) / 10); break;
-                    case DV_KEY_PAGEUP: if (!v->show_info) dv_scroll_by(v, -(v->body_h * 9) / 10); break;
-                    case DV_KEY_HOME:  v->scroll = 0; break;
-                    case DV_KEY_END:   v->scroll = v->content_h; dv_clamp_scroll(v); break;
-                    case DV_KEY_ESC:
-                        if (v->show_info) v->show_info = 0;
-                        else quit = 1;
-                        break;
-                    default: break;
+
+                    if (v->editing) {
+                        int ctrl = (ev.mods & DV_MOD_CTRL) != 0;
+                        switch (ev.key) {
+                        case DV_KEY_S:
+                            if (ctrl && !saved) { dv_save(v); saved = 1; }
+                            break;
+                        case DV_KEY_LEFT:
+                            if (!ctrl) { v->caret = dv_caret_left(&v->etext, v->caret);
+                                         v->goal_col = -1; }
+                            break;
+                        case DV_KEY_RIGHT:
+                            if (!ctrl) { v->caret = dv_caret_right(&v->etext, v->caret);
+                                         v->goal_col = -1; }
+                            break;
+                        case DV_KEY_UP:
+                            v->caret = dv_caret_up(&v->etext, v->caret, &v->goal_col);
+                            break;
+                        case DV_KEY_DOWN:
+                            v->caret = dv_caret_down(&v->etext, v->caret, &v->goal_col);
+                            break;
+                        case DV_KEY_HOME:
+                            v->caret = dv_caret_home(&v->etext, v->caret);
+                            v->goal_col = -1;
+                            break;
+                        case DV_KEY_END:
+                            v->caret = dv_caret_end(&v->etext, v->caret);
+                            v->goal_col = -1;
+                            break;
+                        case DV_KEY_DELETE:
+                            if (dv_edit_delete(&v->etext, &v->caret)) edited = 1;
+                            v->goal_col = -1;
+                            break;
+                        case DV_KEY_PAGEDN:
+                            dv_scroll_by(v, (v->body_h * 9) / 10);
+                            break;
+                        case DV_KEY_PAGEUP:
+                            dv_scroll_by(v, -(v->body_h * 9) / 10);
+                            break;
+                        case DV_KEY_ESC:
+                            if (v->dirty_doc && !v->quit_armed) {
+                                v->quit_armed = 1;
+                                v->status_err = 1;
+                                snprintf(v->status, sizeof(v->status),
+                                         "unsaved changes - Ctrl+S saves, Esc again discards them");
+                            } else {
+                                quit = 1;
+                            }
+                            break;
+                        default: break;
+                        }
+                    } else {
+                        switch (ev.key) {
+                        case DV_KEY_DOWN:  if (!v->show_info) dv_scroll_by(v, step); break;
+                        case DV_KEY_UP:    if (!v->show_info) dv_scroll_by(v, -step); break;
+                        case DV_KEY_PAGEDN: if (!v->show_info) dv_scroll_by(v, (v->body_h * 9) / 10); break;
+                        case DV_KEY_PAGEUP: if (!v->show_info) dv_scroll_by(v, -(v->body_h * 9) / 10); break;
+                        case DV_KEY_HOME:  v->scroll = 0; break;
+                        case DV_KEY_END:   v->scroll = v->content_h; dv_clamp_scroll(v); break;
+                        case DV_KEY_ESC:
+                            if (v->show_info) v->show_info = 0;
+                            else quit = 1;
+                            break;
+                        default: break;
+                        }
                     }
                 }
                 dirty = 1;
@@ -1198,9 +2185,20 @@ int main(int argc, char **argv) {
                     maxs = v->content_h - v->body_h;
                     v->scroll = maxs > 0 ? maxs * ratio / 1000 : 0;
                     dv_clamp_scroll(v);
+                    if (v->editing) dv_caret_reveal(v);
                 }
                 dirty = 1;
             }
+        }
+        if (edited) {
+            /* one whole-buffer re-layout per frame, not per character */
+            dv_layout(v);
+            dv_caret_reveal(v);
+            v->dirty_doc = 1;
+            v->quit_armed = 0;
+            v->status[0] = 0;   /* the "saved ..." note is stale once you type */
+            v->status_err = 0;
+            dirty = 1;
         }
         if (quit) break;
     }
@@ -1211,3 +2209,5 @@ int main(int argc, char **argv) {
     return 0;
 }
 #endif /* DOCVIEW_HOST_TEST */
+
+#endif /* !DOCEDIT_TEST */

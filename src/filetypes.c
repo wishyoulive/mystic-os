@@ -88,9 +88,9 @@ static const FileType FT_TABLE[] = {
     { "m4a",      "M4A audio",          FT_KIND_AUDIO,      FT_ICON_AUDIO,      FT_APP_VIEWER   },
 
     /* ---- text -------------------------------------------------------- */
-    { "txt",      "Plain text",         FT_KIND_TEXT,       FT_ICON_TEXT,       FT_APP_VIEWER   },
+    { "txt",      "Plain text",         FT_KIND_TEXT,       FT_ICON_TEXT,       FT_APP_DOCVIEW  },
     { "log",      "Log file",           FT_KIND_TEXT,       FT_ICON_TEXT,       FT_APP_VIEWER   },
-    { "md",       "Markdown",           FT_KIND_TEXT,       FT_ICON_TEXT,       FT_APP_VIEWER   },
+    { "md",       "Markdown",           FT_KIND_TEXT,       FT_ICON_TEXT,       FT_APP_DOCVIEW  },
     { "rst",      "reStructuredText",   FT_KIND_TEXT,       FT_ICON_TEXT,       FT_APP_VIEWER   },
     { "csv",      "CSV table",          FT_KIND_TEXT,       FT_ICON_DATA,       FT_APP_VIEWER   },
     { "tsv",      "TSV table",          FT_KIND_TEXT,       FT_ICON_DATA,       FT_APP_VIEWER   },

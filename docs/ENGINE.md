@@ -453,7 +453,7 @@ which one is missing instead of a dead rectangle:
 The engine runs with `--no-sandbox`. That is not an oversight: Chromium's own
 sandbox needs unprivileged user namespaces and a filesystem layout the jail
 does not have. The OS jail — a chroot, its own mount namespace, one of the
-sandbox uids 2000..2007, no host `/root` (its own appdata is bound at `/root`),
+sandbox uids 2000..2015, no host `/root` (its own appdata is bound at `/root`),
 the framebuffer, the keyboard device and other clients out of reach — is the
 sandbox. It is weaker than Chromium's: a compromised renderer has the engine's
 whole tree and can reach the network directly (`network = host`; that is the

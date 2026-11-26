@@ -56,7 +56,7 @@
 #include "mystic.h"
 
 #define WM_SOCKET     "/run/mystic/wm.sock"
-#define WM_MAX_CLIENTS 8
+#define WM_MAX_CLIENTS 16   /* windows from separate processes; was 8 */
 #define WM_MAX_APPS    32
 
 /* The two places a bundle can live. WM_APP_DIR is the image's own copy: read

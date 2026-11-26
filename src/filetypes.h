@@ -134,6 +134,7 @@ typedef enum {
  *  this", which is true of the unknown row.
  * ------------------------------------------------------------ */
 #define FT_APP_VIEWER   "viewer"     /* the file viewer (external app) */
+#define FT_APP_DOCVIEW  "docview"    /* Documents: reads Office, edits text */
 #define FT_APP_FILES    "files"      /* the file manager               */
 #define FT_APP_WEB      "web"        /* the browser                    */
 #define FT_APP_TERMINAL "terminal"   /* the shell window               */

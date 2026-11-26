@@ -89,7 +89,7 @@
  * process, so a uid is never reused while an app is still running under it.
  */
 #define SBX_UID_BASE   2000
-#define SBX_UID_SLOTS  WM_MAX_CLIENTS        /* 8 -> uid 2000..2007 */
+#define SBX_UID_SLOTS  WM_MAX_CLIENTS        /* 16 -> uid 2000..2015 */
 #define SBX_UID_TOP    (SBX_UID_BASE + SBX_UID_SLOTS)
 #define SBX_GID_BASE   SBX_UID_BASE          /* gid == uid; groups stay empty */
 
