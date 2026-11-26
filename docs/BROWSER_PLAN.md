@@ -1,14 +1,3 @@
-# Browser plan
-
-> **The Chromium path described below was built and then removed.** It worked -
-> pages rendered, YouTube played - but a headless browser painted through the
-> DevTools screencast is not a browser window: input went through a translation
-> layer, the frame rate was Chromium's own ~24 fps, video had no sound without a
-> codec inside the package, and DRM could never ship. It is gone from the image,
-> from the package repository and from the tree; git history has it if the
-> decision is ever revisited. The OS browser is `src/client/apps/web.c`: our own
-> HTTP client, HTML/CSS renderer and JavaScript, with no engine underneath.
-
 # Running a real browser engine on Mystic OS
 
 There is no X11 and no Wayland here. The compositor owns `/dev/fb0`, draws with
