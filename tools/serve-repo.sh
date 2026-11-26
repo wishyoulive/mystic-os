@@ -37,26 +37,17 @@ pack_one() {
 for d in stage/usr/share/mystic/apps/*/; do
     [ -d "$d" ] || continue
     name=$(basename "$d")
-    # vlc and engine are not plain stage bundles. Their packages carry a
-    # runtime closure (libVLC 103 MB, Chromium 683 MB) and are produced by
-    # tools/fetch-vlc.py and tools/fetch-engine.py; packing the stage
-    # directory here would overwrite the real tarball with an image
-    # placeholder and install an app whose library is not there.
-    if [ "$name" = vlc ] || [ "$name" = engine ]; then continue; fi
+    # vlc is not a plain stage bundle: its package carries the libVLC closure
+    # and is produced by tools/fetch-vlc.py, so packing the stage directory here
+    # would overwrite the real tarball with a placeholder whose library is
+    # missing.
+    if [ "$name" = vlc ]; then continue; fi
     desc=$(sed -n 's/^desc *= *//p' "$d/manifest" 2>/dev/null | head -1)
     pack_one "$name" "$d" "${desc:-Mystic application}"
 done
 # keep the vlc row tools/fetch-vlc.py wrote, if the package is there
 if [ -f "$REPO/vlc.tar.gz" ] && [ -f "$REPO/vlc.row" ]; then
     cat "$REPO/vlc.row" >> "$REPO/index.tsv.new"
-fi
-# keep the engine row tools/fetch-engine.py wrote. This replaces the old
-# 'pack_one browser build/browser-root' line: that tree has no manifest, so the
-# row it published installed a bundle pkg could not read a manifest from, and
-# nothing ever ran. The real package is build/repo/engine.tar.gz and its row is
-# produced (and signed) by the tool that builds it.
-if [ -f "$REPO/engine.tar.gz" ] && [ -f "$REPO/engine.row" ]; then
-    cat "$REPO/engine.row" >> "$REPO/index.tsv.new"
 fi
 
 mv "$REPO/index.tsv.new" "$REPO/index.tsv"

@@ -1,3 +1,8 @@
+# No optional transport sources: the DevTools-driven engine viewer was removed
+# (a headless Chromium screencast is not a browser window), and it was the only
+# user of src/client/cdpws.c. Keep this loop empty rather than deleting it, so
+# a future app can add a source here without rewriting the build line.
+EXTRA_SRC=""
 #!/usr/bin/env bash
 # ============================================================
 #  tools/mkapp.sh - build and package an external Mystic OS app
@@ -18,13 +23,10 @@ APP="${1:-}"
 [ -n "$APP" ] || { echo "usage: ./tools/mkapp.sh <app-id>" >&2; exit 1; }
 
 SRC="src/client/apps/$APP.c"
-# Optional runtime sources that only some apps need. The engine viewer drives a
-# browser over the DevTools protocol, so it links the transport when that file
-# exists - a client that does not use it costs nothing.
+# Optional runtime sources that only some apps need. Empty today: the only
+# user was the DevTools-driven engine viewer, removed because a headless
+# Chromium screencast is not a browser window. The hook stays.
 EXTRA_SRC=""
-for extra in src/client/cdpws.c; do
-    [ -f "$extra" ] && EXTRA_SRC="$EXTRA_SRC $extra"
-done
 [ -f "$SRC" ] || { echo "error: no $SRC" >&2; exit 1; }
 
 ZIG="${ZIG:-}"
