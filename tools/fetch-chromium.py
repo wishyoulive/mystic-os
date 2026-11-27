@@ -11,6 +11,13 @@ The output is self-describing: .pkg-name and .pkg-version are read back by `pkg`
 
 Usage:
   python tools/fetch-chromium.py --branch v3.24 --out build/repo/chromium.tar.gz
+
+  # research a different binary (the full browser, not the headless shell)
+  # without touching the shipping tarball or the shared index cache:
+  python tools/fetch-chromium.py --packages chromium --id chromium \
+      --root .work/full-chromium/root \
+      --out .work/full-chromium/chromium.tar.gz \
+      --cache .work/full-chromium/apk --index-cache .work/full-chromium/idx
 """
 
 import argparse
@@ -201,12 +208,107 @@ def extract_apk(apk, root, symlinks):
                 os.chmod(dest, m.mode & 0o777)
 
 
+def bundle_entrypoint(root, lib_path, version):
+    """Write the bundle's launcher (`chromium`, the manifest's `exec`) and its
+    manifest. Return "browser" or "headless".
+
+    A bundle is only as launchable as the path the launcher execs: the headless
+    shell is one file in usr/bin, the full browser is usr/lib/chromium/chromium
+    behind Alpine's wrapper, and a bundle built for one with the other's path
+    dies with ENOENT before Chromium starts. Kept as a function so the launcher
+    text can be tested without downloading 340 MB (see the RSI report's
+    test-launcher.py, which diffs the headless case against the shipped tarball).
+    """
+    browser_bin = os.path.join(root, "usr", "lib", "chromium", "chromium")
+    headless_bin = os.path.join(root, "usr", "bin", "chromium-headless-shell")
+    is_browser = os.path.exists(browser_bin) and not os.path.exists(headless_bin)
+    libpath_line = ('export LD_LIBRARY_PATH="' + lib_path
+                    + '${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"')
+    if is_browser:
+        script = [
+            "#!/bin/sh",
+            "# Chromium (full browser) from the signed package repository.",
+            "# The binary loads resources.pak, icudtl.dat, libEGL.so and",
+            "# libGLESv2.so from its own directory, so PROGDIR must be intact.",
+            # wmsrv mounts the bundle at /app and execs the payload as
+            # /bin/app with argv[0] = "app" after chdir("/") (src/wmsrv.c:1732,
+            # 2032-2034), so dirname $0 is "/" inside the jail, not the bundle.
+            # MYSTIC_BUNDLE is the path that is true in both worlds; the
+            # dirname fallback keeps a direct host run working.
+            'd=${MYSTIC_BUNDLE:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}',
+            libpath_line,
+            # wmsrv's run dir is /run/mystic (src/wmsrv.c run_dir(), WM_RUN_DIR),
+            # and the Wayland socket lives there. Chromium creates its own
+            # sockets and shm files in XDG_RUNTIME_DIR, so the check is
+            # writability, not existence: a read-only bind of the WM's socket
+            # directory would leave it unable to start. /tmp is the jail's own
+            # per-app tmpfs, which is always writable.
+            'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/mystic}"',
+            '[ -d "$XDG_RUNTIME_DIR" ] && [ -w "$XDG_RUNTIME_DIR" ]'
+            ' || export XDG_RUNTIME_DIR=/tmp',
+            'export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"',
+            # Flags that are not optional here: --ozone-platform=wayland (158 has
+            # no ozone-platform-hint), --disable-gpu (no render node / no 3D
+            # driver in the guest), --no-sandbox (the tarball cannot record
+            # chrome-sandbox's 4755 bit), --disable-dev-shm-usage (the jail's
+            # /dev/shm is a 64 MiB tmpfs, src/wmsrv.c sbx_tmpfs_size),
+            # --user-data-dir (HOME is a tmpfs), --password-store=basic (no
+            # keyring daemon).
+            'exec "$d/usr/lib/chromium/chromium" --ozone-platform=wayland'
+            ' --disable-gpu --no-sandbox --disable-dev-shm-usage'
+            ' --user-data-dir=/tmp/chromium --password-store=basic'
+            ' --no-first-run "$@"',
+        ]
+        manifest = [
+            "name = Chromium",
+            "desc = Chromium browser (Blink and V8) as a native Wayland client",
+            "exec = chromium",
+            "version = " + version,
+            "bundle = chromium",
+            "network = host",
+            # the guest has HDA playback (snd-hda-intel, /dev/snd) but wmsrv
+            # binds /dev/snd only for a manifest that asks for it
+            "audio = yes",
+        ]
+    else:
+        script = [
+            "#!/bin/sh",
+            "# Chromium (headless shell) from the signed package repository.",
+            "# The engine is a real Blink build; Mystic drives it through the",
+            "# DevTools protocol and draws the frames it returns.",
+            'd=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)',
+            libpath_line,
+            'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"',
+            'exec "$d/usr/bin/chromium-headless-shell" --no-sandbox --disable-gpu "$@"',
+        ]
+        manifest = [
+            "name = Chromium",
+            "desc = Chromium browser engine (Blink and V8), driven over DevTools",
+            "exec = chromium",
+            "version = " + version,
+            "bundle = chromium",
+            "network = host",
+        ]
+    launcher = os.path.join(root, "chromium")
+    with open(launcher, "w", newline=chr(10)) as f:
+        f.write(chr(10).join(script) + chr(10))
+    os.chmod(launcher, 0o755)
+    with open(os.path.join(root, "manifest"), "w", newline=chr(10)) as f:
+        f.write(chr(10).join(manifest) + chr(10))
+    return "browser" if is_browser else "headless"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--branch", default="v3.24")
     ap.add_argument("--root", default=None, help="staging directory (default build/chromium-root)")
     ap.add_argument("--out", default=None, help="tarball path (default build/repo/chromium.tar.gz)")
     ap.add_argument("--cache", default=None, help="apk download cache (default build/cache/apk)")
+    ap.add_argument("--index-cache", default=None,
+                    help="APKINDEX cache directory (default build/cache). Point this at a "
+                         "local copy to resolve against a freshened index without "
+                         "rewriting the shared cache: the committed index goes stale "
+                         "and then every URL derived from it 404s.")
     ap.add_argument("--packages", default="chromium-headless-shell",
                     help="space separated root packages")
     ap.add_argument("--id", default="chromium",
@@ -217,7 +319,8 @@ def main():
     root = args.root or os.path.join(here, "build", "chromium-root")
     out = args.out or os.path.join(here, "build", "repo", "chromium.tar.gz")
     cache = args.cache or os.path.join(here, "build", "cache", "apk")
-    index_cache = os.path.join(here, "build", "cache")
+    index_cache = args.index_cache or os.path.join(here, "build", "cache")
+    os.makedirs(index_cache, exist_ok=True)
 
     pkgs = []
     for repo in ("main", "community"):
@@ -254,11 +357,24 @@ def main():
     log("downloaded %.1f MB into %s" % (got_bytes / 1048576, cache))
 
     if os.path.exists(root):
+        # A rebuild into an existing staging directory has to get past one
+        # platform fact: files extracted with mode 0444 are marked read-only on
+        # Windows and cannot be removed until the bit is cleared.
         for dp, dn, fn in os.walk(root, topdown=False):
             for f in fn:
-                os.remove(os.path.join(dp, f))
+                p = os.path.join(dp, f)
+                try:
+                    os.remove(p)
+                except OSError:
+                    os.chmod(p, 0o644)
+                    os.remove(p)
             for d in dn:
-                os.rmdir(os.path.join(dp, d))
+                p = os.path.join(dp, d)
+                try:
+                    os.rmdir(p)
+                except OSError:
+                    os.chmod(p, 0o755)
+                    os.rmdir(p)
     os.makedirs(root, exist_ok=True)
 
     symlinks = {}
@@ -291,32 +407,10 @@ def main():
 
     # pkg only accepts a bare exec name in the bundle root, and the dynamic
     # loader needs the bundled libraries, so the payload is this launcher.
-    launcher = os.path.join(root, "chromium")
-    script = [
-        "#!/bin/sh",
-        "# Chromium (headless shell) from the signed package repository.",
-        "# The engine is a real Blink build; Mystic drives it through the",
-        "# DevTools protocol and draws the frames it returns.",
-        'd=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)',
-        'export LD_LIBRARY_PATH="' + lib_path + '${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"',
-        'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"',
-        'exec "$d/usr/bin/chromium-headless-shell" --no-sandbox --disable-gpu "$@"',
-    ]
-    with open(launcher, "w", newline=chr(10)) as f:
-        f.write(chr(10).join(script) + chr(10))
-    os.chmod(launcher, 0o755)
+    log("entrypoint: %s" % bundle_entrypoint(root, lib_path, main_pkg_version))
 
-    manifest = [
-        "name = Chromium",
-        "desc = Chromium browser engine (Blink and V8), driven over DevTools",
-        "exec = chromium",
-        "version = " + main_pkg_version,
-        "bundle = chromium",
-        "network = host",
-    ]
-    with open(os.path.join(root, "manifest"), "w", newline=chr(10)) as f:
-        f.write(chr(10).join(manifest) + chr(10))
-
+    # pkg reads these back; they must be inside the tarball, so they are written
+    # before the walk below, not after it.
     main_pkg = chosen[roots[0]]
     with open(os.path.join(root, ".pkg-name"), "w") as f:
         f.write(args.id + "\n")

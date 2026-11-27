@@ -83,6 +83,12 @@ def elf_facts_bytes(d):
     phoff = struct.unpack_from("<Q", d, 0x20)[0]
     ents = struct.unpack_from("<H", d, 0x36)[0]
     n = struct.unpack_from("<H", d, 0x38)[0]
+    # A truncated .so passes the magic check above and then made the program
+    # table walk raise struct.error out of a build (the traceback came from
+    # prune_broken_modules, not from anything the caller could act on). Treat
+    # a header that points outside the file as "not an ELF we can read".
+    if ents < 56 or phoff + n * ents > len(d):
+        return None
     interp = None
     loads, dyn = [], None
     for i in range(n):
@@ -97,7 +103,11 @@ def elf_facts_bytes(d):
     needed = []
     if dyn:
         entries = []
+        # The dynamic table is sized by DT_* entries that the file may not
+        # actually contain; stop at the end of the buffer.
         for j in range(dyn[1] // 16):
+            if dyn[0] + (j + 1) * 16 > len(d):
+                break
             tag, val = struct.unpack_from("<QQ", d, dyn[0] + j * 16)
             entries.append((tag, val))
             if tag == 0:
@@ -107,8 +117,13 @@ def elf_facts_bytes(d):
             so = next((o + (sv[0] - va) for va, o, fs in loads
                        if va <= sv[0] < va + fs), None)
             if so is not None:
-                needed = [d[so + v:d.index(b"\x00", so + v)].decode("ascii", "replace")
-                          for t, v in entries if t == 1]
+                for t, v in entries:
+                    if t != 1:
+                        continue
+                    end = d.find(b"\x00", so + v)
+                    if end < 0:          # NEEDED name runs past the buffer
+                        continue
+                    needed.append(d[so + v:end].decode("ascii", "replace"))
     return {"size": len(d), "interp": interp, "needed": needed}
 
 

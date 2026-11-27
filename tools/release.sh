@@ -91,6 +91,24 @@ fi
 "$PYTHON" -c 'import zipfile' >/dev/null 2>&1 \
     || die "$PYTHON cannot create zip files (zipfile module missing)"
 
+# A scripted-input hook under /run/mystic/ is baked into the initramfs like any
+# other file, and src/input.c opens /run/mystic/input-script at boot when
+# MYSTIC_INPUT_TEST is unset: the desktop then types a canned script into
+# whatever has focus (the one found in this tree ran `rm -rf /root/apps/engine`
+# and `pkg install engine`). A test image may carry one; a release must not.
+# tools/mkiso.py calls the same checker for the ISO, which is built from the
+# very same file.
+if hook=$("$PYTHON" "$ROOT/tools/check_initramfs.py" "$INITRD"); then
+    :
+else
+    case $? in
+        1) die "$INITRD carries $hook - a scripted input script that src/input.c
+       replays at boot. Delete it from stage/ (it is test residue, not image
+       content) and rebuild the image." ;;
+        *) die "could not read $INITRD as a gzip cpio archive (see the message above)" ;;
+    esac
+fi
+
 kernel_bytes=$(bytes_of "$KERNEL")
 initrd_bytes=$(bytes_of "$INITRD")
 

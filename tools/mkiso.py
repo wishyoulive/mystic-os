@@ -20,6 +20,8 @@ import pycdlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
+sys.path.insert(0, os.path.join(ROOT, 'tools'))
+import check_initramfs                                   # noqa: E402
 
 SYSL = 'build/iso/syslinux-6.03'
 OUT = 'build/release/mystic-os.iso'
@@ -60,12 +62,36 @@ def need_syslinux():
             print('iso: %s (%d bytes)' % (dest, os.path.getsize(dest)))
 
 
-need_syslinux()
-REQUIRED = ['build/cache/vmlinuz-virt', 'build/initramfs.cpio.gz', ISOLINUX, LDLINUX]
+REQUIRED = ['build/cache/vmlinuz-virt', 'build/initramfs.cpio.gz']
 missing = [f for f in REQUIRED if not os.path.exists(f)]
 if missing:
     sys.exit('missing: %s (run ./image.sh and tools/fetch-kernel.sh first)'
              % ', '.join(missing))
+
+# The ISO is built from the same initramfs as the zip, so it needs the same
+# check: a scripted-input hook under /run/mystic/ is replayed at boot by
+# src/input.c. See tools/check_initramfs.py. This runs before need_syslinux()
+# on purpose - a refused ISO must not download or unpack anything first - and
+# it maps the checker's "cannot read" result to a sentence instead of letting
+# the exception escape.
+try:
+    hook = check_initramfs.scan('build/initramfs.cpio.gz')
+except (OSError, ValueError, EOFError) as exc:
+    print('iso: cannot read build/initramfs.cpio.gz as a gzip cpio archive: %s'
+          % exc, file=sys.stderr)
+    print('iso: nothing was downloaded or written; rebuild with ./image.sh',
+          file=sys.stderr)
+    sys.exit(2)
+if hook:
+    sys.exit('iso: refusing to build: build/initramfs.cpio.gz carries %s\n'
+             '     (a scripted input script that src/input.c replays at boot;\n'
+             '      delete stage/run/ and rebuild the image)' % hook[0])
+
+need_syslinux()
+missing = [f for f in (ISOLINUX, LDLINUX) if not os.path.exists(f)]
+if missing:
+    sys.exit('missing: %s (tools/mkiso.py could not extract them from the '
+             'syslinux tarball)' % ', '.join(missing))
 
 CONFIG = '\n'.join([
     'DEFAULT mystic',

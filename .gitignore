@@ -24,5 +24,9 @@ stage/usr/lib/
 
 # agent scratch space
 .work/
-# test hook for the scripted input device (see src/input.c)
-run/mystic/input-script
+# test hook for the scripted input device (see src/input.c). Root-anchored on
+# purpose: the copy a test image needs lives at stage/run/mystic/, and that one
+# must stay VISIBLE in `git status` - hiding it is how it survived long enough
+# to be packed into an image. tools/mkimage.py warns when it packs run/, and
+# tools/release.sh + tools/mkiso.py refuse an initramfs that carries it.
+/run/mystic/input-script

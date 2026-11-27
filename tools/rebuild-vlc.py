@@ -229,15 +229,22 @@ def main():
         t = tarfile.open(args.tarball, "r:gz")
         print("==> %s" % args.tarball)
         print("    %d members" % len(t.getmembers()))
+        # A tarball made by `tar -C dir .` stores ./bin; one made by
+        # tools/pack-vlc.py stores bin. repack() accepts either (it strips
+        # ./, ), so this report must too - it used to print MISSING for both
+        # members of a pack-vlc.py tarball and still exit 0.
+        names = set(t.getnames())
+        missing = []
         for name in ("bin", "libexec/vlcplay"):
-            try:
-                d = t.extractfile("./" + name).read()
-            except KeyError:
+            member = "./" + name if "./" + name in names else name
+            if member not in names:
                 print("    %-18s MISSING" % name)
+                missing.append(name)
                 continue
+            d = t.extractfile(member).read()
             print("    %-18s %8d bytes  interp=%s"
                   % (name, len(d), elf_interp(d)))
-        return 0
+        return 1 if missing else 0
 
     zig = find_zig()
     if not zig:
@@ -259,14 +266,39 @@ def main():
         print("    %d bytes, no PT_INTERP" % lsize)
 
         print("==> repacking %s" % args.tarball)
-        repack(args.tarball, {"bin": open(launcher, "rb").read(),
-                              "libexec/vlcplay": open(player, "rb").read()})
-        sha, size = index_row(args.tarball)
-        update_index(args.index, size, sha)
-        print("    %d bytes, sha256 %s" % (size, sha))
-        if not args.no_sign:
-            sign(args.index)
-            print("    index re-signed")
+        # Back up everything this run is about to change. update_index()
+        # rewrites index.tsv BEFORE sign() runs, so a signing failure
+        # (build/sign/repo.key missing, or a key that does not match the
+        # distributed public half) left a new index beside the old signature:
+        # pkg verifies the pair before it reads a row, so it then refused
+        # EVERY package until someone noticed - and the tarball had already
+        # been replaced, so there was nothing to fall back to.
+        backup = os.path.join(tmpdir, "restore")
+        os.makedirs(backup, exist_ok=True)
+        saved = []
+        for path in (args.tarball, args.index, args.index + ".sig"):
+            if os.path.exists(path):
+                shutil.copy2(path, os.path.join(backup, os.path.basename(path)))
+                saved.append(path)
+        try:
+            repack(args.tarball, {"bin": open(launcher, "rb").read(),
+                                  "libexec/vlcplay": open(player, "rb").read()})
+            sha, size = index_row(args.tarball)
+            update_index(args.index, size, sha)
+            print("    %d bytes, sha256 %s" % (size, sha))
+            if not args.no_sign:
+                sign(args.index)
+                print("    index re-signed")
+            else:
+                print("    --no-sign: %s no longer matches its signature; pkg "
+                      "will refuse it until it is signed" % args.index,
+                      file=sys.stderr)
+        except BaseException:
+            for path in saved:
+                shutil.copy2(os.path.join(backup, os.path.basename(path)), path)
+            print("    error: restored the tarball and the index - the mirror is "
+                  "unchanged", file=sys.stderr)
+            raise
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
     print("done")

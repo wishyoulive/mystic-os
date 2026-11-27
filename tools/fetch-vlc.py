@@ -1841,27 +1841,53 @@ def upsert_index(tarball, repo):
     tmp = idx + ".part"
     with open(tmp, "w", encoding="utf-8", newline=NL) as f:
         f.write(NL.join(rows) + NL)
-    os.replace(tmp, idx)
-    with open(os.path.join(repo, "vlc.row"), "w", encoding="utf-8",
-              newline=NL) as f:
-        f.write(rows[-1] + NL)
 
+    # Sign the candidate index, then publish the signature, then the index, and
+    # only then the row file. os.replace(tmp, idx) used to run first and the
+    # signing came after, so a failed sign left a new index beside the old
+    # signature: pkg verifies the pair before it reads a single row, so one
+    # failure took the WHOLE repository down (not just vlc) while this tool
+    # exited 1 having already published. Same order pkg uses itself
+    # (stage/usr/bin/pkg:738-746, "publish the signature first").
     key = os.path.join("build", "sign", "repo.key")
     pub = os.path.join("stage", "etc", "mystic", "repo.pub")
+    signed = False
     if os.path.isfile(key):
         # flush ours first: the signer is a child process and inherits the
         # same stdout, so buffered lines would otherwise interleave with it.
         sys.stdout.flush()
         cmd = [sys.executable, os.path.join("tools", "sign-index.py"), "sign",
-               "--seed", key, "--in", idx]
+               "--seed", key, "--in", tmp]
         if os.path.isfile(pub):
             cmd += ["--pub", pub]
         r = subprocess.run(cmd)
         if r.returncode != 0:
-            print("warning: could not sign %s" % idx, file=sys.stderr)
-        elif os.path.isfile(pub):
+            for leftover in (tmp, tmp + ".sig"):
+                if os.path.exists(leftover):
+                    os.unlink(leftover)
+            print("error: could not sign %s (sign-index.py exited %d)\n"
+                  "       nothing was published: %s and its signature are "
+                  "unchanged, so the\n"
+                  "       repository still verifies (it serves the previous "
+                  "row for %s).\n"
+                  "       The new %s is on disk; fix %s (or %s), then run\n"
+                  "       tools/sign-index.py sign --seed %s --in %s to "
+                  "publish it."
+                  % (idx, r.returncode, idx, PKG_NAME, tarball, key, pub,
+                     key, idx), file=sys.stderr)
+            raise SystemExit(1)
+        signed = True
+        if os.path.isfile(pub):
             shutil.copyfile(pub, os.path.join(repo, "index.pub"))
-    else:
+    if signed:
+        os.replace(tmp + ".sig", idx + ".sig")
+    os.replace(tmp, idx)
+    # The row file is an input for tools/serve-repo.sh, so it must describe a
+    # published index, not a candidate one.
+    with open(os.path.join(repo, "vlc.row"), "w", encoding="utf-8",
+              newline=NL) as f:
+        f.write(rows[-1] + NL)
+    if not signed:
         print("    no build/sign/repo.key: index.tsv is UNSIGNED and pkg will "
               "refuse it", file=sys.stderr)
     return size, sha
