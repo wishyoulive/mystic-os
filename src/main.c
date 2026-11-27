@@ -44,7 +44,12 @@
 
 #define THEME_DIR "/etc/mystic/themes"
 #define FONT_DIR  "/usr/share/fonts"
-#define MAX_WINDOWS 10
+/* Must match WM_MAX_CLIENTS (src/ipc.h). It was 10 while the client and
+ * uid caps were 16, so six apps could be launched and served - sandbox,
+ * tmpfs, buffer - with no window slot to bind to: they ran invisibly and
+ * unreachable until another window closed. The cap the user sees must not
+ * be the smallest one. */
+#define MAX_WINDOWS WM_MAX_CLIENTS
 
 /* Desktop layout metrics live in src/ui.c next to ui_px() and the scale,
  * because they are functions of the text they hold - not of a pixel count

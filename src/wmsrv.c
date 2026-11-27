@@ -1983,6 +1983,12 @@ static int wms_launch_arg(const WmApp *app, WmClient *cl, int slot, const char *
             fprintf(stderr, "wms: %s: exec %s: %s\n", app->id, exe, strerror(errno));
             _exit(127);
         }
+        /* Anchor the pid exactly as the jailed path does. Without this the uid is
+         * reserved but no process is recorded against it, so the next acquire - or
+         * any client disconnect, which runs sbx_cred_gc - frees a uid a live process
+         * is still using and hands it to another bundle: the shared-uid hole the
+         * pool exists to close. */
+        sbx_cred_add_anchor(uid, (long)hp);
         fprintf(stderr, "wms: launched %s pid %d (host namespaces, uid %d)\n",
                 app->id, (int)hp, uid);
         return (int)hp;
