@@ -168,3 +168,21 @@ the client adds 8 against an evdev keymap; object ids from 2; advertise
 | `pkg` | **approved** after two revisions; the measurements above are its evidence |
 | `input` | unresolved: code written (coalesced motion, page focus that survives a click, live repaint, keep-frame + 5 s retry), 20/20 selftest, three silent builds — but its critic died mid-verification, so nothing is claimed. Parked on `audit-sweep`, unverified |
 | `wayland` | failed on a provider error before writing the document; the research survives in the pkg report as noted |
+
+## Fixed since the audit (verified)
+
+| # | Fix | Verification |
+|---|-----|--------------|
+| S1 | `host=yes` launches anchor their pid, so a live uid cannot be handed to another bundle (`src/wmsrv.c`) | sandbox-plan harness against the real file: 0 failures, plus a control case without the anchor that reproduces the old reuse |
+| W-1 | `MAX_WINDOWS` was 10 while the client and uid caps were 16: six apps could run sandboxed and unreachable (`src/main.c`) | **11 separate-process windows connected at once** in the guest (screenshot `docs/screenshots/eleven-windows.png`); the 11th could not exist before |
+| P1 | a TTF whose composite glyph references itself is rejected instead of recursing until the stack dies (`src/font.c`) | saved case exits 0 (was `STATUS_STACK_OVERFLOW`); every shipped font still loads |
+| P2 | a ZIP entry whose declared size cannot come out of its compressed bytes is refused (`src/office.c`) | the 198-byte .docx is refused with "would be 268435457 bytes"; docx/xlsx/pptx/odt/odp samples still open |
+| W1–W3 | URL resolution splits query and fragment before cleaning the path, and `<img src>` uses the same resolver (`src/client/apps/web.c`) | `tools/tests/weburl.c`: 44 checks, 0 failures, including the three regressed inputs |
+| T1 | `fetch-vlc.py` signs before publishing, so a signing failure cannot leave a new index beside an old signature | hunter's differential test: 4 failures on the pre-fix module, all pass now |
+| T2 | `mkiso.py` uses the shared `tools/check_initramfs.py` gate and reports its documented exit 2 instead of a traceback | gzip-of-junk initramfs: exit 2, no `build/iso`; a clean build still writes the ISO |
+| T3 | the newer tool tests no longer rewrite tracked `.pyc` files | `git status` clean after running them |
+
+Still open from the audit: S2 (step buffer exactly full), S3–S8 (sandbox
+observations), the documentation pass (30 claims), the Chromium fontconfig bug, and
+`/dev/shm` sized for 8 clients in `stage/init`. The input-layer rewrite is parked on
+`audit-sweep` unverified.
