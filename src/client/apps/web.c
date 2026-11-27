@@ -622,11 +622,25 @@ static void url_make(const Url *u, char *out, size_t osz) {
 }
 
 /* Collapse "//", "." and ".." in a path, in place. Real pages link
- * with "../x", and following those must not send junk to the server. */
+ * with "../x", and following those must not send junk to the server.
+ *
+ * A path that names a directory keeps its trailing '/'. Rebuilding the
+ * path one segment at a time naturally drops the empty last segment, and
+ * that is not cosmetic: RFC 3986 section 5.2.4 says a reference whose last
+ * segment is "." or ".." (or which simply ends in '/') resolves to a
+ * directory, and the slash is what makes the NEXT relative reference
+ * resolve inside it. Measured before this: clicking "sub/" on
+ * https://example.com/a/b/ requested /a/b/sub, and the page then resolved
+ * its own "img.png" against /a/b/ - one directory too high. */
 static void path_clean(char *p) {
     char out[WEB_PATH_MAX];
     size_t o = 0;
     const char *s = p;
+    size_t plen = strlen(p);
+    /* the result is a directory if the input ended in '/' (its empty last
+     * segment), or if the last segment met was "." or ".." */
+    int trailing = (plen > 0 && p[plen - 1] == '/');
+    int dir = 0;
 
     while (*s) {
         while (*s == '/') s++;
@@ -634,18 +648,21 @@ static void path_clean(char *p) {
         while (*s && *s != '/') s++;
         size_t len = (size_t)(s - seg);
         if (len == 0) continue;
-        if (len == 1 && seg[0] == '.') continue;
+        if (len == 1 && seg[0] == '.') { dir = 1; continue; }
         if (len == 2 && seg[0] == '.' && seg[1] == '.') {
             while (o > 0 && out[o - 1] != '/') o--;
             if (o > 0) o--;
+            dir = 1;
             continue;
         }
         if (o + len + 2 >= sizeof(out)) break;
         out[o++] = '/';
         memcpy(out + o, seg, len);
         o += len;
+        dir = 0;
     }
     if (o == 0) out[o++] = '/';
+    if ((trailing || dir) && out[o - 1] != '/' && o + 1 < sizeof(out)) out[o++] = '/';
     out[o] = 0;
     snprintf(p, WEB_PATH_MAX, "%s", out);
 }
@@ -856,25 +873,90 @@ static int url_resolve(const Url *base, const char *href, char *out, size_t osz,
         snprintf(authority, sizeof(authority), "%s://%s:%s", base->scheme, base->host, base->port);
 
     char path[WEB_PATH_MAX];
+    /* Url.path carries the query too (the address bar keeps "?x=1" in it,
+     * and the server needs it), but a relative reference resolves against
+     * the PATH. Splitting here is what makes "?page=2" keep the last path
+     * segment and a base like "/p?next=/x/y/" resolve "img.png" to
+     * "/img.png" instead of appending it inside the query string. */
+    size_t blen = strcspn(base->path, "?#");
+    if (p[0] == '?') {
+        /* RFC 3986: a reference that starts with '?' keeps the base path
+         * and replaces only the query. */
+        size_t have = blen < sizeof(path) - 1 ? blen : sizeof(path) - 1;
+        memcpy(path, base->path, have);
+        size_t i = 0;
+        while (p[i] && have + 1 < sizeof(path)) path[have++] = p[i++];
+        path[have] = 0;
+        snprintf(out, osz, "%s%s", authority, path);
+        return 0;
+    }
+    /* The reference has the same split: everything from its first '?' or
+     * '#' is opaque. It must reach the server byte for byte - a query may
+     * contain "//" (a URL, a base64 blob) or ".." (a path the server is
+     * asked to read), and path_clean() would collapse the first and pop a
+     * path segment for the second. Measured before this: "x?u=https://e/a"
+     * was requested as "x?u=https:/e/a", and "x?p=/../y" as "/y" alone. */
+    size_t plen = strcspn(p, "?#");
     if (p[0] == '/') {
-        snprintf(path, sizeof(path), "%s", p);
+        snprintf(path, sizeof(path), "%.*s", (int)plen, p);
     } else {
-        /* the directory part of the current path */
-        const char *dir_end = strrchr(base->path, '/');
+        /* the directory part of the current path (query excluded) */
+        const char *dir_end = NULL;
+        for (size_t i = 0; i < blen; i++)
+            if (base->path[i] == '/') dir_end = base->path + i;
         int dlen = dir_end ? (int)(dir_end - base->path) + 1 : 1;
         if (dlen >= (int)sizeof(path)) dlen = (int)sizeof(path) - 1;
         memcpy(path, base->path, (size_t)dlen);
         path[dlen] = 0;
         size_t have = (size_t)dlen;
         size_t i = 0;
-        while (p[i] && have + 1 < sizeof(path)) path[have++] = p[i++];
+        while (i < plen && have + 1 < sizeof(path)) path[have++] = p[i++];
         path[have] = 0;
     }
     path_clean(path);
-    snprintf(out, osz, "%s%s", authority, path);
+    /* Reattach the query/fragment untouched. */
+    {
+        size_t have = (size_t)snprintf(out, osz, "%s%s", authority, path);
+        if (have < osz && p[plen]) {
+            size_t k = strlen(p + plen);
+            if (k >= osz - have) k = osz - have - 1;
+            memcpy(out + have, p + plen, k);
+            out[have + k] = 0;
+        }
+    }
     (void)err;
     (void)esz;
     return 0;
+}
+
+/* Resolve an <img src> against the page it came from. This used to be a
+ * second, hand-rolled resolver: it pasted the source onto the page's
+ * directory and stopped there. That got three ordinary cases wrong, all of
+ * them visible on real sites:
+ *
+ *   src="//cdn.example/x.png"  -> "https://site//cdn.example/x.png"
+ *                                 (a protocol-relative URL was treated as a
+ *                                 path on the page's own host, so every CDN
+ *                                 image on such a page failed)
+ *   src="../up.png"            -> "/docs/guide/../up.png" on the wire
+ *                                 (dot segments were never collapsed)
+ *   src="pic.png" on a page
+ *      whose URL has a query   -> the image was requested INSIDE the query
+ *                                 string, because the base "path" holds it
+ *
+ * url_resolve() already answers exactly this question (it is what <a href>,
+ * <form action> and Location: use), so there is one resolver, not two. */
+static void img_url(const Url *base, const char *src, char *out, size_t n) {
+    char err[96];
+    err[0] = 0;
+    out[0] = 0;
+    url_resolve(base, src, out, n, err, sizeof err);
+    if (!out[0]) {
+        /* Something url_resolve will not fetch (a fragment, mailto:, or a
+         * scheme this browser does not speak): keep the bytes, so the error
+         * the decoder reports names the source the page really wrote. */
+        snprintf(out, n, "%s", src);
+    }
 }
 
 /* ============================================================
@@ -3629,8 +3711,18 @@ static void lay_emit(Layout *L, const Atom *a, int ai, int start, int len,
     s->atom = (u16)ai;
     s->start = (u16)start;
     s->len = (u16)len;
-    s->x = (u16)(L->x + x + 0.5f);
-    s->w = (u16)(w + 0.5f);
+    /* Seg.x and Seg.w are u16 page coordinates, and a nowrap run
+     * (white-space: pre / nowrap) is emitted however long it is, so the pen
+     * can pass 65535. The cast used to be the only thing between that and
+     * the field, and an out-of-range float-to-integer conversion is UB:
+     * measured, the run after the limit came back at x=488 for a pen of
+     * 66024.5, i.e. the tail of a long <pre> line was painted on top of its
+     * own beginning instead of past the right edge. Clamp; the painter clips
+     * a run outside the window anyway, so a clamped coordinate draws the same
+     * pixels a clipped one would. */
+    float vx = L->x + x + 0.5f, vw = w + 0.5f;
+    s->x = (u16)(vx < 0.0f ? 0.0f : vx > 65535.0f ? 65535.0f : vx);
+    s->w = (u16)(vw < 0.0f ? 0.0f : vw > 65535.0f ? 65535.0f : vw);
     if (L->first_seg < 0) L->first_seg = d->nseg;
     d->nseg++;
     L->segs_in_line++;
@@ -6635,36 +6727,6 @@ static void web_go(Web *w, const char *addr, int push_history) {
     snprintf(w->edit, sizeof(w->edit), "%s", w->pending);
     if (push_history) hist_push(w, w->pending);
     w->state = ST_LOADING;
-}
-
-/* An <img src> resolved against the page it came from. Absolute URLs pass
- * through; "/x" and "x" both land on the page's own host. */
-static void img_url(const Url *base, const char *src, char *out, size_t n) {
-    if (strstr(src, "://")) { snprintf(out, n, "%s", src); return; }
-    /* Keep the port. The first version dropped it, so every image on a page
-     * served from a non-default port was requested from port 80 and failed. */
-    char hostport[WEB_PATH_MAX];
-    if (base->port[0] &&
-        !((!strcmp(base->scheme, "http") && !strcmp(base->port, "80")) ||
-          (!strcmp(base->scheme, "https") && !strcmp(base->port, "443")))) {
-        snprintf(hostport, sizeof(hostport), "%s:%s", base->host, base->port);
-    } else {
-        snprintf(hostport, sizeof(hostport), "%s", base->host);
-    }
-    if (src[0] == '/') {
-        snprintf(out, n, "%s://%s%s", base->scheme, hostport, src);
-        return;
-    }
-    const char *slash = strrchr(base->path, '/');
-    char dir[WEB_PATH_MAX];
-    if (slash) {
-        size_t k = (size_t)(slash - base->path) + 1;
-        if (k >= sizeof(dir)) k = sizeof(dir) - 1;
-        memcpy(dir, base->path, k); dir[k] = 0;
-    } else {
-        snprintf(dir, sizeof(dir), "/");
-    }
-    snprintf(out, n, "%s://%s%s%s", base->scheme, hostport, dir, src);
 }
 
 /* What the stylesheet says the page's default text, link and heading
