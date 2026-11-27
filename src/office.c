@@ -460,6 +460,19 @@ int office_zip_read(const OfficeZip *z, int i, uint8_t **out, size_t *outlen,
         snprintf(err, errsz, "ZIP entry '%s' would be %u bytes", e->name, e->usize);
         return -1;
     }
+    /* A deflate stream cannot expand by more than 1032:1 (zlib's own
+     * documented worst case). An entry that claims more than that from the
+     * compressed bytes it actually carries is not a document a writer
+     * produced: it is a request for an allocation, and a 200-byte package
+     * could otherwise ask for the whole 256 MiB cap above. Compare before
+     * the malloc, so the cap is a ceiling, not the size we hand out. */
+    if (e->method == 8 &&
+        (uint64_t)e->usize > (uint64_t)e->csize * 1032u + 1024u) {
+        snprintf(err, errsz, "ZIP entry '%s' claims %u bytes from %u compressed "
+                 "bytes, more than deflate can produce",
+                 e->name, e->usize, e->csize);
+        return -1;
+    }
 
     uint8_t *buf = malloc((size_t)e->usize + 1);
     if (!buf) {

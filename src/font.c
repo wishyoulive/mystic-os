@@ -631,6 +631,103 @@ static int validate_glyph_outline(const u8 *d, long glyf, unsigned start, unsign
     return 0;
 }
 
+/* ------------------------------------------------------------
+ *  Composite glyph reference graph
+ *
+ *  validate_glyph_outline() above proves that every component *record* of a
+ *  composite glyph lies inside that glyph's own bytes. It cannot see the
+ *  reference graph: a glyph whose component chain leads back to itself is
+ *  perfectly well formed byte by byte. stb_truetype follows those references
+ *  by recursion (stbtt__GetGlyphShapeTT calls stbtt_GetGlyphShape, which has
+ *  no depth limit), so such a font is a stack overflow in font_width() - on a
+ *  file the user did nothing but open. This walk refuses both a cycle and a
+ *  chain deep enough to exhaust the stack, and it is iterative so the check
+ *  itself cannot overflow; `state` makes it linear in glyphs + components,
+ *  so shared components (a diamond) cannot make it exponential.
+ * ------------------------------------------------------------ */
+#define FONT_COMPOSITE_MAX_DEPTH 32
+
+static unsigned loca_at(const u8 *d, unsigned loca_off, int loc_format, unsigned g) {
+    return loc_format ? be32(d + loca_off + (long)g * 4)
+                      : (unsigned)be16(d + loca_off + (long)g * 2) * 2u;
+}
+
+/* One component record. 1 = another follows, 0 = this was the last,
+ * -1 = malformed (which validate_glyph_outline would already have refused). */
+static int comp_step(const u8 *d, long glyf, unsigned stop, long *pos, unsigned *gid) {
+    long p = *pos, end = glyf + (long)stop;
+    if (p + 4 > end) return -1;
+    unsigned flags = be16(d + p);
+    *gid = be16(d + p + 2);
+    p += 4;
+    p += (flags & 0x0001) ? 4 : 2;               /* ARG_1_AND_2_ARE_WORDS */
+    if (flags & 0x0008) p += 2;                  /* WE_HAVE_A_SCALE      */
+    else if (flags & 0x0040) p += 4;             /* X_AND_Y_SCALE        */
+    else if (flags & 0x0080) p += 8;             /* TWO_BY_TWO           */
+    if (p > end) return -1;
+    *pos = p;
+    return (flags & 0x0020) ? 1 : 0;             /* MORE_COMPONENTS      */
+}
+
+static int validate_composite_graph(const u8 *d, unsigned loca_off, int loc_format,
+                                    long glyf, unsigned glyphs, char *why, size_t cap) {
+    unsigned char *state = calloc(glyphs ? glyphs : 1, 1);   /* 0 new, 1 on path, 2 done */
+    struct { unsigned g; long pos; int done; } fr[FONT_COMPOSITE_MAX_DEPTH + 1];
+    int rc = 0;
+    if (!state) {
+        snprintf(why, cap, "out of memory checking the composite glyph graph");
+        return -1;
+    }
+
+    for (unsigned root = 0; root < glyphs && rc == 0; root++) {
+        unsigned a = loca_at(d, loca_off, loc_format, root);
+        unsigned b = loca_at(d, loca_off, loc_format, root + 1);
+        if (state[root]) continue;
+        if (a >= b || be16s(d + glyf + a) >= 0) { state[root] = 2; continue; }
+
+        int sp = 0;
+        state[root] = 1;
+        fr[0].g = root; fr[0].pos = glyf + (long)a + 10; fr[0].done = 0; sp = 1;
+        while (sp > 0 && rc == 0) {
+            unsigned cur = fr[sp - 1].g;
+            if (fr[sp - 1].done) { state[cur] = 2; sp--; continue; }
+
+            unsigned gid = 0;
+            int r = comp_step(d, glyf, loca_at(d, loca_off, loc_format, cur + 1),
+                              &fr[sp - 1].pos, &gid);
+            if (r < 0) {
+                snprintf(why, cap, "glyph %u has a composite record that runs past its outline", cur);
+                rc = -1;
+                break;
+            }
+            if (r == 0) fr[sp - 1].done = 1;     /* this component is the last */
+            if (gid >= glyphs) continue;         /* stb_truetype treats it as .notdef */
+            if (state[gid] == 1) {
+                snprintf(why, cap, "glyph %u reaches itself through its composite components "
+                                   "(a cycle stb_truetype would recurse on until the stack ends)",
+                         gid);
+                rc = -1;
+                break;
+            }
+            if (state[gid] == 2) continue;
+            unsigned ca = loca_at(d, loca_off, loc_format, gid);
+            unsigned cb = loca_at(d, loca_off, loc_format, gid + 1);
+            if (ca >= cb || be16s(d + glyf + ca) >= 0) { state[gid] = 2; continue; }
+            if (sp > FONT_COMPOSITE_MAX_DEPTH) {
+                snprintf(why, cap, "composite glyphs nest deeper than %d levels",
+                         FONT_COMPOSITE_MAX_DEPTH);
+                rc = -1;
+                break;
+            }
+            state[gid] = 1;
+            fr[sp].g = gid; fr[sp].pos = glyf + (long)ca + 10; fr[sp].done = 0;
+            sp++;
+        }
+    }
+    free(state);
+    return rc;
+}
+
 static unsigned long cff_offset(const u8 *p, unsigned n) {
     unsigned long v = 0;
     for (unsigned i = 0; i < n; i++) v = (v << 8) | p[i];
@@ -829,6 +926,9 @@ static int validate_sfnt(const u8 *d, long len, int *out_off, char *why, size_t 
             if (a != b && validate_glyph_outline(d, (long)tab[T_GLYF].off, a, b, g, why, cap) != 0)
                 return -1;
         }
+        if (validate_composite_graph(d, tab[T_LOCA].off, (int)loc_format,
+                                     (long)tab[T_GLYF].off, glyphs, why, cap) != 0)
+            return -1;
     }
     *out_off = (int)off;
     return 0;
